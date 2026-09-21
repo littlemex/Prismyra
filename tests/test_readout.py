@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from prismyra import Boolean, Choice, QuestionError
-from prismyra.readout import option_token_ids, score
+from prismyra import Boolean, Choice, QuestionError, Scale
+from prismyra.readout import option_token_ids, plan, score
 
 
 class StubTokenizer:
@@ -22,7 +22,7 @@ class StubTokenizer:
 def test_the_leading_space_is_what_gets_scored():
     """A name that is one token bare and two with a space in front must be refused, not scored on the wrong token."""
     tok = StubTokenizer({"maybe": [7], " maybe": [7, 8], " yes": [1], " no": [2]})
-    with pytest.raises(QuestionError, match="tokens with a leading space"):
+    with pytest.raises(QuestionError, match="is 2 tokens as ' maybe'"):
         option_token_ids(Choice(id="c", prompt="p", choices=["maybe", "yes"]), tok)
 
 
@@ -129,3 +129,45 @@ def test_an_unrecognisable_block_layout_is_refused_rather_than_guessed(monkeypat
     _stub_checkpoint(monkeypatch, tmp_path, {"lm_head.weight": stored, "lm_head.weight_scale_inv": torch.ones(3, 1)})
     with pytest.raises(RuntimeError, match="cannot tell what block size"):
         readout.load_unembedding("stub/model", hidden_size=4, device="cpu", dtype=torch.float32)
+
+
+# --------------------------------------------------------------------------- choosing the rendering
+#: A tokenizer that behaves like this model's: a space merges into a word and splits from a digit.
+SPLITS_DIGITS = {
+    " yes": [1],
+    " no": [2],
+    "yes": [11],
+    "no": [12],
+    " 1": [220, 16],
+    " 2": [220, 17],
+    " 3": [220, 18],
+    "1": [16],
+    "2": [17],
+    "3": [18],
+}
+
+
+def test_a_word_keeps_the_space_in_the_option():
+    """Nothing changes for the questions that already worked, which is why the measured numbers still hold."""
+    chosen = plan(Boolean(id="b", prompt="Is it?"), StubTokenizer(SPLITS_DIGITS))
+    assert chosen.trailing_space is False
+    assert chosen.text.endswith("Answer:")
+    assert chosen.token_ids == [2, 1]
+
+
+def test_a_scale_moves_the_space_into_the_prompt():
+    """Otherwise every option's first token is the same space, and the read-out has nothing to tell them apart by.
+
+    This is not a preference. On the supported model `" 1"` tokenises to [space, "1"], so scoring the position after
+    `Answer:` scores the space for every option -- and a scale would be refused, or worse, decided by a tie.
+    """
+    chosen = plan(Scale(id="s", prompt="How clear?", low=1, high=3), StubTokenizer(SPLITS_DIGITS))
+    assert chosen.trailing_space is True
+    assert chosen.text.endswith("Answer: ")
+    assert chosen.token_ids == [16, 17, 18]
+
+
+def test_a_question_neither_rendering_can_score_is_refused_with_both_reasons():
+    table = {" alpha": [5, 6], "alpha": [5, 7], " beta": [5, 9], "beta": [5, 8]}
+    with pytest.raises(QuestionError, match="cannot be scored"):
+        plan(Choice(id="c", prompt="Which?", choices=["alpha", "beta"]), StubTokenizer(table))

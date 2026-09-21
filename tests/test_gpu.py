@@ -112,15 +112,25 @@ def test_a_question_wider_than_the_widest_branch_is_refused_before_the_device(en
         engine.ask(CONTEXT, [huge])
 
 
-def test_the_kernels_were_all_applied(engine):
-    """A swap that matches nothing looks exactly like a swap that worked, so the counts are asserted, not printed."""
-    from prismyra.kernels.qwen3_moe import EXPECTED
+def test_the_counted_kernels_match_what_the_config_implies(engine):
+    """A swap that matches nothing looks exactly like a swap that worked, so what can be counted is asserted.
+
+    Only the counts that follow from the config. The normalisation and the dense projections are found by structure, so
+    they carry a verification instead of a number, which this checks is present.
+    """
+    from prismyra.kernels.qwen3_moe import expected_counts
 
     if engine.applied.adapter != "qwen3-moe":
         pytest.skip(f"no qwen adapter for {MODEL}")
-    assert engine.applied.ok
-    assert {s.name: s.replaced for s in engine.applied.swaps} == EXPECTED
-    assert not engine.applied.skipped
+    assert engine.applied.ok, engine.applied.as_dict()
+
+    decoder = getattr(engine.config, "text_config", engine.config)
+    want = expected_counts(decoder)
+    got = {s.name: s.replaced for s in engine.applied.swaps if s.expected is not None}
+    assert got == {k: v for k, v in want.items() if k in got}
+
+    verified = {s.name for s in engine.applied.swaps if s.verified}
+    assert verified == {"norm", "dense_matmul"}, engine.applied.as_dict()
 
 
 # --------------------------------------------------------------------------- the convolution on its own

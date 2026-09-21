@@ -62,3 +62,68 @@ def test_a_filled_id_that_collides_with_a_given_one_is_refused():
     """Reachable without the caller repeating anything: the missing id is filled from the position."""
     with pytest.raises(QuestionError, match="duplicate question ids"):
         build_questions([{"id": "q1", "prompt": "One?"}, {"prompt": "Two?"}])
+
+
+def test_the_endpoint_accepts_a_request_body_over_real_http():
+    """Regression, and the reason the server module has no `from __future__ import annotations`.
+
+    That import turns annotations into strings, which the web framework resolves against the module's globals -- and the
+    request models live inside `create_app`. It then decided the body parameter was a query parameter and rejected every
+    request with "field required" for a field the caller did send. Nothing below the transport could see it: the schema,
+    the read-out and the queue were all fine. Only a real request finds it, so this makes one, with a stub engine so no
+    device is needed.
+    """
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    import prismyra
+    from prismyra.server import create_app
+
+    class StubEngine:
+        model_name = "stub"
+        group = 32
+
+        class _Tok:
+            def __call__(self, text, **_):
+                return {"input_ids": list(range(len(text.split())))}
+
+        tokenizer = _Tok()
+
+        def cache_bytes(self, tokens):
+            return tokens * 1024
+
+        def stats(self):
+            return {"model": "stub"}
+
+        def ask(self, context, questions):
+            answers = {
+                q.id: Answer(
+                    id=q.id,
+                    kind=q.kind,
+                    value=q.value_of(q.options[0]),
+                    option=q.options[0],
+                    probabilities=dict.fromkeys(q.options, 1.0 / len(q.options)),
+                )
+                for q in questions
+            }
+            return Result(answers=answers, timing=Timing(context_ms=1.0, readout_ms=2.0), model="stub")
+
+    real = prismyra.Prismyra
+    prismyra.Prismyra = lambda *a, **k: StubEngine()
+    try:
+        client = TestClient(create_app("stub/model"))
+        response = client.post(
+            "/ask",
+            json={
+                "context": "Returns are accepted within thirty days.",
+                "questions": [{"id": "thirty", "prompt": "Is there a limit?", "kind": "boolean"}],
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["answers"]["thirty"]["kind"] == "boolean"
+        assert "queue_ms" in body["timing"]
+        assert client.get("/health").json()["ok"] is True
+    finally:
+        prismyra.Prismyra = real

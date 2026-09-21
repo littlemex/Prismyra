@@ -19,11 +19,18 @@ from torch import nn
 
 @dataclass(frozen=True)
 class Swap:
-    """One replacement that was applied, and how many modules it touched."""
+    """One replacement that was applied, how many modules it touched, and how that count was checked.
+
+    `expected` is `None` when the count is not the check. Some replacements are identified by structure rather than by
+    position, and how many of those a model contains is a fact about one revision of somebody else's module tree -- a
+    hardcoded number there breaks on a framework upgrade while proving nothing. Those are verified instead: the
+    replacement is run against the implementation it replaces and the outputs must agree. `verified` says so.
+    """
 
     name: str
     replaced: int
-    expected: int
+    expected: int | None = None
+    verified: str | None = None
 
 
 @dataclass
@@ -39,7 +46,7 @@ class Applied:
 
     @property
     def ok(self) -> bool:
-        return all(s.replaced == s.expected for s in self.swaps)
+        return all(s.replaced == s.expected for s in self.swaps if s.expected is not None)
 
     def summary(self) -> str:
         parts = [f"{s.name}={s.replaced}" for s in self.swaps]
@@ -53,6 +60,7 @@ class Applied:
             "adapter": self.adapter,
             "complete": self.ok and not self.skipped,
             "applied": {s.name: s.replaced for s in self.swaps},
+            "verified": {s.name: s.verified for s in self.swaps if s.verified},
             "skipped": list(self.skipped),
             "notes": list(self.notes),
         }
@@ -106,7 +114,7 @@ def apply(model: nn.Module, config, required: bool = False) -> Applied:
         bad = [
             f"{s.name} replaced {s.replaced} of an expected {s.expected}"
             for s in applied.swaps
-            if s.replaced != s.expected
+            if s.expected is not None and s.replaced != s.expected
         ]
         raise AdapterError(f"{adapter.name} found a model it does not recognise: " + "; ".join(bad))
     if required and applied.skipped:

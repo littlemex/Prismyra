@@ -224,11 +224,17 @@ class Result(Mapping[str, Answer]):
         return len(self.answers)
 
 
-def render_question(question: Question) -> str:
+def render_question(question: Question, trailing_space: bool = False) -> str:
     """The text a branch reads. Options are listed in a canonical order, and that is load-bearing.
 
     Listing them in the caller's order made answers depend on it, by up to 0.165. Omitting the list entirely put
     three-way questions at chance. So they are listed, sorted, always.
+
+    `trailing_space` puts the space before the answer into the prompt instead of leaving it to the model. Which of the
+    two a question needs is a property of the tokenizer rather than of the question, and `readout.plan` decides it: this
+    model's tokenizer merges a space into a word, so " yes" is one token, but splits it from a digit, so " 1" is two and
+    the first of them is the same space for every option. A scale is unreadable without this, and unaffected by it.
     """
     options = ", ".join(sorted(question.options))
-    return f"Question: {question.prompt}\nAnswer with one of: {options}\nAnswer:"
+    tail = "Answer: " if trailing_space else "Answer:"
+    return f"Question: {question.prompt}\nAnswer with one of: {options}\n{tail}"

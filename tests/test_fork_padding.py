@@ -7,6 +7,7 @@ import torch
 
 from prismyra import Boolean
 from prismyra.fork import WIDTHS, TooWide, build_suffixes, round_width
+from prismyra.schema import render_question
 
 
 class Tok:
@@ -36,7 +37,7 @@ def test_a_question_past_the_widest_bucket_is_refused_rather_than_accommodated()
 
 def test_every_row_is_read_at_its_own_last_real_token():
     questions = [Boolean(id="a", prompt="short"), Boolean(id="b", prompt="a considerably longer prompt here")]
-    ids, read_at, real = build_suffixes(questions, Tok(), "cpu", rows=4, width=512)
+    ids, read_at, real = build_suffixes([render_question(q) for q in questions], Tok(), "cpu", rows=4, width=512)
     assert ids.shape == (4, 512)
     assert int(real) == 2
     assert read_at[0] < read_at[1]  # the shorter question is read earlier in its row
@@ -46,7 +47,7 @@ def test_every_row_is_read_at_its_own_last_real_token():
 
 def test_padded_rows_repeat_a_real_question_so_they_compute_something_well_formed():
     questions = [Boolean(id="a", prompt="only one")]
-    ids, read_at, real = build_suffixes(questions, Tok(), "cpu", rows=4, width=512)
+    ids, read_at, real = build_suffixes([render_question(q) for q in questions], Tok(), "cpu", rows=4, width=512)
     assert int(real) == 1
     for r in range(1, 4):
         assert torch.equal(ids[r], ids[0])
@@ -56,10 +57,10 @@ def test_padded_rows_repeat_a_real_question_so_they_compute_something_well_forme
 def test_too_many_questions_for_the_pinned_rows_is_refused():
     questions = [Boolean(id=f"q{i}", prompt="p") for i in range(5)]
     with pytest.raises(ValueError, match="will not fit"):
-        build_suffixes(questions, Tok(), "cpu", rows=4, width=512)
+        build_suffixes([render_question(q) for q in questions], Tok(), "cpu", rows=4, width=512)
 
 
 def test_a_question_wider_than_the_pinned_width_is_refused():
     questions = [Boolean(id="a", prompt="x" * 100)]
     with pytest.raises(ValueError, match="pinned to"):
-        build_suffixes(questions, Tok(), "cpu", rows=1, width=32)
+        build_suffixes([render_question(q) for q in questions], Tok(), "cpu", rows=1, width=32)
