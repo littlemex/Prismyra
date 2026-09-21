@@ -24,6 +24,7 @@ from .fork import (
     round_width,
     snapshot,
 )
+from .media import encode, position_offset
 from .readout import load_unembedding, plan, score
 from .schema import (
     Answer,
@@ -116,6 +117,9 @@ class Prismyra:
 
         self.config = AutoConfig.from_pretrained(model)
         self.tokenizer = AutoTokenizer.from_pretrained(model)
+        # A processor only if the checkpoint has one. It is what turns an image into pixels and expands the placeholder
+        # into as many pad tokens as the resolution needs; a text-only checkpoint has none and does not need one.
+        self.processor = _load_processor(model)
         # No language-model head: it projects to the whole vocabulary and nothing here generates a token.
         self.backbone = AutoModel.from_pretrained(model, dtype=self.dtype, device_map=self.device if on_cuda else None)
         self.backbone.eval()
@@ -162,28 +166,44 @@ class Prismyra:
         """
         return cache_bytes(self.config, context_tokens + WIDTHS[-1], self.group, self.dtype)
 
-    def open_context(self, context: str) -> Context:
+    def open_context(self, context: str, *, images: list | None = None, videos: list | None = None) -> Context:
         """Read a context and keep it open. The expensive half happens here, once.
+
+        `images` and `videos` take anything the model's processor accepts -- a `PIL.Image`, a path, an array of frames
+        -- and are read into the context alongside the text. This is where the design pays best: a frame costs the
+        vision tower once and then behaves like any other context token, so the questions after it are nearly free.
 
         The returned context holds device memory until it is closed -- `Context.close`, or a `with` block. See
         `cache_bytes`.
         """
-        if not context.strip():
+        if not context.strip() and not images and not videos:
             # The same refusal `Request` makes. Without it the direct path answers a question about nothing, and the
-            # answer looks like an answer.
+            # answer looks like an answer. Media on its own is a context, so only the empty-handed case is refused.
             raise PrismyraError("a context cannot be empty")
-        ids = self.tokenizer(context, add_special_tokens=True)["input_ids"]
-        self._check_fits(len(ids))
+        encoded = encode(context, images, videos, self.processor, self.tokenizer, self.device)
+        self._check_fits(encoded.tokens)
         with self._lock:
             start = _now(self.torch_device)
             with torch.inference_mode():
-                prefill = self._read(ids)
-            return Context(_engine=self, _prefill=prefill, tokens=len(ids), context_ms=_since(start, self.torch_device))
+                prefill = self._read(encoded)
+            return Context(
+                _engine=self,
+                _prefill=prefill,
+                tokens=encoded.tokens,
+                context_ms=_since(start, self.torch_device),
+            )
 
-    def ask(self, context: str, questions: list[Question]) -> Result:
+    def ask(
+        self,
+        context: str,
+        questions: list[Question],
+        *,
+        images: list | None = None,
+        videos: list | None = None,
+    ) -> Result:
         """Read a context and answer questions about it. Sugar for `open_context(...).ask(...)`."""
         self.validate(questions)
-        with self._lock, self.open_context(context) as opened:
+        with self._lock, self.open_context(context, images=images, videos=videos) as opened:
             assert opened._prefill is not None
             answered = self._answer(opened._prefill, questions, opened.tokens, context_ms=opened.context_ms)
         return answered
@@ -235,12 +255,18 @@ class Prismyra:
                 f"holds its own copy of the context, so halving the group halves this; a shorter context does too."
             )
 
-    def _read(self, ids: list[int]) -> Prefill:
-        x = torch.tensor([ids], device=self.device)
+    def _read(self, encoded) -> Prefill:
         # Room for the context plus the widest branch, since the same cache carries both.
-        cache = build_cache(self.config, len(ids) + WIDTHS[-1], self.group, self.dtype, self.device)
-        self.backbone(input_ids=x, use_cache=True, past_key_values=cache)
-        return Prefill(cache=cache, tokens=len(ids), last_position=torch.tensor([len(ids) - 1], device=self.device))
+        cache = build_cache(self.config, encoded.tokens + WIDTHS[-1], self.group, self.dtype, self.device)
+        self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
+        # Read after the forward, not before: the offset is something the model works out while reading the context.
+        position_from = position_offset(self.backbone, encoded.tokens) if encoded.has_media else encoded.tokens
+        return Prefill(
+            cache=cache,
+            tokens=encoded.tokens,
+            last_position=torch.tensor([encoded.tokens - 1], device=self.device),
+            position_from=position_from,
+        )
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
         # Already validated: both public entry points call `validate` before the context is read, and repeating it
@@ -293,11 +319,23 @@ class Prismyra:
         restore_and_fork(prefill.cache, prefill.snapshot, rows)
 
         ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, rows, width)
-        positions = torch.arange(prefill.tokens, prefill.tokens + ids.shape[1], device=self.device).expand(rows, -1)
+        # From where the model thinks the context reached, which is past its token count when media widened it.
+        start = prefill.position_from or prefill.tokens
+        positions = torch.arange(start, start + ids.shape[1], device=self.device).expand(rows, -1)
         out = self.backbone(input_ids=ids, position_ids=positions, use_cache=True, past_key_values=prefill.cache)
         hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
         # Each row is read at its own last real token, which is why the padding cannot reach an answer.
         return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
+
+
+def _load_processor(model: str):
+    """The model's processor, or None. Absent is the ordinary case for a text-only checkpoint, not a failure."""
+    try:
+        from transformers import AutoProcessor
+
+        return AutoProcessor.from_pretrained(model)
+    except Exception:  # noqa: BLE001 - a checkpoint without one simply cannot take images, which `encode` reports
+        return None
 
 
 def _now(device: torch.device) -> float:

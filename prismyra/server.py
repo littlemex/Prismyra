@@ -23,9 +23,11 @@ half-built version of them away. In-process callers that want follow-ups use `Pr
 # and every request is rejected with "field required" for a field the caller did send. Keeping the annotations as real
 # objects is what makes the body a body.
 import argparse
+import base64
 import dataclasses
 from typing import Any, Literal
 
+from .media import DEFAULT_VIDEO_FRAMES, decode_image, decode_video
 from .queue import QueueFull, Worker
 from .schema import Boolean, Choice, PrismyraError, Question, QuestionError, Result, Scale
 
@@ -101,6 +103,12 @@ def with_queue_time(result: Result, queue_ms: float) -> Result:
 MAX_CONTEXT_TOKENS = 32_000
 MAX_QUESTIONS = 512
 
+#: Media limits. Separate from the token limit because an image's cost in tokens is only known after the processor has
+#: sized it, which is after the bytes have been accepted -- so the bytes are what has to be bounded.
+MAX_MEDIA_BYTES = 64 * 1024 * 1024
+MAX_IMAGES = 16
+MAX_VIDEOS = 2
+
 
 def create_app(
     model: str,
@@ -109,6 +117,8 @@ def create_app(
     request_timeout: float = 120.0,
     max_context_tokens: int = MAX_CONTEXT_TOKENS,
     max_questions: int = MAX_QUESTIONS,
+    max_media_bytes: int = MAX_MEDIA_BYTES,
+    video_frames: int = DEFAULT_VIDEO_FRAMES,
     **engine_kwargs,
 ):
     """A FastAPI application with the engine and its worker already running.
@@ -124,7 +134,10 @@ def create_app(
     from . import Prismyra, __version__
 
     engine = Prismyra(model, **engine_kwargs)
-    worker = Worker(lambda payload: engine.ask(payload[0], payload[1]), max_queue=max_queue).start()
+    worker = Worker(
+        lambda payload: engine.ask(payload[0], payload[1], images=payload[2] or None, videos=payload[3] or None),
+        max_queue=max_queue,
+    ).start()
 
     @asynccontextmanager
     async def lifespan(_):
@@ -140,8 +153,12 @@ def create_app(
         high: int = 5
 
     class AskIn(BaseModel):
-        context: str = Field(min_length=1)
+        context: str = ""
         questions: list[QuestionIn] = Field(min_length=1)
+        #: Base64 of the file's own bytes. A path would name a file on this machine rather than on the caller's, and a
+        #: URL would make the server fetch whatever it is pointed at.
+        images: list[str] = Field(default_factory=list, max_length=MAX_IMAGES)
+        videos: list[str] = Field(default_factory=list, max_length=MAX_VIDEOS)
 
     app = FastAPI(
         title="prismyra",
@@ -154,6 +171,23 @@ def create_app(
     def ask(body: AskIn) -> dict:
         # Refused before admission, so an oversized request costs the queue nothing. 413 rather than 422: the request is
         # well formed, there is just too much of it. Tokenising to find out is cheap next to what admitting it costs.
+        if not body.context.strip() and not body.images and not body.videos:
+            raise HTTPException(status_code=422, detail="a request needs a context, an image or a video")
+        encoded = body.images + body.videos
+        total = sum(len(blob) for blob in encoded)
+        if total > max_media_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"the media is {total} encoded bytes and the limit is {max_media_bytes}",
+            )
+        try:
+            images = [decode_image(base64.b64decode(blob, validate=True)) for blob in body.images]
+            videos = [decode_video(base64.b64decode(blob, validate=True), frames=video_frames) for blob in body.videos]
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(status_code=422, detail=f"could not read the media: {e}") from e
+
+        # Text tokens only. What the images add is known only after the processor has sized them, and the engine
+        # refuses a context that will not fit on the device by name, which is the limit that actually binds.
         tokens = len(engine.tokenizer(body.context)["input_ids"])
         if tokens > max_context_tokens:
             raise HTTPException(
@@ -173,7 +207,7 @@ def create_app(
         except QuestionError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         try:
-            job = worker.submit((body.context, questions), timeout=request_timeout)
+            job = worker.submit((body.context, questions, images, videos), timeout=request_timeout)
         except QueueFull as e:
             # The work was never started, so 503 with Retry-After is the honest answer. Its own exception type matters
             # here: the engine raises `RuntimeError` too, and reporting that as an overloaded server would send the

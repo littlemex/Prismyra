@@ -14,8 +14,8 @@ After reading a context, the model holds two kinds of state, and they behave dif
 | a branch's own tokens | yes | private by construction |
 
 `prismyra/cache.py` is built on this: `ForkLayer` takes a one-row write and lands it in every row, then returns only the
-rows the caller brought. Writing broadly and reading narrowly is what removes the separate copy step, and afterwards each
-row owns storage it can write without aliasing its neighbours.
+rows the caller brought. Writing broadly and reading narrowly is what removes the separate copy step, and each
+row then owns storage it can write without aliasing its neighbours.
 
 **The context is physically replicated, not shared.** Being read-only is what makes one write correct for every row; it
 is not what makes it cheap. Each of the `group` rows holds its own copy of the context's keys and values, so an open
@@ -52,8 +52,20 @@ Two alternatives were measured and rejected:
 
 What does work is packing: several contexts laid end to end with their boundaries passed as data, so every kernel knows
 where each one stops. Nothing here uses it yet. `ask_many` answers requests one after another and shares nothing between
-them, and the attention and convolution kernels already take the boundaries they would need, so this is the largest piece
-of work the design has room for rather than a feature to describe as though it shipped.
+them, and the attention and convolution kernels already take the boundaries they would need, so this is the largest
+piece of work the design has room for rather than a feature to describe as though it shipped.
+
+## Images and video
+
+Nothing above changes for them, and that is the point. A frame's embeddings are written into the context's keys and
+values, where every branch reads them and none writes them -- the same asymmetry the text case rests on. One image
+encoded once serves every question asked about it.
+
+One thing does change. With media present the model uses a three-axis rotary scheme whose text axis stops counting
+tokens: an image occupies one position per grid cell rather than one per token. The model works out the difference while
+reading the context and records it, and a branch has to continue from there rather than from the token count. Getting
+that wrong raises nothing -- every branch simply reads the context from the wrong place -- so the test for it asks which
+way a block travels in a clip, and then asks the same of the same frames reversed.
 
 ## Groups
 

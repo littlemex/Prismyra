@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import pytest
 import torch
 
@@ -87,12 +88,17 @@ def test_a_second_group_starts_from_the_context_and_not_from_the_first(engine):
 def test_padding_a_batch_does_not_reach_an_answer(engine):
     """Three questions in a batch pinned to thirty-two rows must answer as three questions in three rows.
 
-    Two engines rather than one call with a different group: the group is fixed at construction because the cache is
-    preallocated for it, so this is the only way to compare the two widths.
+    Two engines, because the group is fixed at construction -- the cache is preallocated for it -- so there is no other
+    way to compare two widths. That means a second copy of the weights, which one 48 GiB card cannot hold beside the
+    first. Skipped rather than quietly dropped: on a larger card it runs, and the reason it did not is printed.
     """
     asked = questions(3)
     padded = engine.ask(CONTEXT, asked)
-    exact = Prismyra(MODEL, group=3).ask(CONTEXT, asked)
+    try:
+        narrow = Prismyra(MODEL, group=3)
+    except torch.OutOfMemoryError:
+        pytest.skip("no room for a second copy of the weights beside the first; needs a larger card or a second one")
+    exact = narrow.ask(CONTEXT, asked)
     for q in asked:
         assert padded[q.id].option == exact[q.id].option
 
@@ -171,3 +177,82 @@ def test_the_convolution_matches_a_plain_one_and_respects_boundaries(packed):
     got = causal_depthwise_conv1d(x, weight, seq_starts=starts, activation="silu")
     want = reference_conv(x, weight, starts)
     assert (got.float() - want).abs().max().item() < 2e-2
+
+
+# --------------------------------------------------------------------------- images and video
+def solid(colour, size=336):
+    from PIL import Image
+
+    return Image.fromarray(np.zeros((size, size, 3), np.uint8) + np.array(colour, np.uint8))
+
+
+def sliding_block(direction, frames=12, size=252):
+    """A red block crossing a white frame, left to right or right to left.
+
+    The point of building it rather than loading a clip: the right answer is known, and reversing the frames must
+    reverse the answer. Nothing else here can tell whether the clip's order survived the context pass.
+    """
+    from PIL import Image, ImageDraw
+
+    out = []
+    for i in range(frames):
+        image = Image.new("RGB", (size, size), "white")
+        draw = ImageDraw.Draw(image)
+        x = i * 16 if direction == "right" else (frames - 1 - i) * 16
+        draw.rectangle([x, 100, x + 50, 150], fill=(200, 20, 20))
+        out.append(np.array(image))
+    return np.stack(out)
+
+
+def test_an_image_is_read_into_the_context(engine):
+    pytest.importorskip("PIL")
+    result = engine.ask(
+        "This is a photograph.",
+        [
+            Boolean(id="red", prompt="Is the image mostly red?"),
+            Boolean(id="blue", prompt="Is the image mostly blue?"),
+            Choice(id="colour", prompt="What is the dominant colour?", choices=["red", "green", "blue"]),
+        ],
+        images=[solid((200, 30, 30))],
+    )
+    assert result["red"].value is True
+    assert result["blue"].value is False
+    assert result["colour"].option == "red"
+
+
+def test_two_images_stay_in_the_order_they_were_given(engine):
+    pytest.importorskip("PIL")
+    result = engine.ask(
+        "Two photographs, in order.",
+        [Boolean(id="first_red", prompt="Is the first image red?")],
+        images=[solid((200, 30, 30)), solid((30, 60, 200))],
+    )
+    assert result["first_red"].value is True
+
+
+def test_a_clip_read_backwards_answers_backwards(engine):
+    """The strongest check in this file. Same frames, reversed, and the answer has to reverse with them.
+
+    It is also the check that the three-axis positions are right. With media the model's text positions advance by an
+    image's grid rather than by its token count, and a branch that continues from the wrong place reads the context from
+    the wrong place -- which shows up here as an answer that does not track the direction.
+    """
+    pytest.importorskip("PIL")
+    question = [Choice(id="direction", prompt="Which way does the red block travel?", choices=["left", "right"])]
+    rightwards = engine.ask("This is a short clip.", question, videos=[sliding_block("right")])
+    leftwards = engine.ask("This is a short clip.", question, videos=[sliding_block("left")])
+    assert rightwards["direction"].option == "right"
+    assert leftwards["direction"].option == "left"
+
+
+def test_an_image_costs_the_vision_tower_once_however_many_questions_follow(engine):
+    """The reason media is worth supporting at all: the encoding is in the context, which is paid once."""
+    pytest.importorskip("PIL")
+    image = solid((200, 30, 30))
+    with engine.open_context("This is a photograph.", images=[image]) as context:
+        one = context.ask([Boolean(id="q0", prompt="Is the image red?")])
+        many = context.ask([Boolean(id=f"q{i}", prompt=f"Is region {i} red?") for i in range(16)])
+    # Neither ask paid for the image: the context did, and it reports that separately.
+    assert one.timing.context_ms == 0.0
+    assert context.context_ms > 0.0
+    assert len(many) == 16
