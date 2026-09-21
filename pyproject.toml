@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prismyra"
+version = "0.1.0"
+description = "Read one context once, then answer many typed questions about it."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "littlemex" }]
+keywords = ["inference", "classification", "llm", "prefill", "serving"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# torch is a dependency but not pinned to a build: the wheel a user needs depends on their CUDA, and pinning one here
+# would fight their own index.
+# Upper bounds on the two that matter. The kernel adapter reaches into the framework's cache classes and one model
+# module, so a major release is a change of contract rather than an upgrade, and `accelerate` is what loads a model onto
+# a named device -- omitting it makes the documented CUDA path fail on a clean install.
+dependencies = [
+  "torch>=2.4",
+  "transformers>=4.57,<5",
+  "accelerate>=0.26",
+  "safetensors>=0.4",
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# The borrowed kernels. Without these the model still answers, and `engine.stats()["kernels"]` says what was skipped.
+# Linux and CUDA only: these wheels do not exist for macOS or Windows. Left to fail loudly rather than hidden behind a
+# platform marker, which would install nothing and leave the engine quietly on its fallbacks.
+fast = ["vllm>=0.11,<1", "triton>=3.0"]
+server = ["fastapi>=0.115", "uvicorn>=0.30", "pydantic>=2.7"]
+dev = ["pytest>=8.0", "ruff==0.16.8", "mypy>=1.11"]
+
+[project.scripts]
+prismyra-bench = "prismyra.bench:main"
+prismyra-serve = "prismyra.server:main"
+
+[project.urls]
+Homepage = "https://github.com/littlemex/prismyra"
+Documentation = "https://github.com/littlemex/prismyra/tree/main/docs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["prismyra"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "PL", "RUF", "EXE", "BLE"]
+ignore = [
+  "PLC0415",  # imports inside functions are deliberate: vLLM and Triton are optional, and importing them at module
+              # scope would make an absent kernel an import error instead of a fallback
+  "PLR0913",  # a constructor with many keyword arguments is the clearer interface here
+  "PLR0917",
+  "PLR2004",  # the magic numbers in tests are the measured facts under test
+  "PLR0912",  # branch counts in the kernel adapter track the model's module kinds, not complexity
+  "PLR0915",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The adapter registers itself on import, which has to happen after the registry it calls is defined.
+"prismyra/kernels/__init__.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: needs a CUDA device and the model weights"]
+addopts = "-ra"
+
+[tool.mypy]
+# Deliberately not strict, and two modules are left out.
+#
+# `kernels/` wraps other people's modules, where every attribute arrives through `nn.Module.__getattr__` and is therefore
+# typed `Tensor | Module` whatever it really is; `cache.py` overrides a framework base class that annotates the very
+# fields this design changes the type of. In both the checker reports the framework's annotations, not our mistakes, and
+# the casts needed to quiet it would cost real clarity. What is checked is everything that defines the public contract:
+# the schema, the read-out, the fork, the engine, the queue and the server.
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+module = ["prismyra.kernels.*", "prismyra.cache"]
+ignore_errors = true
