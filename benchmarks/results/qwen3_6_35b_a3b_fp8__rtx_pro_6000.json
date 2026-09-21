@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "measured_on": "2026-09-21",
+  "machine": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "memory_gib": 96,
+    "compute_capability": "12.0",
+    "measured_peak_tflops": {
+      "bf16": 419,
+      "fp8": 810
+    },
+    "measured_copy_gb_per_s": 1461
+  },
+  "software": {
+    "torch": "2.13.0+cu130",
+    "vllm": "0.27.1"
+  },
+  "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+  "context": {
+    "note": "10,000 Japanese characters. Japanese runs 0.516 tokens per character, so the token count is the number that matters and both are given.",
+    "characters": 10000,
+    "tokens": 4924
+  },
+  "method": "Median of seven, first three discarded. Device time only: the engine is called in process, so no transport is included. The baseline is vLLM on the same card with VLLM_USE_DEEP_GEMM=0, which it needs on this architecture.",
+  "whole_job": {
+    "note": "One context, N questions. Prismyra is flat to 32 because a traversal costs the same whatever it carries; the staircase steps every 32.",
+    "prismyra_ms": {
+      "1": 225.9,
+      "8": 227.2,
+      "16": 228.1,
+      "32": 229.5,
+      "64": 320.2,
+      "128": 502.6
+    },
+    "vllm_ms": {
+      "1": 134,
+      "2": 181,
+      "3": 228,
+      "4": 275,
+      "8": 463,
+      "16": 839,
+      "32": 1591,
+      "64": 3095,
+      "128": 6103
+    },
+    "vllm_model": "87 ms for the context plus 47 ms per question. The per-question figure is measured; multiplying it is an extrapolation, and it is vLLM used straightforwardly -- padding contexts to block multiples and submitting every question in one batch are untested workarounds that would narrow the gap.",
+    "crossover_questions": 4
+  },
+  "cost_model": {
+    "note": "At about 5,000 context tokens. Both constants grow with the context.",
+    "context_ms": 138.0,
+    "per_group_ms": 91.6,
+    "questions_per_group": 32,
+    "per_question_ms_at_full_group": 2.85
+  },
+  "context_pass_steps": {
+    "note": "Each step is its own paired run: the same process measures with and without that one change. The chain is therefore not continuous -- one step's 'after' and the next step's 'before' differ by a few milliseconds of run-to-run variation, and both are reported rather than smoothed.",
+    "baseline_ms": 288.1,
+    "final_ms": 138.3,
+    "vllm_ms": 87,
+    "steps": [
+      {
+        "change": "routed experts on a fused kernel",
+        "before_ms": 288.1,
+        "after_ms": 208.3,
+        "predicted_ms": 81
+      },
+      {
+        "change": "dense projections on a block-scaled fp8 kernel",
+        "before_ms": 204.5,
+        "after_ms": 185.7,
+        "predicted_ms": 22.2
+      },
+      {
+        "change": "normalisation on a faster kernel",
+        "before_ms": 185.2,
+        "after_ms": 174.7,
+        "predicted_ms": 10.5
+      },
+      {
+        "change": "head duplication deleted (bit-identical)",
+        "before_ms": 175.1,
+        "after_ms": 166.6,
+        "predicted_ms": 9
+      },
+      {
+        "change": "convolution on a Triton kernel written for it",
+        "before_ms": 166.7,
+        "after_ms": 138.3,
+        "predicted_ms": 21.6
+      }
+    ]
+  },
+  "kernels_against_vllm": {
+    "note": "Same work, same card, from profiles of both. Lower is better.",
+    "convolution_30_layers": {
+      "prismyra_ms": 3.0,
+      "vllm_ms": 3.37
+    },
+    "recurrence_30_layers": {
+      "prismyra_ms": 18.9,
+      "vllm_ms": 21.0
+    },
+    "attention_10_layers": {
+      "prismyra_ms": 6.8,
+      "vllm_ms": 8.13
+    },
+    "routed_experts_40_layers": {
+      "prismyra_ms": 29.5,
+      "vllm_ms": 29.97
+    },
+    "dense_projections": {
+      "prismyra_ms": 32.7,
+      "vllm_ms": 21.65
+    }
+  },
+  "branch_pass": {
+    "note": "One group of up to 32 questions, at the same context length.",
+    "before_flash_ms": 123.5,
+    "after_flash_ms": 91.6,
+    "masked_attention_10_layers_ms": 43.3,
+    "flash_attention_10_layers_ms": 10.9
+  },
+  "several_users": {
+    "note": "Four users with different contexts and two questions each. Their context passes share one traversal; their branch passes do not yet.",
+    "one_at_a_time_ms": 660.4,
+    "shared_context_pass_ms": 429.9,
+    "packed_context_pass_ms": 90.1,
+    "per_user_branch_ms": 84.9,
+    "choices_unchanged": "8 of 8 against each user run alone"
+  },
+  "queue": {
+    "note": "Eight requests arriving together, from a run predating the kernel work; the shape is what matters, not the absolute values.",
+    "interleaved": {
+      "median_latency_ms": 2113,
+      "first_home_ms": 2113,
+      "requests_per_second": 3.8
+    },
+    "queued": {
+      "median_latency_ms": 945,
+      "first_home_ms": 214,
+      "requests_per_second": 4.8
+    },
+    "answers_changed": "0 of 8 at every concurrency tried"
+  }
+}
