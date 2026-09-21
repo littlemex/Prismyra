@@ -37,15 +37,29 @@ MEASURED_CONFIG = {
     "num_key_value_heads": 2,
 }
 
-# How many modules of each kind this architecture has. A different number means a different model.
-EXPECTED = {
-    "routed_experts": 40,
-    "dense_matmul": 250,
-    "norm": 80,
-    "head_duplication": 30,
-    "attention": 10,
-    "convolution": 30,
-}
+
+def expected_counts(decoder) -> dict[str, int]:
+    """How many modules of each kind this configuration implies, derived rather than remembered.
+
+    Every count here follows from the config: one routed block per layer, one replacement per attention layer, one per
+    recurrent layer. Deriving them means the check keeps working when the framework reorganises its module tree, and it
+    keeps failing when the model is genuinely a different one -- which is what the check is for.
+
+    Two replacements are absent on purpose. The normalisation and the dense projections are found by structure, and how
+    many of those a model contains is a fact about one revision of somebody else's tree: 40 layers give 80 layer
+    norms on one version and 101 modules on another, once per-head query and key norms and the final norm share a class.
+    A number there would break on an upgrade while proving nothing, so those two are verified against the implementation
+    they replace instead. See `_verify`.
+    """
+    layer_types = list(getattr(decoder, "layer_types", []) or [])
+    attention_layers = layer_types.count("full_attention")
+    recurrent_layers = layer_types.count("linear_attention")
+    return {
+        "routed_experts": decoder.num_hidden_layers,
+        "attention": attention_layers,
+        "head_duplication": recurrent_layers,
+        "convolution": recurrent_layers,
+    }
 
 
 # --------------------------------------------------------------------------- routed experts
@@ -113,17 +127,25 @@ class Fp8Linear(nn.Module):
 
 # --------------------------------------------------------------------------- normalisation
 class FastRMSNorm(nn.Module):
-    """Normalisation on a faster kernel, with the model's `1.0 + weight` offset folded in once.
+    """Normalisation on a faster kernel, with the module's scale folded in once.
 
-    The offset is the trap: this model computes `normalised * (1.0 + weight)` and the kernel computes
-    `normalised * weight`. Folding it at construction keeps the forward free of an addition over the full width.
+    The trap is which scale. Some revisions of this model compute `normalised * (1.0 + weight)` and others
+    `normalised * weight`, while the borrowed kernel always computes the latter -- so whether to add one is a fact about
+    the code in front of you, not about the architecture. Getting it backwards does not raise; it shifts every
+    activation by a factor near one, which is a plausible wrong answer.
+
+    So it is not assumed. `offset` is chosen by running the module both ways and keeping the arrangement that matches
+    bit for bit, in `_swap_and_verify`. Folding the choice in at construction keeps the forward free of an addition over
+    the full width either way.
     """
 
-    def __init__(self, inner: nn.Module):
+    def __init__(self, inner: nn.Module, offset: bool = True):
         super().__init__()
         self.inner = inner
+        self.offset = offset
         self.eps = float(getattr(inner, "eps", 1e-6))
-        self.register_buffer("weight_plus_one", (1.0 + inner.weight.float()).to(inner.weight.dtype), persistent=False)
+        scale = inner.weight.float() + 1.0 if offset else inner.weight.float()
+        self.register_buffer("weight_plus_one", scale.to(inner.weight.dtype), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from vllm import _custom_ops as ops
@@ -310,7 +332,13 @@ class Qwen3MoeAdapter:
 
     def replace(self, model: nn.Module, config) -> Applied:
         decoder = getattr(config, "text_config", config)
+        expected = expected_counts(decoder)
         applied = Applied(adapter=self.name)
+        # The text decoder only. This checkpoint's class carries a vision tower that nothing here ever runs, and
+        # replacing modules inside it would be work with no measurement behind it and no caller to benefit.
+        text = getattr(model, "language_model", model)
+        if text is not model:
+            applied.notes.append("replacements were applied to the text decoder; the vision tower is untouched")
         have_vllm = _have("vllm")
         # Probed here rather than discovered in the forward pass. A replacement that falls back on its first call has
         # already been counted as applied, so `stats()` would report a kernel that never runs.
@@ -324,31 +352,136 @@ class Qwen3MoeAdapter:
                 Swap(
                     "routed_experts",
                     _swap_children(
-                        model, "Qwen3_5MoeSparseMoeBlock", lambda m: FusedExperts(m, decoder.num_experts_per_tok)
+                        text, "Qwen3_5MoeSparseMoeBlock", lambda m: FusedExperts(m, decoder.num_experts_per_tok)
                     ),
-                    EXPECTED["routed_experts"],
+                    expected["routed_experts"],
                 )
             )
-            applied.swaps.append(Swap("dense_matmul", _swap_block_quantised(model), EXPECTED["dense_matmul"]))
             applied.swaps.append(
-                Swap("norm", _swap_children(model, "Qwen3_5MoeRMSNorm", FastRMSNorm), EXPECTED["norm"])
+                Swap(
+                    "attention",
+                    _swap_children(text, "Qwen3_5MoeAttention", FlashAttention),
+                    expected["attention"],
+                )
             )
-            applied.swaps.append(
-                Swap("attention", _swap_children(model, "Qwen3_5MoeAttention", FlashAttention), EXPECTED["attention"])
+            # Counted by neither of these two: found by structure, so verified against what they replace instead.
+            # The normalisation is offered both scale conventions and keeps whichever agrees to a rounding step.
+            _swap_and_verify(
+                applied,
+                text,
+                "norm",
+                "Qwen3_5MoeRMSNorm",
+                [
+                    ("weight+1", lambda m: FastRMSNorm(m, offset=True)),
+                    ("weight", lambda m: FastRMSNorm(m, offset=False)),
+                ],
+                tolerance=2 * BF16_ULP,
             )
+            _swap_and_verify(applied, text, "dense_matmul", None, [("fp8", Fp8Linear)], tolerance=5e-2)
         else:
             applied.skipped.append("vllm is not installed: the borrowed kernels are unavailable")
 
-        applied.swaps.append(Swap("head_duplication", _drop_head_duplication(model), EXPECTED["head_duplication"]))
+        dropped, declined = _drop_head_duplication(text)
+        if declined is None:
+            applied.swaps.append(Swap("head_duplication", dropped, expected["head_duplication"]))
+        else:
+            applied.skipped.append(f"head duplication left in place: {declined}")
         if not _install_conv():
             applied.skipped.append("triton is not available: the convolution keeps the framework's path")
         else:
-            applied.swaps.append(Swap("convolution", _tag_conv_weights(model), EXPECTED["convolution"]))
+            applied.swaps.append(Swap("convolution", _tag_conv_weights(text), expected["convolution"]))
             applied.notes.append(
                 "the convolution kernel covers the context pass; a branch pass arrives as many rows and keeps the "
                 "framework's path"
             )
         return applied
+
+
+def _swap_and_verify(applied, root: nn.Module, name: str, class_name: str | None, candidates, tolerance: float) -> None:
+    """Replace every module this pattern matches, then check one against the implementation it replaced.
+
+    The check is the point. These two replacements are found by structure rather than by counting, so there is no number
+    to compare against -- and a number would be wrong anyway, being a fact about one revision of somebody else's module
+    tree. What can be compared is behaviour: run the original and the replacement on the same input and require them to
+    agree. If they do not, every replacement of that kind is put back and the reason is recorded, because a kernel that
+    changes answers is worth less than the milliseconds it saves.
+
+    `tolerance` is relative to the largest output, because that is the only scale at which "the same answer" means
+    anything. Bit-identity is the wrong bar even for a replacement that does identical arithmetic: this model's
+    normalisation accumulates in float32 and rounds once at the end, while the borrowed kernel rounds earlier, and the
+    two differ by one step of the output's own dtype -- 3.9e-3 relative in bfloat16. Demanding zero rejects a correct
+    kernel; demanding one ulp accepts it and still rejects a wrong scale, which is off by a factor rather than a step.
+    """
+    if class_name is not None:
+        targets = _find_children(root, lambda m: type(m).__name__ == class_name)
+    else:
+        targets = _find_children(root, _is_block_quantised)
+    if not targets:
+        applied.skipped.append(f"{name}: nothing matched")
+        return
+
+    # Each candidate is tried on one module before any of the rest is touched. More than one exists where the
+    # arrangement cannot be read off the model -- see `FastRMSNorm` -- and choosing by measurement is the only way that
+    # stays true across framework versions.
+    parent, attribute, original = targets[0]
+    tried = []
+    for label, make in candidates:
+        moved = _compare(original, make(original))
+        tried.append(f"{label} {'raised' if moved is None else format(moved, '.3e')}")
+        if moved is not None and moved <= tolerance:
+            for p, a, child in targets:
+                setattr(p, a, make(child))
+            applied.swaps.append(
+                Swap(name, len(targets), None, verified=f"{label}, {len(targets)} modules, agreed to {moved:.3e}")
+            )
+            return
+
+    setattr(parent, attribute, original)
+    applied.skipped.append(f"{name} left alone, nothing agreed to within {tolerance:.1e} relative: " + "; ".join(tried))
+
+
+#: One step of bfloat16 at a given magnitude, relative. Two of these is the bar for a replacement that should be doing
+#: the same arithmetic in a different order: it admits a different rounding point and excludes a different scale.
+BF16_ULP = 2.0**-8
+
+
+def _compare(original: nn.Module, replacement: nn.Module) -> float | None:
+    """The largest disagreement on one random input, relative to the largest output. None if either side raised.
+
+    Relative, not absolute. An absolute figure says nothing without the magnitude beside it: 6.25e-2 is a rounding step
+    where the output reaches 16 and a wrong answer where it reaches 0.1.
+    """
+    p = next(original.parameters())
+    width = getattr(original, "in_features", None) or p.shape[-1]
+    x = torch.randn(4, width, device=p.device, dtype=torch.bfloat16) * 0.1
+    try:
+        with torch.inference_mode():
+            want = original(x)
+            got = replacement(x)
+    except Exception:  # noqa: BLE001 - a replacement that cannot run on this model is a replacement to put back
+        return None
+    scale = want.float().abs().max().item()
+    return (want.float() - got.float()).abs().max().item() / max(scale, 1e-6)
+
+
+def _is_block_quantised(module: nn.Module) -> bool:
+    """A two-dimensional fp8 projection carrying a two-dimensional block scale.
+
+    Identified by structure, which excludes the expert stacks: those hold a leading expert dimension and no
+    `weight`, and belong to the routed path.
+    """
+    w = getattr(module, "weight", None)
+    if w is None or w.dtype != torch.float8_e4m3fn or w.dim() != 2:
+        return False
+    s = getattr(module, "weight_scale_inv", None)
+    return s is not None and getattr(s, "dim", lambda: 0)() == 2
+
+
+def _find_children(root: nn.Module, matches) -> list[tuple[nn.Module, str, nn.Module]]:
+    """Collected before anything is replaced, so the walk is not mutated under itself."""
+    return [
+        (parent, name, child) for parent in root.modules() for name, child in parent.named_children() if matches(child)
+    ]
 
 
 def _have(module: str) -> bool:
@@ -370,38 +503,19 @@ def _swap_children(model: nn.Module, class_name: str, make) -> int:
     return len(targets)
 
 
-def _swap_block_quantised(model: nn.Module) -> int:
-    """Replace every two-dimensional fp8 projection that carries a two-dimensional block scale.
+def _drop_head_duplication(model: nn.Module, verify: bool = True) -> tuple[int, str | None]:
+    """Stop the linear-attention layers duplicating query and key, where the recurrence handles it itself.
 
-    Identified by structure, which excludes the expert stacks: they hold a leading expert dimension and no `weight`, and
-    belong to the routed path.
-    """
+    This one is a flag set through an attribute whose name stops describing its value. On the framework version it was
+    measured against, `num_k_heads` was read in the forward pass only to decide whether to duplicate, so setting it
+    equal to `num_v_heads` disabled the duplication and changed nothing else. That is not a property of the model but of
+    one revision of somebody else's forward pass, so it is checked every time rather than assumed: one layer is run both
+    ways and the outputs must match exactly.
 
-    def is_target(module: nn.Module) -> bool:
-        w = getattr(module, "weight", None)
-        if w is None or w.dtype != torch.float8_e4m3fn or w.dim() != 2:
-            return False
-        s = getattr(module, "weight_scale_inv", None)
-        return s is not None and getattr(s, "dim", lambda: 0)() == 2
-
-    targets = [
-        (parent, name, child)
-        for parent in model.modules()
-        for name, child in parent.named_children()
-        if is_target(child)
-    ]
-    for parent, name, child in targets:
-        setattr(parent, name, Fp8Linear(child))
-    return len(targets)
-
-
-def _drop_head_duplication(model: nn.Module, verify: bool = True) -> int:
-    """Stop the linear-attention layers duplicating query and key, which the recurrence handles itself.
-
-    The layer reads `num_k_heads` in its forward pass only to decide whether to duplicate, so setting it equal to
-    `num_v_heads` disables that and changes nothing else. That is a flag being set through an attribute whose name no
-    longer describes its value, so one layer is run both ways and the outputs are required to match exactly before the
-    change is applied to any of them.
+    Returns the number of layers changed and, if none were, why. **Declining is not an error.** A later framework
+    version uses the attribute for more than that -- on transformers 5.15 the probe raises a shape mismatch rather than
+    returning a different answer -- and the right response is to leave the duplication in place and say so. It is worth
+    8.5 ms of a 138 ms pass; refusing to run at all over it would be a poor trade.
     """
     layers = [
         m
@@ -409,28 +523,40 @@ def _drop_head_duplication(model: nn.Module, verify: bool = True) -> int:
         if type(m).__name__ == "Qwen3_5MoeGatedDeltaNet" and getattr(m, "num_v_heads", 0) > getattr(m, "num_k_heads", 1)
     ]
     if not layers:
-        return 0
+        return 0, "no layer duplicates its heads"
     if verify:
-        probe = layers[0]
-        p = next(probe.parameters())
-        x = torch.randn(1, 64, probe.hidden_size, device=p.device, dtype=p.dtype) * 0.1
-        original = probe.num_k_heads
+        declined = _probe_head_duplication(layers[0])
+        if declined is not None:
+            return 0, declined
+    for m in layers:
+        m.num_k_heads = m.num_v_heads
+    return len(layers), None
+
+
+def _probe_head_duplication(probe: nn.Module) -> str | None:
+    """Run one layer both ways. Returns None when they match exactly, or the reason to decline."""
+    p = next(probe.parameters())
+    x = torch.randn(1, 64, probe.hidden_size, device=p.device, dtype=p.dtype) * 0.1
+    original = probe.num_k_heads
+    try:
         with torch.inference_mode():
             before = probe(x, cache_params=None)
             probe.num_k_heads = probe.num_v_heads
             after = probe(x, cache_params=None)
+    except Exception as e:  # noqa: BLE001 - any failure here means the attribute now does more than gate duplication
+        return f"the head-duplication probe raised {type(e).__name__}: {e}"
+    finally:
         probe.num_k_heads = original
-        before = before[0] if isinstance(before, tuple) else before
-        after = after[0] if isinstance(after, tuple) else after
-        moved = (before.float() - after.float()).abs().max().item()
-        if moved != 0.0:
-            raise RuntimeError(
-                f"skipping the head duplication moved a layer's output by {moved:.3e}; it was bit-identical when "
-                f"measured, so this layer's code has changed and the optimisation is no longer safe"
-            )
-    for m in layers:
-        m.num_k_heads = m.num_v_heads
-    return len(layers)
+
+    before = before[0] if isinstance(before, tuple) else before
+    after = after[0] if isinstance(after, tuple) else after
+    moved = (before.float() - after.float()).abs().max().item()
+    if moved != 0.0:
+        return (
+            f"skipping the head duplication moved a layer's output by {moved:.3e}; it was bit-identical when measured, "
+            f"so this framework version uses the attribute for more than gating the duplication"
+        )
+    return None
 
 
 register(Qwen3MoeAdapter())

@@ -24,7 +24,7 @@ from .fork import (
     round_width,
     snapshot,
 )
-from .readout import load_unembedding, option_token_ids, score
+from .readout import load_unembedding, plan, score
 from .schema import (
     Answer,
     PrismyraError,
@@ -32,7 +32,6 @@ from .schema import (
     Request,
     Result,
     Timing,
-    render_question,
 )
 
 #: Questions per traversal. A traversal costs the same carrying one row or this many, so a group is the unit of
@@ -148,8 +147,8 @@ class Prismyra:
             # questions with nothing saying which was lost.
             raise PrismyraError(f"duplicate question ids: {ids}")
         for q in questions:
-            option_token_ids(q, self.tokenizer)
-            rendered = self.tokenizer("\n" + render_question(q), add_special_tokens=False)["input_ids"]
+            chosen = plan(q, self.tokenizer)
+            rendered = self.tokenizer("\n" + chosen.text, add_special_tokens=False)["input_ids"]
             if len(rendered) > WIDTHS[-1]:
                 raise PrismyraError(
                     f"question {q.id!r} renders to {len(rendered)} tokens and the widest branch is {WIDTHS[-1]}"
@@ -249,10 +248,9 @@ class Prismyra:
         # The batch width is the one the cache was allocated for. It is not a per-call option: the cache is preallocated
         # at construction time and a write of any other row count is refused, which is the point of preallocating.
         rows = self.group
-        token_ids = [option_token_ids(q, self.tokenizer) for q in questions]
-        widest = max(
-            len(self.tokenizer("\n" + render_question(q), add_special_tokens=False)["input_ids"]) for q in questions
-        )
+        plans = [plan(q, self.tokenizer) for q in questions]
+        token_ids = [p.token_ids for p in plans]
+        widest = max(len(self.tokenizer("\n" + p.text, add_special_tokens=False)["input_ids"]) for p in plans)
         try:
             width = round_width(widest)
         except TooWide as e:
@@ -262,7 +260,7 @@ class Prismyra:
         probabilities: list[torch.Tensor] = []
         with self._lock, torch.inference_mode():
             for lo in range(0, len(questions), rows):
-                chunk = questions[lo : lo + rows]
+                chunk = [p.text for p in plans[lo : lo + rows]]
                 hidden = self._branch(prefill, chunk, rows, width)
                 probabilities.extend(score(hidden, self.unembedding, token_ids[lo : lo + rows]))
         readout_ms = _since(start, self.torch_device)
@@ -286,7 +284,7 @@ class Prismyra:
             timing=Timing(context_ms=context_ms, readout_ms=readout_ms),
         )
 
-    def _branch(self, prefill: Prefill, questions: list[Question], rows: int, width: int) -> torch.Tensor:
+    def _branch(self, prefill: Prefill, texts: list[str], rows: int, width: int) -> torch.Tensor:
         # The snapshot is taken on the first branch, when the cache holds exactly the context, so restoring it also puts
         # every layer's token count back to the end of the context. One mechanism, not a state restore plus a separate
         # rewind: two of them can disagree, and the one that is wrong answers plausibly.
@@ -294,12 +292,12 @@ class Prismyra:
             prefill.snapshot = snapshot(prefill.cache)
         restore_and_fork(prefill.cache, prefill.snapshot, rows)
 
-        ids, read_at, _ = build_suffixes(questions, self.tokenizer, self.device, rows, width)
+        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, rows, width)
         positions = torch.arange(prefill.tokens, prefill.tokens + ids.shape[1], device=self.device).expand(rows, -1)
         out = self.backbone(input_ids=ids, position_ids=positions, use_cache=True, past_key_values=prefill.cache)
         hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
         # Each row is read at its own last real token, which is why the padding cannot reach an answer.
-        return hidden[torch.arange(rows, device=self.device), read_at][: len(questions)]
+        return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
 
 
 def _now(device: torch.device) -> float:

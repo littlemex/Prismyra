@@ -17,8 +17,11 @@ expiry, a memory budget and an eviction rule, and adding those later without bre
 half-built version of them away. In-process callers that want follow-ups use `Prismyra.open_context` directly.
 """
 
-from __future__ import annotations
-
+# No `from __future__ import annotations` here, and that is load-bearing. It turns annotations into strings, which the
+# web framework then resolves against this module's globals -- and the request models below are defined inside
+# `create_app`, so they are not there. The framework finds an unresolvable name, decides the parameter cannot be a body,
+# and every request is rejected with "field required" for a field the caller did send. Keeping the annotations as real
+# objects is what makes the body a body.
 import argparse
 import dataclasses
 from typing import Any, Literal

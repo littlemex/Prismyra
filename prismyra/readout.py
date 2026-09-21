@@ -7,38 +7,72 @@ over the declared options only. Nothing is trained. See `schema.SCORING` for wha
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
-from .schema import Question, QuestionError
+from .schema import Question, QuestionError, render_question
 
 
-def option_token_ids(question: Question, tokenizer) -> list[int]:
-    """One vocabulary id per option: the first token of the option's text **with a leading space**.
+@dataclass(frozen=True)
+class Plan:
+    """How one question will be asked and read: the text of its branch, and the token scored for each option."""
 
-    The leading space matters because that is how the token appears after "Answer:". Checking the bare text instead
-    would accept a name that is one token alone and two with a space in front, and then score the wrong token.
+    text: str
+    token_ids: list[int]
+    trailing_space: bool
 
-    Options whose first token collides are refused rather than silently scored as ties, and an option that needs more
-    than one token is refused rather than truncated -- a truncated option is answerable and wrong.
+
+def plan(question: Question, tokenizer) -> Plan:
+    """Choose the rendering this tokenizer can actually answer, and the token to score for each option.
+
+    One position is read, so one token per option has to identify it. Two renderings are tried, and which one works is a
+    property of the tokenizer rather than of the question:
+
+    * the prompt ends `Answer:` and the option is scored **with a leading space**, which is how the token appears there.
+      This model's tokenizer merges a space into a word, so " yes" and " buyer" are each one token;
+    * the prompt ends `Answer: ` and the bare option is scored. The same tokenizer splits a space from a digit, so " 1"
+      is two tokens and the first is the space -- identical for every option, and so no answer at all. Putting the space
+      in the prompt moves the digit to the position that gets read.
+
+    The first that gives every option a distinct single token wins. If neither does, the question is refused rather than
+    scored on the wrong token, because an option truncated to its first piece is answerable and wrong.
+    """
+    attempts = []
+    for trailing_space in (False, True):
+        try:
+            ids = option_token_ids(question, tokenizer, trailing_space=trailing_space)
+        except QuestionError as e:
+            attempts.append(str(e))
+            continue
+        return Plan(text=render_question(question, trailing_space), token_ids=ids, trailing_space=trailing_space)
+    raise QuestionError(f"question {question.id!r} cannot be scored: " + "; ".join(attempts))
+
+
+def option_token_ids(question: Question, tokenizer, trailing_space: bool = False) -> list[int]:
+    """One vocabulary id per option: the first token of the option as it appears after the prompt.
+
+    With `trailing_space`, the prompt already ends in a space and the option is tokenised bare; without it, the option
+    carries the leading space. Options whose first token collides are refused rather than silently scored as ties.
     """
     ids: list[int] = []
     seen: dict[int, str] = {}
     for option in question.options:
-        pieces = tokenizer(" " + option, add_special_tokens=False)["input_ids"]
+        text = option if trailing_space else " " + option
+        pieces = tokenizer(text, add_special_tokens=False)["input_ids"]
         if not pieces:
             raise QuestionError(f"question {question.id!r}: option {option!r} produces no tokens")
         if len(pieces) > 1:
             raise QuestionError(
-                f"question {question.id!r}: option {option!r} is {len(pieces)} tokens with a leading space. "
+                f"question {question.id!r}: option {option!r} is {len(pieces)} tokens as {text!r}. "
                 f"This read-out scores a single token, so use a shorter name."
             )
         token = pieces[0]
         if token in seen:
             raise QuestionError(
-                f"question {question.id!r}: options {option!r} and {seen[token]!r} start with the same token, "
-                f"so they cannot be told apart."
+                f"question {question.id!r}: options {option!r} and {seen[token]!r} start with the same token as "
+                f"{text!r}, so they cannot be told apart."
             )
         seen[token] = option
         ids.append(token)

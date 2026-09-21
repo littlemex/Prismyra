@@ -17,8 +17,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .schema import Question, render_question
-
 if TYPE_CHECKING:
     from transformers.cache_utils import Cache
 
@@ -157,15 +155,19 @@ def restore_and_fork(cache, snap: dict, rows: int) -> None:
 
 
 def build_suffixes(
-    questions: list[Question], tokenizer, device: str, rows: int | None, width: int | None
+    texts: list[str], tokenizer, device: str, rows: int | None, width: int | None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Tokenise each question and right-pad to a common width. Returns ids, positions and read positions.
+    """Tokenise each branch's text and right-pad to a common width. Returns ids, positions and read positions.
+
+    Takes the rendered text rather than the question, because which of two renderings a question needs is decided by the
+    read-out -- see `readout.plan` -- and the branch has to read the one that was planned for it. Rendering again here
+    could disagree with what the token ids were chosen for, and a disagreement there scores the wrong position.
 
     Padding a branch is safe in a way padding the context is not: a pad token after a branch's own tokens is never read
     by the read-out and cannot be attended to by a real position, whereas one added to the context passes through the
     recurrence where there is nothing to mask it out of.
     """
-    pieces = [tokenizer("\n" + render_question(q), add_special_tokens=False)["input_ids"] for q in questions]
+    pieces = [tokenizer("\n" + text, add_special_tokens=False)["input_ids"] for text in texts]
     real = len(pieces)
     longest = max(len(p) for p in pieces)
     target = width or round_width(longest)
@@ -173,7 +175,7 @@ def build_suffixes(
         raise ValueError(f"a question needs {longest} tokens and the width is pinned to {target}")
     n_rows = rows or real
     if real > n_rows:
-        raise ValueError(f"{real} questions will not fit in a batch pinned to {n_rows} rows")
+        raise ValueError(f"{real} branches will not fit in a batch pinned to {n_rows} rows")
 
     pad = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
     ids = torch.full((n_rows, target), pad, dtype=torch.long, device=device)

@@ -22,12 +22,14 @@ classifiers = [
 
 # torch is a dependency but not pinned to a build: the wheel a user needs depends on their CUDA, and pinning one here
 # would fight their own index.
-# Upper bounds on the two that matter. The kernel adapter reaches into the framework's cache classes and one model
-# module, so a major release is a change of contract rather than an upgrade, and `accelerate` is what loads a model onto
-# a named device -- omitting it makes the documented CUDA path fail on a clean install.
+# No upper bound on transformers, deliberately. The adapter does reach into the framework's cache classes and one model
+# module, so a release can break it -- but the measurements were taken on transformers 5.15, so a `<5` bound would
+# exclude the only version this has ever run against. The adapter fails closed instead, which is the check that matters.
+# `accelerate` is what loads a model onto a named device; omitting it makes the documented CUDA path fail on a clean
+# install.
 dependencies = [
   "torch>=2.4",
-  "transformers>=4.57,<5",
+  "transformers>=4.57",
   "accelerate>=0.26",
   "safetensors>=0.4",
   "numpy>=1.24",
@@ -37,9 +39,15 @@ dependencies = [
 # The borrowed kernels. Without these the model still answers, and `engine.stats()["kernels"]` says what was skipped.
 # Linux and CUDA only: these wheels do not exist for macOS or Windows. Left to fail loudly rather than hidden behind a
 # platform marker, which would install nothing and leave the engine quietly on its fallbacks.
-fast = ["vllm>=0.11,<1", "triton>=3.0"]
+# `kernels` is here for a roundabout reason worth stating: recent transformers routes its own fp8 linear through it, and
+# that implementation is what the dense-projection replacement is verified against. Without it the reference cannot run,
+# the verification cannot pass, and the replacement is declined -- so the fast path needs it even though none of this
+# package's code calls it.
+fast = ["vllm>=0.11,<1", "triton>=3.0", "kernels>=0.16,<0.17"]
 server = ["fastapi>=0.115", "uvicorn>=0.30", "pydantic>=2.7"]
-dev = ["pytest>=8.0", "ruff==0.16.8", "mypy>=1.11"]
+# fastapi and httpx are dev dependencies so CI can exercise the server over real HTTP. Without that, a
+# mistake in how the request body is declared passes every unit test and fails every request.
+dev = ["pytest>=8.0", "ruff==0.16.8", "mypy>=1.11", "fastapi>=0.115", "httpx>=0.27"]
 
 [project.scripts]
 prismyra-bench = "prismyra.bench:main"
