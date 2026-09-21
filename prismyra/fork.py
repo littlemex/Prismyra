@@ -51,6 +51,9 @@ class Prefill:
     cache: Cache
     tokens: int
     last_position: torch.Tensor
+    #: Where a branch's positions start. Equal to `tokens` for text; larger when the context held images or video, whose
+    #: three-axis positions advance by a grid rather than by a token count. See `media.position_offset`.
+    position_from: int = 0
     snapshot: dict | None = field(default=None, repr=False)
 
 

@@ -96,7 +96,8 @@ def test_the_endpoint_accepts_a_request_body_over_real_http():
         def stats(self):
             return {"model": "stub"}
 
-        def ask(self, context, questions):
+        def ask(self, context, questions, images=None, videos=None):
+            self.saw_media = (images, videos)
             answers = {
                 q.id: Answer(
                     id=q.id,
@@ -125,5 +126,69 @@ def test_the_endpoint_accepts_a_request_body_over_real_http():
         assert body["answers"]["thirty"]["kind"] == "boolean"
         assert "queue_ms" in body["timing"]
         assert client.get("/health").json()["ok"] is True
+    finally:
+        prismyra.Prismyra = real
+
+
+def test_an_image_arrives_as_bytes_and_reaches_the_engine():
+    """Base64 rather than a path or a URL: a path names a file on the server, and a URL sends the server fetching.
+
+    Also covers that a request with media and no text is accepted -- a picture is a context.
+    """
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    pytest.importorskip("PIL")
+    import base64
+    import io
+
+    from fastapi.testclient import TestClient
+    from PIL import Image
+
+    import prismyra
+    from prismyra.server import create_app
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 32), (200, 30, 30)).save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+
+    seen = {}
+
+    class StubEngine:
+        model_name = "stub"
+        group = 32
+        tokenizer = staticmethod(lambda text, **_: {"input_ids": []})
+
+        def cache_bytes(self, tokens):
+            return 0
+
+        def stats(self):
+            return {}
+
+        def ask(self, context, questions, images=None, videos=None):
+            seen["images"] = images
+            answer = Answer(id="q0", kind="boolean", value=True, option="yes", probabilities={"yes": 1.0, "no": 0.0})
+            return Result(answers={"q0": answer}, timing=Timing(), model="stub")
+
+    real = prismyra.Prismyra
+    prismyra.Prismyra = lambda *a, **k: StubEngine()
+    try:
+        client = TestClient(create_app("stub/model"))
+        response = client.post(
+            "/ask",
+            json={"context": "", "images": [encoded], "questions": [{"id": "q0", "prompt": "Is it red?"}]},
+        )
+        assert response.status_code == 200, response.text
+        assert len(seen["images"]) == 1
+        assert seen["images"][0].size == (32, 32)
+        assert seen["images"][0].mode == "RGB"
+
+        empty = client.post("/ask", json={"context": "  ", "questions": [{"id": "q0", "prompt": "Is it?"}]})
+        assert empty.status_code == 422
+
+        bad = client.post(
+            "/ask",
+            json={"context": "x", "images": ["not base64!"], "questions": [{"id": "q0", "prompt": "Is it?"}]},
+        )
+        assert bad.status_code == 422
     finally:
         prismyra.Prismyra = real

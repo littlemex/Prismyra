@@ -44,10 +44,18 @@ dependencies = [
 # the verification cannot pass, and the replacement is declined -- so the fast path needs it even though none of this
 # package's code calls it.
 fast = ["vllm>=0.11,<1", "triton>=3.0", "kernels>=0.16,<0.17"]
-server = ["fastapi>=0.115", "uvicorn>=0.30", "pydantic>=2.7"]
+# pillow and opencv are here because the server is what turns bytes into frames. A caller working in process already
+# holds its images as objects and needs neither.
+server = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "pydantic>=2.7",
+  "pillow>=10.0",
+  "opencv-python-headless>=4.9",
+]
 # fastapi and httpx are dev dependencies so CI can exercise the server over real HTTP. Without that, a
 # mistake in how the request body is declared passes every unit test and fails every request.
-dev = ["pytest>=8.0", "ruff==0.16.8", "mypy>=1.11", "fastapi>=0.115", "httpx>=0.27"]
+dev = ["pytest>=8.0", "ruff==0.16.8", "mypy>=1.11", "fastapi>=0.115", "httpx>=0.27", "pillow>=10.0"]
 
 [project.scripts]
 prismyra-bench = "prismyra.bench:main"

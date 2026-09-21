@@ -84,6 +84,48 @@ Modest at ordinary lengths and not at long ones. `engine.cache_bytes(tokens)` gi
 and a context that will not fit is refused by name rather than by an allocator. Lowering `group` lowers this
 proportionally at the cost of one extra traversal per group of questions. Use `close()` or a `with` block.
 
+## Images and video
+
+An image or a clip goes in the context, which is exactly where this design wants it: the vision tower runs once and the
+frames then behave like any other context token, so the questions after them are nearly free.
+
+```python
+from PIL import Image
+
+with engine.open_context("A product photograph.", images=[Image.open("chair.jpg")]) as context:
+    result = context.ask([
+        Boolean(id="damaged", prompt="Is the item visibly damaged?"),
+        Boolean(id="assembled", prompt="Is the item assembled?"),
+        Choice(id="room", prompt="Which room is this for?", choices=["kitchen", "bedroom", "office"]),
+    ])
+```
+
+`videos=` takes frames the same way. Anything the model's processor accepts works -- a `PIL.Image`, an array of
+frames -- and the placeholders are assembled for you.
+
+Measured on the supported model: reading a 336 by 336 image costs about 290 ms and a twelve frame clip about 300 ms,
+after which a group of questions costs what it costs for text. A clip read backwards answers backwards, which is the
+check that the three-axis positions media needs are being continued correctly.
+
+Over HTTP, media arrives as base64 of the file's own bytes. A path would name a file on the server rather than on the
+caller's machine, and a URL would send the server fetching whatever it was pointed at.
+
+```bash
+python3 - chair.jpg > request.json <<'EOF'
+import base64, json, sys
+print(json.dumps({
+    "context": "A product photograph.",
+    "images": [base64.b64encode(open(sys.argv[1], "rb").read()).decode()],
+    "questions": [{"id": "damaged", "prompt": "Is the item visibly damaged?", "kind": "boolean"}],
+}))
+EOF
+
+curl -s localhost:8000/ask -H 'content-type: application/json' --data-binary @request.json
+```
+
+Video files are decoded by the server, which is what the decoder in the `server` extra is for. Frames passed in process
+need no decoder.
+
 ## Several requests at once
 
 ```python
