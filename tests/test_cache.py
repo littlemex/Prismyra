@@ -1,0 +1,200 @@
+"""What the cache hands back, and what it refuses. No device needed: this is indexing, and indexing is where it breaks.
+
+The change these cover is that the context is stored once instead of once per branch. The property that makes it safe
+to make is that a read returns **exactly** what replicating would have returned -- the same bytes in the same order --
+so these tests compare against a replication done by hand rather than against a recorded number.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from prismyra.cache import ForkLayer, cache_bytes
+
+
+def layer(rows: int = 4, context: int = 20, branch: int = 8, heads: int = 2, dim: int = 3) -> ForkLayer:
+    made = ForkLayer(max_cache_len=context + branch, max_batch_size=rows, max_branch_len=branch)
+    made.early_initialization(rows, heads, dim, torch.float32, "cpu")
+    return made
+
+
+def tokens(count: int, heads: int = 2, dim: int = 3, rows: int = 1, start: float = 0.0) -> torch.Tensor:
+    """Distinguishable values, so a misplaced write is visible rather than plausible."""
+    total = rows * heads * count * dim
+    return (torch.arange(total, dtype=torch.float32) + start).reshape(rows, heads, count, dim)
+
+
+def test_a_branch_read_is_exactly_what_replicating_would_have_returned():
+    """The property the whole change rests on. Not a tolerance: the same bytes in the same order."""
+    held = layer(rows=4, context=20, branch=8)
+    context = tokens(12)
+    held.update(context, context * -1)
+
+    branch = tokens(5, rows=4, start=1000)
+    keys, values = held.update(branch, branch * -1)
+
+    expected_keys = torch.cat((context.expand(4, -1, -1, -1), branch), dim=-2)
+    assert torch.equal(keys, expected_keys)
+    assert torch.equal(values, expected_keys * -1)
+    assert keys.shape == (4, 2, 17, 3)
+
+
+def test_the_context_is_stored_once():
+    """The point of the change, asserted on the storage rather than inferred from a memory figure."""
+    held = layer(rows=32, context=100, branch=8)
+    assert held.keys.shape[0] == 1, "the context must occupy one row however many branches read it"
+    assert held.branch_keys.shape[0] == 32, "each branch needs its own tokens"
+
+
+def test_a_context_write_returns_one_row():
+    """The model's own attention uses this return value during the context pass, and it is a one-row pass."""
+    held = layer(rows=4, context=20)
+    context = tokens(12)
+    keys, _ = held.update(context, context)
+    assert keys.shape == (1, 2, 12, 3)
+    assert torch.equal(keys, context)
+
+
+def test_a_second_group_starts_from_the_context_and_overwrites_the_first_group_tokens():
+    """The mistake most likely to be made, and invisible without more than one group.
+
+    The first group advances the length by its own tokens. The second has to start from the end of the context again
+    and write over the first group's, rather than after them.
+    """
+    held = layer(rows=4, context=20, branch=8)
+    context = tokens(12)
+    held.update(context, context)
+
+    first = tokens(5, rows=4, start=1000)
+    held.update(first, first)
+    assert held.get_seq_length() == 17
+
+    held.rewind_to(held.context_length)
+    assert held.get_seq_length() == 12
+
+    second = tokens(3, rows=4, start=9000)
+    keys, _ = held.update(second, second)
+    assert keys.shape == (4, 2, 15, 3)
+    # The second group's tokens are there and the first group's are gone from the read, not appended after.
+    assert torch.equal(keys[:, :, 12:], second)
+    assert torch.equal(keys[:, :, :12], context.expand(4, -1, -1, -1))
+
+
+def test_groups_of_the_same_shape_read_identically():
+    """Bit-exact across groups, which a stale cursor or an unreset buffer would break."""
+    held = layer(rows=4, context=20, branch=8)
+    context = tokens(12)
+    held.update(context, context)
+
+    branch = tokens(5, rows=4, start=1000)
+    first, _ = held.update(branch, branch)
+    first = first.clone()
+
+    held.rewind_to(held.context_length)
+    other = tokens(4, rows=4, start=7000)
+    held.update(other, other)
+    held.rewind_to(held.context_length)
+
+    third, _ = held.update(branch, branch)
+    assert torch.equal(first, third)
+
+
+def test_a_branch_offset_is_measured_from_the_context_not_from_a_position():
+    """With media in a context the model's positions run ahead of the token count. A branch's storage offset must come
+    from the token count, and this checks the layer never learns a position at all."""
+    held = layer(rows=4, context=20, branch=8)
+    context = tokens(12)
+    held.update(context, context)
+    assert held.context_length == 12
+    assert held.get_seq_length() == 12
+    # There is nowhere to put a position, which is the strongest form of the guarantee.
+    assert not any("position" in name for name in vars(held))
+
+
+def test_a_context_that_does_not_fit_is_refused():
+    held = layer(rows=4, context=20, branch=8)
+    too_long = tokens(21)
+    with pytest.raises(ValueError, match="does not fit"):
+        held.update(too_long, too_long)
+
+
+def test_a_branch_longer_than_the_buffer_is_refused():
+    held = layer(rows=4, context=20, branch=8)
+    context = tokens(12)
+    held.update(context, context)
+    too_long = tokens(9, rows=4)
+    with pytest.raises(ValueError, match="does not fit in 8"):
+        held.update(too_long, too_long)
+
+
+def test_a_partial_row_count_is_refused():
+    held = layer(rows=4, context=20)
+    context = tokens(12)
+    held.update(context, context)
+    with pytest.raises(ValueError, match="holds 4 rows and was given 2"):
+        held.update(tokens(3, rows=2), tokens(3, rows=2))
+
+
+def test_rewinding_anywhere_but_the_context_end_is_refused():
+    """A rewind into the context would leave the branch buffer describing tokens the length no longer claims."""
+    held = layer(rows=4, context=20, branch=8)
+    context = tokens(12)
+    held.update(context, context)
+    held.update(tokens(5, rows=4), tokens(5, rows=4))
+    with pytest.raises(ValueError, match="only rewind to the end of its context"):
+        held.rewind_to(6)
+
+
+def test_cropping_is_refused_rather_than_half_done():
+    held = layer()
+    with pytest.raises(NotImplementedError, match="cannot be cropped"):
+        held.crop(3)
+
+
+def test_reordering_permutes_the_branches_and_leaves_the_context_alone():
+    held = layer(rows=4, context=20, branch=8)
+    context = tokens(12)
+    held.update(context, context)
+    branch = tokens(5, rows=4, start=1000)
+    held.update(branch, branch)
+
+    held.reorder_cache(torch.tensor([3, 2, 1, 0]))
+    keys, _ = held.branch_keys, held.branch_values
+    assert torch.equal(keys[0, :, :5], branch[3])
+    assert held.keys.shape[0] == 1
+
+
+def test_resetting_clears_both_buffers_and_the_context_mark():
+    held = layer(rows=4, context=20, branch=8)
+    context = tokens(12)
+    held.update(context, context)
+    held.update(tokens(5, rows=4), tokens(5, rows=4))
+    held.reset()
+    assert held.get_seq_length() == 0
+    assert held.context_length == 0
+    assert held.keys.abs().sum().item() == 0.0
+    assert held.branch_keys.abs().sum().item() == 0.0
+
+
+def test_the_memory_figure_counts_the_context_once():
+    """The number that decides how many contexts fit on a card, so it is checked against the arithmetic rather than
+    against a remembered value."""
+
+    from typing import ClassVar
+
+    class Config:
+        num_key_value_heads = 2
+        num_attention_heads = 16
+        head_dim = 256
+        hidden_size = 2048
+        layer_types: ClassVar[list[str]] = ["full_attention", "linear_attention", "full_attention"]
+
+    branch, context, rows = 512, 3040, 32
+    got = cache_bytes(Config(), context + branch, rows, torch.bfloat16, branch)
+    expected = 2 * 2 * 2 * 256 * (context + rows * branch) * 2
+    assert got == expected
+
+    # Replicating the context across the group is what this replaces, and it is much larger.
+    replicated = 2 * 2 * 2 * 256 * rows * (context + branch) * 2
+    assert replicated / got > 5
