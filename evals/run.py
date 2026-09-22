@@ -318,6 +318,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fit-split", default="train", help="the split anything fitted is fitted on")
     parser.add_argument("--fit-limit", type=int, default=400, help="contexts to fit on, which is the label budget")
     parser.add_argument("--repeat", type=int, default=1, help="whole runs, so the latency spread is visible")
+    parser.add_argument(
+        "--bury",
+        type=int,
+        default=0,
+        help="surround each context with other items' contexts to about this many tokens, so the same questions with "
+        "the same answers are asked about a longer document",
+    )
     parser.add_argument("--json", type=Path, help="write the whole measurement here")
     args = parser.parse_args(argv)
 
@@ -344,12 +351,25 @@ def main(argv: list[str] | None = None) -> int:
         "generate",
         "generate_thinking",
     }
+    needs_model.add("alone")
     if needs_model & set(wanted):
         from prismyra import Prismyra
 
         started = time.perf_counter()
         engine = Prismyra(args.model)
         print(f"[load] {time.perf_counter() - started:.0f}s  kernels: {engine.applied.as_dict()['applied']}\n")
+
+    if args.bury:
+        # After the engine, because the tokenizer that decides the length has to be the one that will read it. Counting
+        # with a different tokeniser would report a length the model never sees.
+        if engine is None:
+            raise SystemExit("--bury needs a method that loads the model, since its tokenizer decides the length")
+        items = tasks.bury(items, engine.tokenizer, args.bury, seed=args.seed)
+        buried = [len(engine.tokenizer(item.context, add_special_tokens=False)["input_ids"]) for item in items]
+        print(
+            f"[bury] each context padded with other items to a median {sorted(buried)[len(buried) // 2]} tokens "
+            f"(shortest {min(buried)}, longest {max(buried)}); the questions and answers are unchanged\n"
+        )
 
     results: dict[str, dict] = {}
     # Repeated whole runs with the method order reversed on alternate passes. Running methods once in a fixed order

@@ -24,7 +24,7 @@ baseline that reasons is a different and much more expensive method.
 **majority** always answers the commonest label, taken from the training split. Taken from the scored slice it would be
 an oracle rather than a baseline.
 
-## The read-out answers as well as generating does
+## The read-out answers as well as generating does, on a short context
 
 | task | contexts | questions | read-out | generation | difference, 95% interval | majority |
 |---|---|---|---|---|---|---|
@@ -33,6 +33,47 @@ an oracle rather than a baseline.
 
 Both intervals span zero. On these slices the two methods cannot be separated, and that -- not a win -- is the claim
 worth making, because it is what makes a comparison of speed a comparison of anything at all.
+
+Read the heading's last four words, though. A RACE article is a few hundred tokens, and that is the only length at
+which this was ever measured.
+
+## On a long context they separate, and not in this package's favour
+
+The same 159 questions with the same right answers, asked about the same articles, with each article surrounded by
+other articles from the same slice until the context reaches a length. `evals/run.py --bury N` does that. Nothing about
+the question changes; only how much competing material is in front of it.
+
+| context tokens | read-out | generation | difference, 95% interval |
+|---|---|---|---|
+| 407 (median, unpadded) | 95.0% | 94.3% | +0.6% [-1.3%, +3.0%] |
+| 6,104 | 83.6% | 86.2% | -2.5% [-5.6%, +0.6%] |
+| 10,199 | 82.4% | 87.4% | **-5.0% [-8.6%, -1.3%]** |
+
+**The last interval excludes zero.** It is the first comparison in this project that separates the two methods, and it
+separates them against the read-out: burying the answer costs it 12.6 points and costs generation 6.9.
+
+Two things follow and they point in different directions.
+
+Some of the fall is the model's and nothing to do with this design -- generation loses 6.9 points on the same material,
+so roughly half of what the read-out loses is simply the difficulty of finding an answer in a haystack. But the
+*widening* is the mechanism's. The two methods share everything up to the last position of the branch: the same weights,
+the same cache, the same fork. The only difference is how the answer is taken out -- the read-out scores the declared
+options at one position, while generation emits tokens that are then parsed, and the parser accepts an exact match, a
+delimited one, a prefix, or the option merely being mentioned. A flattening distribution costs a single-position argmax
+more than it costs four chances at a string.
+
+That is a hypothesis, not a finding. What would settle it is comparing generation's *first* token against the
+read-out's argmax on the same questions: if they agree and the accuracy still differs, the parser's extra chances are
+the whole story, and if they disagree the read-out's position is.
+
+**What to do with this.** Padding is an adversarial way to make a context long -- competing articles are harder than a
+long single document, which is the ordinary case. So this is a lower bound on long-context accuracy rather than a
+measurement of it. But it is the only measurement there is, and the package's speed and memory figures go out to 24,327
+tokens while its accuracy figures stopped at a few hundred. If you are asking many questions about a long document, this
+is the number to plan against, and the read-out's advantage there is speed bought at a measured cost.
+
+The padding length has a ceiling set by the slice: forty RACE articles of about 400 tokens cannot pad any one of them
+past about 16,000, which is why asking for 18,000 produced 10,199.
 
 The interval comes from resampling whole contexts, not questions. Questions about one article share a passage and a
 topic, so treating them as independent draws would make every interval several times too narrow. It is also why the

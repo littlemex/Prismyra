@@ -134,3 +134,41 @@ def _unfair_tos(rows) -> list[Item]:
             )
         )
     return items
+
+
+def bury(items: list[Item], tokenizer, target_tokens: int, seed: int = 0) -> list[Item]:
+    """Surround each item's context with other items' contexts until it reaches about `target_tokens`.
+
+    Every accuracy figure this package reports was measured on contexts of a few hundred to a few thousand tokens,
+    while its memory and latency figures go out to 24,327. That leaves the obvious question unasked: does reading the
+    answer out of one forward pass still work when the answer is buried?
+
+    The padding is other items from the same task, which keeps one thing fixed that matters. Generated filler, or the
+    same passage repeated, would change the *kind* of text as well as the amount of it, and a drop could then be read
+    either way. Here the questions, the gold answers and the register are identical and only the amount of competing
+    material changes -- so a drop is attributable to length.
+
+    The real context is placed at a seeded position rather than first or last. First makes it a primacy test and last a
+    recency one, and both are known to flatter or punish a model for reasons that have nothing to do with this design.
+    """
+    import random
+
+    if not target_tokens or len(items) < 2:
+        return items
+
+    rng = random.Random(seed)
+    out = []
+    for i, item in enumerate(items):
+        others = [items[j].context for j in range(len(items)) if j != i]
+        rng.shuffle(others)
+        before: list[str] = []
+        after: list[str] = []
+        length = len(tokenizer(item.context, add_special_tokens=False)["input_ids"])
+        for other in others:
+            if length >= target_tokens:
+                break
+            (before if rng.random() < 0.5 else after).append(other)
+            length += len(tokenizer(other, add_special_tokens=False)["input_ids"])
+        context = "\n\n".join([*before, item.context, *after])
+        out.append(Item(context=context, questions=item.questions, gold=item.gold, task=item.task))
+    return out
