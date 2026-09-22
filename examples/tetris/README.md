@@ -13,8 +13,8 @@ controls, because the first answer this example published was wrong.
 
 ```bash
 python examples/tetris/play.py --agents heuristic,random --pieces 60 --games 8
-python examples/tetris/play.py --agents readout,readout_features,readout_score --pieces 60 --games 3
-python examples/tetris/play.py --perception 14     # is the board being read at all
+python examples/tetris/play.py --agents readout,readout_picture,readout_features,readout_score --pieces 60 --games 3
+python examples/tetris/play.py --perception 12     # is the board being read, as text and as an image
 python examples/tetris/play.py --diagnose 12       # does the ranking resemble one that plays
 ```
 
@@ -31,46 +31,69 @@ measure where pieces placed is a per-game one.
 | `readout_features` | the candidate table, no score | **51.7 +/- 2.1** | **6.0 +/- 1.7** | 4.00 | -- |
 | `readout` | the board drawn, placements described | 26.3 +/- 2.7 | 0.3 +/- 0.5 | 14.61 | p = 0.16 |
 | `readout_outcome` | the board each placement would produce | 24.0 +/- 6.2 | 0.2 +/- 0.4 | 22.49 | p = 0.68 |
+| `readout_picture` | the board **as an image** | 24.5 +/- 4.2 | 0.0 +/- 0.0 | 15.68 | p = 0.88 |
 | `random` | -- | 23.7 +/- 3.4 | 0.2 +/- 0.4 | 17.15 | -- |
 
 `readout_features` is the interesting row. The five numbers for every candidate are in the shared context and the score
 is not, so the model still has to decide what those numbers are worth -- and it survives 51.7 pieces of 60 and clears
 six rows where random survives 23.7 and clears none.
 
-The two rows below it are **not distinguishable from random**: exact two-sided p of 0.16 and 0.68 over all arrangements
-of the six games each. That is why `random` is in the table. Without it, "26 pieces placed at 537 ms a move" reads
+The three rows below it are **not distinguishable from random**: exact two-sided p of 0.16, 0.68 and 0.88 over all
+arrangements of their games. That is why `random` is in the table. Without it, "26 pieces placed at 537 ms a move" reads
 like a working agent with a latency figure.
 
-## The conclusion this example published first, and why it was wrong
+`readout_picture` is the one to look at twice. It reads the board -- see below -- and it still cannot play, so better
+perception on its own bought nothing here.
 
-The first version of this file had only the top and bottom of that table -- the heuristic, `readout`, `readout_outcome`
-and `random` -- and concluded:
+## Where the failure actually is, after two wrong answers
+
+This file has published two conclusions and both were wrong. Keeping them is cheaper than the mistakes were.
+
+**First**, from the heuristic, `readout`, `readout_outcome` and `random` alone:
 
 > Showing the resulting board did not help, so the failure is not that the model cannot work out which position a phrase
 > produces. It cannot judge the positions.
 
-Both reviewers rejected the inference and they were right. Showing a branch the board its placement would produce
-removes the need to **imagine** a placement. It does not remove the need to **read a grid of text**, and those are
-different failures. The conclusion needed a measurement it did not have.
+Both reviewers rejected the inference. Showing a branch the board its placement would produce removes the need to
+**imagine** a placement; it does not remove the need to **read a grid of text**.
 
-Two were missing, and both are now here.
+**Second**, after the features framing and the text perception probe:
 
-**Is the board being read at all?** `--perception` asks questions about a rendered board whose answers are mechanically
-known and depend on no policy: does it have more than *k* holes, is column *a* taller than column *b*, is column *x*
-empty. Thresholds sit either side of the true count so that a constant answer does not score well.
+> The model can judge Tetris positions. It cannot read an ASCII board.
 
-> **110 of 154 right, 71.4%, over 14 boards -- against 69.5% for answering "no" to everything.** P(>= 110) = 0.34
-> against that baseline, so this is indistinguishable from not reading the board.
+Half right, and the wrong half was the diagnosis. "Cannot read an ASCII board" is not the same as "cannot see a board"
+-- this model has a vision tower and this package puts images in a context, and the board had only ever been handed
+over as characters. That question was asked from outside and it was the right one.
 
-**Can the read-out rank anything at all?** `readout_score` is the positive control: the candidate table carries the
-weighted score, so the best placement is the largest number in a column and choosing it needs no judgement. It places
-57.3 of 60. So the mechanism and the read-out are sound, and nothing about scoring 34 candidates in one pass is at
-fault.
+So the same probe was run again with the board drawn as an image, same questions, same thresholds, same read-out:
 
-Those two together make the corrected conclusion, and it is the opposite of the first one:
+| channel | right on mechanically-answerable questions | answering "no" to everything |
+|---|---|---|
+| the board written out in characters | 92 / 132 = **69.7%** | 69.7% |
+| the board drawn as an image | 112 / 132 = **84.8%** | 69.7% |
 
-> The model can judge Tetris positions well enough to play. It cannot read an ASCII board. The floor scores are a
-> perception failure, and giving it the same state as numbers recovers most of the play.
+The text figure is not near the constant-answer baseline, it **is** the constant-answer baseline, to a tenth of a point
+(P(>= 92) = 0.54). The image figure is far above it (P(>= 112) = 0.00005), and beats text on 8 of the 9 boards where
+they differed (sign test p = 0.039).
+
+Why a grid written out in text defeats a model that reads images: tokenisation merges runs of dots into pieces whose
+boundaries differ from row to row, so nothing indicates that the fifth character of one line sits above the fifth
+character of the next; text carries one-dimensional positions in this model's position scheme while image patches carry
+two-dimensional ones; and the vision tower is not involved at all when the board is characters.
+
+**And it still does not play.** `readout_picture` places 24.5 +/- 4.2 of 60 and clears nothing -- wins 0.54 of pairings
+against random, exact two-sided p = 0.88. Reading the board was necessary and is not sufficient.
+
+That locates the failure precisely, which neither earlier conclusion did:
+
+* it can **see** the board when the board is a picture -- 84.8% on holes, heights and emptiness;
+* it can **judge** a position when the aggregates are handed to it -- 51.7 of 60 pieces from the features, with the
+  score withheld;
+* it cannot **get from one to the other**. Judging a placement needs five aggregates over ten columns computed for each
+  of 34 candidates and then compared. Per-question accuracy of 84.8% does not survive that many combinations.
+
+`readout_score` is the positive control that keeps the mechanism out of it: the candidate table carries the weighted
+score, so the best placement is the largest number in a column, and the read-out places 57.3 of 60.
 
 ## Why the ranking diagnostic did not catch this
 
@@ -93,9 +116,11 @@ the likely explanation and there is no reason to pursue it.
 
 * **The mechanism did what it claims.** 34 placements scored in one forward pass, 537 to 680 ms depending on framing,
   against 34 separate calls. That holds in every row of the table, including the rows where the agent cannot play.
-* **A mechanism that delivers a decision cheaply cannot make the decision good**, and it cannot make an unreadable input
-  readable. In this task the representation was worth about 28 pieces of survival and six rows -- far more than anything
-  in the engine.
+* **A mechanism that delivers a decision cheaply cannot make the decision good.** In this task the representation was
+  worth about 27 pieces of survival and six rows, which is far more than anything in the engine has been worth -- and
+  the representation that paid was numbers, not a clearer picture.
+* **Fixing perception did not fix the decision.** The image channel reads the board and plays at the floor. Where a
+  chain has three links, measuring the first and the last does not locate the break.
 * **A floor belongs in every table like this**, and so does a positive control. The floor says whether the agent is
   playing; the control says whether a failure belongs to the mechanism or to the model.
 * **Ranking by P(yes) is already ranking by log-odds** here. A reviewer asked for the latter; a Boolean read-out
@@ -108,9 +133,13 @@ the likely explanation and there is no reason to pursue it.
   cleaner version gives column heights and holes per column -- nearly lossless for this game, and not a feature set
   chosen by the reference.
 * No plain generative agent was run: one ordinary prompt per move, all placements listed, the model reasons and names
-  one. If that plays from the drawn board, then ASCII perception is recoverable with enough tokens spent on it and the
-  perception result is about one-pass scoring rather than about the model. It is slow and it is the next thing worth
-  doing.
+  one. Now that the image channel is known to read the board, the interesting version of that is generative **from the
+  image**: if reasoning tokens turn 84.8% per-question perception into playable judgement, the gap identified above is
+  about one-pass scoring rather than about the model.
+* The step that is actually missing has not been probed directly. Ask the model, from the image, for the aggregates it
+  would need -- how many holes in total, which column is tallest, how bumpy -- and score those against the truth. The
+  per-cell questions are answered at 84.8% and the aggregates are what judging needs, so that is where the accuracy
+  should be measured next.
 * The diagnostic's boards come from the heuristic's play, so they are cleaner than the boards a weak agent meets.
 * `readout_outcome` is nominally below random (24.0 against 23.7) and that is variance, not an anti-signal: p = 0.68.
 

@@ -33,6 +33,7 @@ from .schema import (
     Scale,
     Timing,
 )
+from .temperature import Temperature
 from .thresholds import Thresholds
 
 __version__ = "0.1.0"
@@ -51,6 +52,7 @@ __all__ = [
     "Request",
     "Result",
     "Scale",
+    "Temperature",
     "Thresholds",
     "Timing",
     "__version__",

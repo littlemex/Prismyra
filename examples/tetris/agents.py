@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from itertools import pairwise
 
-from game import Board, Move, apply, legal_moves
+from game import Board, Move, apply, draw, legal_moves
 
 #: Weights over the features below. Not tuned here and not meant to be: this is a reference point, and a reference that
 #: was fitted against the same games it is a reference for would be a competitor. These are the long-published
@@ -425,3 +425,81 @@ def regret(board: Board, piece: str, chosen: Move) -> float:
     best = max(value for _, value in scored)
     mine = next(value for move, value in scored if move == chosen)
     return round(best - mine, 3)
+
+
+#: Where the board goes when it is an image rather than characters. The words stay the same so the only difference from
+#: the text framings is the channel.
+PICTURE = """You are playing Tetris. The picture shows the board: a black square is a filled cell and a white square is
+empty. Columns are numbered 0 to 9 along the top and rows 0 to 19 down the left, with row 0 at the top and row 19 the
+floor. A piece is dropped straight down into a column at a chosen rotation and cannot slide sideways underneath an
+overhang. A row vanishes when all ten of its cells are filled.
+
+A good placement keeps the stack low and flat and leaves no empty cell with a filled cell above it.
+
+The piece to place is {piece}."""
+
+
+@dataclass
+class ReadOutPicture:
+    """The board as an image, every placement as a row. One pass, one vision tower, one context.
+
+    The framing the first conclusion here should have tried before blaming the model: the model has a vision tower and
+    this package puts images in a context, and the board had only ever been handed over as characters.
+    """
+
+    engine: object
+    name: str = "readout_picture"
+
+    def choose(self, board: Board, piece: str) -> Choice | None:
+        from prismyra import Boolean
+
+        playable = [m for m in legal_moves(piece) if apply(board, piece, m) is not None]
+        if not playable:
+            return None
+        questions = [
+            Boolean(id=f"m{i}", prompt=f"Is placing the piece as {m.describe(piece)} a good move?")
+            for i, m in enumerate(playable)
+        ]
+        started = time.perf_counter()
+        result = self.engine.ask(  # type: ignore[attr-defined]
+            PICTURE.format(piece=piece), questions, images=[draw(board)]
+        )
+        seconds = time.perf_counter() - started
+        best = max(range(len(playable)), key=lambda i: result[f"m{i}"].probabilities["yes"])
+        return Choice(playable[best], seconds, len(playable))
+
+
+def perception_picture(engine, board: Board) -> dict:
+    """The same mechanically-answerable questions, with the board as an image instead of characters.
+
+    The comparison that says whether "cannot read the board" is about seeing a grid or about reading one written out in
+    characters. Same questions, same thresholds, same read-out; only the channel differs.
+    """
+    from prismyra import Boolean
+
+    heights = board.heights()
+    holes = board.holes()
+    asked: list[tuple[str, str, bool]] = []
+    for n, k in enumerate((max(0, holes - 1), holes, holes + 1)):
+        asked.append((f"h{n}", f"Does this board have more than {k} holes?", holes > k))
+    for a, b in ((0, 5), (2, 7), (3, 4), (1, 8), (6, 9)):
+        asked.append((f"t{a}{b}", f"Is column {a} taller than column {b}?", heights[a] > heights[b]))
+    for x in (0, 4, 9):
+        asked.append((f"e{x}", f"Is column {x} completely empty?", heights[x] == 0))
+
+    result = engine.ask(
+        "The picture shows a Tetris board. A black square is a filled cell and a white square is empty. Columns are "
+        "numbered 0 to 9 along the top and rows 0 to 19 down the left, with row 0 at the top and row 19 the floor. A "
+        "hole is an empty cell with at least one filled cell somewhere above it in the same column. A column's height "
+        "is measured from the floor to its highest filled cell.",
+        [Boolean(id=i, prompt=q) for i, q, _ in asked],
+        images=[draw(board)],
+    )
+    right = sum(result[i].value is truth for i, _, truth in asked)
+    return {
+        "asked": len(asked),
+        "right": right,
+        "accuracy": round(right / len(asked), 4),
+        "always_no_would_score": round(sum(not truth for _, _, truth in asked) / len(asked), 4),
+        "wrong": [q for i, q, truth in asked if result[i].value is not truth],
+    }
