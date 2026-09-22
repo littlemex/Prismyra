@@ -5,9 +5,10 @@ each question a row carrying only its own tokens. What makes that safe is one as
 are only read by the branches, so one write can serve every row, while the recurrence state and each row's own tokens
 are written, so those must be copied per row.
 
-Being read-only is what makes one write *correct* for every row; it is not what makes it cheap. `ForkLayer` is
-preallocated at the full batch, so the context ends up physically replicated across the group -- the memory cost
-`cache.cache_bytes` reports. See docs/FORK.md.
+Being read-only is what makes one write *correct* for every row, and `ForkLayer` keeps the context in one row rather
+than replicating it across the group -- `cache.cache_bytes` reports what that holds. A group uses only as many rows as
+it has questions, because the read joins the context with each row's own tokens and that join is per row. See
+docs/FORK.md.
 """
 
 from __future__ import annotations

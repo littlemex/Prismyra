@@ -202,11 +202,14 @@ because when reading is what does not fit, a smaller group changes nothing.
 Both figures are **observed on the engine that will use them**, not derived, and both are ratcheted upwards as passes
 happen. The answering figure is split in two, which is not tidiness:
 
-    per row  =  a constant, observed  +  4,096 bytes x context tokens, arithmetic
+    per row  =  a constant, observed  +  2,048 bytes x context tokens, arithmetic
 
-The arithmetic part is the join and its reshape copy, from the model's own shapes -- two key-value heads, head_dim 256,
-two bytes, keys and values, doubled by the transpose-then-reshape the kernel needs. It predicts 4,096 bytes per context
-token per row against 3,838 measured between the two lengths, so it over-states by 7%, which is the safe direction.
+The arithmetic part is the join, from the model's own shapes -- two key-value heads, head_dim 256, two bytes, keys and
+values. It was 4,096 while the join was copied a second time to reach the layout the kernel reads, and 3,838 was
+measured against that prediction, so it over-stated by 7%, which is the safe direction. The second copy is gone (see
+[below](#the-second-copy-of-the-join)) and the figure halves with it. The **fallback** path -- the framework's own
+attention, when the borrowed kernel is unavailable -- is budgeted at 4,096 instead, because it is handed a strided view
+and whether it copies that is not something this package controls or has measured.
 Keeping the largest observed *prediction* instead would ratchet the wrong way: a prediction scaled up from a short
 context is larger per token than one from a long context, so the shortest context ever seen would win and be kept
 forever, and a full-width pass at 24,327 tokens would be budgeted at 17.7 GiB when it needs 4.97 -- refused with four
@@ -217,14 +220,24 @@ yet. That is a real hole and is closed by the allocator rather than by admission
 engine raises a named error from the read, saying that asking fewer questions will not help and a shorter context is the
 only knob. After one read the figure exists and a longer context is refused before anything is allocated.
 
-**Per-row cost is not flat in width at the bottom of the range**, and admission says so rather than pretending
-otherwise. At 24,327 tokens a pass cost 0.111 GiB per row at width 1 and 0.155 at widths 8 and 32; an observation taken
-at width 1 therefore under-states a width-32 pass by 29%. `prismyra-bench admission --context-tokens 18000` is that
-sequence run deliberately: a fresh engine answers one question at 24,327 tokens, the estimate it then makes for
-thirty-two is 4.028 GiB, and the pass measures 4.970 -- short by a factor of 1.23. So `budget_is_evidenced()` is false
-for any pass wider than the widest yet measured, and the refusal message says "at least" rather than a figure. The
-allocator is the authoritative gate for such a pass, and `torch.OutOfMemoryError` is caught and re-raised naming the
-knobs: fewer questions per call, or a smaller group.
+**Per-row cost used not to be flat in width**, and admission still says it cannot vouch for a width it has not seen.
+`prismyra-bench admission --context-tokens 18000` runs the sequence that shows why: a fresh engine answers one question
+at 24,327 tokens, then the estimate it makes for thirty-two is compared with that pass.
+
+| | per row at width 1 | per row at width 32 | estimate for 32 rows | that pass measured |
+|---|---|---|---|---|
+| head-major, copied twice | 0.111 GiB | 0.155 GiB | 4.028 GiB | 4.970 GiB, short by 1.23x |
+| token-major, copied once | 0.109 GiB | 0.109 GiB | 4.028 GiB | 3.482 GiB, covered |
+
+The second copy of the join **was** the width dependence. It is proportional to rows and to context, and it was the part
+that made a narrow pass look cheaper per row than a wide one; with it gone the two agree to three decimals and an
+observation at width 1 predicts width 32. That was not the reason for making the change and is not something this
+document predicted.
+
+`budget_is_evidenced()` is nevertheless still false for a pass wider than the widest yet measured, and the refusal says
+"at least" rather than a figure. One measurement on one model is not a reason to promise a shape holds; the allocator
+remains the authoritative gate, and `torch.OutOfMemoryError` is caught and re-raised naming the knobs that apply --
+fewer questions per call, or a smaller group.
 
 Free memory is the device's free bytes plus the allocator's reserved-but-unallocated pool. Asking the device alone
 refused an 18,000-token context that had 9 GiB waiting for it inside the process, because loading these weights leaves
@@ -247,10 +260,35 @@ never a feature, and bringing it back correctly means doing the verification fro
 now records `last_branch_rows`, the row count it actually received, so a claim about how a pass ran can be checked
 against the code that would have done the work.
 
-The join it would have removed is still there and still costs 4,096 bytes per context token per row. Whether that is
-worth a second storage path is a question about time rather than memory: narrow rows remove the cost for requests with
-few questions, and the cheaper things to try first are removing the transpose-then-reshape copy, which is half the
-slope, and writing the join into a buffer allocated once per context instead of per layer.
+### The second copy of the join
+
+Half of what the join cost was not the join. The borrowed kernel wants `(total_tokens, heads, dim)`; the framework's
+cache layout is head-major, `(rows, heads, tokens, dim)`; and `transpose(1, 2).reshape(...)` cannot be a view, so every
+layer of every pass copied the whole join a second time to get there.
+
+`ForkLayer` now stores token-major and returns a transposed **view**, so callers still see the framework's layout and
+the kernel's own reshape is free. The attention code is unchanged. What it bought, at 24,327 context tokens:
+
+| context tokens | | branch ms at width 32 | branch peak at width 32 | width factor, 1 to 32 |
+|---|---|---|---|---|
+| 24,327 | head-major, copied twice | 360.4 | 4.970 GiB | 1.51 |
+| 24,327 | token-major, copied once | 312.0 | **3.482 GiB** | **1.29** |
+| 3,040 | head-major, copied twice | 254.1 | 2.534 GiB | 1.02 |
+| 3,040 | token-major, copied once | 252.7 | 2.534 GiB | 1.02 |
+
+At 24,327 tokens the saving is 1.488 GiB, against 1.63 predicted by halving the slope, and 48 ms of clock. **At 3,040
+tokens nothing moved at all** -- the peak is identical to three decimals, not merely close. That is worth stating
+rather than averaging away: at a short context the join is not the high-water mark of the pass, so removing half of it
+changes the traffic and not the peak. The change is a long-context one, and the shape of the table is how you can tell.
+
+Answers are unchanged, and not within a tolerance: the kernel is handed the same bytes in the same order. All 137 device
+tests pass.
+
+What remains of the join is one copy per layer per row, 2,048 bytes per context token per row, and removing it is what
+a page table would be for. Two cheaper things come first and neither is done: a scratch buffer the join is written into
+rather than allocated per layer, and running rows through attention in chunks so the buffer is bounded by the chunk. The
+first trades transient memory for held memory, which is the figure the storage work bought in the first place, so it
+needs measuring rather than assuming.
 
 ## Concurrency, as first measured
 

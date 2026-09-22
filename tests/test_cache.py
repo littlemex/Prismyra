@@ -215,8 +215,9 @@ def test_reordering_permutes_the_branches_and_leaves_the_context_alone():
     held.update(branch, branch)
 
     held.reorder_cache(torch.tensor([3, 2, 1, 0]))
-    keys, _ = held.branch_keys, held.branch_values
-    assert torch.equal(keys[0, :, :5], branch[3])
+    # Storage is token-major, `(rows, tokens, heads, dim)`, while the branch written above is head-major as every
+    # caller's is. So the comparison transposes rather than asserting on a layout this class does not use.
+    assert torch.equal(held.branch_keys[0, :5], branch[3].transpose(0, 1))
     assert held.keys.shape[0] == 1
 
 

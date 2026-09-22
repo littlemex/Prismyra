@@ -12,11 +12,10 @@ together, which costs a copy that lives for one layer and is freed before the ne
 group of 32, against 2.17 GiB that used to be held for as long as the context was open.
 
 **Why a transient copy rather than a page table.** The kernel can be handed a page table naming shared pages, which
-would remove the copy as well, and that path is measured and available: `tests/test_gpu_paging.py` confirms many rows
-may read one set of pages. It is not what this file does, because joining the two buffers is **bit-identical to
-replicating them** -- the same bytes in the same order -- while a paged read reduces in a different order and would
-change answers by a rounding step in a 40-layer model, where one changed routing logit picks a different expert. So
-the storage is fixed first, against an unchanged baseline, and the copy is removed second.
+would remove the copy as well. A path doing that was written and deleted -- it was never wired to anything, so its
+measurements were this path compared with itself, and docs/PERFORMANCE.md says so at length. What this file does
+instead is join, which is **bit-identical to replicating** -- the same bytes in the same order -- and store the join
+token-major so the kernel's own reshape is a view rather than a second copy of the whole thing.
 
 What it costs, measured on the supported model at 3,040 context tokens and a group of 32: an open context held 2.17
 GiB and now holds 0.37 GiB, a factor of 5.9. At 20,000 tokens the factor is 18, because the shared part stops being
@@ -94,13 +93,21 @@ class ForkLayer(CacheLayerMixin):
         self._allocate(num_heads, head_dim, dtype, device)
 
     def _allocate(self, heads: int, head_dim: int, dtype, device) -> None:
+        """Token-major: `(rows, tokens, heads, dim)`, which is the layout the attention kernel reads.
+
+        The framework's layout is head-major, `(rows, heads, tokens, dim)`, and `update` returns a transposed view so
+        callers see that. Storing it the other way round is what makes the view enough: the kernel wants
+        `(total_tokens, heads, dim)`, and reaching it from a head-major join means transposing and then reshaping,
+        which cannot be a view and copies the whole join a second time. Half of what a branch pass transiently
+        allocates was that second copy -- 2,048 of the 4,096 bytes per context token per row.
+        """
         self.device, self.dtype = device, dtype
         context_room = max(1, self.max_cache_len - self.max_branch_len)
-        # One row for the context. This is the whole change: it used to be `max_batch_size` rows of the same bytes.
-        self.keys = torch.zeros((1, heads, context_room, head_dim), dtype=dtype, device=device)
+        # One row for the context. It used to be `max_batch_size` rows of the same bytes.
+        self.keys = torch.zeros((1, context_room, heads, head_dim), dtype=dtype, device=device)
         self.values = torch.zeros_like(self.keys)
         self.branch_keys = torch.zeros(
-            (self.max_batch_size, heads, self.max_branch_len, head_dim), dtype=dtype, device=device
+            (self.max_batch_size, self.max_branch_len, heads, head_dim), dtype=dtype, device=device
         )
         self.branch_values = torch.zeros_like(self.branch_keys)
         self.cumulative_length = self.cumulative_length.to(device)
@@ -110,10 +117,13 @@ class ForkLayer(CacheLayerMixin):
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *_, **__):
         """A one-row write is the context; a full-batch write is the branches.
 
-        Returns contiguous keys and values either way, which is not an incidental convenience. The model's own
-        attention is the fallback when the borrowed kernel is unavailable, and it takes tensors rather than a page
-        table -- so a layer that returned anything else would not fall back, it would fail on the first cached
-        forward.
+        Returns keys and values in the framework's head-major layout either way, which is not an incidental
+        convenience. The model's own attention is the fallback when the borrowed kernel is unavailable and it takes
+        tensors in that layout, so a layer that returned anything else would not fall back, it would fail on the first
+        cached forward.
+
+        What is returned is a **view** of token-major storage, so the borrowed kernel's
+        `key.transpose(1, 2).reshape(...)` gets the storage back and reshapes it for free rather than copying it.
         """
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
@@ -131,18 +141,25 @@ class ForkLayer(CacheLayerMixin):
         return self._write_branches(key_states, value_states, count, rows)
 
     def _write_context(self, key_states: torch.Tensor, value_states: torch.Tensor, count: int):
-        """Into the single shared row, and the branches read it from there rather than being given a copy."""
+        """Into the single shared row, and the branches read it from there rather than being given a copy.
+
+        The incoming tensors are head-major and the storage is token-major, so the write transposes. That costs one
+        copy of the context, once, against a copy of it per row per layer on every later read.
+        """
         assert self.keys is not None and self.values is not None
         start = self._host_length
-        if start + count > self.keys.shape[-2]:
+        if start + count > self.keys.shape[1]:
             raise ValueError(
-                f"a context of {start + count} tokens does not fit: this layer holds {self.keys.shape[-2]} context "
+                f"a context of {start + count} tokens does not fit: this layer holds {self.keys.shape[1]} context "
                 f"tokens beside {self.max_branch_len} for each branch"
             )
-        self.keys[:, :, start : start + count] = key_states
-        self.values[:, :, start : start + count] = value_states
+        self.keys[:, start : start + count] = key_states.transpose(1, 2)
+        self.values[:, start : start + count] = value_states.transpose(1, 2)
         self._advance(count)
-        return self.keys[:, :, : self._host_length], self.values[:, :, : self._host_length]
+        return (
+            self.keys[:, : self._host_length].transpose(1, 2),
+            self.values[:, : self._host_length].transpose(1, 2),
+        )
 
     def _write_branches(self, key_states: torch.Tensor, value_states: torch.Tensor, count: int, rows: int):
         """Into each branch's own row, then joined with the context for the read.
@@ -164,23 +181,22 @@ class ForkLayer(CacheLayerMixin):
                 f"a branch of {at + count} tokens does not fit in {self.max_branch_len}; the widest branch is what "
                 f"this buffer was sized for"
             )
-        self.branch_keys[:rows, :, at : at + count] = key_states
-        self.branch_values[:rows, :, at : at + count] = value_states
+        self.branch_keys[:rows, at : at + count] = key_states.transpose(1, 2)
+        self.branch_values[:rows, at : at + count] = value_states.transpose(1, 2)
         self.last_branch_rows = rows
         self._advance(count)
 
         used = self._host_length - self.context_length
         # Joined for this layer's read and dropped before the next layer runs. `expand` costs nothing; the copy is the
-        # `cat`, and it is the price of keeping this bit-identical to holding the rows separately.
+        # `cat`, and it is the price of keeping this bit-identical to holding the rows separately. Token-major, so the
+        # result is what the kernel reads and the transposed view below is what the fallback reads.
         keys = torch.cat(
-            (self.keys[:, :, : self.context_length].expand(rows, -1, -1, -1), self.branch_keys[:rows, :, :used]),
-            dim=-2,
+            (self.keys[:, : self.context_length].expand(rows, -1, -1, -1), self.branch_keys[:rows, :used]), dim=1
         )
         values = torch.cat(
-            (self.values[:, :, : self.context_length].expand(rows, -1, -1, -1), self.branch_values[:rows, :, :used]),
-            dim=-2,
+            (self.values[:, : self.context_length].expand(rows, -1, -1, -1), self.branch_values[:rows, :used]), dim=1
         )
-        return keys, values
+        return keys.transpose(1, 2), values.transpose(1, 2)
 
     def _advance(self, count: int) -> None:
         self._host_length += count
@@ -301,27 +317,33 @@ def cache_bytes(config, max_cache_len: int, rows: int, dtype: torch.dtype, max_b
     return 2 * attention_layers * heads * head_dim * slots * per_element
 
 
-def join_bytes_per_token(config, dtype: torch.dtype) -> int:
+def join_bytes_per_token(config, dtype: torch.dtype, doubled: bool = False) -> int:
     """What one context token costs, per branch row, in the transient a branch pass allocates.
 
     Derived rather than measured, because it is arithmetic: for each attention layer the context is joined with the
-    branch's own tokens into a contiguous tensor for the read, keys and values both, and the attention replacement
-    transposes and reshapes that for the kernel, which copies it again.
+    branch's own tokens into one tensor for the read, keys and values both.
 
-        attention_layers x kv_heads x head_dim x bytes x 2 (keys and values) x 2 (the reshape)
+        kv_heads x head_dim x bytes x 2 (keys and values), doubled if the join is copied a second time
 
-    Divided by the layers, because a layer's join is freed before the next layer's is allocated, so what is live at
-    once is one layer's -- with two of them briefly overlapping, which is the factor of two already counted above.
+    Not multiplied by the layers: a layer's join is freed before the next layer's is allocated, so what is live at once
+    is one layer's.
 
-    On the supported model this is 4,096 bytes per context token per row. The peak of a real pass grew by 3,838 bytes
-    per token per row between 3,040 and 24,327 context tokens, so this over-states slightly, which is the safe
-    direction for a memory budget.
+    On the supported model that is 2,048 bytes per context token per row, and `doubled` makes it 4,096. The join is
+    stored token-major, which is the layout the borrowed kernel reads, so its `transpose(1, 2).reshape(...)` is a view.
+    The framework's own attention is the fallback when that kernel is unavailable, and it is handed a head-major
+    **view** of the same storage -- whether it works on those strides or quietly makes itself a contiguous copy is not
+    something this package controls, so the fallback is budgeted at the doubled figure until something measures it.
+    Over-budgeting a path nobody has measured is the safe direction.
+
+    Measured, on the borrowed kernel: the slope was 3,838 bytes per token per row when this predicted 4,096, and
+    removing the second copy took a full-width pass at 24,327 tokens from 4.970 to 3.482 GiB -- a saving of 0.0465 GiB
+    per row against the 0.0474 predicted, which is 2% out.
     """
     decoder = getattr(config, "text_config", config)
     heads = decoder.num_key_value_heads
     head_dim = getattr(decoder, "head_dim", None) or decoder.hidden_size // decoder.num_attention_heads
     per_element = torch.empty((), dtype=dtype).element_size()
-    return 2 * 2 * heads * head_dim * per_element
+    return (2 if doubled else 1) * 2 * heads * head_dim * per_element
 
 
 def _layer_types(decoder):
