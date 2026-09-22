@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import torch
 
 from . import kernels
-from .cache import build_cache, cache_bytes
+from .cache import build_cache, cache_bytes, join_bytes_per_token
 from .calibration import Calibration
 from .fork import (
     WIDTHS,
@@ -36,9 +36,15 @@ from .schema import (
     Timing,
 )
 
-#: Questions per traversal. A traversal costs the same carrying one row or this many, so a group is the unit of cost
-#: and the default fills it. Measured figures are in docs/PERFORMANCE.md.
+#: The widest group of questions one traversal may carry. A group of questions is answered in one pass and a request
+#: with more than this is answered in several; a request with fewer uses only as many rows as it has questions, which
+#: is not the same as it once was -- see docs/PERFORMANCE.md for the measurement that changed it.
 GROUP = 32
+
+#: How much more than the model predicts a branch pass is budgeted at. An allocator's peak is blocks rounded up and
+#: reused rather than a sum of tensor sizes, and the prediction is two terms answering to a handful of measurements.
+#: One number in one place, so there is one thing to argue with.
+ANSWERING_MARGIN = 1.15
 
 
 @dataclass
@@ -63,9 +69,10 @@ class Context:
     def close(self) -> None:
         """Release the cache. Worth doing explicitly, because it is measured in tens of gigabytes.
 
-        Every branch holds its own copy of the context's keys and values, so an open context costs the context's
-        key-value cache times the group -- about 3.4 GiB at 5,000 tokens with the default group of 32, and 12.5 GiB at
-        20,000. `Prismyra.cache_bytes` reports the figure for a given length.
+        The context's keys and values are held once and each branch holds only its own short run of tokens, so an open
+        context costs about 0.41 GiB at 5,000 tokens with the default group of 32 and 0.69 GiB at 20,000 --
+        `Prismyra.cache_bytes` reports the figure for a given length. It used to be 3.4 and 12.5 GiB, when every branch
+        held its own copy.
         """
         self._prefill = None
 
@@ -110,6 +117,22 @@ class Prismyra:
         # The caches are held by the engine and mutated in place, so two threads asking at once would interleave one
         # another's branches. The lock makes that safe; `prismyra.queue.Worker` is still what makes it fast.
         self._lock = threading.RLock()
+        #: The largest per-row transient seen with the context-proportional part taken out -- activations and kernel
+        #: workspace for one row -- and the widest pass it was seen at. None until the first pass.
+        #:
+        #: The width is kept because per-row cost is **not** flat in width at the bottom of the range: at 24,327
+        #: context tokens a pass cost 0.111 GiB per row at width 1 and 0.155 at widths 8 and 32. So an observation
+        #: taken at width 1 under-states a wide pass by 29%, and admission must not claim to have budgeted one.
+        self._observed_row_constant: int | None = None
+        self._observed_at_rows = 0
+        #: The largest transient seen while **reading** a context, per context token, above the cache it leaves behind.
+        #: A separate number because it is the larger of the two on this model -- 4.78 GiB against 4.97 for a full-width
+        #: branch pass at 24,327 tokens, and 0.60 against 2.53 at 3,040 -- and because budgeting only the answering
+        #: transient admits a context whose *read* runs out of memory before any question is asked.
+        #:
+        #: Proportional to the length with no constant worth keeping: measured at 1.96e-4 GiB per token at both 3,040
+        #: and 24,327 tokens, and independent of the group, which is what makes one observation usable at any length.
+        self._observed_reading_per_token: int | None = None
 
         if require_kernels and not (fast_kernels and on_cuda):
             raise PrismyraError(
@@ -166,12 +189,70 @@ class Prismyra:
                 )
 
     def cache_bytes(self, context_tokens: int) -> int:
-        """The device memory one open context of this length will hold.
+        """The device memory one open context of this length **holds** between questions.
 
-        Exposed because the number is large: the fan-out that lets branches be written independently means every row
-        carries its own copy of the context, so this grows with the group as well as with the context.
+        Not what answering one costs. The context is held once, so this grows with the context and only slightly with
+        the group -- but a branch pass allocates several times this much transiently, and that peak is what decides how
+        many contexts can be answered at once. `answering_bytes` is that number, and `stats()` reports both.
         """
         return cache_bytes(self.config, context_tokens + WIDTHS[-1], self.group, self.dtype, WIDTHS[-1])
+
+    def answering_bytes(self, context_tokens: int, questions: int | None = None) -> int:
+        """What a branch pass will transiently allocate on top of the held cache.
+
+        Two parts, because the measured shape has two parts. Per row, the transient is a constant plus a term in the
+        context length -- 0.080 GiB per row at 3,040 context tokens and 0.155 GiB at 24,327 on the supported model:
+
+        * the term in the length is the join of context and branch for each layer's read, and it is **arithmetic**:
+          `cache.join_bytes_per_token` computes it from the config, and the figure it gives is within 7% of the
+          measured slope;
+        * the constant is one row's activations and whatever the kernels want as workspace, and that is **observed**,
+          because deriving it would mean encoding one model's shapes into this package.
+
+        Splitting it that way is not tidiness. Keeping the largest observed *prediction* instead would ratchet towards
+        refusing work: a prediction scaled from a short context is larger per token than one from a long context, so
+        the shortest context ever seen would win and be kept forever, and a full-width pass at 24,327 tokens would be
+        budgeted at 17.7 GiB when it needs 4.97 -- refused with four gigabytes idle. The constant is context-free by
+        construction, so ratcheting it cannot do that.
+
+        Zero until a pass has happened, which is honest rather than convenient: admission cannot budget the first one,
+        and the refusal message says so.
+        """
+        if self._observed_row_constant is None:
+            return 0
+        rows = min(self.group, questions) if questions else self.group
+        per_token = join_bytes_per_token(self.config, self.dtype)
+        per_row = self._observed_row_constant + per_token * (context_tokens + WIDTHS[-1])
+        # A margin, because an allocator's peak is blocks rounded up and reused, not a sum of tensor sizes. One place,
+        # so there is one number to argue with.
+        return int(rows * per_row * ANSWERING_MARGIN)
+
+    def reading_bytes(self, context_tokens: int) -> int:
+        """What reading a context of this length transiently allocates, above the cache it leaves behind.
+
+        Observed and scaled, with no constant term, because that is what was measured: 0.602 GiB of transient at 3,040
+        context tokens and 4.775 GiB at 24,327, which is 1.96e-4 GiB per token both times and the same at every group
+        width. A single observation therefore predicts any length, unlike the answering transient.
+
+        This is the larger of the two phases on the supported model, and it is the one a caller cannot make smaller by
+        asking fewer questions. Extrapolated, a context somewhere near 48,000 tokens needs more of it than a 44 GiB
+        card has left after the weights -- which is a limit worth refusing by name rather than discovering.
+        """
+        if self._observed_reading_per_token is None:
+            return 0
+        return int(self._observed_reading_per_token * context_tokens * ANSWERING_MARGIN)
+
+    def budget_is_evidenced(self, questions: int | None = None) -> bool:
+        """Whether `answering_bytes` is an estimate this engine has seen a pass wide enough to support.
+
+        False for a pass wider than any yet observed. It is a separate question from the estimate's value because the
+        two have different consequences: a low estimate for a pass no wider than one already measured is a reason to
+        refuse, and the same number for a wider pass is not evidence of anything and must not be used to refuse.
+        Admission still checks it -- an estimate that already exceeds free memory is a refusal either way -- but the
+        pass that goes ahead unbudgeted is caught by the allocator, which is why that error names the knobs.
+        """
+        rows = min(self.group, questions) if questions else self.group
+        return self._observed_row_constant is not None and rows <= self._observed_at_rows
 
     def open_context(self, context: str, *, images: list | None = None, videos: list | None = None) -> Context:
         """Read a context and keep it open. The expensive half happens here, once.
@@ -191,8 +272,17 @@ class Prismyra:
         self._check_fits(encoded.tokens)
         with self._lock:
             start = _now(self.torch_device)
-            with torch.inference_mode():
-                prefill = self._read(encoded)
+            before = self._peak_baseline()
+            try:
+                with torch.inference_mode():
+                    prefill = self._read(encoded)
+            except torch.OutOfMemoryError as e:
+                raise PrismyraError(
+                    f"ran out of memory reading a context of {encoded.tokens} tokens. This is the read rather than a "
+                    f"question, so asking fewer questions will not help and a shorter context is the only knob; the "
+                    f"transient this needs grows with the length and is larger than answering costs."
+                ) from e
+            self._observe_reading(before, encoded.tokens)
             return Context(
                 _engine=self,
                 _prefill=prefill,
@@ -243,6 +333,14 @@ class Prismyra:
             "group": self.group,
             "kernels": self.applied.as_dict(),
             "scoring": self.calibration.mode if self.calibration else "raw",
+            "storage": "joined",
+            # Measured on this engine rather than derived, and zero until a question has been answered. Reported
+            # because it is the number that decides how many contexts can be answered at once, and it is several times
+            # the held cache.
+            "answering_row_constant_bytes": self._observed_row_constant or 0,
+            "answering_bytes_per_context_token_per_row": join_bytes_per_token(self.config, self.dtype),
+            "answering_observed_at_rows": self._observed_at_rows,
+            "reading_bytes_per_context_token": self._observed_reading_per_token or 0,
         }
 
     # ------------------------------------------------------------------ internals
@@ -254,14 +352,51 @@ class Prismyra:
         """
         if self.torch_device.type != "cuda":
             return
-        wanted = self.cache_bytes(context_tokens)
+        held = self.cache_bytes(context_tokens)
+        # What the work costs as well as what holding costs. Budgeting only the cache admitted contexts that fitted
+        # idle and ran out of memory on their first question: at 24,327 tokens the cache is 0.87 GiB and a full-width
+        # pass peaks at 4.97 GiB, so the check was short by a factor of six.
+        #
+        # The larger of the two phases rather than their sum, because they do not overlap: the read's transient is
+        # freed before any question is asked. Reading is the larger of them on the supported model, and it is the one a
+        # caller cannot shrink by asking fewer questions.
+        answering = self.answering_bytes(context_tokens)
+        reading = self.reading_bytes(context_tokens)
+        wanted = held + max(answering, reading)
         free, total = torch.cuda.mem_get_info(self.torch_device)
+        # The device's free memory is not what is available. The allocator keeps a pool it has already taken from the
+        # device and can hand out without asking again, and loading these weights leaves that pool large -- so asking
+        # the device alone refused an 18,000-token context that had 9 GiB waiting for it inside the process.
+        spare = torch.cuda.memory_reserved(self.torch_device) - torch.cuda.memory_allocated(self.torch_device)
+        free += max(0, spare)
         if wanted >= free:
+            phase = "reading it" if reading >= answering else f"answering at group={self.group}"
+            work = max(answering, reading)
+            if not work:
+                budget = (
+                    f"{held / 1024**3:.1f} GiB to hold at group={self.group}, and what the work adds is not yet known "
+                    f"because nothing has been read or answered on this engine"
+                )
+            elif reading >= answering or self.budget_is_evidenced():
+                budget = f"{held / 1024**3:.1f} GiB to hold and {work / 1024**3:.1f} GiB for {phase}"
+            else:
+                budget = (
+                    f"{held / 1024**3:.1f} GiB to hold and at least {work / 1024**3:.1f} GiB for {phase} -- at least, "
+                    f"because the widest pass measured on this engine was {self._observed_at_rows} rows and a wider "
+                    f"one costs more per row"
+                )
+            # The advice has to follow whichever phase bound, or it is wrong half the time: a smaller group shrinks a
+            # branch pass and does nothing at all to a read, and a read is the larger of the two on this model.
+            knobs = (
+                "only a shorter context reduces this: reading is what does not fit, and it costs the same whatever is "
+                "asked afterwards"
+                if reading >= answering
+                else "a shorter context reduces both parts; a smaller group, or asking fewer questions at a time, "
+                "reduces the second"
+            )
             raise PrismyraError(
-                f"a context of {context_tokens} tokens needs {wanted / 1024**3:.1f} GiB of key-value cache at "
-                f"group={self.group}, and {free / 1024**3:.1f} GiB of {total / 1024**3:.1f} GiB is free. The context "
-                f"is held once, so a shorter context is what reduces this; lowering the group only shrinks the branch "
-                f"part, which is the smaller half."
+                f"a context of {context_tokens} tokens needs {budget}, and {free / 1024**3:.1f} GiB of "
+                f"{total / 1024**3:.1f} GiB is available. The context is held once, so {knobs}."
             )
 
     def _read(self, encoded) -> Prefill:
@@ -279,10 +414,15 @@ class Prismyra:
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
         # Already validated: both public entry points call `validate` before the context is read, and repeating it
-        # here would tokenise every question a second time on the request path. The batch width is the one the cache
-        # was allocated for. It is not a per-call option: the cache is preallocated at construction time and a write
-        # of any other row count is refused, which is the point of preallocating.
-        rows = self.group
+        # here would tokenise every question a second time on the request path.
+        #
+        # `group` is the widest batch the cache was allocated for, and each group of questions uses only as many of
+        # its rows as it has questions. That used to be the full width always, on the strength of a measurement
+        # showing a branch pass cost the same at width 1 and width 32. That measurement was taken at 3,040 context
+        # tokens and does not hold at longer ones: at 24,327 tokens the same pass costs 238 ms at width 1 and 360 ms
+        # at width 32, and its transient peak goes from 0.111 GiB to 4.970 GiB. Both of those are per-row work
+        # proportional to the context, so a request with three questions should not pay for thirty-two rows of it.
+        largest_group = self.group
         plans = [plan(q, self.tokenizer) for q in questions]
         token_ids = [p.token_ids for p in plans]
         width = self._width_for(plans)
@@ -293,18 +433,32 @@ class Prismyra:
 
         start = _now(self.torch_device)
         probabilities: list[torch.Tensor] = []
+        widest_chunk = 0
         with self._lock, torch.inference_mode():
-            for lo in range(0, len(questions), rows):
-                chunk = [p.text for p in plans[lo : lo + rows]]
-                hidden = self._branch(prefill, chunk, rows, width)
-                probabilities.extend(
-                    score(
-                        hidden,
-                        self.unembedding,
-                        token_ids[lo : lo + rows],
-                        priors[lo : lo + rows] if priors else None,
+            before = self._peak_baseline()
+            try:
+                for lo in range(0, len(questions), largest_group):
+                    chunk = [p.text for p in plans[lo : lo + largest_group]]
+                    widest_chunk = max(widest_chunk, len(chunk))
+                    hidden = self._branch(prefill, chunk, len(chunk), width)
+                    probabilities.extend(
+                        score(
+                            hidden,
+                            self.unembedding,
+                            token_ids[lo : lo + largest_group],
+                            priors[lo : lo + largest_group] if priors else None,
+                        )
                     )
-                )
+            except torch.OutOfMemoryError as e:
+                # The allocator is the authoritative answer to "does this fit", and admission is only a pre-filter:
+                # it budgets from what has been observed, and the first pass on an engine has nothing to observe.
+                # Naming the knobs here is the difference between a diagnosis and a byte count.
+                raise PrismyraError(
+                    f"ran out of memory answering {len(questions)} questions about {tokens} context tokens at "
+                    f"group={self.group}. Ask fewer questions at a time, or build the engine with a smaller group; "
+                    f"the context itself is held once and is not what grew."
+                ) from e
+            self._observe_peak(before, tokens, widest_chunk)
         readout_ms = _since(start, self.torch_device)
 
         answers = {}
@@ -326,6 +480,47 @@ class Prismyra:
             scoring=self.calibration.mode if self.calibration else "raw",
             timing=Timing(context_ms=context_ms, readout_ms=readout_ms),
         )
+
+    def _peak_baseline(self) -> int | None:
+        """Where the allocator stood before a pass, or None off CUDA. Resets the peak so the next reading is this
+        pass's own and not a larger one from some earlier request."""
+        if self.torch_device.type != "cuda":
+            return None
+        torch.cuda.synchronize(self.torch_device)
+        torch.cuda.reset_peak_memory_stats(self.torch_device)
+        return int(torch.cuda.memory_allocated(self.torch_device))
+
+    def _observe_reading(self, before: int | None, context_tokens: int) -> None:
+        """Remember what reading a context transiently cost, per token, above the cache it left behind.
+
+        The cache is subtracted because it is held rather than transient and is already budgeted separately; leaving it
+        in would count it twice and grow the double-count with the group.
+        """
+        if before is None or not context_tokens:
+            return
+        peak = int(torch.cuda.max_memory_allocated(self.torch_device)) - before
+        transient = max(0, peak - self.cache_bytes(context_tokens))
+        per_token = transient // context_tokens
+        seen = self._observed_reading_per_token
+        self._observed_reading_per_token = per_token if seen is None else max(seen, per_token)
+
+    def _observe_peak(self, before: int | None, context_tokens: int, rows: int) -> None:
+        """Remember the largest transient per row, so the next admission can budget it.
+
+        Kept as a maximum rather than an average: admission is deciding whether a pass will fit, and the pass that
+        matters is the largest one. No synchronise here beyond the one the caller's timing already does, so this costs
+        a host-side read.
+        """
+        if before is None or not rows:
+            return
+        peak = int(torch.cuda.max_memory_allocated(self.torch_device)) - before
+        self._observed_row_constant = row_constant(
+            self._observed_row_constant,
+            max(0, peak) // rows,
+            context_tokens + WIDTHS[-1],
+            join_bytes_per_token(self.config, self.dtype),
+        )
+        self._observed_at_rows = max(self._observed_at_rows, rows)
 
     def _width_for(self, plans: list) -> int:
         """The branch width these questions need, rounded to a pinned bucket.
@@ -355,6 +550,22 @@ class Prismyra:
         hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
         # Each row is read at its own last real token, which is why the padding cannot reach an answer.
         return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
+
+
+def row_constant(seen: int | None, per_row: int, at_tokens: int, per_token: int) -> int:
+    """One row's context-free transient, taken from an observed per-row peak by subtracting the part that scales.
+
+    Separate and pure because it is the rule admission depends on, and it can then be checked without a device.
+
+    Ratcheted upwards: admission is deciding whether a pass will fit, so the largest constant seen is the one to
+    budget. Ratcheting this rather than a prediction is what keeps the estimate from drifting towards refusing work --
+    this quantity does not depend on the context length, so an observation at any length is comparable with any other.
+
+    Floored at zero. A measured peak below the arithmetic slope means the two never overlapped the way the slope
+    assumes, and a negative constant would budget less than the slope alone.
+    """
+    constant = max(0, per_row - per_token * at_tokens)
+    return constant if seen is None else max(seen, constant)
 
 
 def _load_processor(model: str):

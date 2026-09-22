@@ -105,9 +105,15 @@ read it:
 
 Measured on one 48 GiB card: **19 contexts of 3,040 tokens can be open at once**, where three could before. The last
 column is what it cost when each branch held its own copy of the context, which is what changed; the answers did not, to
-the bit. `engine.cache_bytes(tokens)` gives the figure for your configuration, and a context that will not fit is
-refused by name rather than by an allocator. Lowering `group` now shrinks only the per-branch part, which is the
-smaller half. Use `close()` or a `with` block.
+the bit. `engine.cache_bytes(tokens)` gives the figure for your configuration. Use `close()` or a `with` block.
+
+**Holding a context is the cheaper half.** Working on one costs several times as much, transiently: reading a context of
+24,327 tokens allocates about 4.8 GiB above the 0.9 GiB it leaves behind, and answering thirty-two questions about it
+peaks at 5.0 GiB. `engine.reading_bytes(tokens)` and `engine.answering_bytes(tokens, questions)` report both, from
+figures this engine has measured on itself rather than from a formula. A context that will not fit is refused by name;
+one whose *reading* will not fit is refused too, and the difference matters because asking fewer questions does not make
+a read smaller -- only a shorter context does. There is therefore a longest context this card can read at all, and
+`prismyra-bench ceiling` finds it.
 
 ## Images and video
 

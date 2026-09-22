@@ -139,6 +139,11 @@ def restore_and_fork(cache, snap: dict, rows: int) -> None:
     for i, layer in enumerate(cache.layers):
         entry = snap.get(i, {})
         _restore_lengths(layer, entry.get(LENGTHS, {}))
+        # A group is starting. The attention layers are told rather than left to guess, because a row count cannot
+        # distinguish a context write from a branch write when the group is one.
+        begin = getattr(layer, "begin_branches", None)
+        if begin is not None:
+            begin()
         for attr in ("recurrent_states", "conv_states"):
             if attr not in entry:
                 continue

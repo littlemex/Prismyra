@@ -97,8 +97,8 @@ addopts = "-ra"
 # Deliberately not strict, and two modules are left out.
 #
 # `kernels/` wraps other people's modules, where every attribute arrives through `nn.Module.__getattr__` and is therefore
-# typed `Tensor | Module` whatever it really is; `cache.py` overrides a framework base class that annotates the very
-# fields this design changes the type of. In both the checker reports the framework's annotations, not our mistakes, and
+# typed `Tensor | Module` whatever it really is; `cache.py` overrides a framework base class that annotates
+# the very fields this design changes the type of. In both the checker reports the framework's annotations, not our mistakes, and
 # the casts needed to quiet it would cost real clarity. What is checked is everything that defines the public contract:
 # the schema, the read-out, the fork, the engine, the queue and the server.
 ignore_missing_imports = true

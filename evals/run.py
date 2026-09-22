@@ -50,9 +50,65 @@ def run_readout(engine, items) -> tuple[list[dict], dict]:
                     "want": item.gold[question.id],
                     "confidence": max(answer.probabilities.values()),
                     "questions_in_item": len(item.questions),
+                    # Carried so `companions` can compare distributions and not only decisions. A decision that holds
+                    # while the probability behind it moves by a tenth is worth knowing about.
+                    "probabilities": dict(answer.probabilities),
                 }
             )
     return rows, timings
+
+
+def run_alone(engine, items) -> tuple[list[dict], dict]:
+    """The same questions, each asked by itself. One row per pass instead of as many as the item has questions.
+
+    Exists to price a property rather than a method. A group now uses only as many rows as it has questions, and a
+    batch's width decides the order the reductions happen in -- so the same question can come back with a slightly
+    different probability depending on what it was asked alongside. Asking each one alone is the extreme of that, and
+    comparing it with `run_readout` on the same items says whether the difference reaches a decision or stays in the
+    digits after it.
+
+    Slow on purpose: one context pass per question rather than per item. It is a measurement, not a way to answer.
+    """
+    rows, timings = [], {"context_ms": [], "readout_ms": []}
+    for item in items:
+        for question in item.questions:
+            result = engine.ask(item.context, [question])
+            timings["context_ms"].append(result.timing.context_ms)
+            timings["readout_ms"].append(result.timing.readout_ms)
+            answer = result[question.id]
+            rows.append(
+                {
+                    "id": question.id,
+                    "got": answer.value,
+                    "want": item.gold[question.id],
+                    "confidence": max(answer.probabilities.values()),
+                    "questions_in_item": 1,
+                    "probabilities": dict(answer.probabilities),
+                }
+            )
+    return rows, timings
+
+
+def companions(together: list[dict], alone: list[dict]) -> dict:
+    """How much being asked alongside other questions moves an answer.
+
+    Reported as two separate things, because they are two separate claims: whether the **decision** changed, which is
+    what a caller sees, and how far a **probability** moved, which is what a tolerance in a test can be set from.
+    """
+    # Paired by position, not by id. A question's id is unique within a request and repeats across them -- RACE has six
+    # distinct ids across a hundred questions -- so keying on it silently compared one article's question with another
+    # article's, and reported 73 of 101 decisions changed when nothing of the kind had happened. Both runs walk the same
+    # items and questions in the same order, so position is the pairing; the ids are checked to prove it.
+    if len(together) != len(alone):
+        raise ValueError(f"{len(together)} answers against {len(alone)}: these did not run over the same questions")
+    moved, flipped = 0.0, 0
+    for row, mine in zip(together, alone, strict=True):
+        if row["id"] != mine["id"]:
+            raise ValueError(f"paired {row['id']!r} with {mine['id']!r}: the two runs did not walk the same order")
+        flipped += row["got"] != mine["got"]
+        for option, p in row["probabilities"].items():
+            moved = max(moved, abs(p - mine["probabilities"].get(option, 0.0)))
+    return {"compared": len(together), "decisions_changed": flipped, "largest_probability_move": round(moved, 6)}
 
 
 def run_generate(engine, items, reasoning: bool = False) -> tuple[list[dict], dict]:
@@ -174,10 +230,14 @@ def _accuracy(rows: list[dict]) -> float:
     return sum(1 for r in rows if str(r["got"]).lower() == str(r["want"]).lower()) / len(rows)
 
 
-def _run_one(name: str, engine, items, fit_slice) -> tuple[list[dict], dict]:
+def _run_one(  # noqa: PLR0911 - one return per method reads better than a dispatch table of closures
+    name: str, engine, items, fit_slice
+) -> tuple[list[dict], dict]:
     """One method over the whole slice. Separated so a repeat is a loop rather than a copy."""
     if name == "readout":
         return run_readout(engine, items)
+    if name == "alone":
+        return run_alone(engine, items)
     if name in ("calibrated_options", "calibrated_context"):
         # The same engine with the correction switched on, so nothing but the read-out differs. A second engine would
         # change the weights' placement as well and leave the difference unattributable.
@@ -244,7 +304,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--methods",
         default="readout,calibrated_options,generate,majority",
-        help="readout, thresholded, calibrated_options, calibrated_context, generate, generate_thinking, majority",
+        help="readout, alone, thresholded, calibrated_options, calibrated_context, generate, generate_thinking, "
+        "majority",
     )
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B-FP8")
     parser.add_argument("--seed", type=int, default=0, help="which random sample of contexts to score")
@@ -313,6 +374,21 @@ def main(argv: list[str] | None = None) -> int:
         result["wall_s"] = statistics.median(result["passes"])
 
     _print_table(args.task, items, results)
+    if "readout" in results and "alone" in results:
+        # Printed beside the accuracy table rather than folded into it, because it is not an accuracy claim. It says
+        # what a group's width does to an answer, which is the cost of letting a group use only the rows it needs.
+        found = companions(results["readout"]["rows"], results["alone"]["rows"])
+        results["companions"] = found
+        print(
+            f"\nAsked alongside others against asked alone, over {found['compared']} questions: "
+            f"{found['decisions_changed']} decisions changed and the largest probability moved "
+            f"{found['largest_probability_move']:.4f}."
+        )
+        print(
+            "A group uses only as many rows as it has questions, and a width decides the order reductions happen in.\n"
+            "Decisions changing is the number that matters; probabilities moving below that is the price, and it is\n"
+            "what the tolerance in tests/test_gpu.py is set from."
+        )
     if args.json:
         args.json.write_text(
             json.dumps({"task": args.task, "contexts": len(items), "results": results}, indent=2, default=str)
