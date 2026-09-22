@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pytest
 
+from prismyra import Boolean, Choice
 from prismyra.schema import Answer, QuestionError, Result, Timing
 from prismyra.server import as_json, build_questions, with_queue_time
 
@@ -244,3 +245,45 @@ def _tiny_video(frames: int, fps: int) -> bytes:
             writer.write(frame)
         writer.release()
         return open(path, "rb").read()
+
+
+# --------------------------------------------------------------------------- the evaluation harness's parser
+def test_a_generated_answer_is_read_without_crediting_or_robbing_the_model():
+    """The parser in `evals/generate.py`, which decides what the comparison baseline scored.
+
+    Every case below was wrong at some point in writing it, and every one of those errors went against generation: a
+    single-letter option matched as a prefix reads "because the passage says so" as B, "a few people" as A and
+    "definitely B" as D. A baseline that loses points to its own parser is not a baseline, and the accuracy it makes the
+    read-out look better than is not a result.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "evals"))
+    from generate import parse
+
+    letters = Choice(id="c", prompt="?", choices=["A", "B", "C", "D"])
+    yes_no = Boolean(id="b", prompt="?")
+
+    assert parse("B", letters)[0] == "B"
+    assert parse("<think>\n\n</think>\n\nB", letters)[0] == "B"
+    assert parse("B.", letters)[0] == "B"
+    assert parse("The answer is B", letters)[0] == "B"
+    assert parse("definitely B", letters)[0] == "B"
+
+    # Prose that happens to start with, or contain, a letter that is also an option.
+    assert parse("because the passage says so", letters)[0] is None
+    assert parse("a few people were hurt", letters)[0] is None
+
+    # Two options named is not an answer to a closed question.
+    assert parse("It is either A or B", letters) == (None, "ambiguous")
+
+    # An unclosed reasoning block means the budget ran out, which is unanswered rather than wrong.
+    assert parse("<think>", letters) == (None, "empty")
+
+    # The option's own text, when the question was rendered as letters.
+    assert parse("Over 2,000 people", letters, aliases={"A": ["Over 2,000 people."]})[0] == "A"
+
+    assert parse("yes, because the policy says so", yes_no)[0] is True
+    assert parse("no.", yes_no)[0] is False
+    assert parse("I am not sure", yes_no)[0] is None

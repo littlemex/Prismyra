@@ -207,6 +207,9 @@ class Result(Mapping[str, Answer]):
     timing: Timing
     model: str
     scoring_version: int = SCORING_VERSION
+    #: Which read-out produced the probabilities. `raw` is `SCORING` as written; `null_context` has each option's
+    #: content-free prior subtracted first, which changes what a probability means and so travels with it.
+    scoring: str = "raw"
     context_tokens: int = 0
 
     def __getitem__(self, question_id: str) -> Answer:
