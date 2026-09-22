@@ -80,29 +80,37 @@ topic, so treating them as independent draws would make every interval several t
 numbers are stated with intervals at all: the same BoolQ measurement at sixty passages and a different seed gave 95.0%
 for both methods rather than 89.5% and 88.8%, a ten point swing from the sample alone.
 
-## A decision loop, where the mechanism works and the model does not
+## A decision loop, where the representation mattered more than anything in the engine
 
 Everything above asks about a document. `examples/tetris/` asks about a state the previous answer produced, which is the
 other thing a one-pass typed decision gets built into: a loop that looks at a state, picks one of a few dozen moves, and
 lives with the consequence. A tetromino has up to 34 legal placements, so one board is one context and every placement
 is one row -- the shape this design is best at.
 
-| agent | pieces placed | rows cleared | ms per move |
-|---|---|---|---|
-| five features and five weights | **261.0 / 300** | **96.0** | 0.4 |
-| read-out, placements described | 26.0 / 60 | 0.0 | 555.8 |
-| read-out, resulting board shown | 20.5 / 60 | 0.0 | 809.2 |
-| random placements | 22.7 / 300 | 0.3 | 0.1 |
+| agent | what it is shown | placed / 60 | rows cleared | against random |
+|---|---|---|---|---|
+| five features, fixed weights | exact features | **60.0 +/- 0.0** | **20.5 +/- 1.5** | p = 0.0002 |
+| read-out | the candidate table with its score | 57.3 +/- 2.3 | 9.0 +/- 3.6 | -- |
+| read-out | the candidate table, no score | **51.7 +/- 2.1** | **6.0 +/- 1.7** | -- |
+| read-out | the board drawn, placements described | 26.3 +/- 2.7 | 0.3 +/- 0.5 | p = 0.16 |
+| read-out | the board each placement would produce | 24.0 +/- 6.2 | 0.2 +/- 0.4 | p = 0.68 |
+| random placements | -- | 23.7 +/- 3.4 | 0.2 +/- 0.4 | -- |
 
-**The model agents are at the random floor**, and showing them the board each placement would produce does not help, so
-this is not prompt wording. Ranking the placements directly rather than through a game gives a rank correlation with the
-arithmetic reference of +0.096 +/- 0.070 and -0.105 +/- 0.083 for the two framings -- neither distinguishable from zero.
+Two framings play and two are indistinguishable from random, and the difference between them is **how the state is
+written down**, not what is asked or how the answer is taken out. Given the five numbers per candidate and no score, the
+model still has to decide what they are worth, and it survives 51.7 pieces where random survives 23.7.
 
-The floor is in that table for a reason. Without it, "26 pieces placed at 556 ms a move" reads as a working agent with a
-latency figure, and it is a latency figure for not playing. The mechanism did its part: 34 placements scored in one
-forward pass, where 34 calls would have cost far more. It cannot make the decision good, and a task where decisions
-compound is where that distinction is most expensive to miss. `examples/tetris/README.md` has the framings, the exact
-tail probability of the one marginal number, and what a real attempt would change.
+What separates the halves of that table is perception. Asked questions about a rendered board whose answers are
+mechanically known -- more than *k* holes, is column *a* taller than column *b*, is column *x* empty -- the model scores
+**71.4% against 69.5% for answering "no" to everything**, which is indistinguishable from not reading the board at all.
+The row with the score supplied is the positive control that rules out the mechanism: choosing the largest number in a
+column needs no judgement, and the read-out does it.
+
+This example first published the opposite conclusion -- that the model could see the positions and not judge them --
+from the bottom half of the table alone. `examples/tetris/README.md` keeps that mistake, what was wrong with the
+inference, and the two measurements that corrected it. The short version is worth carrying into any use of this
+package: **measure whether the input is being read before measuring whether the decision is good**, and put a floor
+and a positive control in every table, because without them a latency figure for not playing looks like a result.
 
 ## Speed is entirely a question of how many questions share a context
 
