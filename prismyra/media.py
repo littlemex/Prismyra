@@ -129,7 +129,8 @@ class Clip:
     """
 
     frames: Any
-    #: Frames per second **of the array in `frames`**, which is the source rate divided by any stride used to decode it.
+    #: Frames per second **of the array in `frames`**, which is the source rate divided by any stride used to decode
+    #: it.
     fps: float
     duration: float
     source_frames: int

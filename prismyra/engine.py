@@ -15,6 +15,7 @@ import torch
 
 from . import kernels
 from .cache import build_cache, cache_bytes
+from .calibration import Calibration
 from .fork import (
     WIDTHS,
     Prefill,
@@ -35,8 +36,8 @@ from .schema import (
     Timing,
 )
 
-#: Questions per traversal. A traversal costs the same carrying one row or this many, so a group is the unit of
-#: cost and the default fills it. Measured figures are in docs/PERFORMANCE.md.
+#: Questions per traversal. A traversal costs the same carrying one row or this many, so a group is the unit of cost
+#: and the default fills it. Measured figures are in docs/PERFORMANCE.md.
 GROUP = 32
 
 
@@ -91,6 +92,7 @@ class Prismyra:
         fast_kernels: bool = True,
         require_kernels: bool = False,
         group: int = GROUP,
+        calibrate: bool = False,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -134,6 +136,9 @@ class Prismyra:
             else kernels.Applied(adapter="none", skipped=[f"not applied on {self.device}"])
         )
         self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
+        # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
+        # measured question rather than an obvious one -- `evals/run.py` compares the two.
+        self.calibration = Calibration() if calibrate else None
 
     # ------------------------------------------------------------------ public
     def validate(self, questions: list[Question]) -> None:
@@ -235,6 +240,7 @@ class Prismyra:
             "device": self.device,
             "group": self.group,
             "kernels": self.applied.as_dict(),
+            "scoring": self.calibration.mode if self.calibration else "raw",
         }
 
     # ------------------------------------------------------------------ internals
@@ -276,11 +282,11 @@ class Prismyra:
         rows = self.group
         plans = [plan(q, self.tokenizer) for q in questions]
         token_ids = [p.token_ids for p in plans]
-        widest = max(len(self.tokenizer("\n" + p.text, add_special_tokens=False)["input_ids"]) for p in plans)
-        try:
-            width = round_width(widest)
-        except TooWide as e:
-            raise PrismyraError(str(e)) from e
+        width = self._width_for(plans)
+
+        # Before the clock starts, and outside the lock's timed section: a prior is cached per question, so charging the
+        # first request for every later one's correction would report a cost that is not there.
+        priors = self.calibration.priors(self, questions, plans) if self.calibration else None
 
         start = _now(self.torch_device)
         probabilities: list[torch.Tensor] = []
@@ -288,7 +294,14 @@ class Prismyra:
             for lo in range(0, len(questions), rows):
                 chunk = [p.text for p in plans[lo : lo + rows]]
                 hidden = self._branch(prefill, chunk, rows, width)
-                probabilities.extend(score(hidden, self.unembedding, token_ids[lo : lo + rows]))
+                probabilities.extend(
+                    score(
+                        hidden,
+                        self.unembedding,
+                        token_ids[lo : lo + rows],
+                        priors[lo : lo + rows] if priors else None,
+                    )
+                )
         readout_ms = _since(start, self.torch_device)
 
         answers = {}
@@ -307,8 +320,21 @@ class Prismyra:
             answers=answers,
             model=self.model_name,
             context_tokens=tokens,
+            scoring=self.calibration.mode if self.calibration else "raw",
             timing=Timing(context_ms=context_ms, readout_ms=readout_ms),
         )
+
+    def _width_for(self, plans: list) -> int:
+        """The branch width these questions need, rounded to a pinned bucket.
+
+        One place, because the calibration measures its priors through the same passes an answer comes through, and a
+        prior taken at a different width would correct for a different arrangement of the batch.
+        """
+        widest = max(len(self.tokenizer("\n" + p.text, add_special_tokens=False)["input_ids"]) for p in plans)
+        try:
+            return round_width(widest)
+        except TooWide as e:
+            raise PrismyraError(str(e)) from e
 
     def _branch(self, prefill: Prefill, texts: list[str], rows: int, width: int) -> torch.Tensor:
         # The snapshot is taken on the first branch, when the cache holds exactly the context, so restoring it also puts

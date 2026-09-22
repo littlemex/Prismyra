@@ -182,18 +182,36 @@ def _dequantise(matrix: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return wide * expanded[: matrix.shape[0], : matrix.shape[1]]
 
 
-def score(hidden: torch.Tensor, unembedding: torch.Tensor, token_ids: list[list[int]]) -> list[torch.Tensor]:
+def logits_for(hidden: torch.Tensor, unembedding: torch.Tensor, token_ids: list[list[int]]) -> list[torch.Tensor]:
+    """Per question, the raw score of each declared option. No softmax, so the numbers can still be shifted.
+
+    Separated from `score` because a prior has to be subtracted before the softmax, not after: after it, the correction
+    is a reweighting of something already normalised and no longer removes a bias.
+    """
+    if hidden.shape[0] != len(token_ids):
+        raise ValueError(f"{hidden.shape[0]} branch rows against {len(token_ids)} questions")
+    return [(hidden[row : row + 1].float() @ unembedding[ids].float().t())[0] for row, ids in enumerate(token_ids)]
+
+
+def score(
+    hidden: torch.Tensor,
+    unembedding: torch.Tensor,
+    token_ids: list[list[int]],
+    priors: list[torch.Tensor] | None = None,
+) -> list[torch.Tensor]:
     """Per question, a probability over its declared options.
 
     `hidden` is (branches, hidden_size), one row per question, taken at that branch's final position. The softmax is
     over each question's own options, which is why the result is a list rather than a tensor: questions declare
     different numbers of options.
+
+    With `priors`, each question's scores have its prior subtracted first. See `calibration` for what that is and what
+    it is worth. The short version: some option tokens are likelier than others before the context is read at all, and
+    subtracting that leaves what the context contributed.
     """
-    if hidden.shape[0] != len(token_ids):
-        raise ValueError(f"{hidden.shape[0]} branch rows against {len(token_ids)} questions")
-    out = []
-    for row, ids in enumerate(token_ids):
-        columns = unembedding[ids]  # (options, hidden)
-        logits = (hidden[row : row + 1].float() @ columns.float().t())[0]
-        out.append(torch.softmax(logits, dim=-1))
-    return out
+    scores = logits_for(hidden, unembedding, token_ids)
+    if priors is not None:
+        if len(priors) != len(scores):
+            raise ValueError(f"{len(priors)} priors against {len(scores)} questions")
+        scores = [row - prior.to(row.device, row.dtype) for row, prior in zip(scores, priors, strict=True)]
+    return [torch.softmax(row, dim=-1) for row in scores]

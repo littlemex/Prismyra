@@ -94,12 +94,11 @@ def with_queue_time(result: Result, queue_ms: float) -> Result:
 
 
 #: Hard limits on one request. An endpoint with none lets a single caller hold the device for as long as it likes, and
-#: the failure arrives as everyone else's latency rather than as that caller's error.
-#:
-#: The context limit is in tokens, not characters, because that is what both costs are a function of -- and a character
-#: count is a proxy that varies by a factor of two between languages. Time grows with the context, and so does the
-#: key-value cache: at the default group of 32 on the supported model, 32,000 tokens is about 20 GiB.
-#: `engine.cache_bytes(tokens)` gives the exact figure, and the engine refuses a context that will not fit.
+#: the failure arrives as everyone else's latency rather than as that caller's error. The context limit is in tokens,
+#: not characters, because that is what both costs are a function of -- and a character count is a proxy that varies
+#: by a factor of two between languages. Time grows with the context, and so does the key-value cache: at the default
+#: group of 32 on the supported model, 32,000 tokens is about 20 GiB. `engine.cache_bytes(tokens)` gives the exact
+#: figure, and the engine refuses a context that will not fit.
 MAX_CONTEXT_TOKENS = 32_000
 MAX_QUESTIONS = 512
 
