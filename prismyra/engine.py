@@ -159,6 +159,10 @@ class Prismyra:
             if fast_kernels and on_cuda
             else kernels.Applied(adapter="none", skipped=[f"not applied on {self.device}"])
         )
+        #: Whether the borrowed attention kernel is in use, which decides whether the join is read in the layout it is
+        #: stored in or handed to the framework's own attention as a strided view. That changes what a branch pass
+        #: transiently allocates, so it changes what admission budgets.
+        self._borrowed_kernel = self.applied.ok and not self.applied.skipped
         self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
         # measured question rather than an obvious one -- `evals/run.py` compares the two.
@@ -221,7 +225,7 @@ class Prismyra:
         if self._observed_row_constant is None:
             return 0
         rows = min(self.group, questions) if questions else self.group
-        per_token = join_bytes_per_token(self.config, self.dtype)
+        per_token = join_bytes_per_token(self.config, self.dtype, doubled=not self._borrowed_kernel)
         per_row = self._observed_row_constant + per_token * (context_tokens + WIDTHS[-1])
         # A margin, because an allocator's peak is blocks rounded up and reused, not a sum of tensor sizes. One place,
         # so there is one number to argue with.
@@ -338,7 +342,9 @@ class Prismyra:
             # because it is the number that decides how many contexts can be answered at once, and it is several times
             # the held cache.
             "answering_row_constant_bytes": self._observed_row_constant or 0,
-            "answering_bytes_per_context_token_per_row": join_bytes_per_token(self.config, self.dtype),
+            "answering_bytes_per_context_token_per_row": join_bytes_per_token(
+                self.config, self.dtype, doubled=not self._borrowed_kernel
+            ),
             "answering_observed_at_rows": self._observed_at_rows,
             "reading_bytes_per_context_token": self._observed_reading_per_token or 0,
         }
@@ -518,7 +524,7 @@ class Prismyra:
             self._observed_row_constant,
             max(0, peak) // rows,
             context_tokens + WIDTHS[-1],
-            join_bytes_per_token(self.config, self.dtype),
+            join_bytes_per_token(self.config, self.dtype, doubled=not self._borrowed_kernel),
         )
         self._observed_at_rows = max(self._observed_at_rows, rows)
 

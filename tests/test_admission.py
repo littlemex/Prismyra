@@ -31,6 +31,9 @@ class Fake:
     config = Config()
     _observed_row_constant: int | None = None
     _observed_at_rows = 0
+    #: The borrowed kernel reads the join in the layout it is stored in; the framework's fallback is handed a strided
+    #: view and is budgeted at twice the slope because nothing has measured whether it copies.
+    _borrowed_kernel = True
 
     answering_bytes = Prismyra.answering_bytes
     budget_is_evidenced = Prismyra.budget_is_evidenced
@@ -46,10 +49,15 @@ def test_nothing_is_budgeted_before_a_pass_has_been_observed():
     assert Fake().answering_bytes(10_000) == 0
 
 
-def test_the_slope_is_arithmetic_and_matches_what_was_measured():
-    """4,096 bytes per context token per row from these shapes, against 3,838 measured between 3,040 and 24,327 context
-    tokens -- so the arithmetic over-states by 7%, which is the safe direction for a budget."""
-    assert PER_TOKEN == 4_096
+def test_the_slope_is_arithmetic_and_halved_by_token_major_storage():
+    """2,048 bytes per context token per row from these shapes: keys and values, and two layers' joins overlapping.
+
+    It was 4,096 while the join was head-major and the kernel's `transpose(1, 2).reshape(...)` had to copy the whole
+    thing a second time to reach the layout it reads. The measured slope was 3,838 against that 4,096, so the
+    arithmetic over-stated by 7%; with the copy gone the prediction halves and `prismyra-bench widths` is what says
+    whether the measurement followed it.
+    """
+    assert PER_TOKEN == 2_048
 
 
 def test_the_budget_grows_with_the_rows_a_request_will_use():
@@ -104,9 +112,11 @@ def test_a_peak_below_the_arithmetic_slope_floors_at_zero():
 def test_a_pass_wider_than_any_measured_is_not_claimed_to_be_budgeted():
     """The estimate exists for every width; the claim that it is evidence does not.
 
-    Per-row cost is not flat in width at the bottom of the range: 0.111 GiB per row at width 1 against 0.155 at widths
-    8 and 32, at the same context. So an observation at width 1 under-states a width-32 pass by 29%, and refusing on
-    that number would be refusing on a figure nothing supports.
+    Per-row cost used not to be flat in width -- 0.111 GiB per row at width 1 against 0.155 at widths 8 and 32 -- so an
+    observation at width 1 under-stated a width-32 pass by 29%. Storing the join in the layout the kernel reads removed
+    the second copy that caused it, and the two now agree to three decimals. This stays true anyway: one measurement on
+    one model is not a reason to promise the shape holds, and refusing on a figure nothing supports is the failure this
+    guards against.
     """
     engine = Fake()
     engine._observed_row_constant = 1_000
@@ -121,3 +131,18 @@ def test_a_pass_wider_than_any_measured_is_not_claimed_to_be_budgeted():
 
 def test_nothing_is_evidenced_before_the_first_pass():
     assert not Fake().budget_is_evidenced(questions=1)
+
+
+def test_the_fallback_path_is_budgeted_at_twice_the_slope():
+    """Not because it is known to copy, but because it is not known not to.
+
+    The join is stored in the layout the borrowed kernel reads. The framework's own attention takes the same storage as
+    a strided view, and whether it works on those strides or makes itself a contiguous copy is inside the framework. A
+    path nobody has measured is budgeted at the larger figure.
+    """
+    assert join_bytes_per_token(Config(), torch.bfloat16, doubled=True) == 2 * PER_TOKEN
+
+    fast, slow = Fake(), Fake()
+    fast._observed_row_constant = slow._observed_row_constant = 0
+    slow._borrowed_kernel = False
+    assert slow.answering_bytes(10_000, questions=8) == 2 * fast.answering_bytes(10_000, questions=8)

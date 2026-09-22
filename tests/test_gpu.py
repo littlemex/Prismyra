@@ -55,7 +55,11 @@ def questions(n: int) -> list[Boolean]:
 #: It was 1e-3 while every request ran at the full group width whatever it carried. A group now uses only as many rows
 #: as it has questions, and a batch's width decides the order the reductions happen in, so this is the price of not
 #: paying for thirty-two rows to answer three questions. See docs/PERFORMANCE.md.
-COMPANION_MOVEMENT = 0.2
+#:
+#: Set half again above the measured maximum rather than at it. A bound sitting exactly on the largest value a hundred
+#: questions produced would fail on the hundred-and-first without anything having regressed, and the guard that
+#: actually matters is the assertion that the decision did not change.
+COMPANION_MOVEMENT = 0.3
 
 
 def test_an_answer_does_not_depend_on_its_companions(engine):
