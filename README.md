@@ -100,8 +100,33 @@ with engine.open_context("A product photograph.", images=[Image.open("chair.jpg"
     ])
 ```
 
-`videos=` takes frames the same way. Anything the model's processor accepts works -- a `PIL.Image`, an array of
-frames -- and the placeholders are assembled for you.
+`videos=` takes frames the same way, and the placeholders are assembled for you.
+
+**A clip has to carry its timing.** Frames alone do not say how fast they run, and the processor then assumes a rate,
+decides the clip is shorter than it is, and answers about a clip that does not exist. Nothing looks wrong: everything
+visual is still right. Measured on the supported model, asked how long a six second clip is, it answers six when told
+the rate and two when not. So `prismyra.media.decode_video` returns a `Clip` carrying the rate of the frames it hands
+back, and passing that `Clip` is what makes timing questions mean anything:
+
+```python
+from prismyra.media import decode_video
+
+clip = decode_video(open("delivery.mp4", "rb").read())
+with engine.open_context("A doorway camera recording.", videos=[clip]) as context:
+    result = context.ask([
+        Boolean(id="person", prompt="Does a person appear?"),
+        Choice(id="when", prompt="When does the parcel arrive?", choices=["beginning", "middle", "end"]),
+        Scale(id="seconds", prompt="Roughly how many seconds long is this clip?", low=1, high=9),
+    ])
+```
+
+A bare array of frames is still accepted; the processor guesses the rate, and the guess is its own rather than one made
+here and presented as a fact.
+
+The frame cap -- `decode_video(..., max_frames=...)`, and `--max-video-frames` on the server -- bounds decoding work
+and host memory, not what the model sees. The processor does the real sampling, at a couple of frames per second of
+the clip's own duration. Lowering the cap raises the stride and leaves the duration alone, which is why the six second
+clip still reads as six at a cap of 32.
 
 Measured on the supported model: reading a 336 by 336 image costs about 290 ms and a twelve frame clip about 300 ms,
 after which a group of questions costs what it costs for text. A clip read backwards answers backwards, which is the

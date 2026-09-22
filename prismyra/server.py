@@ -27,7 +27,7 @@ import base64
 import dataclasses
 from typing import Any, Literal
 
-from .media import DEFAULT_VIDEO_FRAMES, decode_image, decode_video
+from .media import MAX_DECODED_FRAMES, decode_image, decode_video
 from .queue import QueueFull, Worker
 from .schema import Boolean, Choice, PrismyraError, Question, QuestionError, Result, Scale
 
@@ -118,7 +118,7 @@ def create_app(
     max_context_tokens: int = MAX_CONTEXT_TOKENS,
     max_questions: int = MAX_QUESTIONS,
     max_media_bytes: int = MAX_MEDIA_BYTES,
-    video_frames: int = DEFAULT_VIDEO_FRAMES,
+    max_video_frames: int = MAX_DECODED_FRAMES,
     **engine_kwargs,
 ):
     """A FastAPI application with the engine and its worker already running.
@@ -182,7 +182,9 @@ def create_app(
             )
         try:
             images = [decode_image(base64.b64decode(blob, validate=True)) for blob in body.images]
-            videos = [decode_video(base64.b64decode(blob, validate=True), frames=video_frames) for blob in body.videos]
+            videos = [
+                decode_video(base64.b64decode(blob, validate=True), max_frames=max_video_frames) for blob in body.videos
+            ]
         except (ValueError, RuntimeError) as e:
             raise HTTPException(status_code=422, detail=f"could not read the media: {e}") from e
 
@@ -242,6 +244,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-context-tokens", type=int, default=MAX_CONTEXT_TOKENS)
     parser.add_argument("--max-questions", type=int, default=MAX_QUESTIONS)
     parser.add_argument(
+        "--max-video-frames",
+        type=int,
+        default=MAX_DECODED_FRAMES,
+        help="how many frames to decode from a clip at most; the processor then samples at the clip's own rate",
+    )
+    parser.add_argument(
         "--request-timeout",
         type=float,
         default=120.0,
@@ -266,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         request_timeout=args.request_timeout,
         max_context_tokens=args.max_context_tokens,
         max_questions=args.max_questions,
+        max_video_frames=args.max_video_frames,
         require_kernels=args.require_kernels,
     )
     uvicorn.run(app, host=args.host, port=args.port)

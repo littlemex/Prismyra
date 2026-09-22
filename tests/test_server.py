@@ -192,3 +192,55 @@ def test_an_image_arrives_as_bytes_and_reaches_the_engine():
         assert bad.status_code == 422
     finally:
         prismyra.Prismyra = real
+
+
+def test_a_clip_reports_the_rate_its_frames_actually_run_at():
+    """The timing is what the processor needs, and getting it wrong is silent.
+
+    Hand a processor sixteen frames with nothing else and it assumes 24 per second, decides the clip is two thirds of a
+    second long, and keeps a handful. Every question about when something happened is then answered about a clip that
+    does not exist. So the decoder reports the rate of the array it returns, which is the source rate over the stride it
+    used -- not the source rate, and not a default.
+    """
+    pytest.importorskip("cv2")
+    pytest.importorskip("PIL")
+    import numpy as np
+
+    from prismyra.media import decode_video
+
+    encoded = _tiny_video(frames=60, fps=30)
+
+    whole = decode_video(encoded, max_frames=256)
+    assert whole.frames.shape[0] == 60
+    assert whole.fps == pytest.approx(30, abs=0.5)
+    assert whole.duration == pytest.approx(2.0, abs=0.2)
+
+    # Capped: a stride of three, so the array runs at a third of the source rate and says so.
+    strided = decode_video(encoded, max_frames=20)
+    assert strided.frames.shape[0] == 20
+    assert strided.fps == pytest.approx(10, abs=0.5)
+    assert strided.duration == pytest.approx(whole.duration, abs=0.2)
+    assert strided.source_frames == 60
+
+    meta = strided.metadata
+    assert meta.total_num_frames == 20
+    assert meta.fps == pytest.approx(10, abs=0.5)
+    assert np.isclose(meta.duration, whole.duration, atol=0.2)
+
+
+def _tiny_video(frames: int, fps: int) -> bytes:
+    """A clip written with the same decoder that reads it, so the test needs no fixture file."""
+    import tempfile
+
+    import cv2
+    import numpy as np
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}/clip.mp4"
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (64, 64))
+        for i in range(frames):
+            frame = np.zeros((64, 64, 3), np.uint8)
+            frame[:, min(i, 63)] = 255
+            writer.write(frame)
+        writer.release()
+        return open(path, "rb").read()

@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 import torch
 
-from prismyra import Boolean, Choice, Prismyra, PrismyraError
+from prismyra import Boolean, Choice, Prismyra, PrismyraError, Scale
 
 pytestmark = pytest.mark.gpu
 
@@ -256,3 +256,61 @@ def test_an_image_costs_the_vision_tower_once_however_many_questions_follow(engi
     assert one.timing.context_ms == 0.0
     assert context.context_ms > 0.0
     assert len(many) == 16
+
+
+def test_a_clip_is_as_long_as_it_says_it_is(engine):
+    """Timing withheld is not a smaller error than timing wrong. It is the same error, and it is silent.
+
+    A six second clip decoded to a handful of frames and handed over bare looks to the processor like two thirds of a
+    second at its default rate, and the model answers about a clip that does not exist. Measured on the supported model:
+    asked how long this clip is, it answers six with the timing and two without. Everything visual is right either way,
+    which is why nothing else in this file catches it.
+    """
+    pytest.importorskip("cv2")
+    from prismyra.media import decode_video
+
+    encoded = _six_second_clip()
+    asked = [Scale(id="seconds", prompt="Roughly how many seconds long is this clip?", low=1, high=9)]
+
+    clip = decode_video(encoded, max_frames=32)
+    assert clip.duration == pytest.approx(6.0, abs=0.3)
+    assert engine.ask("This is a video clip.", asked, videos=[clip])["seconds"].value == 6
+
+    # The same frames with the timing withheld. Not asserted to be wrong -- a model may guess right -- but the clip's
+    # own duration must not have to be guessed at, so this documents what withholding it costs.
+    bare = engine.ask("This is a video clip.", asked, videos=[clip.frames])["seconds"].value
+    if bare == 6:
+        pytest.skip(f"the model guessed the duration without being told it ({bare}s); the check proves nothing today")
+
+
+def test_a_clip_keeps_its_duration_however_few_frames_survive(engine):
+    """The frame cap bounds decoding work, not what the clip is. Halving it must not halve the clip."""
+    pytest.importorskip("cv2")
+    from prismyra.media import decode_video
+
+    encoded = _six_second_clip()
+    asked = [Scale(id="seconds", prompt="Roughly how many seconds long is this clip?", low=1, high=9)]
+    for cap in (256, 32):
+        clip = decode_video(encoded, max_frames=cap)
+        assert clip.duration == pytest.approx(6.0, abs=0.3)
+        assert engine.ask("This is a video clip.", asked, videos=[clip])["seconds"].value == 6
+
+
+def _six_second_clip(seconds: int = 6, fps: int = 30, size: int = 224) -> bytes:
+    """A block moving left to right, red for the first two thirds and blue for the last third."""
+    import tempfile
+
+    import cv2
+
+    total = seconds * fps
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}/clip.mp4"
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (size, size))
+        for i in range(total):
+            frame = np.full((size, size, 3), 255, np.uint8)
+            x = int(i / total * (size - 50))
+            colour = (60, 60, 200) if i < total * 2 // 3 else (200, 60, 60)  # BGR, so red then blue
+            cv2.rectangle(frame, (x, 90), (x + 45, 135), colour, -1)
+            writer.write(frame)
+        writer.release()
+        return open(path, "rb").read()

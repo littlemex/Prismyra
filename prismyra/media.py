@@ -70,20 +70,27 @@ def encode(
     # Placeholders first, in the order the caller gave them, then the text. Leading rather than trailing because a
     # question about a picture reads better after the picture, and because the branch's tokens must come last.
     prefix = IMAGE_PLACEHOLDER * len(images or []) + VIDEO_PLACEHOLDER * len(videos or [])
+    # A clip carries its timing; a bare array does not, and the processor then has to guess it. Both are accepted, and
+    # the guess is the processor's to make rather than one made here and presented as fact.
+    frames = [clip.frames if isinstance(clip, Clip) else clip for clip in videos or []]
+    timings = [clip.metadata for clip in videos or [] if isinstance(clip, Clip)]
+    extra = {"video_metadata": timings} if timings and len(timings) == len(frames) else {}
     batch = processor(
         text=[prefix + context],
         images=list(images) if images else None,
-        videos=list(videos) if videos else None,
+        videos=frames or None,
         return_tensors="pt",
+        **extra,
     )
     ids = batch["input_ids"]
     # `attention_mask` is dropped on purpose: this is one unpadded sequence, so the mask is all ones and passing it
     # makes
     # the framework materialise a mask the fast attention kernel cannot take.
+    # `video_metadata` comes back when it went in, and the backbone does not take it.
     media = {
         key: value.to(device) if hasattr(value, "to") else value
         for key, value in batch.items()
-        if key not in ("input_ids", "attention_mask")
+        if key not in ("input_ids", "attention_mask", "video_metadata")
     }
     return Encoded(input_ids=ids.to(device), tokens=int(ids.shape[-1]), media=media)
 
@@ -105,9 +112,42 @@ def position_offset(backbone, tokens: int) -> int:
 
 
 # --------------------------------------------------------------------------- bytes to frames
-#: Frames sampled from a clip, evenly across its length. More is not better past a point: each frame costs tokens in the
-#: context, and the context is the expensive half.
-DEFAULT_VIDEO_FRAMES = 16
+#: How many frames are handed to the processor at most. The processor does the real sampling -- it targets a couple of
+#: frames per second and caps itself -- so this is only a bound on decoding work and on host memory, not on what the
+#: model sees. Decoding every frame of a long clip to throw most away is the only thing it prevents.
+MAX_DECODED_FRAMES = 256
+
+
+@dataclass(frozen=True)
+class Clip:
+    """Frames and the timing they came from.
+
+    The timing is the point. The processor samples a clip at a target rate, so it needs to know how fast the frames it
+    was given actually run: hand it sixteen frames with nothing else and it assumes 24 per second, decides the clip is
+    two thirds of a second long, and keeps four of them. Every question about when something happened is then answered
+    about the wrong clip, and nothing says so.
+    """
+
+    frames: Any
+    #: Frames per second **of the array in `frames`**, which is the source rate divided by any stride used to decode it.
+    fps: float
+    duration: float
+    source_frames: int
+    source_fps: float
+
+    @property
+    def metadata(self):
+        from transformers.video_utils import VideoMetadata
+
+        height, width = self.frames.shape[1:3]
+        return VideoMetadata(
+            total_num_frames=int(self.frames.shape[0]),
+            fps=float(self.fps),
+            width=int(width),
+            height=int(height),
+            duration=float(self.duration),
+            video_backend="opencv",
+        )
 
 
 def decode_image(data: bytes):
@@ -120,40 +160,47 @@ def decode_image(data: bytes):
     return Image.open(io.BytesIO(data)).convert("RGB")
 
 
-def decode_video(data: bytes, frames: int = DEFAULT_VIDEO_FRAMES):
-    """Video bytes to evenly spaced frames.
+def decode_video(data: bytes, max_frames: int = MAX_DECODED_FRAMES) -> Clip:
+    """Video bytes to frames, with the timing they were taken at.
 
-    Decoding is done here rather than handed to the framework because which decoder the framework reaches for depends on
-    what happens to be installed -- its default is one that often is not -- and a missing decoder should be a sentence
-    saying so rather than an import error from three layers down.
+    Decoding happens here rather than in the framework because which decoder the framework reaches for depends on what
+    happens to be installed -- its default is one that often is not -- and a missing decoder should be a sentence saying
+    so rather than an import error from three layers down.
+
+    Frames are taken at a stride, and the stride is reported rather than hidden: the returned `fps` describes the array
+    that comes back, not the file it came from, because that is what the processor needs to know how long the clip is.
     """
     import tempfile
 
     import numpy as np
 
+    try:
+        import cv2
+    except ImportError as e:
+        raise RuntimeError(
+            "reading a video file needs opencv: pip install opencv-python-headless. Frames passed directly as arrays "
+            "or images need no decoder."
+        ) from e
+
     with tempfile.NamedTemporaryFile(suffix=".video") as handle:
         handle.write(data)
         handle.flush()
-        try:
-            import cv2
-        except ImportError as e:
-            raise RuntimeError(
-                "reading a video file needs opencv: pip install opencv-python-headless. Frames passed directly as "
-                "arrays or images need no decoder."
-            ) from e
-
         capture = cv2.VideoCapture(handle.name)
         try:
             total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+            source_fps = float(capture.get(cv2.CAP_PROP_FPS)) or 0.0
             if total <= 0:
                 raise RuntimeError("that video has no readable frames; the container or codec may be unsupported")
-            wanted = {round(float(i)) for i in np.linspace(0, total - 1, min(frames, total))}
+            if source_fps <= 0:
+                # A container that does not say. Assuming is better than refusing, and the assumption is stated.
+                source_fps = 24.0
+            stride = max(1, -(-total // max_frames))
             picked, index = [], 0
             while True:
                 ok, frame = capture.read()
                 if not ok:
                     break
-                if index in wanted:
+                if index % stride == 0:
                     picked.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 index += 1
         finally:
@@ -161,4 +208,10 @@ def decode_video(data: bytes, frames: int = DEFAULT_VIDEO_FRAMES):
 
     if not picked:
         raise RuntimeError("that video decoded to no frames")
-    return np.stack(picked)
+    return Clip(
+        frames=np.stack(picked),
+        fps=source_fps / stride,
+        duration=total / source_fps,
+        source_frames=total,
+        source_fps=source_fps,
+    )
