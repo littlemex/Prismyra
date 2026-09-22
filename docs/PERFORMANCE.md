@@ -34,11 +34,11 @@ which on the supported model -- 10 attention layers among 40, **2** key-value he
 formula because their state is a fixed size per layer whatever the context length.
 
 Two key-value heads is why this is affordable at all, and it is easy to get wrong: the model has 16 attention heads and
-this family's linear-attention layers carry 32 value heads, neither of which is the number in this formula. Taking one of
-those instead overstates the cache by 8x or 16x.
+this family's linear-attention layers carry 32 value heads, neither of which is the number in this formula. Taking one
+of those instead overstates the cache by 8x or 16x.
 
-`group` is therefore a memory dial as well as a cost dial: it divides the memory exactly and multiplies the traversals by
-`ceil(questions / group)`. `Prismyra.cache_bytes(tokens)` reports the figure for a given configuration, and
+`group` is therefore a memory dial as well as a cost dial: it divides the memory exactly and multiplies the traversals
+by `ceil(questions / group)`. `Prismyra.cache_bytes(tokens)` reports the figure for a given configuration, and
 `open_context` refuses a context that will not fit rather than letting the allocator refuse it.
 
 ## Where it wins and where it loses
@@ -111,7 +111,38 @@ Same work, same card, read from profiles of both. Lower is better.
 Three are faster and the convolution is also more accurate than the one it replaces. The dense projections are slower
 and that is the honest remaining gap.
 
-## Concurrency
+## Concurrency, and the ceiling that actually binds
+
+Measured on one L40S at 3,040 context tokens, eight questions each, through `prismyra.queue.Worker`:
+
+| callers arriving together | requests per second | first answer home | median | median spent queueing | median in
+  service |
+|---|---|---|---|---|---|
+| 1 | 1.04 | 962 ms | 962 ms | 0 ms | 962 ms |
+| 2 | 1.09 | 926 ms | 1,384 ms | 463 ms | 921 ms |
+| 4 | 1.08 | 934 ms | 2,324 ms | 1,398 ms | 929 ms |
+| 8 | 1.08 | 927 ms | 927 ms -> 4,158 ms | 3,235 ms | 924 ms |
+
+**Throughput does not move.** One device serves one request at a time, so it cannot: service time stays at about 925 ms
+whatever arrives, and every millisecond added by concurrency is queueing. That is worth knowing before building anything
+for multiple users, because it says what such work could and could not achieve -- it can decide who waits, not how many
+are served.
+
+What binds instead is memory. **Three contexts can be open at once**, each holding about 2.17 GiB, and the fourth is
+refused by name. That is the number a session-based service would live inside, and it is the number single-copy storage
+would change: this model has two key-value heads, so one copy is about a thirtieth of what the group replicates.
+
+Two measurements decide whether that is worth building, and both have been made:
+
+* **A narrow batch reclaims nothing.** A branch pass costs 245 ms at one row and 246 ms at thirty-two -- a factor of
+  1.01, which is the design's central premise holding exactly. So the replication costs memory and not time, and
+  there is
+  no latency to recover by arranging smaller batches. `prismyra-bench widths` is that measurement.
+* **The attention kernel tolerates aliased pages.** Rows whose page tables name the same prefix pages answer as rows
+  holding their own copies, within two steps of bfloat16. `tests/test_gpu_paging.py` is that measurement, and it is a
+  kill criterion rather than a feature test: had it failed, single-copy storage would not have been available.
+
+## Concurrency, as first measured
 
 Eight requests arriving together, from a run predating the kernel work -- the shape is what matters, not the levels:
 
@@ -129,9 +160,10 @@ Answers did not change at any concurrency tried: 0 of 8 differed.
 
 **Not shipped, and recorded here because it says what the ceiling is.** Four users with different contexts and two
 questions each cost 660.4 ms one at a time. Packing their contexts into one traversal brought that to 429.9 ms, and the
-packed context pass alone is 90.1 ms against 4 x 90 ms separately; all 8 of 8 choices were unchanged against each user run
-alone. `ask_many` in this package does none of that -- it answers requests one after another -- so the figures are the
-size of the opportunity, not a claim about the code. The kernels already accept the sequence boundaries packing needs.
+packed context pass alone is 90.1 ms against 4 x 90 ms separately; all 8 of 8 choices were unchanged against each user
+run alone. `ask_many` in this package does none of that -- it answers requests one after another -- so the figures are
+the size of the opportunity, not a claim about the code. The kernels already accept the sequence boundaries packing
+needs.
 
 ## Reproducing this
 
