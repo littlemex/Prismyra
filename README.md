@@ -52,6 +52,13 @@ so they were measured on published labels. On RACE-middle the read-out scores 94
 generating the answer, and on BoolQ 89.5% against 88.8% -- both differences with a 95% interval spanning zero. The two
 methods cannot be separated on accuracy, which is what makes comparing their speed worth doing.
 
+**That equivalence is a short-context result.** Both of those tasks give a few hundred tokens of context. Bury the same
+RACE questions in ten thousand tokens of other articles and the read-out scores 82.4% against 87.4% for generation, a
+difference of -5.0% with an interval of [-8.6%, -1.3%] that **excludes zero**. Some of that is the model -- generation
+falls too, by 6.9 points -- but the gap between the two methods opens with length, and this is the one comparison that
+separates them. [docs/ACCURACY.md](docs/ACCURACY.md) has the three lengths and what is and is not established about
+why.
+
 **The crossover is real and it is measurable on those same tasks.** RACE asks 3.9 questions per article and the read-out
 is 2.2x faster there; BoolQ asks one per passage and the read-out is **0.7x -- slower**. One question and this is the
 wrong tool, exactly as the table above says.
