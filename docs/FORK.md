@@ -27,11 +27,22 @@ card beside the weights. Nineteen fit now. The measurement that decided the chan
 [PERFORMANCE.md](PERFORMANCE.md), and the reason it was safe to make is that joining two buffers is bit-identical to
 replicating them -- the same bytes in the same order.
 
-The copy could go too. The kernel accepts a table of pages, and many rows may name the same pages: that is measured, in
-`tests/test_gpu_paging.py`, and it is the next step rather than this one. A paged read reduces in a different order,
-so it would change answers by a rounding step -- and in a 40-layer mixture of experts one changed routing logit picks
-a different expert, which is not a rounding difference by the time it reaches an answer. So the storage was fixed
-first, against a baseline that did not move.
+**A group uses only as many rows as it has questions.** The buffers are sized for the widest group and a group of three
+uses three of their rows, which matters because the join is per row: three copies of the context rather than
+thirty-two. That was not always so either, and the reason it changed is that a branch pass stops being
+width-independent once the context is long -- 1.51 times the cost from width 1 to 32 at 24,327 tokens, against 1.02 at
+3,040. [PERFORMANCE.md](PERFORMANCE.md) has both tables.
+
+Two consequences worth knowing before relying on them. A batch's width decides the order the reductions happen in, so
+the same question asked alone and asked alongside thirty-one others can come back with slightly different
+probabilities; `evals/run.py --methods readout,alone` measures how far they move and whether it reaches a decision. And
+`ForkLayer.last_branch_rows` records the row count a pass actually used, because a claim about how a pass ran should be
+checked against the code that would have done the work rather than against what the caller meant.
+
+The copy could go too -- the kernel accepts a table of pages and many rows may name the same pages, which is measured.
+A path built on that was written and deleted; [PERFORMANCE.md](PERFORMANCE.md#the-paged-path-that-never-ran) says why,
+and the short version is that it was never wired to anything and its measurements were the joined path compared with
+itself.
 
 The primitive underneath is ordinary: selecting along the batch dimension, which is what beam search does to reorder
 candidates. A constant index gives the fork; a non-constant one gives several contexts in one batch.

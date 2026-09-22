@@ -212,7 +212,7 @@ def measure_open_contexts(engine, context: str, limit: int = 64) -> dict:
     }
 
 
-def measure_widths(model: str, context: str, widths: tuple[int, ...], repeats: int = 5) -> list[dict]:
+def measure_widths(model: str, context: str, widths: tuple[int, ...], repeats: int = 5, pad_to: int = 0) -> list[dict]:
     """What a branch pass costs at each batch width, which decides whether a narrow one is worth arranging.
 
     The premise of the whole design is that a traversal costs about the same whatever it carries, because the cost is
@@ -234,21 +234,34 @@ def measure_widths(model: str, context: str, widths: tuple[int, ...], repeats: i
     out = []
     for width in widths:
         engine = Prismyra(model, group=width)
+        cuda = torch.cuda.is_available() and engine.torch_device.type == "cuda"
         try:
+            asked = pad_context(engine, context, pad_to)
             questions = build_questions(width)
             samples = []
             for _ in range(repeats + 2):
                 started = time.perf_counter()
-                result = engine.ask(context, questions)
+                result = engine.ask(asked, questions)
                 samples.append((time.perf_counter() - started) * 1e3)
+            # The peaks come from one extra pass rather than from the timed ones, because resetting the allocator's
+            # statistics inside a timed region synchronises the device and would put a stall in the number.
+            #
+            # Inside a function because a `Context` holds its engine. A name still bound to a closed context after the
+            # `with` block keeps the whole 35 GiB of weights alive through it, and the next width then cannot load --
+            # which is how this was found, as an out-of-memory error at the second width rather than the first.
+            context_peak, held, branch_peak = _measure_peaks(engine, cuda, asked, questions)
             kept = samples[2:]
             out.append(
                 {
                     "width": width,
+                    "context_tokens": len(engine.tokenizer(asked)["input_ids"]),
                     "total_ms": round(statistics.median(kept), 1),
                     "context_ms": round(result.timing.context_ms, 1),
                     "branch_ms": round(result.timing.readout_ms, 1),
                     "branch_ms_per_question": round(result.timing.readout_ms / width, 2),
+                    "held_gib": round(held / 1024**3, 3),
+                    "context_peak_gib": round(context_peak / 1024**3, 3),
+                    "branch_peak_gib": round(branch_peak / 1024**3, 3),
                 }
             )
         finally:
@@ -257,6 +270,254 @@ def measure_widths(model: str, context: str, widths: tuple[int, ...], repeats: i
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     return out
+
+
+#: One context and the questions both storage layouts are asked, fixed so two runs ask exactly the same thing.
+STORAGE_QUESTIONS = (
+    ("thirty", "boolean", "Is there a thirty day limit?"),
+    ("unopened", "boolean", "Are unopened items refunded in full?"),
+    ("who_pays", "choice", "Who pays return shipping on a faulty item?"),
+)
+
+STORAGE_CONTEXT = (
+    "Returns are accepted within thirty days of delivery. Unopened items are refunded in full. Opened items are "
+    "exchanged rather than refunded, unless a manufacturing fault is confirmed. Return shipping is paid by the seller "
+    "when the item is faulty and by the buyer otherwise."
+)
+
+
+def measure_admission(engine, context: str, narrow: int = 1, wide: int = 32) -> dict:
+    """Whether the budget an engine forms from a narrow pass survives a wide one at the same context.
+
+    The sequence a reviewer asked for, because it is the one that falsifies the claim: a fresh engine answers `narrow`
+    questions, the estimate it then makes for `wide` is recorded, and `wide` is answered and measured. Per-row cost is
+    not flat in width -- 0.111 GiB per row at width 1 against 0.155 at width 8 and above, at 24,327 context tokens --
+    so an estimate formed at width 1 is expected to fall short, and the engine says so rather than claiming a budget.
+    """
+    import torch
+
+    from . import Boolean
+
+    asked = [Boolean(id=f"q{i}", prompt=f"Is clause {i} about returns?") for i in range(wide)]
+    tokens = len(engine.tokenizer(context)["input_ids"])
+    cuda = torch.cuda.is_available() and engine.torch_device.type == "cuda"
+
+    _, _, narrow_peak = _measure_peaks(engine, cuda, context, asked[:narrow])
+    predicted = engine.answering_bytes(tokens, questions=wide)
+    evidenced = engine.budget_is_evidenced(questions=wide)
+    _, _, wide_peak = _measure_peaks(engine, cuda, context, asked)
+
+    return {
+        "context_tokens": tokens,
+        "narrow_rows": narrow,
+        "wide_rows": wide,
+        "narrow_peak_gib": round(narrow_peak / 1024**3, 3),
+        "predicted_wide_gib": round(predicted / 1024**3, 3),
+        "actual_wide_gib": round(wide_peak / 1024**3, 3),
+        "claimed_as_evidenced": evidenced,
+        "shortfall": round(wide_peak / predicted, 3) if predicted else None,
+    }
+
+
+def measure_ceiling(engine, lengths: tuple[int, ...]) -> list[dict]:
+    """The longest context this card can read, and whether the refusal arrives as a diagnosis or as an allocator error.
+
+    Reading is the larger of the two transients and no caller can shrink it, so there is a length beyond which a context
+    cannot be opened at all -- measured at somewhere between 24,327 and 48,655 tokens on a 44 GiB card with these
+    weights. Worth finding by name: the first context on a fresh engine is unbudgeted, because the figure admission uses
+    is observed rather than derived, so what this shows is the budget taking effect after one read has been seen.
+    """
+    from .schema import PrismyraError
+
+    out = []
+    for length in lengths:
+        context = pad_context(engine, STORAGE_CONTEXT, length)
+        tokens = len(engine.tokenizer(context)["input_ids"])
+        predicted = engine.reading_bytes(tokens)
+        try:
+            with engine.open_context(context):
+                outcome, detail = "read", ""
+        except PrismyraError as e:
+            # Which of the two refused it is the point of the measurement, so the message is classified rather than
+            # printed: "ran out of memory" is the allocator having the last word, anything else is admission.
+            outcome = "allocator" if "ran out of memory" in str(e) else "refused"
+            detail = str(e)
+        out.append(
+            {
+                "context_tokens": tokens,
+                "predicted_reading_gib": round(predicted / 1024**3, 3),
+                "observed_per_token": engine.stats()["reading_bytes_per_context_token"],
+                "outcome": outcome,
+                "detail": detail,
+            }
+        )
+        if outcome != "read":
+            break
+    return out
+
+
+def _measure_peaks(engine, cuda: bool, context: str, questions) -> tuple[int, int, int]:
+    """The largest transient of each phase, and what the open context holds between them."""
+    baseline = _settle(engine, cuda)
+    with engine.open_context(context) as opened:
+        context_peak = _peak_since(engine, cuda, baseline)
+        held = _allocated(engine, cuda) - baseline
+        _reset_peak(engine, cuda)
+        opened.ask(questions)
+        return context_peak, held, _peak_since(engine, cuda, baseline + held)
+
+
+def pad_context(engine, context: str, pad_to: int) -> str:
+    """Repeat a context until it reaches about `pad_to` tokens. Repetition rather than prose because what is being
+    varied is the length, and generating different text would vary the difficulty with it."""
+    if not pad_to:
+        return context
+    while len(engine.tokenizer(context)["input_ids"]) < pad_to:
+        context = context + " " + context
+    return context
+
+
+def storage_answers(engine, pad_to: int = 0) -> dict:
+    """The answers one storage layout gives, recorded so another process can be compared against them.
+
+    Two processes rather than two engines: two copies of these weights do not fit on one card, and releasing the first
+    does not reliably return its memory. So one run records and the next compares, which is also why this is a
+    benchmark rather than a test.
+
+    Asked twice -- once within one group, once with enough filler to span two -- because a single group cannot see a
+    cursor that was not reset between them.
+    """
+    import torch
+
+    from . import Boolean, Choice, Question
+
+    asked: list[Question] = []
+    for name, kind, prompt in STORAGE_QUESTIONS:
+        if kind == "boolean":
+            asked.append(Boolean(id=name, prompt=prompt))
+        else:
+            asked.append(Choice(id=name, prompt=prompt, choices=["seller", "buyer"]))
+    padding = [Boolean(id=f"pad{i}", prompt=f"Is clause {i} about opening hours?") for i in range(31)]
+
+    # The join this path removes copies the context once per branch, so its cost grows with the context. A short
+    # context is therefore the case where paging has least to win, and `pad_to` is how the long case gets measured.
+    context = pad_context(engine, STORAGE_CONTEXT, pad_to)
+
+    out = {
+        "storage": engine.stats()["storage"],
+        "context_tokens": len(engine.tokenizer(context)["input_ids"]),
+        "groups": {},
+    }
+    cuda = torch.cuda.is_available() and engine.torch_device.type == "cuda"
+    if cuda:
+        torch.cuda.empty_cache()
+    for label, questions in (("one_group", asked), ("two_groups", [*padding, *asked])):
+        # The join this path removes is transient: allocated inside a layer and freed before the next. So it does not
+        # show up in what an idle open context holds, and the only place it can be seen is the peak while answering.
+        # That peak is what decides how many contexts can be answered at once, which is the claim paging is making.
+        # Measured per phase, because a whole-`ask` peak cannot answer this question: reading the context is by far the
+        # larger transient and it is identical under both layouts, so it hides whatever the join costs underneath it.
+        # The branch phase on its own is where a join appears or does not.
+        started = time.perf_counter()
+        result = engine.ask(context, questions)
+        wall = (time.perf_counter() - started) * 1e3
+        context_peak, held, branch_peak = _measure_peaks(engine, cuda, context, questions)
+        out["groups"][label] = {
+            "wall_ms": round(wall, 1),
+            "context_peak_gib": round(context_peak / 1024**3, 3),
+            "branch_peak_gib": round(branch_peak / 1024**3, 3),
+            "held_gib": round(held / 1024**3, 3),
+            "context_ms": round(result.timing.context_ms, 1),
+            "readout_ms": round(result.timing.readout_ms, 1),
+            "answers": {
+                a.id: {"option": a.option, "probabilities": {k: round(v, 6) for k, v in a.probabilities.items()}}
+                for a in result.values()
+                if not a.id.startswith("pad")
+            },
+        }
+    return out
+
+
+def _settle(engine, cuda: bool) -> int:
+    """Bytes allocated once outstanding device work has finished. Without the synchronise the number read here belongs
+    to whatever point the queue had reached, which is not a point in this program."""
+    if not cuda:
+        return 0
+    import torch
+
+    torch.cuda.synchronize(engine.torch_device)
+    torch.cuda.reset_peak_memory_stats(engine.torch_device)
+    return int(torch.cuda.memory_allocated(engine.torch_device))
+
+
+def _allocated(engine, cuda: bool) -> int:
+    if not cuda:
+        return 0
+    import torch
+
+    torch.cuda.synchronize(engine.torch_device)
+    return int(torch.cuda.memory_allocated(engine.torch_device))
+
+
+def _reset_peak(engine, cuda: bool) -> None:
+    if not cuda:
+        return
+    import torch
+
+    torch.cuda.synchronize(engine.torch_device)
+    torch.cuda.reset_peak_memory_stats(engine.torch_device)
+
+
+def _peak_since(engine, cuda: bool, baseline: int) -> int:
+    """The largest transient above a baseline. Reported rather than the absolute peak because the absolute number is
+    mostly weights, and weights are the same under every layout."""
+    if not cuda:
+        return 0
+    import torch
+
+    torch.cuda.synchronize(engine.torch_device)
+    return max(0, int(torch.cuda.max_memory_allocated(engine.torch_device)) - baseline)
+
+
+def compare_storage(recorded: dict, measured: dict, tolerance: float = 2e-2) -> int:
+    """Whether two layouts agree. On decisions and on probabilities within a tolerance, not on bits.
+
+    A paged read reduces in a different order, and in a forty-layer mixture of experts a rounding step in a routing
+    logit picks a different expert. Bit-identity is not available, so demanding it would reject a correct
+    implementation -- and a decision that changes is the thing that actually matters to a caller.
+    """
+    print(f"\n{recorded['storage']} against {measured['storage']}, {measured['context_tokens']} context tokens")
+    if recorded.get("context_tokens") != measured.get("context_tokens"):
+        print(
+            f"  [warning] the recording used {recorded.get('context_tokens')} tokens and this run used "
+            f"{measured.get('context_tokens')}; the timings are not comparable"
+        )
+    problems = 0
+    for label in recorded["groups"]:
+        want, got = recorded["groups"][label], measured["groups"][label]
+        print(
+            f"\n{label}: {want['wall_ms']:.0f} ms -> {got['wall_ms']:.0f} ms "
+            f"({want['readout_ms']:.0f} ms answering -> {got['readout_ms']:.0f} ms)"
+        )
+        print(
+            f"  held {want.get('held_gib', 0):.3f} -> {got.get('held_gib', 0):.3f} GiB, "
+            f"branch peak {want.get('branch_peak_gib', 0):.3f} -> {got.get('branch_peak_gib', 0):.3f} GiB, "
+            f"context peak {want.get('context_peak_gib', 0):.2f} -> {got.get('context_peak_gib', 0):.2f} GiB"
+        )
+        for name, answer in want["answers"].items():
+            mine = got["answers"][name]
+            same = answer["option"] == mine["option"]
+            moved = max(
+                abs(probability - mine["probabilities"][key]) for key, probability in answer["probabilities"].items()
+            )
+            mark = "OK " if same and moved < tolerance else "NO "
+            problems += int(not (same and moved < tolerance))
+            print(f"  {mark}{name:<12} {answer['option']:>8} -> {mine['option']:<8} largest move {moved:.4f}")
+    if problems:
+        print(f"\n{problems} answer(s) disagreed beyond {tolerance}, so the layouts are not interchangeable")
+    else:
+        print(f"\nevery decision matched and no probability moved by {tolerance} or more")
+    return 1 if problems else 0
 
 
 def run_sweep(args) -> dict:
@@ -365,11 +626,14 @@ def compare(measured: dict, reference: Path, tolerance: float) -> int:
     return 1 if regressions else 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911 - one return per command reads better than a dispatch
     parser = argparse.ArgumentParser(
         prog="prismyra-bench", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("command", choices=["sweep", "compare", "concurrency", "widths"])
+    parser.add_argument(
+        "command",
+        choices=["sweep", "compare", "concurrency", "widths", "storage", "admission", "ceiling"],
+    )
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B-FP8")
     parser.add_argument("--counts", type=int, nargs="+", default=list(COUNTS))
     parser.add_argument("--repeats", type=int, default=REPEATS)
@@ -385,7 +649,11 @@ def main(argv: list[str] | None = None) -> int:
         help="refuse to measure without the faster kernels, so a slow run cannot be filed as a result",
     )
     parser.add_argument("--update", type=Path, help="merge the measured keys into this result file")
-    parser.add_argument("--against", type=Path, help="the result file to compare with")
+    parser.add_argument(
+        "--against",
+        type=Path,
+        help="the file to compare with: a result file for compare, a recorded answer file for storage",
+    )
     parser.add_argument("--tolerance", type=float, default=0.10)
     parser.add_argument(
         "--callers",
@@ -395,20 +663,100 @@ def main(argv: list[str] | None = None) -> int:
         help="how many arrive together, for the concurrency command",
     )
     parser.add_argument("--questions", type=int, default=8, help="questions per caller, for the concurrency command")
+    parser.add_argument(
+        "--context-tokens",
+        type=int,
+        default=0,
+        help="lengthen the storage context to about this many tokens; what paging removes grows with the context",
+    )
+    parser.add_argument("--record", type=Path, help="write this layout's answers here, for the storage command")
     parser.add_argument("--json", action="store_true", help="print the measurement as JSON instead of a table")
     args = parser.parse_args(argv)
 
     if args.command == "compare" and args.against is None:
         parser.error("compare needs --against FILE")
 
-    if args.command == "widths":
-        context = PARAGRAPH * args.repeat_paragraph
-        rows = measure_widths(args.model, context, tuple(args.callers))
-        print(f"\n{'width':>6} {'total ms':>9} {'context ms':>11} {'branch ms':>10} {'branch ms/question':>19}")
+    if args.command == "storage":
+        from . import Prismyra
+
+        engine = Prismyra(args.model, require_kernels=args.require_kernels)
+        measured = storage_answers(engine, pad_to=args.context_tokens)
+        if args.record:
+            args.record.write_text(json.dumps(measured, indent=2))
+            print(f"recorded the {measured['storage']} layout to {args.record}")
+            return 0
+        if args.against:
+            return compare_storage(json.loads(args.against.read_text()), measured)
+        print(json.dumps(measured, indent=2))
+        return 0
+
+    if args.command == "ceiling":
+        from . import Prismyra
+
+        engine = Prismyra(args.model, require_kernels=args.require_kernels)
+        rows = measure_ceiling(engine, tuple(args.callers))
+        print(f"\n{'tokens':>8} {'predicted read':>15} {'bytes/token':>12}  outcome")
         for row in rows:
             print(
-                f"{row['width']:>6} {row['total_ms']:>9.1f} {row['context_ms']:>11.1f} "
-                f"{row['branch_ms']:>10.1f} {row['branch_ms_per_question']:>19.2f}"
+                f"{row['context_tokens']:>8} {row['predicted_reading_gib']:>15.3f} "
+                f"{row['observed_per_token']:>12}  {row['outcome']}"
+            )
+        last = rows[-1]
+        if last["outcome"] == "refused":
+            print(f"\nRefused by name before reading anything:\n  {last['detail']}")
+        elif last["outcome"] == "allocator":
+            print(
+                f"\nThe allocator had the last word, which is what happens when nothing has been read yet and\n"
+                f"there is no figure to budget from:\n  {last['detail']}"
+            )
+        else:
+            print("\nEvery length read. The ceiling is above the longest asked for.")
+        if args.json:
+            print(json.dumps(rows, indent=2))
+        return 0
+
+    if args.command == "admission":
+        from . import Prismyra
+
+        engine = Prismyra(args.model, require_kernels=args.require_kernels)
+        context = pad_context(engine, PARAGRAPH * args.repeat_paragraph, args.context_tokens)
+        found = measure_admission(engine, context, wide=engine.group)
+        print(f"\n{found['context_tokens']} context tokens, a fresh engine, {found['wide_rows']} rows to budget for")
+        print(f"  a pass of {found['narrow_rows']} row(s) peaked at {found['narrow_peak_gib']:.3f} GiB")
+        print(f"  the estimate it then made for {found['wide_rows']} rows was {found['predicted_wide_gib']:.3f} GiB")
+        print(f"  that pass actually peaked at {found['actual_wide_gib']:.3f} GiB")
+        print(f"  the engine claimed this estimate as evidenced: {found['claimed_as_evidenced']}")
+        if found["shortfall"]:
+            print(
+                f"\nThe estimate was short by a factor of {found['shortfall']:.2f}. That is expected and is why the "
+                f"engine\nreports it as a lower bound for a pass wider than any it has measured; refusing on it would "
+                f"be\nrefusing on a figure nothing supports. The allocator is the gate for that pass."
+            )
+        if args.json:
+            print(json.dumps(found, indent=2))
+        return 0
+
+    if args.command == "widths":
+        context = PARAGRAPH * args.repeat_paragraph
+        rows = measure_widths(args.model, context, tuple(args.callers), pad_to=args.context_tokens)
+        print(
+            f"\n{'width':>6} {'tokens':>7} {'total ms':>9} {'branch ms':>10} {'ms/question':>12} "
+            f"{'held GiB':>9} {'ctx peak':>9} {'branch peak':>12}"
+        )
+        for row in rows:
+            print(
+                f"{row['width']:>6} {row['context_tokens']:>7} {row['total_ms']:>9.1f} "
+                f"{row['branch_ms']:>10.1f} {row['branch_ms_per_question']:>12.2f} "
+                f"{row['held_gib']:>9.3f} {row['context_peak_gib']:>9.3f} {row['branch_peak_gib']:>12.3f}"
+            )
+        # The peak is the number that decides how many callers fit, and it is not the held cache. Printed beside the
+        # clock so the two are read together: the clock says a narrow batch reclaims nothing, and the peak says
+        # whether it reclaims memory.
+        first, last = rows[0], rows[-1]
+        if last["branch_peak_gib"]:
+            print(
+                f"\nThe branch pass peaked at {first['branch_peak_gib']:.3f} GiB at width {first['width']} and "
+                f"{last['branch_peak_gib']:.3f} GiB at width {last['width']}, against {last['held_gib']:.3f} GiB held."
             )
         narrow, wide = rows[0]["branch_ms"], rows[-1]["branch_ms"]
         print(

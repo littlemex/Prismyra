@@ -211,11 +211,11 @@ class FlashAttention(nn.Module):
         if past_key_values is not None:
             key, value = past_key_values.update(key, value, a.layer_idx)
             rows, _, q_len, _ = query.shape
-            k_len = key.shape[-2]
             q = query.transpose(1, 2).reshape(rows * q_len, -1, a.head_dim)
+            cu_q = torch.arange(0, rows * q_len + 1, q_len, device=q.device, dtype=torch.int32)
+            k_len = key.shape[-2]
             k = key.transpose(1, 2).reshape(rows * k_len, -1, a.head_dim)
             v = value.transpose(1, 2).reshape(rows * k_len, -1, a.head_dim)
-            cu_q = torch.arange(0, rows * q_len + 1, q_len, device=q.device, dtype=torch.int32)
             cu_k = torch.arange(0, rows * k_len + 1, k_len, device=q.device, dtype=torch.int32)
             max_q, max_k = q_len, k_len
         else:

@@ -141,21 +141,116 @@ against 167.7 ms per question on RACE. What the change costs is a copy that live
 branch rows joined for that layer's read, 222 MiB at these sizes -- rather than 2.17 GiB held for as long as the
 context is open.
 
-Two measurements decided how to do it, and both are worth keeping:
+Two measurements decided how to do it. One of them turned out to be true only of the shape it was taken at, and the
+correction is the more useful finding:
 
-* **A narrow batch reclaims nothing.** A branch pass costs 245 ms at one row and 246 ms at thirty-two -- a factor of
-  1.01, which is the design's central premise holding exactly. So the replication cost memory and not time, and
-  there was
-  no latency to recover by arranging smaller batches. `prismyra-bench widths` is that measurement.
+* **A narrow batch reclaims nothing -- at 3,040 context tokens.** A branch pass cost 245 ms at one row and 246 ms at
+  thirty-two, a factor of 1.01, and that was read as the design's central premise holding. It holds at that length and
+  not beyond it: see below.
 * **The attention kernel tolerates aliased pages.** Rows whose page tables name the same prefix pages answer as rows
-  holding their own copies, within two steps of bfloat16. `tests/test_gpu_paging.py` is that measurement, and it is a
-  kill criterion rather than a feature test: had it failed, the next step would not be available.
+  holding their own copies, within two steps of bfloat16. That was measured on device, and it was the kill criterion for
+  removing the join by handing the kernel a page table instead. The capability is real; the path built on it is not
+  here, and why is in [the paged path](#the-paged-path-that-never-ran) below.
 
-That next step is to remove the transient join by handing the kernel a page table instead. It is deliberately not done
-yet. Joining two buffers is bit-identical to replicating them, so this change could be made against a baseline that did
-not move; a paged read reduces in a different order, and in a forty-layer mixture of experts a rounding step in a
-routing logit picks a different expert. Doing them at once would have left no way to tell a storage bug from a
-rounding one.
+## What a pass costs, by phase and by width
+
+The figure above -- what an open context *holds* -- is the smaller half of the story. Answering transiently allocates
+several times as much, and reading the context allocates more still. `prismyra-bench widths --context-tokens N` reports
+all three; peaks are the allocator's, measured above the bytes already allocated when the phase began, with the device
+synchronised either side.
+
+| context tokens | width | branch ms | held GiB | reading peak | answering peak |
+|---|---|---|---|---|---|
+| 3,040 | 1 | 250.1 | 0.129 | 0.731 | 0.080 |
+| 3,040 | 8 | 235.5 | 0.198 | 0.802 | 0.634 |
+| 3,040 | 32 | 254.1 | 0.432 | 1.035 | 2.534 |
+| 24,327 | 1 | 238.3 | 0.563 | 5.330 | 0.111 |
+| 24,327 | 8 | 247.8 | 0.613 | 5.381 | 1.238 |
+| 24,327 | 32 | 360.4 | 0.868 | 5.631 | 4.970 |
+
+Three things follow, and the first two overturn what this document said before.
+
+**The premise is context-dependent.** A branch pass costs the same at any width when the context is short -- 1.02 across
+widths at 3,040 tokens -- and does not when it is long: 1.51 at 24,327, 238 ms against 360 ms. The 1.01 reported above
+was taken at one length and generalised to all of them. What makes the difference is per-row work proportional to the
+context: each row's read is joined with its own copy of the context, and at 3,040 tokens that is small against the fixed
+cost of a traversal while at 24,327 it is not. So a request with three questions should not pay for thirty-two rows of
+it, and since this measurement **it does not** -- a group uses as many rows as it has questions.
+
+**Answering costs several times what holding costs.** 4.970 GiB against 0.868 GiB held at 24,327 tokens and full width.
+Admission used to compare only the held cache against free memory, which meant a context could be admitted, sit
+comfortably, and run out of memory on its first question. It now budgets the work as well.
+
+**Reading costs more than answering, and no caller can shrink it.** The reading peak is 4.78 GiB above the cache it
+leaves behind at 24,327 tokens, against 2.53 GiB for the widest branch pass, and it is flat in the group -- 1.96e-4 GiB
+per context token at both lengths measured. Asking fewer questions does not reduce it; only a shorter context does. So
+there is a length beyond which a context cannot be opened at all, whatever the group. `prismyra-bench ceiling` finds it
+and reports which of the two refused it:
+
+| context tokens | predicted read | outcome |
+|---|---|---|
+| 3,264 | not yet known | read |
+| 26,112 | 6.588 GiB | read |
+| 52,224 | 13.177 GiB | refused by name, before allocating anything |
+
+The observed figure is 235,582 bytes per context token. A fresh engine reads the first context unbudgeted and measures
+it; from then on the refusal arrives before the allocator is asked, and it says that only a shorter context helps --
+because when reading is what does not fit, a smaller group changes nothing.
+
+### How admission budgets them
+
+Both figures are **observed on the engine that will use them**, not derived, and both are ratcheted upwards as passes
+happen. The answering figure is split in two, which is not tidiness:
+
+    per row  =  a constant, observed  +  4,096 bytes x context tokens, arithmetic
+
+The arithmetic part is the join and its reshape copy, from the model's own shapes -- two key-value heads, head_dim 256,
+two bytes, keys and values, doubled by the transpose-then-reshape the kernel needs. It predicts 4,096 bytes per context
+token per row against 3,838 measured between the two lengths, so it over-states by 7%, which is the safe direction.
+Keeping the largest observed *prediction* instead would ratchet the wrong way: a prediction scaled up from a short
+context is larger per token than one from a long context, so the shortest context ever seen would win and be kept
+forever, and a full-width pass at 24,327 tokens would be budgeted at 17.7 GiB when it needs 4.97 -- refused with four
+gigabytes idle. The constant does not depend on the context length, so ratcheting it cannot do that.
+
+The first context on a fresh engine is **unbudgeted**, because the figure is observed and there is nothing to observe
+yet. That is a real hole and is closed by the allocator rather than by admission: a 48,655-token context on a fresh
+engine raises a named error from the read, saying that asking fewer questions will not help and a shorter context is the
+only knob. After one read the figure exists and a longer context is refused before anything is allocated.
+
+**Per-row cost is not flat in width at the bottom of the range**, and admission says so rather than pretending
+otherwise. At 24,327 tokens a pass cost 0.111 GiB per row at width 1 and 0.155 at widths 8 and 32; an observation taken
+at width 1 therefore under-states a width-32 pass by 29%. `prismyra-bench admission --context-tokens 18000` is that
+sequence run deliberately: a fresh engine answers one question at 24,327 tokens, the estimate it then makes for
+thirty-two is 4.028 GiB, and the pass measures 4.970 -- short by a factor of 1.23. So `budget_is_evidenced()` is false
+for any pass wider than the widest yet measured, and the refusal message says "at least" rather than a figure. The
+allocator is the authoritative gate for such a pass, and `torch.OutOfMemoryError` is caught and re-raised naming the
+knobs: fewer questions per call, or a smaller group.
+
+Free memory is the device's free bytes plus the allocator's reserved-but-unallocated pool. Asking the device alone
+refused an 18,000-token context that had 9 GiB waiting for it inside the process, because loading these weights leaves
+that pool large.
+
+### The paged path that never ran
+
+A paged storage path was written -- `block_table` and `seqused_k`, the context's pages named by every row's table, the
+join removed entirely. It was measured at two context lengths, reported identical decisions and probability movements of
+0.0000, and was 8-9% slower at 3,040 tokens and break-even at 18,003.
+
+None of that happened. `Prismyra.__init__` stored the flag, validated that the installed kernel took the arguments, and
+reported `"storage": "paged"`; `_read` calls `build_cache` with six positional arguments and the flag is the seventh.
+The paged layer was never constructed. Every "paged" run was the joined path compared against itself, which is why a
+path that reduces in a different order moved no probability at all and why the peaks matched to three decimals.
+
+What found it was disbelieving the perfection. The flag had a construction-time check, a field in `stats()`, a benchmark
+option, and eighteen unit tests of its page arithmetic -- and no wiring. The code is gone rather than fixed: it was
+never a feature, and bringing it back correctly means doing the verification from the beginning anyway. `ForkLayer`
+now records `last_branch_rows`, the row count it actually received, so a claim about how a pass ran can be checked
+against the code that would have done the work.
+
+The join it would have removed is still there and still costs 4,096 bytes per context token per row. Whether that is
+worth a second storage path is a question about time rather than memory: narrow rows remove the cost for requests with
+few questions, and the cheaper things to try first are removing the transpose-then-reshape copy, which is half the
+slope, and writing the join into a buffer allocated once per context instead of per layer.
 
 ## Concurrency, as first measured
 

@@ -63,14 +63,23 @@ class ForkLayer(CacheLayerMixin):
         # name.
         self.cumulative_length = torch.tensor(0, dtype=torch.long)
         self._host_length = 0
-        #: Where the context ended, which is where each branch's own tokens begin. Set by the context write, and the
-        #: thing a branch write measures its own offset from.
+        #: Where the context ended, which is where each branch's own tokens begin. Set when the caller says the
+        #: context is finished, and the thing a branch write measures its own offset from.
         self.context_length = 0
+        #: Which kind of write to expect. Told rather than guessed: a row count cannot distinguish them, because at a
+        #: group of one the context and a branch are both one row. Inferring it from the count meant a group of one
+        #: wrote its context into the branch buffer and was refused for not fitting -- found by a benchmark, not a
+        #: test.
+        self.writing_branches = False
         self.keys: torch.Tensor | None = None
         self.values: torch.Tensor | None = None
         #: One row per branch, `max_branch_len` long. Short, so replicating it is cheap in a way the context is not.
         self.branch_keys: torch.Tensor | None = None
         self.branch_values: torch.Tensor | None = None
+        #: How many rows the last branch write actually carried. A witness, not state: a flag that reported one thing
+        #: and did another is what cost this package a whole round of measurement, so a claim about the row count a
+        #: pass used is checked against what the layer received rather than against what the caller meant to pass.
+        self.last_branch_rows = 0
         self.is_initialized = False
 
     # ---------------------------------------------------------------- allocation
@@ -113,14 +122,13 @@ class ForkLayer(CacheLayerMixin):
         rows = key_states.shape[0]
         count = key_states.shape[-2]
 
-        if rows == 1 and self.max_batch_size > 1:
+        if not self.writing_branches:
+            if rows != 1:
+                raise ValueError(f"a context arrives as one row and this one arrived as {rows}")
             return self._write_context(key_states, value_states, count)
-        if rows == self.max_batch_size:
-            return self._write_branches(key_states, value_states, count)
-        raise ValueError(
-            f"this layer holds {self.max_batch_size} rows and was given {rows}; a write is either one row, "
-            f"meaning the shared context, or all of them, meaning the branches"
-        )
+        if rows > self.max_batch_size:
+            raise ValueError(f"this layer holds {self.max_batch_size} branch rows and was given {rows}")
+        return self._write_branches(key_states, value_states, count, rows)
 
     def _write_context(self, key_states: torch.Tensor, value_states: torch.Tensor, count: int):
         """Into the single shared row, and the branches read it from there rather than being given a copy."""
@@ -134,11 +142,15 @@ class ForkLayer(CacheLayerMixin):
         self.keys[:, :, start : start + count] = key_states
         self.values[:, :, start : start + count] = value_states
         self._advance(count)
-        self.context_length = self._host_length
         return self.keys[:, :, : self._host_length], self.values[:, :, : self._host_length]
 
-    def _write_branches(self, key_states: torch.Tensor, value_states: torch.Tensor, count: int):
+    def _write_branches(self, key_states: torch.Tensor, value_states: torch.Tensor, count: int, rows: int):
         """Into each branch's own row, then joined with the context for the read.
+
+        Fewer rows than the layer holds is allowed and is not a special case: the buffers were sized for the widest
+        group, and a group of three uses three of their rows. It matters because the join is per row -- so a narrow
+        group copies the context three times rather than thirty-two, and at a long context that is most of what the
+        pass costs. See docs/PERFORMANCE.md for the measurement that made this worth doing.
 
         The offset is measured from the context's length, not from the position the tokens carry. Those two stop being
         equal as soon as an image is in the context -- the model's three-axis positions advance by a grid rather than
@@ -152,19 +164,20 @@ class ForkLayer(CacheLayerMixin):
                 f"a branch of {at + count} tokens does not fit in {self.max_branch_len}; the widest branch is what "
                 f"this buffer was sized for"
             )
-        self.branch_keys[:, :, at : at + count] = key_states
-        self.branch_values[:, :, at : at + count] = value_states
+        self.branch_keys[:rows, :, at : at + count] = key_states
+        self.branch_values[:rows, :, at : at + count] = value_states
+        self.last_branch_rows = rows
         self._advance(count)
 
         used = self._host_length - self.context_length
-        rows = self.max_batch_size
         # Joined for this layer's read and dropped before the next layer runs. `expand` costs nothing; the copy is the
         # `cat`, and it is the price of keeping this bit-identical to holding the rows separately.
         keys = torch.cat(
-            (self.keys[:, :, : self.context_length].expand(rows, -1, -1, -1), self.branch_keys[:, :, :used]), dim=-2
+            (self.keys[:, :, : self.context_length].expand(rows, -1, -1, -1), self.branch_keys[:rows, :, :used]),
+            dim=-2,
         )
         values = torch.cat(
-            (self.values[:, :, : self.context_length].expand(rows, -1, -1, -1), self.branch_values[:, :, :used]),
+            (self.values[:, :, : self.context_length].expand(rows, -1, -1, -1), self.branch_values[:rows, :, :used]),
             dim=-2,
         )
         return keys, values
@@ -172,6 +185,16 @@ class ForkLayer(CacheLayerMixin):
     def _advance(self, count: int) -> None:
         self._host_length += count
         self.cumulative_length.add_(count)
+
+    def begin_branches(self) -> None:
+        """The context is finished; what follows is branches.
+
+        Called rather than inferred. The first call fixes where the context ended, and later calls -- one per group --
+        are harmless, which is what lets `fork.restore_and_fork` call it without knowing whether it is the first.
+        """
+        if not self.writing_branches:
+            self.context_length = self._host_length
+            self.writing_branches = True
 
     # ---------------------------------------------------------------- the rest of the contract
     def get_seq_length(self) -> int:
@@ -199,6 +222,7 @@ class ForkLayer(CacheLayerMixin):
             self.cumulative_length.zero_()
             self._host_length = 0
             self.context_length = 0
+            self.writing_branches = False
 
     def rewind_to(self, length: int) -> None:
         """Set the length back to a point already written, leaving the contents.
@@ -277,13 +301,43 @@ def cache_bytes(config, max_cache_len: int, rows: int, dtype: torch.dtype, max_b
     return 2 * attention_layers * heads * head_dim * slots * per_element
 
 
+def join_bytes_per_token(config, dtype: torch.dtype) -> int:
+    """What one context token costs, per branch row, in the transient a branch pass allocates.
+
+    Derived rather than measured, because it is arithmetic: for each attention layer the context is joined with the
+    branch's own tokens into a contiguous tensor for the read, keys and values both, and the attention replacement
+    transposes and reshapes that for the kernel, which copies it again.
+
+        attention_layers x kv_heads x head_dim x bytes x 2 (keys and values) x 2 (the reshape)
+
+    Divided by the layers, because a layer's join is freed before the next layer's is allocated, so what is live at
+    once is one layer's -- with two of them briefly overlapping, which is the factor of two already counted above.
+
+    On the supported model this is 4,096 bytes per context token per row. The peak of a real pass grew by 3,838 bytes
+    per token per row between 3,040 and 24,327 context tokens, so this over-states slightly, which is the safe
+    direction for a memory budget.
+    """
+    decoder = getattr(config, "text_config", config)
+    heads = decoder.num_key_value_heads
+    head_dim = getattr(decoder, "head_dim", None) or decoder.hidden_size // decoder.num_attention_heads
+    per_element = torch.empty((), dtype=dtype).element_size()
+    return 2 * 2 * heads * head_dim * per_element
+
+
 def _layer_types(decoder):
     from transformers.cache_utils import get_layer_types_and_kwargs
 
     return get_layer_types_and_kwargs(decoder)
 
 
-def build_cache(config, max_cache_len: int, rows: int, dtype: torch.dtype, device: str, max_branch_len: int = 512):
+def build_cache(
+    config,
+    max_cache_len: int,
+    rows: int,
+    dtype: torch.dtype,
+    device: str,
+    max_branch_len: int = 512,
+):
     """A cache for one backbone: `ForkLayer` where attention needs keys and values, the framework's own layer elsewhere.
 
     The recurrent layers need no replacement. Their state is a fixed size per layer whatever the context length, so
