@@ -66,8 +66,9 @@ closed-question classifier that works out of the box on a rare class is not what
 **What fixes it is a decision point, and it costs about eight hundred labelled documents.** `prismyra.thresholds` fits
 one number per question from answers you already logged beside what turned out to be true -- no gradient, no device, no
 second model. On those clauses it takes precision from 5.8% to 39.1% and F1 from 10.5% to 47.4% with recall unchanged.
-Below roughly eight hundred documents it declines to fit rather than guessing, because five of the eight classes appear
-fewer than five times in a smaller sample. [docs/ACCURACY.md](docs/ACCURACY.md) has all of it, including what did not
+Below roughly eight hundred documents it declines to fit rather than guessing, and above them it stops improving: two
+and a half times the labels buys nothing, which says the rest of the gap is in how the read-out orders the probabilities
+rather than where they are cut. [docs/ACCURACY.md](docs/ACCURACY.md) has all of it, including what did not
 help and one figure this project published and then withdrew.
 
 ## Install

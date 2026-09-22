@@ -123,12 +123,19 @@ refused and why. At a 1.5% base rate that guard binds hard:
 | clauses fitted on | answers fitted on | questions given a cut | F1 |
 |---|---|---|---|
 | 200 | 1,600 | 3 of 8 | 11.3% |
-| 800 | 6,400 | 8 of 8 | 47.4% |
+| 800 | 6,400 | 8 of 8 | **47.4%** |
+| 2,000 | 16,000 | 8 of 8 | 46.6% |
 
-So below roughly eight hundred labelled documents this does almost nothing on this task, and the reason is visible
-rather than mysterious: at two hundred clauses, five of the eight unfairness types each appear fewer than five
-times. The rarer the class, the more documents it takes to find its decision point, and the mechanism declines
-rather than inventing one.
+Two things to read off that. Below roughly eight hundred labelled documents this does almost nothing here, because at
+two hundred clauses five of the eight unfairness types each appear fewer than five times, and the mechanism declines
+rather than inventing a cut from one or two examples.
+
+And **it saturates there**. Two and a half times as many labels buys nothing -- 46.6% against 47.4%, well inside the
+noise of thirty positives. That is the more useful half of the finding, because it says where the remaining gap is not:
+more labels will not move a threshold that has already found its place. What is left is the order the read-out puts the
+probabilities in, and a threshold cannot change an order. Anything aimed at the rest of this gap has to change the
+scoring itself -- a trained head on the branch's final hidden state is the obvious candidate -- and the bar it has to
+clear is 47.4% pooled and 50.9% macro, not the read-out's 10.5%.
 
 That guard is also what caught a figure this project nearly published. An earlier version of the harness fitted its own
 cuts with no such guard and reported F1 rising from 10.5% to 33.7%. Seven of those eight cuts were fitted on between
