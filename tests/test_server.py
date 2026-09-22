@@ -68,11 +68,11 @@ def test_a_filled_id_that_collides_with_a_given_one_is_refused():
 def test_the_endpoint_accepts_a_request_body_over_real_http():
     """Regression, and the reason the server module has no `from __future__ import annotations`.
 
-    That import turns annotations into strings, which the web framework resolves against the module's globals -- and the
-    request models live inside `create_app`. It then decided the body parameter was a query parameter and rejected every
-    request with "field required" for a field the caller did send. Nothing below the transport could see it: the schema,
-    the read-out and the queue were all fine. Only a real request finds it, so this makes one, with a stub engine so no
-    device is needed.
+    That import turns annotations into strings, which the web framework resolves against the module's globals -- and
+    the request models live inside `create_app`. It then decided the body parameter was a query parameter and rejected
+    every request with "field required" for a field the caller did send. Nothing below the transport could see it: the
+    schema, the read-out and the queue were all fine. Only a real request finds it, so this makes one, with a stub
+    engine so no device is needed.
     """
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
@@ -198,10 +198,10 @@ def test_an_image_arrives_as_bytes_and_reaches_the_engine():
 def test_a_clip_reports_the_rate_its_frames_actually_run_at():
     """The timing is what the processor needs, and getting it wrong is silent.
 
-    Hand a processor sixteen frames with nothing else and it assumes 24 per second, decides the clip is two thirds of a
-    second long, and keeps a handful. Every question about when something happened is then answered about a clip that
-    does not exist. So the decoder reports the rate of the array it returns, which is the source rate over the stride it
-    used -- not the source rate, and not a default.
+    Hand a processor sixteen frames with nothing else and it assumes 24 per second, decides the clip is two thirds of
+    a second long, and keeps a handful. Every question about when something happened is then answered about a clip
+    that does not exist. So the decoder reports the rate of the array it returns, which is the source rate over the
+    stride it used -- not the source rate, and not a default.
     """
     pytest.importorskip("cv2")
     pytest.importorskip("PIL")
@@ -253,8 +253,8 @@ def test_a_generated_answer_is_read_without_crediting_or_robbing_the_model():
 
     Every case below was wrong at some point in writing it, and every one of those errors went against generation: a
     single-letter option matched as a prefix reads "because the passage says so" as B, "a few people" as A and
-    "definitely B" as D. A baseline that loses points to its own parser is not a baseline, and the accuracy it makes the
-    read-out look better than is not a result.
+    "definitely B" as D. A baseline that loses points to its own parser is not a baseline, and the accuracy it makes
+    the read-out look better than is not a result.
     """
     import sys
     from pathlib import Path

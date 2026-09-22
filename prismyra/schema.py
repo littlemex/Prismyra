@@ -1,8 +1,8 @@
 """Questions, requests and answers. The read-out contract lives here because the read-out is the product.
 
 What a probability means is stated once, in `SCORING`, and versioned. Three different things could be called "the
-probability of an option" -- a first-token logit, a sequence likelihood, a renormalisation over the declared options --
-and they do not agree. See docs/READOUT.md.
+probability of an option" -- a first-token logit, a sequence likelihood, a renormalisation over the declared options
+-- and they do not agree. See docs/READOUT.md.
 """
 
 from __future__ import annotations
@@ -31,9 +31,9 @@ class QuestionError(PrismyraError):
     """A question cannot be scored as written.
 
     Raised as early as the check allows. What can be seen from the question alone -- an empty prompt, one option, a
-    repeat -- is refused at construction. Two refusals need the model's tokenizer and so belong to the engine: an option
-    that is more than one token, and two options sharing a first token. `Prismyra.validate` runs those before the
-    context is read, so they still cost no device time.
+    repeat -- is refused at construction. Two refusals need the model's tokenizer and so belong to the engine: an
+    option that is more than one token, and two options sharing a first token. `Prismyra.validate` runs those before
+    the context is read, so they still cost no device time.
     """
 
 
@@ -111,8 +111,9 @@ class Choice(Question):
         if isinstance(self.choices, str | bytes):
             raise QuestionError(f"question {self.id!r} was given one string as its choices; pass a list of options")
         # Copied into a tuple, which is what makes this dataclass frozen in fact and not only in name. The options are
-        # read several times during one answer -- to find their tokens, to render the prompt, to label the probabilities
-        # -- and a list the caller can still reorder between those reads would attach the scores to the wrong names.
+        # read several times during one answer -- to find their tokens, to render the prompt, to label the
+        # probabilities -- and a list the caller can still reorder between those reads would attach the scores to the
+        # wrong names.
         object.__setattr__(self, "choices", tuple(self.choices))
         super().__post_init__()
 
@@ -199,8 +200,8 @@ class Request:
 class Result(Mapping[str, Answer]):
     """The answers to one request, with what produced them.
 
-    An envelope rather than a bare mapping so that the scoring version and the model travel with the numbers: an answer
-    stored without them cannot be compared to a later one.
+    An envelope rather than a bare mapping so that the scoring version and the model travel with the numbers: an
+    answer stored without them cannot be compared to a later one.
     """
 
     answers: Mapping[str, Answer]
@@ -234,9 +235,10 @@ def render_question(question: Question, trailing_space: bool = False) -> str:
     three-way questions at chance. So they are listed, sorted, always.
 
     `trailing_space` puts the space before the answer into the prompt instead of leaving it to the model. Which of the
-    two a question needs is a property of the tokenizer rather than of the question, and `readout.plan` decides it: this
-    model's tokenizer merges a space into a word, so " yes" is one token, but splits it from a digit, so " 1" is two and
-    the first of them is the same space for every option. A scale is unreadable without this, and unaffected by it.
+    two a question needs is a property of the tokenizer rather than of the question, and `readout.plan` decides it:
+    this model's tokenizer merges a space into a word, so " yes" is one token, but splits it from a digit, so " 1" is
+    two and the first of them is the same space for every option. A scale is unreadable without this, and unaffected
+    by it.
     """
     options = ", ".join(sorted(question.options))
     tail = "Answer: " if trailing_space else "Answer:"

@@ -1,9 +1,9 @@
 """One worker owns the device; callers queue.
 
-This is in the core rather than in the server because it is a correctness and latency property of using one device from
-several threads, not an HTTP concern. Requests entering the model together are correct but slow in a specific way: they
-share one stream, so they all crawl and all finish late, and throughput drops. A queue lets the first one leave first.
-Measured figures are in docs/PERFORMANCE.md.
+This is in the core rather than in the server because it is a correctness and latency property of using one device
+from several threads, not an HTTP concern. Requests entering the model together are correct but slow in a specific
+way: they share one stream, so they all crawl and all finish late, and throughput drops. A queue lets the first one
+leave first. Measured figures are in docs/PERFORMANCE.md.
 """
 
 from __future__ import annotations
@@ -55,8 +55,8 @@ class Job:
 class Worker:
     """A single thread that runs `handler` on one job at a time.
 
-    `handler` is called only from the worker thread, so it may hold and mutate whatever state it likes without locking,
-    which is the point, since the model's caches are exactly such state.
+    `handler` is called only from the worker thread, so it may hold and mutate whatever state it likes without
+    locking, which is the point, since the model's caches are exactly such state.
     """
 
     def __init__(self, handler: Callable[[Any], Any], max_queue: int = 512):
@@ -130,8 +130,8 @@ class Worker:
             job.error = WorkerStopped("the worker stopped while this job was being queued")
             job.done.set()
         if not job.done.wait(timeout=timeout):
-            # Marked before raising. If it has not started, the worker drops it; if it has, it runs to the end, because
-            # stopping a forward pass part-way would leave the caches in a state the next request would read.
+            # Marked before raising. If it has not started, the worker drops it; if it has, it runs to the end,
+            # because stopping a forward pass part-way would leave the caches in a state the next request would read.
             job.cancelled = True
             started = job.started_at is not None
             raise TimeoutError(
@@ -172,8 +172,8 @@ class Worker:
     def stats(self) -> dict:
         """Waiting and working reported separately, because their fixes are different.
 
-        Time in the queue is answered by batching or another device; time in service is answered by kernels. One latency
-        figure hides which one is binding.
+        Time in the queue is answered by batching or another device; time in service is answered by kernels. One
+        latency figure hides which one is binding.
         """
         with self._lock:
             history = list(self._history)

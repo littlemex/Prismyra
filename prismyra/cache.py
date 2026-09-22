@@ -8,9 +8,9 @@ The design rests on one asymmetry:
 
 Being read-only is what makes the fan-out *correct*, not what makes it free. `ForkLayer` is preallocated at the full
 batch and a one-row context write is copied into every row, so the context's keys and values are physically replicated
-`group` times. That is the memory cost `cache_bytes` reports: about 3.4 GiB at 5,000 tokens at the default group of 32,
-which this model can afford because it has only two key-value heads. Storing the context once and giving each branch
-only its own tail is the obvious improvement, and is not done here.
+`group` times. That is the memory cost `cache_bytes` reports: about 3.4 GiB at 5,000 tokens at the default group of
+32, which this model can afford because it has only two key-value heads. Storing the context once and giving each
+branch only its own tail is the obvious improvement, and is not done here.
 
 Neither of the framework's two cache families fits: the dynamic one grows by concatenation, so every request allocates
 new tensors; the static one insists the batch it was allocated for is the batch every write arrives at, and here the
@@ -40,10 +40,10 @@ class ForkLayer(CacheLayerMixin):
         self.max_cache_len = max_cache_len
         self.max_batch_size = max_batch_size
         # The same number twice, for two consumers. The tensor is mutated in place rather than replaced, so anything
-        # holding a reference to it keeps seeing the current value.
-        # The integer exists because the framework asks for the length on the *host* during the forward pass, and
-        # reading it off the tensor there is a device-to-host copy on the request path. The tensor is kept because the
-        # framework's own code expects to find one under this name.
+        # holding a reference to it keeps seeing the current value. The integer exists because the framework asks for
+        # the length on the *host* during the forward pass, and reading it off the tensor there is a device-to-host
+        # copy on the request path. The tensor is kept because the framework's own code expects to find one under this
+        # name.
         self.cumulative_length = torch.tensor(0, dtype=torch.long)
         self._host_length = 0
         self.keys: torch.Tensor | None = None
@@ -161,9 +161,10 @@ def cache_bytes(config, max_cache_len: int, rows: int, dtype: torch.dtype) -> in
 
     Worth a function rather than a comment, because the number is large and surprising. Every branch gets its own copy
     of the context's keys and values -- that fan-out is what lets rows be written independently -- so the cost is the
-    context's key-value cache multiplied by the group. At 5,000 tokens and the default group of 32 that is about 3.4 GiB
-    on the supported model, which has two key-value heads; one with sixteen would pay eight times that. The recurrent
-    layers are left out: their state is a fixed size per layer whatever the context length, so they do not grow with it.
+    context's key-value cache multiplied by the group. At 5,000 tokens and the default group of 32 that is about 3.4
+    GiB on the supported model, which has two key-value heads; one with sixteen would pay eight times that. The
+    recurrent layers are left out: their state is a fixed size per layer whatever the context length, so they do not
+    grow with it.
     """
     decoder = getattr(config, "text_config", config)
     layer_types, _ = _layer_types(decoder)
@@ -183,8 +184,8 @@ def _layer_types(decoder):
 def build_cache(config, max_cache_len: int, rows: int, dtype: torch.dtype, device: str):
     """A cache for one backbone: `ForkLayer` where attention needs keys and values, the framework's own layer elsewhere.
 
-    The recurrent layers need no replacement. Their state is a fixed size per layer whatever the context length, so they
-    are already preallocated in everything but name.
+    The recurrent layers need no replacement. Their state is a fixed size per layer whatever the context length, so
+    they are already preallocated in everything but name.
     """
     from transformers.cache_utils import STATIC_LAYER_TYPE_MAPPING, Cache
 

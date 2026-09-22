@@ -1,8 +1,8 @@
 """Faster kernels, applied through a per-model adapter.
 
 Prismyra does not own the model's forward pass. The framework's implementation stays in place and specific modules are
-replaced inside it, which keeps that implementation available as the reference every replacement was verified against --
-the same reason a change should not remove its own oracle.
+replaced inside it, which keeps that implementation available as the reference every replacement was verified against
+-- the same reason a change should not remove its own oracle.
 
 An adapter declares which architectures it handles and how many modules of each kind it expects to find. Finding a
 different number means the model is not the one the adapter was measured on, and it fails rather than silently leaving

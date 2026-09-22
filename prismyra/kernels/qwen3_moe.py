@@ -1,8 +1,8 @@
 """Replacements for Qwen3.6-style mixture-of-experts backbones with a gated linear-attention recurrence.
 
 Six replacements, each verified against the implementation it replaces before being kept. What each is worth, and what
-was measured and rejected on the way, is in docs/KERNELS.md; the counts below are the only measured facts that belong in
-code, because they are what tells an unfamiliar model from a familiar one.
+was measured and rejected on the way, is in docs/KERNELS.md; the counts below are the only measured facts that belong
+in code, because they are what tells an unfamiliar model from a familiar one.
 
 Every replacement falls back rather than failing when the kernel it borrows is absent, so the model answers without
 vLLM installed -- slower, and the adapter says so.
@@ -42,14 +42,14 @@ def expected_counts(decoder) -> dict[str, int]:
     """How many modules of each kind this configuration implies, derived rather than remembered.
 
     Every count here follows from the config: one routed block per layer, one replacement per attention layer, one per
-    recurrent layer. Deriving them means the check keeps working when the framework reorganises its module tree, and it
-    keeps failing when the model is genuinely a different one -- which is what the check is for.
+    recurrent layer. Deriving them means the check keeps working when the framework reorganises its module tree, and
+    it keeps failing when the model is genuinely a different one -- which is what the check is for.
 
-    Two replacements are absent on purpose. The normalisation and the dense projections are found by structure, and how
-    many of those a model contains is a fact about one revision of somebody else's tree: 40 layers give 80 layer
-    norms on one version and 101 modules on another, once per-head query and key norms and the final norm share a class.
-    A number there would break on an upgrade while proving nothing, so those two are verified against the implementation
-    they replace instead. See `_verify`.
+    Two replacements are absent on purpose. The normalisation and the dense projections are found by structure, and
+    how many of those a model contains is a fact about one revision of somebody else's tree: 40 layers give 80 layer
+    norms on one version and 101 modules on another, once per-head query and key norms and the final norm share a
+    class. A number there would break on an upgrade while proving nothing, so those two are verified against the
+    implementation they replace instead. See `_verify`.
     """
     layer_types = list(getattr(decoder, "layer_types", []) or [])
     attention_layers = layer_types.count("full_attention")
@@ -129,14 +129,14 @@ class Fp8Linear(nn.Module):
 class FastRMSNorm(nn.Module):
     """Normalisation on a faster kernel, with the module's scale folded in once.
 
-    The trap is which scale. Some revisions of this model compute `normalised * (1.0 + weight)` and others
-    `normalised * weight`, while the borrowed kernel always computes the latter -- so whether to add one is a fact about
-    the code in front of you, not about the architecture. Getting it backwards does not raise; it shifts every
-    activation by a factor near one, which is a plausible wrong answer.
+    The trap is which scale. Some revisions of this model compute `normalised * (1.0 + weight)` and others `normalised
+    * weight`, while the borrowed kernel always computes the latter -- so whether to add one is a fact about the code
+    in front of you, not about the architecture. Getting it backwards does not raise; it shifts every activation by a
+    factor near one, which is a plausible wrong answer.
 
     So it is not assumed. `offset` is chosen by running the module both ways and keeping the arrangement that matches
-    bit for bit, in `_swap_and_verify`. Folding the choice in at construction keeps the forward free of an addition over
-    the full width either way.
+    bit for bit, in `_swap_and_verify`. Folding the choice in at construction keeps the forward free of an addition
+    over the full width either way.
     """
 
     def __init__(self, inner: nn.Module, offset: bool = True):
@@ -162,9 +162,9 @@ class FlashAttention(nn.Module):
 
     The branch pass is where this matters. With a cache present the framework materialises an additive mask, which the
     fast kernel cannot take, so it falls back to a memory-efficient kernel built for an older architecture. No mask is
-    needed: every branch's queries are the last positions of its own sequence and attend to the context's keys plus its
-    own, which is the right-aligned causal case. Padding branches to a common width stays safe because a pad position's
-    answer is never read.
+    needed: every branch's queries are the last positions of its own sequence and attend to the context's keys plus
+    its own, which is the right-aligned causal case. Padding branches to a common width stays safe because a pad
+    position's answer is never read.
     """
 
     def __init__(self, inner: nn.Module):
@@ -180,8 +180,8 @@ class FlashAttention(nn.Module):
         a = self.inner
         shape = hidden_states.shape[:-1]
         heads = (*shape, -1, a.head_dim)
-        # The query projection carries the output gate beside the queries, which is why it is twice as wide as the head
-        # count suggests.
+        # The query projection carries the output gate beside the queries, which is why it is twice as wide as the
+        # head count suggests.
         query, gate = torch.chunk(a.q_proj(hidden_states).view(*shape, -1, a.head_dim * 2), 2, dim=-1)
         query = a.q_norm(query.view(heads)).transpose(1, 2)
         key = a.k_norm(a.k_proj(hidden_states).view(heads)).transpose(1, 2)
@@ -249,9 +249,9 @@ MEASURED_MARK = "_prismyra_measured"
 def _tag_conv_weights(model: nn.Module) -> int:
     """Mark the convolution weight of every recurrent layer.
 
-    Found by type rather than by attribute name: a one-dimensional convolution inside a gated linear-attention layer is
-    the thing, and depending on an attribute's spelling would silently tag nothing if the framework renamed it -- which
-    the adapter would then report as a model it does not recognise.
+    Found by type rather than by attribute name: a one-dimensional convolution inside a gated linear-attention layer
+    is the thing, and depending on an attribute's spelling would silently tag nothing if the framework renamed it --
+    which the adapter would then report as a model it does not recognise.
     """
     tagged = 0
     for module in model.modules():
@@ -285,10 +285,10 @@ def _install_conv() -> bool:
     original = m.causal_conv1d_fn
 
     def patched(x, weight, bias=None, activation=None, **kwargs):
-        # Two guards, and the first is the important one. Replacing a name in the framework's module is process-wide, so
-        # another model of this family in the same process calls this function too -- and it was not measured on that
-        # model. The weights this adapter tagged are the only ones it will act on; everything else goes back to the
-        # original, which is the implementation those cases were written for.
+        # Two guards, and the first is the important one. Replacing a name in the framework's module is process-wide,
+        # so another model of this family in the same process calls this function too -- and it was not measured on
+        # that model. The weights this adapter tagged are the only ones it will act on; everything else goes back to
+        # the original, which is the implementation those cases were written for.
         if not getattr(weight, MEASURED_MARK, False):
             return original(x, weight, bias, activation=activation, **kwargs)
         if bias is not None or x.dim() != 3 or x.shape[0] != 1 or not x.is_cuda:
@@ -364,8 +364,8 @@ class Qwen3MoeAdapter:
                     expected["attention"],
                 )
             )
-            # Counted by neither of these two: found by structure, so verified against what they replace instead.
-            # The normalisation is offered both scale conventions and keeps whichever agrees to a rounding step.
+            # Counted by neither of these two: found by structure, so verified against what they replace instead. The
+            # normalisation is offered both scale conventions and keeps whichever agrees to a rounding step.
             _swap_and_verify(
                 applied,
                 text,
@@ -400,11 +400,11 @@ class Qwen3MoeAdapter:
 def _swap_and_verify(applied, root: nn.Module, name: str, class_name: str | None, candidates, tolerance: float) -> None:
     """Replace every module this pattern matches, then check one against the implementation it replaced.
 
-    The check is the point. These two replacements are found by structure rather than by counting, so there is no number
-    to compare against -- and a number would be wrong anyway, being a fact about one revision of somebody else's module
-    tree. What can be compared is behaviour: run the original and the replacement on the same input and require them to
-    agree. If they do not, every replacement of that kind is put back and the reason is recorded, because a kernel that
-    changes answers is worth less than the milliseconds it saves.
+    The check is the point. These two replacements are found by structure rather than by counting, so there is no
+    number to compare against -- and a number would be wrong anyway, being a fact about one revision of somebody
+    else's module tree. What can be compared is behaviour: run the original and the replacement on the same input and
+    require them to agree. If they do not, every replacement of that kind is put back and the reason is recorded,
+    because a kernel that changes answers is worth less than the milliseconds it saves.
 
     `tolerance` is relative to the largest output, because that is the only scale at which "the same answer" means
     anything. Bit-identity is the wrong bar even for a replacement that does identical arithmetic: this model's
@@ -421,8 +421,8 @@ def _swap_and_verify(applied, root: nn.Module, name: str, class_name: str | None
         return
 
     # Each candidate is tried on one module before any of the rest is touched. More than one exists where the
-    # arrangement cannot be read off the model -- see `FastRMSNorm` -- and choosing by measurement is the only way that
-    # stays true across framework versions.
+    # arrangement cannot be read off the model -- see `FastRMSNorm` -- and choosing by measurement is the only way
+    # that stays true across framework versions.
     parent, attribute, original = targets[0]
     tried = []
     for label, make in candidates:
@@ -448,8 +448,8 @@ BF16_ULP = 2.0**-8
 def _compare(original: nn.Module, replacement: nn.Module) -> float | None:
     """The largest disagreement on one random input, relative to the largest output. None if either side raised.
 
-    Relative, not absolute. An absolute figure says nothing without the magnitude beside it: 6.25e-2 is a rounding step
-    where the output reaches 16 and a wrong answer where it reaches 0.1.
+    Relative, not absolute. An absolute figure says nothing without the magnitude beside it: 6.25e-2 is a rounding
+    step where the output reaches 16 and a wrong answer where it reaches 0.1.
     """
     p = next(original.parameters())
     width = getattr(original, "in_features", None) or p.shape[-1]
@@ -508,14 +508,14 @@ def _drop_head_duplication(model: nn.Module, verify: bool = True) -> tuple[int, 
 
     This one is a flag set through an attribute whose name stops describing its value. On the framework version it was
     measured against, `num_k_heads` was read in the forward pass only to decide whether to duplicate, so setting it
-    equal to `num_v_heads` disabled the duplication and changed nothing else. That is not a property of the model but of
-    one revision of somebody else's forward pass, so it is checked every time rather than assumed: one layer is run both
-    ways and the outputs must match exactly.
+    equal to `num_v_heads` disabled the duplication and changed nothing else. That is not a property of the model but
+    of one revision of somebody else's forward pass, so it is checked every time rather than assumed: one layer is run
+    both ways and the outputs must match exactly.
 
     Returns the number of layers changed and, if none were, why. **Declining is not an error.** A later framework
-    version uses the attribute for more than that -- on transformers 5.15 the probe raises a shape mismatch rather than
-    returning a different answer -- and the right response is to leave the duplication in place and say so. It is worth
-    8.5 ms of a 138 ms pass; refusing to run at all over it would be a poor trade.
+    version uses the attribute for more than that -- on transformers 5.15 the probe raises a shape mismatch rather
+    than returning a different answer -- and the right response is to leave the duplication in place and say so. It is
+    worth 8.5 ms of a 138 ms pass; refusing to run at all over it would be a poor trade.
     """
     layers = [
         m

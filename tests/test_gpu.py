@@ -88,9 +88,9 @@ def test_a_second_group_starts_from_the_context_and_not_from_the_first(engine):
 def test_padding_a_batch_does_not_reach_an_answer(engine):
     """Three questions in a batch pinned to thirty-two rows must answer as three questions in three rows.
 
-    Two engines, because the group is fixed at construction -- the cache is preallocated for it -- so there is no other
-    way to compare two widths. That means a second copy of the weights, which one 48 GiB card cannot hold beside the
-    first. Skipped rather than quietly dropped: on a larger card it runs, and the reason it did not is printed.
+    Two engines, because the group is fixed at construction -- the cache is preallocated for it -- so there is no
+    other way to compare two widths. That means a second copy of the weights, which one 48 GiB card cannot hold beside
+    the first. Skipped rather than quietly dropped: on a larger card it runs, and the reason it did not is printed.
     """
     asked = questions(3)
     padded = engine.ask(CONTEXT, asked)
@@ -121,8 +121,8 @@ def test_a_question_wider_than_the_widest_branch_is_refused_before_the_device(en
 def test_the_counted_kernels_match_what_the_config_implies(engine):
     """A swap that matches nothing looks exactly like a swap that worked, so what can be counted is asserted.
 
-    Only the counts that follow from the config. The normalisation and the dense projections are found by structure, so
-    they carry a verification instead of a number, which this checks is present.
+    Only the counts that follow from the config. The normalisation and the dense projections are found by structure,
+    so they carry a verification instead of a number, which this checks is present.
     """
     from prismyra.kernels.qwen3_moe import expected_counts
 
@@ -234,8 +234,8 @@ def test_a_clip_read_backwards_answers_backwards(engine):
     """The strongest check in this file. Same frames, reversed, and the answer has to reverse with them.
 
     It is also the check that the three-axis positions are right. With media the model's text positions advance by an
-    image's grid rather than by its token count, and a branch that continues from the wrong place reads the context from
-    the wrong place -- which shows up here as an answer that does not track the direction.
+    image's grid rather than by its token count, and a branch that continues from the wrong place reads the context
+    from the wrong place -- which shows up here as an answer that does not track the direction.
     """
     pytest.importorskip("PIL")
     question = [Choice(id="direction", prompt="Which way does the red block travel?", choices=["left", "right"])]
@@ -262,9 +262,9 @@ def test_a_clip_is_as_long_as_it_says_it_is(engine):
     """Timing withheld is not a smaller error than timing wrong. It is the same error, and it is silent.
 
     A six second clip decoded to a handful of frames and handed over bare looks to the processor like two thirds of a
-    second at its default rate, and the model answers about a clip that does not exist. Measured on the supported model:
-    asked how long this clip is, it answers six with the timing and two without. Everything visual is right either way,
-    which is why nothing else in this file catches it.
+    second at its default rate, and the model answers about a clip that does not exist. Measured on the supported
+    model: asked how long this clip is, it answers six with the timing and two without. Everything visual is right
+    either way, which is why nothing else in this file catches it.
     """
     pytest.importorskip("cv2")
     from prismyra.media import decode_video

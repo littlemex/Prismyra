@@ -14,8 +14,8 @@
     result["who_pays"].option           # "buyer"
     result.timing.total_ms
 
-Prefill only: nothing here generates text. The scope, and the point below which a general serving engine is faster, are
-stated in the README.
+Prefill only: nothing here generates text. The scope, and the point below which a general serving engine is faster,
+are stated in the README.
 """
 
 from .engine import Context, Prismyra
@@ -33,6 +33,7 @@ from .schema import (
     Scale,
     Timing,
 )
+from .thresholds import Thresholds
 
 __version__ = "0.1.0"
 
@@ -50,6 +51,7 @@ __all__ = [
     "Request",
     "Result",
     "Scale",
+    "Thresholds",
     "Timing",
     "__version__",
 ]

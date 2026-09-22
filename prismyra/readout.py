@@ -27,17 +27,17 @@ class Plan:
 def plan(question: Question, tokenizer) -> Plan:
     """Choose the rendering this tokenizer can actually answer, and the token to score for each option.
 
-    One position is read, so one token per option has to identify it. Two renderings are tried, and which one works is a
-    property of the tokenizer rather than of the question:
+    One position is read, so one token per option has to identify it. Two renderings are tried, and which one works is
+    a property of the tokenizer rather than of the question:
 
     * the prompt ends `Answer:` and the option is scored **with a leading space**, which is how the token appears there.
       This model's tokenizer merges a space into a word, so " yes" and " buyer" are each one token;
     * the prompt ends `Answer: ` and the bare option is scored. The same tokenizer splits a space from a digit, so " 1"
-      is two tokens and the first is the space -- identical for every option, and so no answer at all. Putting the space
-      in the prompt moves the digit to the position that gets read.
+      is two tokens and the first is the space -- identical for every option, and so no answer at all. Putting the
+      space in the prompt moves the digit to the position that gets read.
 
-    The first that gives every option a distinct single token wins. If neither does, the question is refused rather than
-    scored on the wrong token, because an option truncated to its first piece is answerable and wrong.
+    The first that gives every option a distinct single token wins. If neither does, the question is refused rather
+    than scored on the wrong token, because an option truncated to its first piece is answerable and wrong.
     """
     attempts = []
     for trailing_space in (False, True):
@@ -82,10 +82,10 @@ def option_token_ids(question: Question, tokenizer, trailing_space: bool = False
 def load_unembedding(model_name: str, hidden_size: int, device: str, dtype: torch.dtype) -> torch.Tensor:
     """Fetch the output embedding matrix by name from the shard that holds it.
 
-    Instantiating a language-model wrapper to reach its head would materialise a second copy of every parameter to keep
-    one matrix, which on a large mixture-of-experts exhausts the device. Matched by suffix because checkpoints in the
-    same family prefix the key differently; the output projection is preferred and the input embedding is the fallback
-    for a checkpoint that ties them.
+    Instantiating a language-model wrapper to reach its head would materialise a second copy of every parameter to
+    keep one matrix, which on a large mixture-of-experts exhausts the device. Matched by suffix because checkpoints in
+    the same family prefix the key differently; the output projection is preferred and the input embedding is the
+    fallback for a checkpoint that ties them.
     """
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
@@ -113,8 +113,8 @@ def load_unembedding(model_name: str, hidden_size: int, device: str, dtype: torc
             raise RuntimeError(f"{model_name} has no lm_head or embed_tokens in its index")
         path = hf_hub_download(model_name, weight_map[key])
 
-    # Opened rather than loaded: reading the file whole would materialise every tensor in the shard on the host to keep
-    # one of them, which on a large mixture-of-experts is tens of gigabytes for a single matrix.
+    # Opened rather than loaded: reading the file whole would materialise every tensor in the shard on the host to
+    # keep one of them, which on a large mixture-of-experts is tens of gigabytes for a single matrix.
     with safe_open(path, framework="pt") as shard:
         present = set(shard.keys())
         key = pick(present)
@@ -168,8 +168,8 @@ def _block_size(dimension: int, blocks: int) -> int:
 def _dequantise(matrix: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Undo block quantisation. `scale` holds one multiplier per block of the matrix, so it is expanded back to shape.
 
-    `_scale_inv` is the multiplier that restores a stored value, not its reciprocal -- the same convention the borrowed
-    matrix-multiply kernels use, and the one thing here that is easy to get backwards.
+    `_scale_inv` is the multiplier that restores a stored value, not its reciprocal -- the same convention the
+    borrowed matrix-multiply kernels use, and the one thing here that is easy to get backwards.
     """
     wide = matrix.float()
     if scale.dim() == 0 or scale.numel() == 1:
@@ -185,8 +185,8 @@ def _dequantise(matrix: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 def logits_for(hidden: torch.Tensor, unembedding: torch.Tensor, token_ids: list[list[int]]) -> list[torch.Tensor]:
     """Per question, the raw score of each declared option. No softmax, so the numbers can still be shifted.
 
-    Separated from `score` because a prior has to be subtracted before the softmax, not after: after it, the correction
-    is a reweighting of something already normalised and no longer removes a bias.
+    Separated from `score` because a prior has to be subtracted before the softmax, not after: after it, the
+    correction is a reweighting of something already normalised and no longer removes a bias.
     """
     if hidden.shape[0] != len(token_ids):
         raise ValueError(f"{hidden.shape[0]} branch rows against {len(token_ids)} questions")

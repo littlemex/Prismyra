@@ -1,8 +1,8 @@
 """The engine: load a model, read a context once, answer typed questions about it.
 
 `open_context` is the primitive and `ask` is sugar over it. The distinction matters: a follow-up against an open
-context costs a branch, while calling `ask` again re-reads the context. A library that only offered `ask` would hide the
-thing it exists to provide.
+context costs a branch, while calling `ask` again re-reads the context. A library that only offered `ask` would hide
+the thing it exists to provide.
 """
 
 from __future__ import annotations
@@ -119,8 +119,9 @@ class Prismyra:
 
         self.config = AutoConfig.from_pretrained(model)
         self.tokenizer = AutoTokenizer.from_pretrained(model)
-        # A processor only if the checkpoint has one. It is what turns an image into pixels and expands the placeholder
-        # into as many pad tokens as the resolution needs; a text-only checkpoint has none and does not need one.
+        # A processor only if the checkpoint has one. It is what turns an image into pixels and expands the
+        # placeholder into as many pad tokens as the resolution needs; a text-only checkpoint has none and does not
+        # need one.
         self.processor = _load_processor(model)
         # No language-model head: it projects to the whole vocabulary and nothing here generates a token.
         self.backbone = AutoModel.from_pretrained(model, dtype=self.dtype, device_map=self.device if on_cuda else None)
@@ -144,9 +145,10 @@ class Prismyra:
     def validate(self, questions: list[Question]) -> None:
         """Refuse a question that cannot be scored, before any context is read.
 
-        Two of the read-out's refusals need the tokenizer -- an option that is more than one token with a leading space,
-        and two options sharing a first token -- so they cannot happen when the question is constructed. Running them
-        here keeps them off the device: a request refused after the context pass has already spent the expensive half.
+        Two of the read-out's refusals need the tokenizer -- an option that is more than one token with a leading
+        space, and two options sharing a first token -- so they cannot happen when the question is constructed.
+        Running them here keeps them off the device: a request refused after the context pass has already spent the
+        expensive half.
         """
         if not questions:
             raise PrismyraError("ask needs at least one question")
@@ -247,8 +249,8 @@ class Prismyra:
     def _check_fits(self, context_tokens: int) -> None:
         """Refuse a context that cannot fit, by name, before the allocator refuses it by address.
 
-        An out-of-memory error from inside a framework allocation says how many bytes it wanted and nothing about which
-        knob to turn. This says the context length and the group, which are the two knobs.
+        An out-of-memory error from inside a framework allocation says how many bytes it wanted and nothing about
+        which knob to turn. This says the context length and the group, which are the two knobs.
         """
         if self.torch_device.type != "cuda":
             return
@@ -276,16 +278,16 @@ class Prismyra:
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
         # Already validated: both public entry points call `validate` before the context is read, and repeating it
-        # here would tokenise every question a second time on the request path.
-        # The batch width is the one the cache was allocated for. It is not a per-call option: the cache is preallocated
-        # at construction time and a write of any other row count is refused, which is the point of preallocating.
+        # here would tokenise every question a second time on the request path. The batch width is the one the cache
+        # was allocated for. It is not a per-call option: the cache is preallocated at construction time and a write
+        # of any other row count is refused, which is the point of preallocating.
         rows = self.group
         plans = [plan(q, self.tokenizer) for q in questions]
         token_ids = [p.token_ids for p in plans]
         width = self._width_for(plans)
 
-        # Before the clock starts, and outside the lock's timed section: a prior is cached per question, so charging the
-        # first request for every later one's correction would report a cost that is not there.
+        # Before the clock starts, and outside the lock's timed section: a prior is cached per question, so charging
+        # the first request for every later one's correction would report a cost that is not there.
         priors = self.calibration.priors(self, questions, plans) if self.calibration else None
 
         start = _now(self.torch_device)
@@ -337,9 +339,9 @@ class Prismyra:
             raise PrismyraError(str(e)) from e
 
     def _branch(self, prefill: Prefill, texts: list[str], rows: int, width: int) -> torch.Tensor:
-        # The snapshot is taken on the first branch, when the cache holds exactly the context, so restoring it also puts
-        # every layer's token count back to the end of the context. One mechanism, not a state restore plus a separate
-        # rewind: two of them can disagree, and the one that is wrong answers plausibly.
+        # The snapshot is taken on the first branch, when the cache holds exactly the context, so restoring it also
+        # puts every layer's token count back to the end of the context. One mechanism, not a state restore plus a
+        # separate rewind: two of them can disagree, and the one that is wrong answers plausibly.
         if prefill.snapshot is None:
             prefill.snapshot = snapshot(prefill.cache)
         restore_and_fork(prefill.cache, prefill.snapshot, rows)

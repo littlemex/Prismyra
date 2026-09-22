@@ -2,8 +2,8 @@
 """Validate every checked-in result file. Runs in CI without a GPU.
 
 The README's tables are generated from these files, so a malformed one would publish a wrong number. This checks shape
-and internal consistency -- that the steps add up, that the crossover is where the two curves actually cross -- not the
-measurements themselves, which no machine without the GPU can reproduce.
+and internal consistency -- that the steps add up, that the crossover is where the two curves actually cross -- not
+the measurements themselves, which no machine without the GPU can reproduce.
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ def check(path: Path) -> list[str]:
         return problems
 
     # Each step is a paired run, so what is checked is that the pairs are ordered and that the chain does not jump:
-    # one step's "after" and the next step's "before" should differ only by run-to-run variation. A large gap would mean
-    # the steps came from different configurations and the chain does not describe one sequence of changes.
+    # one step's "after" and the next step's "before" should differ only by run-to-run variation. A large gap would
+    # mean the steps came from different configurations and the chain does not describe one sequence of changes.
     steps = data["context_pass_steps"]
     previous_after = steps["baseline_ms"]
     for step in steps["steps"]:
