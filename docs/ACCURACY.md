@@ -96,19 +96,50 @@ knowledge about the answer and subtracting it subtracts the knowledge -- pointwi
 and answer rather than a thumb off the scale. Subtracting only the option list, nearer to the token bias alone, is
 roughly neutral and costs 4% more time. Neither is on by default.
 
-**Choosing the decision point per question** (`prismyra.thresholds`) is supervised operating-point selection: one number
-per question, fitted on labelled answers from a split it is not then scored on. It is textbook cost-sensitive decision
-making rather than a new idea, and what recommends it is the price -- no gradient, no device, no second model, and the
-inputs are answers already given beside what turned out to be true, which a caller that logs its requests already holds.
-It is the floor any expensive mechanism has to clear.
+**Choosing the decision point per question** (`prismyra.thresholds`) is what works. One number per question, fitted on
+labelled answers from a split it is not then scored on, on a fitting slice of 800 clauses:
 
-**It also has a label budget below which it correctly refuses to work**, and finding that out corrected a number this
-page previously carried. An earlier version of the harness fitted its own cuts with no guard on how many positive
-examples it had seen and reported F1 rising from 10.5% to 33.7%. The packaged mechanism requires at least five positive
-labels per question, and on a fitting slice of 125 clauses seven of the eight questions have fewer than that -- so seven
-of the eight cuts in that 33.7% were fitted on between zero and three positive examples. That is noise, the guard exists
-to refuse it, and the figure has been withdrawn. What replaces it is a measurement of how many labels the mechanism
-actually needs, which is the more useful question.
+| | recall | precision | F1 | macro F1 | accuracy |
+|---|---|---|---|---|---|
+| read-out | 60.0% | 5.8% | 10.5% | 39.5% | 84.7% |
+| read-out with fitted cuts | 60.0% | **39.1%** | **47.4%** | **50.9%** | 98.0% |
+| majority (train) | 0.0% | -- | 0.0% | 0.0% | 98.5% |
+
+Recall does not move. Precision goes from 5.8% to 39.1%, which is the trade a rare class wants: the same positives
+found, far fewer things wrongly called positive. Per question it helps five of the eight, ties one, and costs two --
+and one of those two has a single positive label in the scored slice, so it is one answer rather than a trend.
+
+This is supervised operating-point selection, which is textbook cost-sensitive decision making rather than a new idea.
+What recommends it is the price: no gradient, no device, no second model, and the inputs are answers already given
+beside what turned out to be true, which a caller that logs its requests already holds. That makes it the floor an
+expensive mechanism has to clear, not something to be impressed by. It is also not label-free -- it needs labels, and
+a fine-tune given the same labels will go considerably further.
+
+### How many labels it takes, which is the number worth knowing
+
+The mechanism requires five positive examples per question before it will fit a cut at all, and says which questions it
+refused and why. At a 1.5% base rate that guard binds hard:
+
+| clauses fitted on | answers fitted on | questions given a cut | F1 |
+|---|---|---|---|
+| 200 | 1,600 | 3 of 8 | 11.3% |
+| 800 | 6,400 | 8 of 8 | 47.4% |
+
+So below roughly eight hundred labelled documents this does almost nothing on this task, and the reason is visible
+rather than mysterious: at two hundred clauses, five of the eight unfairness types each appear fewer than five
+times. The rarer the class, the more documents it takes to find its decision point, and the mechanism declines
+rather than inventing one.
+
+That guard is also what caught a figure this project nearly published. An earlier version of the harness fitted its own
+cuts with no such guard and reported F1 rising from 10.5% to 33.7%. Seven of those eight cuts were fitted on between
+zero and three positive examples. Two independent reviews found that the harness and the package were running
+different code before they found anything else, and the figure was withdrawn rather than explained.
+
+### Read these as preliminary
+
+Thirty positive labels in two thousand answers. At that count one label moves recall by about three points, so the
+interval around 47.4% is wide and this page does not pretend otherwise. What would close it: the LexGLUE test split,
+scored once, with a paired bootstrap over source documents rather than clauses.
 
 ## Honest limits of this page
 

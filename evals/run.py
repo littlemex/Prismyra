@@ -174,6 +174,31 @@ def _accuracy(rows: list[dict]) -> float:
     return sum(1 for r in rows if str(r["got"]).lower() == str(r["want"]).lower()) / len(rows)
 
 
+def _run_one(name: str, engine, items, fit_slice) -> tuple[list[dict], dict]:
+    """One method over the whole slice. Separated so a repeat is a loop rather than a copy."""
+    if name == "readout":
+        return run_readout(engine, items)
+    if name in ("calibrated_options", "calibrated_context"):
+        # The same engine with the correction switched on, so nothing but the read-out differs. A second engine would
+        # change the weights' placement as well and leave the difference unattributable.
+        from prismyra.calibration import Calibration
+
+        engine.calibration = Calibration(mode="options_only" if name.endswith("options") else "null_context")
+        try:
+            return run_readout(engine, items)
+        finally:
+            engine.calibration = None
+    if name == "generate":
+        return run_generate(engine, items, reasoning=False)
+    if name == "generate_thinking":
+        return run_generate(engine, items, reasoning=True)
+    if name == "thresholded":
+        return run_thresholded(engine, items, fitted_on=fit_slice)
+    if name == "majority":
+        return run_majority(items, fitted_on=fit_slice)
+    raise ValueError(f"unknown method {name!r}")
+
+
 def score(rows) -> dict:
     """Accuracy, and the numbers that matter when accuracy does not.
 
@@ -265,38 +290,27 @@ def main(argv: list[str] | None = None) -> int:
         engine = Prismyra(args.model)
         print(f"[load] {time.perf_counter() - started:.0f}s  kernels: {engine.applied.as_dict()['applied']}\n")
 
-    results = {}
-    for name in wanted:
-        began = time.perf_counter()
-        if name == "readout":
-            rows, timings = run_readout(engine, items)
-        elif name in ("calibrated_options", "calibrated_context"):
-            # The same engine with the correction switched on, so nothing but the read-out differs. A second engine
-            # would change the weights' placement as well and leave the difference unattributable.
-            from prismyra.calibration import Calibration
+    results: dict[str, dict] = {}
+    # Repeated whole runs with the method order reversed on alternate passes. Running methods once in a fixed order
+    # puts warm-up, kernel selection and allocator state entirely on whichever went first, which is a difference
+    # between methods that has nothing to do with the methods.
+    order = list(wanted)
+    for pass_number in range(max(1, args.repeat)):
+        if pass_number:
+            order = list(reversed(order))
+        for name in order:
+            began = time.perf_counter()
+            rows, timings = _run_one(name, engine, items, fit_slice)
+            elapsed = time.perf_counter() - began
+            if name in results:
+                # A repeat measures the clock, not the answers: every method here is deterministic, so a second pass
+                # that disagreed would be a bug rather than a sample.
+                results[name]["passes"].append(elapsed)
+                continue
+            results[name] = {**score(rows), "timings": timings, "wall_s": elapsed, "passes": [elapsed], "rows": rows}
 
-            mode = "options_only" if name.endswith("options") else "null_context"
-            engine.calibration = Calibration(mode=mode)
-            try:
-                rows, timings = run_readout(engine, items)
-            finally:
-                engine.calibration = None
-        elif name == "generate":
-            rows, timings = run_generate(engine, items, reasoning=False)
-        elif name == "generate_thinking":
-            rows, timings = run_generate(engine, items, reasoning=True)
-        elif name == "thresholded":
-            rows, timings = run_thresholded(engine, items, fitted_on=fit_slice)
-        elif name == "majority":
-            rows, timings = run_majority(items, fitted_on=fit_slice)
-        else:
-            raise ValueError(f"unknown method {name!r}")
-        results[name] = {
-            **score(rows),
-            "timings": timings,
-            "wall_s": time.perf_counter() - began,
-            "rows": rows,
-        }
+    for result in results.values():
+        result["wall_s"] = statistics.median(result["passes"])
 
     _print_table(args.task, items, results)
     if args.json:
@@ -381,6 +395,16 @@ def _print_table(task: str, items, results: dict) -> None:
             f"\n[read this table by F1, not accuracy] {share:.1%} of the answers are positive, so answering no to "
             f"everything scores {1 - share:.1%}. Accuracy does not separate the methods on this task."
         )
+
+    passes = max(len(result["passes"]) for result in results.values())
+    if passes > 1:
+        print(f"\nlatency over {passes} passes, alternating the order methods ran in:")
+        for name, result in results.items():
+            spread = result["passes"]
+            print(
+                f"  {name:<20} median {statistics.median(spread) * 1e3 / questions:>8.1f} ms/question, "
+                f"range {min(spread) * 1e3 / questions:.1f} to {max(spread) * 1e3 / questions:.1f}"
+            )
 
     if "readout" in results:
         timings = results["readout"]["timings"]
