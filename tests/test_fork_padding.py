@@ -28,8 +28,8 @@ def test_widths_are_rounded_up_to_a_bucket():
 def test_a_question_past_the_widest_bucket_is_refused_rather_than_accommodated():
     """It used to return the exact width, which looked accommodating and wrote past the end of the cache.
 
-    The cache is allocated for the context plus `WIDTHS[-1]`, so a wider suffix is an out-of-bounds device write -- and
-    on CUDA an asynchronous one, surfacing later on an unrelated call or not at all.
+    The cache is allocated for the context plus `WIDTHS[-1]`, so a wider suffix is an out-of-bounds device write --
+    and on CUDA an asynchronous one, surfacing later on an unrelated call or not at all.
     """
     with pytest.raises(TooWide, match="widest branch"):
         round_width(WIDTHS[-1] + 1)

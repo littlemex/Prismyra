@@ -1,12 +1,12 @@
 """A causal depthwise convolution in Triton, reading a token-major tensor and respecting sequence boundaries.
 
 Written because everything easier was measured and lost: the framework's path falls back to a general two-dimensional
-convolution, `torch.nn.functional.conv1d` is slower still, and the borrowed variable-length kernel needs the paged state
-its own model code maintains. Triton compiles at run time, so no toolchain is required.
+convolution, `torch.nn.functional.conv1d` is slower still, and the borrowed variable-length kernel needs the paged
+state its own model code maintains. Triton compiles at run time, so no toolchain is required.
 
 Token-major on purpose: the layer holds its tensor that way before transposing for the old kernel, and since that
-transpose is a view, consuming it directly removes the copy the old kernel's contiguity demand forced. Measured figures
-are in docs/KERNELS.md.
+transpose is a view, consuming it directly removes the copy the old kernel's contiguity demand forced. Measured
+figures are in docs/KERNELS.md.
 """
 
 from __future__ import annotations

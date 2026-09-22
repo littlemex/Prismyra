@@ -14,8 +14,8 @@ Three ways of answering the same questions:
 * **majority** -- the most common label in the slice being scored. Not a strawman: on a sparse task it is hard to beat,
   and a method that does not beat it has not been shown to work.
 
-A method's accuracy is reported beside its latency always, and never without it. A wrong answer can be made arbitrarily
-fast, so a speed-up without an accuracy column is not a result.
+A method's accuracy is reported beside its latency always, and never without it. A wrong answer can be made
+arbitrarily fast, so a speed-up without an accuracy column is not a result.
 """
 
 from __future__ import annotations
@@ -77,12 +77,45 @@ def run_generate(engine, items, reasoning: bool = False) -> tuple[list[dict], di
     return rows, timings
 
 
+def run_thresholded(engine, items, fitted_on) -> tuple[list[dict], dict]:
+    """The read-out with the decision point chosen per question, through the package's own mechanism.
+
+    Calls `prismyra.thresholds` rather than reimplementing it. An earlier version of this function fitted its own cuts
+    with different guards and a different idea of which option means yes, which meant the number it produced was not
+    the number the package would produce -- the most serious thing a measurement can get wrong.
+
+    It targets a measured failure rather than a supposed one. On the unfair terms-of-service task the labels are so
+    sparse that answering no to everything scores 98.5%, and the read-out's argmax reached 60% recall at 6% precision:
+    it says yes to nearly everything, because taking the larger of two probabilities stands the threshold at 0.5.
+    """
+    from prismyra.thresholds import Thresholds
+
+    history = [(engine.ask(item.context, item.questions), item.gold) for item in fitted_on]
+    cuts, report = Thresholds.fit(history)
+    print(report.explain())
+    print()
+
+    rows = []
+    for item in items:
+        decided = cuts.decide(engine.ask(item.context, item.questions))
+        for question in item.questions:
+            rows.append(
+                {
+                    "id": question.id,
+                    "got": decided[question.id].value,
+                    "want": item.gold[question.id],
+                    "questions_in_item": len(item.questions),
+                }
+            )
+    return rows, {"cuts": cuts.cuts, "support": {k: list(v) for k, v in cuts.support.items()}}
+
+
 def run_majority(items, fitted_on) -> tuple[list[dict], dict]:
     """Always answer the commonest label. Which label is read off a **different** slice.
 
     Fitting the constant on the slice being scored would make this an oracle rather than a baseline: it would be told
-    the answer distribution it is about to be graded on. The label comes from the training split instead, which is what
-    a method that had to be deployed could actually know.
+    the answer distribution it is about to be graded on. The label comes from the training split instead, which is
+    what a method that had to be deployed could actually know.
     """
     counts = collections.Counter(str(item.gold[q.id]) for item in fitted_on for q in item.questions)
     top = counts.most_common(1)[0][0]
@@ -97,8 +130,8 @@ def run_majority(items, fitted_on) -> tuple[list[dict], dict]:
 def paired(a: list[dict], b: list[dict], items, draws: int = 2000, seed: int = 0) -> dict:
     """Whether one method beats another, resampling whole contexts rather than questions.
 
-    Questions from one article share a passage, a topic and whatever the model does or does not understand about it, so
-    they are not independent draws. Resampling questions would give an interval several times too narrow and turn a
+    Questions from one article share a passage, a topic and whatever the model does or does not understand about it,
+    so they are not independent draws. Resampling questions would give an interval several times too narrow and turn a
     one-question difference into a result. Contexts are the unit that was sampled, so contexts are what is resampled.
     """
     import random
@@ -145,9 +178,9 @@ def score(rows) -> dict:
     """Accuracy, and the numbers that matter when accuracy does not.
 
     On a sparse task accuracy is not a measure of anything. The unfair terms-of-service labels are mostly absent, so
-    answering "no" to everything scores 99.2% and beats every method here -- measured, not hypothesised. What separates
-    methods there is whether the rare positive is found at all, so the positives are scored separately: how many were
-    found, how many claimed positives were right, and the balance of the two.
+    answering "no" to everything scores 99.2% and beats every method here -- measured, not hypothesised. What
+    separates methods there is whether the rare positive is found at all, so the positives are scored separately: how
+    many were found, how many claimed positives were right, and the balance of the two.
     """
     correct = sum(1 for row in rows if str(row["got"]).lower() == str(row["want"]).lower())
     answered = sum(1 for row in rows if row["got"] is not None)
@@ -186,24 +219,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--methods",
         default="readout,calibrated_options,generate,majority",
-        help="readout, calibrated_options, calibrated_context, generate, generate_thinking, majority",
+        help="readout, thresholded, calibrated_options, calibrated_context, generate, generate_thinking, majority",
     )
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B-FP8")
     parser.add_argument("--seed", type=int, default=0, help="which random sample of contexts to score")
+    parser.add_argument(
+        "--split",
+        default="validation",
+        help="the split to score on. Use test once, at the end: a validation slice that has shaped a mechanism has "
+        "become development data, and scoring on it again measures the shaping as well as the mechanism",
+    )
     parser.add_argument("--fit-split", default="train", help="the split anything fitted is fitted on")
+    parser.add_argument("--fit-limit", type=int, default=400, help="contexts to fit on, which is the label budget")
     parser.add_argument("--repeat", type=int, default=1, help="whole runs, so the latency spread is visible")
     parser.add_argument("--json", type=Path, help="write the whole measurement here")
     args = parser.parse_args(argv)
 
     wanted = [name.strip() for name in args.methods.split(",") if name.strip()]
-    items = tasks.load(args.task, args.limit, seed=args.seed)
-    # A separate slice for anything that has to be fitted, so nothing is fitted on what it is graded on.
-    fit_slice = tasks.load(args.task, max(20, args.limit // 2), split=args.fit_split, seed=args.seed + 1)
+    items = tasks.load(args.task, args.limit, split=args.split, seed=args.seed)
+    # A separate slice for anything that has to be fitted, so nothing is fitted on what it is graded on. Its size is a
+    # separate dial because it is the interesting one: at a 1.5% base rate, a hundred contexts hold one or two
+    # positives per question, and a threshold fitted on two positives is a threshold fitted on noise. How many labels
+    # a mechanism needs before it pays is the operational question, so it is a parameter rather than half the scored
+    # slice.
+    fit_slice = tasks.load(args.task, args.fit_limit, split=args.fit_split, seed=args.seed + 1)
     questions = sum(len(item.questions) for item in items)
-    print(f"{args.task}: {len(items)} contexts, {questions} questions ({questions / len(items):.1f} per context)\n")
+    print(
+        f"{args.task} [{args.split}, seed {args.seed}]: {len(items)} contexts, {questions} questions "
+        f"({questions / len(items):.1f} per context), anything fitted uses {args.fit_split}\n"
+    )
 
     engine = None
-    if {"readout", "calibrated_options", "calibrated_context", "generate", "generate_thinking"} & set(wanted):
+    needs_model = {
+        "readout",
+        "thresholded",
+        "calibrated_options",
+        "calibrated_context",
+        "generate",
+        "generate_thinking",
+    }
+    if needs_model & set(wanted):
         from prismyra import Prismyra
 
         started = time.perf_counter()
@@ -230,6 +285,8 @@ def main(argv: list[str] | None = None) -> int:
             rows, timings = run_generate(engine, items, reasoning=False)
         elif name == "generate_thinking":
             rows, timings = run_generate(engine, items, reasoning=True)
+        elif name == "thresholded":
+            rows, timings = run_thresholded(engine, items, fitted_on=fit_slice)
         elif name == "majority":
             rows, timings = run_majority(items, fitted_on=fit_slice)
         else:
@@ -250,6 +307,44 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _print_per_question(items, results: dict) -> None:
+    """Per question id, and macro F1 beside the pooled figure.
+
+    Eight thresholds were fitted, so eight results were produced, and a pooled score can be carried by two of them
+    while six do nothing. Macro F1 is also what the literature on this task reports, so it is the number a reader will
+    want to compare against.
+    """
+    ids = list(dict.fromkeys(q.id for item in items for q in item.questions))
+    if len(ids) < 2 or len(ids) > 12:
+        return
+
+    print("\nper question, F1 (positives in the scored slice):")
+    header = f"  {'question':<26}" + "".join(f"{name:>22}" for name in results)
+    print(header)
+    macro = {name: [] for name in results}
+    for question_id in ids:
+        positives = sum(
+            1
+            for name, result in results.items()
+            for row in result["rows"]
+            if row["id"] == question_id and _is_positive(row["want"]) and name == next(iter(results))
+        )
+        cells = ""
+        for name, result in results.items():
+            rows = [row for row in result["rows"] if row["id"] == question_id]
+            f1 = score(rows)["f1"]
+            macro[name].append(f1)
+            cells += f"{f1:>21.1%} "
+        print(f"  {question_id:<26}{cells} ({positives} positive)")
+    print(f"  {'macro average':<26}" + "".join(f"{sum(v) / len(v):>21.1%} " for v in macro.values()))
+
+    first = next(iter(results.values()))
+    print(
+        f"\n  {first['positives']} positive labels in {first['questions']} answers. At that count one label moves "
+        f"recall by about {1 / max(1, first['positives']):.1%}, so read these as preliminary."
+    )
+
+
 def _sparse(results: dict, threshold: float = 0.2) -> float | None:
     """The share of positive labels, when it is small enough that accuracy is the wrong summary."""
     any_result = next(iter(results.values()), None)
@@ -262,20 +357,25 @@ def _sparse(results: dict, threshold: float = 0.2) -> float | None:
 def _print_table(task: str, items, results: dict) -> None:
     questions = sum(len(item.questions) for item in items)
     sparse = _sparse(results)
-    print(
-        f"{'method':<20} {'accuracy':>9} {'answered':>10} {'recall':>8} {'precision':>10} {'F1':>7} {'ms/question':>12}"
-    )
-    print("-" * 82)
+    # The positive-class columns only exist where there is a positive class. On a lettered multiple choice there is
+    # none, and printing three zeroes per row invites the reader to compare them.
+    two_class = any(result["positives"] for result in results.values())
+    header = f"{'method':<20} {'accuracy':>9} {'answered':>10}"
+    if two_class:
+        header += f" {'recall':>8} {'precision':>10} {'F1':>7}"
+    print(header + f" {'ms/question':>12}")
+    print("-" * (len(header) + 13))
     for name, result in results.items():
         per_question = result["wall_s"] * 1e3 / questions
         answered = f"{result['answered']}/{result['questions']}"
-        latency = "    <0.05" if per_question < 0.05 else f"{per_question:>12.1f}"
-        print(
-            f"{name:<20} {result['accuracy']:>8.1%} {answered:>10} {result['recall']:>7.1%} "
-            f"{result['precision']:>9.1%} {result['f1']:>6.1%} {latency:>12}"
-        )
+        latency = "       <0.05" if per_question < 0.05 else f"{per_question:>12.1f}"
+        row = f"{name:<20} {result['accuracy']:>8.1%} {answered:>10}"
+        if two_class:
+            row += f" {result['recall']:>7.1%} {result['precision']:>9.1%} {result['f1']:>6.1%}"
+        print(row + latency)
 
     if sparse:
+        _print_per_question(items, results)
         share = sparse
         print(
             f"\n[read this table by F1, not accuracy] {share:.1%} of the answers are positive, so answering no to "
@@ -306,7 +406,7 @@ def _print_table(task: str, items, results: dict) -> None:
                 f"accuracy is confounded by the budget rather than measured by it"
             )
 
-    for other in ("calibrated_options", "calibrated_context", "generate", "generate_thinking"):
+    for other in ("thresholded", "calibrated_options", "calibrated_context", "generate", "generate_thinking"):
         if "readout" not in results or other not in results:
             continue
         test = paired(results["readout"]["rows"], results[other]["rows"], items)

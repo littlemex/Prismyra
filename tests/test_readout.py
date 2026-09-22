@@ -108,8 +108,9 @@ def _stub_checkpoint(monkeypatch, tmp_path, tensors: dict) -> None:
 def test_a_partial_last_block_takes_its_own_blocks_scale(monkeypatch, tmp_path):
     """The block size is recovered, not divided out.
 
-    Two hundred rows in two blocks of 128 leaves the second block holding 72 rows. Dividing 200 by 2 gives 100 and hands
-    rows 100 to 127 the second multiplier instead of the first -- wrong by a scale factor, on a seventh of the matrix.
+    Two hundred rows in two blocks of 128 leaves the second block holding 72 rows. Dividing 200 by 2 gives 100 and
+    hands rows 100 to 127 the second multiplier instead of the first -- wrong by a scale factor, on a seventh of the
+    matrix.
     """
     from prismyra import readout
 

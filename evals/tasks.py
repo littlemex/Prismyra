@@ -1,8 +1,8 @@
 """Public benchmarks with real labels, shaped into one context and the questions asked about it.
 
 Real labels, on purpose. The comparison this package invites -- one traversal against one per question -- says nothing
-unless the answers are right, and a wrong answer can be made arbitrarily fast. So every task here comes from a published
-dataset with published labels, and every number the harness prints carries an accuracy beside it.
+unless the answers are right, and a wrong answer can be made arbitrarily fast. So every task here comes from a
+published dataset with published labels, and every number the harness prints carries an accuracy beside it.
 
 Three tasks, chosen for what they expose rather than for what they flatter:
 
@@ -40,8 +40,8 @@ UNFAIR_TYPES = (
 class Item:
     """One context and everything asked about it, with the right answers.
 
-    `gold` is keyed by question id, as answers are, so scoring is a lookup rather than a zip -- a zip over two lists is
-    how an off-by-one in one of them becomes a plausible accuracy.
+    `gold` is keyed by question id, as answers are, so scoring is a lookup rather than a zip -- a zip over two lists
+    is how an off-by-one in one of them becomes a plausible accuracy.
     """
 
     context: str
@@ -53,9 +53,9 @@ class Item:
 def load(task: str, limit: int, split: str = "validation", seed: int = 0) -> list[Item]:
     """A seeded random sample, not the first N rows.
 
-    The first N is a slice of whatever order the dataset happens to be in, and once a budget or a prompt has been chosen
-    by looking at it, it has become a development set. A seed makes the sample nameable, so a result can be repeated on
-    the same one or checked on a different one.
+    The first N is a slice of whatever order the dataset happens to be in, and once a budget or a prompt has been
+    chosen by looking at it, it has become a development set. A seed makes the sample nameable, so a result can be
+    repeated on the same one or checked on a different one.
     """
     from datasets import load_dataset
 

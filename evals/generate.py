@@ -1,16 +1,16 @@
 """The comparison that matters: the same model, generating the answer instead of scoring one token.
 
 Deliberately not a second serving engine. A second process cannot hold a second copy of these weights on one card, and
-more importantly a different engine would change two things at once -- the read-out and the implementation -- leaving no
-way to say which moved the accuracy. This uses the backbone Prismyra already loaded and the output embedding it already
-holds, so the only difference from Prismyra's read-out is what happens at the final position: greedily emit tokens and
-read the text, rather than score the declared options.
+more importantly a different engine would change two things at once -- the read-out and the implementation -- leaving
+no way to say which moved the accuracy. This uses the backbone Prismyra already loaded and the output embedding it
+already holds, so the only difference from Prismyra's read-out is what happens at the final position: greedily emit
+tokens and read the text, rather than score the declared options.
 
-That makes the **accuracy** comparison clean. The latency comparison is weaker and in the opposite direction to the one
-first written here: this is a plain decode loop with no batching, no paged cache and no prefix sharing, so a speed
-advantage measured against it is an **upper bound** on the advantage over generation, not a lower one. A serving engine
-can batch the questions and share the article's prefix without using this read-out at all. Read every speed-up here as
-"against an unoptimised implementation", because that is what it is.
+That makes the **accuracy** comparison clean. The latency comparison is weaker and in the opposite direction to the
+one first written here: this is a plain decode loop with no batching, no paged cache and no prefix sharing, so a speed
+advantage measured against it is an **upper bound** on the advantage over generation, not a lower one. A serving
+engine can batch the questions and share the article's prefix without using this read-out at all. Read every speed-up
+here as "against an unoptimised implementation", because that is what it is.
 """
 
 from __future__ import annotations
@@ -48,14 +48,14 @@ def answer_by_generating(
     Once per question, not once per context, because that is what generating means here: the branch trick is the thing
     being compared against, so borrowing it would compare Prismyra with itself.
 
-    With `reasoning`, the model is left to think first and given a budget to do it in. That is a different and much more
-    expensive method than the read-out, and worth measuring separately rather than instead: half of this model's answers
-    do not fit in twenty-four tokens because it is genuinely reasoning, and scoring those as unanswered understates
-    generation badly. Both rows belong in the table.
+    With `reasoning`, the model is left to think first and given a budget to do it in. That is a different and much
+    more expensive method than the read-out, and worth measuring separately rather than instead: half of this model's
+    answers do not fit in twenty-four tokens because it is genuinely reasoning, and scoring those as unanswered
+    understates generation badly. Both rows belong in the table.
 
     Returns the answers, the elapsed milliseconds, and how many answers ran to the end of the budget. That last number
-    is the audit on this baseline: if it is not zero, an accuracy taken from this run is confounded by the budget rather
-    than measured, and saying so is the only way a reader can tell.
+    is the audit on this baseline: if it is not zero, an accuracy taken from this run is confounded by the budget
+    rather than measured, and saying so is the only way a reader can tell.
     """
     import time
 
@@ -90,9 +90,9 @@ def _greedy(engine, prompt: str, budget: int) -> str:
     ids = encoded.input_ids
     cache = None
     produced: list[int] = []
-    # The output projection in its stored dtype, once. Casting it per token converts the largest matrix in the model on
-    # every step, which inflated this baseline's latency by more than the thing being measured. The small side is cast
-    # instead, so the arithmetic is unchanged and the copy is gone.
+    # The output projection in its stored dtype, once. Casting it per token converts the largest matrix in the model
+    # on every step, which inflated this baseline's latency by more than the thing being measured. The small side is
+    # cast instead, so the arithmetic is unchanged and the copy is gone.
     head = engine.unembedding
 
     with torch.inference_mode():
@@ -133,8 +133,8 @@ def _stop_tokens(tokenizer) -> set[int]:
 def strip_reasoning(text: str) -> str:
     """Drop a reasoning block so the answer after it can be read.
 
-    Not cosmetic. This model opens every answer with `<think>`, so a parser that reads from the first character finds a
-    tag rather than an answer and scores a correct answer wrong. Anything after the closing tag is the answer; an
+    Not cosmetic. This model opens every answer with `<think>`, so a parser that reads from the first character finds
+    a tag rather than an answer and scores a correct answer wrong. Anything after the closing tag is the answer; an
     unclosed block means the budget ran out before the model got to one, which stays unparseable.
     """
     opened, closed = THINK
@@ -152,14 +152,14 @@ def parse(text: str, question, aliases: dict[str, list[str]] | None = None) -> t
     refusing "the answer is B" would penalise generation for writing a sentence, which is not what is being compared.
     Being loose is not fair either, so each widening is counted separately and can be audited.
 
-    **A one-character option is matched differently, and that is what most of this function is for.** A prefix match on
-    a single letter reads "because the passage says so" as B, "a few people" as A and "definitely B" as D. All three
-    were measured on an earlier version of this function, silently, and all three went against generation. So a
+    **A one-character option is matched differently, and that is what most of this function is for.** A prefix match
+    on a single letter reads "because the passage says so" as B, "a few people" as A and "definitely B" as D. All
+    three were measured on an earlier version of this function, silently, and all three went against generation. So a
     one-letter option has to be followed by punctuation or nothing at all.
 
     `aliases` lets an option be answered by another name. A multiple-choice task rendered as letters should accept the
-    option's own text as well, because answering "Over 2,000 people" rather than "A" is an answer, and scoring it absent
-    is this function failing rather than the model.
+    option's own text as well, because answering "Over 2,000 people" rather than "A" is an answer, and scoring it
+    absent is this function failing rather than the model.
     """
     import re
 
@@ -179,8 +179,8 @@ def parse(text: str, question, aliases: dict[str, list[str]] | None = None) -> t
     # Longest first, so a longer name is not shadowed by a shorter one that prefixes it.
     for name in sorted(names, key=len, reverse=True):
         if len(name) == 1:
-            # Punctuation or the end of the answer, never a space. A letter followed by a space begins a word, and
-            # "a few people" is not an answer of A -- this is the tier that was letting that through.
+            # Punctuation or the end of the answer, never a space. A letter followed by a space begins a word, and "a
+            # few people" is not an answer of A -- this is the tier that was letting that through.
             if re.match(rf"{re.escape(name)}\s*(?:[.)\]:,;-]|$)", cleaned):
                 return question.value_of(names[name]), "delimited"
         elif cleaned.startswith(name):
@@ -188,8 +188,8 @@ def parse(text: str, question, aliases: dict[str, list[str]] | None = None) -> t
 
     # The last resort searches the whole answer, and needs two passes rather than one. A single letter appears in
     # ordinary English as a word -- "a few people" -- so accepting one requires punctuation or the end of the answer
-    # after it. But an answer naming two options is not an answer to a closed question, and only the loose pass notices
-    # that. So: accept on the strict pass, refuse whenever the loose pass sees more than one.
+    # after it. But an answer naming two options is not an answer to a closed question, and only the loose pass
+    # notices that. So: accept on the strict pass, refuse whenever the loose pass sees more than one.
     def matches(pattern: str) -> set:
         return {names[name] for name in names if re.search(pattern.format(re.escape(name)), cleaned)}
 

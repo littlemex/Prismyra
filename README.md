@@ -47,6 +47,24 @@ widens quickly, because a traversal costs the same whether it carries one questi
 Use it for: classifying, routing, scoring or extracting many fields from the same document, transcript, ticket or page.
 Do not use it for: generating text, chat, one-off questions, or anything where the context differs per question.
 
+**And one thing the speed table does not tell you.** Those figures are worth something only if the answers are right,
+so they were measured on published labels. On RACE-middle the read-out scores 94.8% against 95.3% for the same model
+generating the answer, and on BoolQ 89.5% against 88.8% -- both differences with a 95% interval spanning zero. The two
+methods cannot be separated on accuracy, which is what makes comparing their speed worth doing.
+
+**The crossover is real and it is measurable on those same tasks.** RACE asks 3.9 questions per article and the read-out
+is 2.2x faster there; BoolQ asks one per passage and the read-out is **0.7x -- slower**. One question and this is the
+wrong tool, exactly as the table above says.
+
+**Where it does not work is sharper than where it does.** On a task whose interesting class is rare -- LexGLUE's unfair
+terms-of-service clauses, where 1.5% of the answers are yes -- the read-out reaches 60% recall at 6% precision. It says
+yes to nearly everything, and the same model generating the answer does the same, so this is not the read-out's limit
+but the absence of a decision point: taking the larger of two probabilities stands it at 0.5 when it belongs near
+0.97. A
+closed-question classifier that works out of the box on a rare class is not what this is. See
+[docs/ACCURACY.md](docs/ACCURACY.md) for all of it, including what helps, what does not, and one figure this project
+published and then withdrew.
+
 ## Install
 
 ```bash
@@ -233,6 +251,7 @@ prismyra-bench compare --against benchmarks/results/qwen3_6_35b_a3b_fp8__rtx_pro
 | [docs/READOUT.md](docs/READOUT.md) | What a probability is, exactly |
 | [docs/KERNELS.md](docs/KERNELS.md) | Each replacement, what it is worth, and what was rejected |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | How the numbers were measured and how to reproduce them |
+| [docs/ACCURACY.md](docs/ACCURACY.md) | Whether the answers are right, on public labels, and where they are not |
 
 ## Licence
 

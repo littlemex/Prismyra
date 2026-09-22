@@ -84,9 +84,8 @@ def encode(
     )
     ids = batch["input_ids"]
     # `attention_mask` is dropped on purpose: this is one unpadded sequence, so the mask is all ones and passing it
-    # makes
-    # the framework materialise a mask the fast attention kernel cannot take.
-    # `video_metadata` comes back when it went in, and the backbone does not take it.
+    # makes the framework materialise a mask the fast attention kernel cannot take. `video_metadata` comes back when
+    # it went in, and the backbone does not take it.
     media = {
         key: value.to(device) if hasattr(value, "to") else value
         for key, value in batch.items()
@@ -99,9 +98,8 @@ def position_offset(backbone, tokens: int) -> int:
     """How far along the model thinks the context reached, which is not how many tokens it held.
 
     With media present the model's three-axis positions advance by an image's grid rather than by its token count, and
-    it
-    records the difference as `rope_deltas` when it reads the context. A branch continues from `tokens + delta`. Without
-    media the delta is absent and the answer is just the token count.
+    it records the difference as `rope_deltas` when it reads the context. A branch continues from `tokens + delta`.
+    Without media the delta is absent and the answer is just the token count.
     """
     deltas = getattr(backbone, "rope_deltas", None)
     if deltas is None:
@@ -165,11 +163,12 @@ def decode_video(data: bytes, max_frames: int = MAX_DECODED_FRAMES) -> Clip:
     """Video bytes to frames, with the timing they were taken at.
 
     Decoding happens here rather than in the framework because which decoder the framework reaches for depends on what
-    happens to be installed -- its default is one that often is not -- and a missing decoder should be a sentence saying
-    so rather than an import error from three layers down.
+    happens to be installed -- its default is one that often is not -- and a missing decoder should be a sentence
+    saying so rather than an import error from three layers down.
 
-    Frames are taken at a stride, and the stride is reported rather than hidden: the returned `fps` describes the array
-    that comes back, not the file it came from, because that is what the processor needs to know how long the clip is.
+    Frames are taken at a stride, and the stride is reported rather than hidden: the returned `fps` describes the
+    array that comes back, not the file it came from, because that is what the processor needs to know how long the
+    clip is.
     """
     import tempfile
 

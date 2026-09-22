@@ -1,20 +1,20 @@
 """What an option's score is worth before the context is read, so it can be subtracted.
 
-Some option tokens win before the question is asked. `yes` is a commoner continuation than `no`, `A` a commoner one than
-`D`, and a long option name's first token is rarer than a short one's. None of that is about the context, and all of it
-lands in the score. Subtracting it is the cheapest improvement available above the raw read-out: it needs no labels, no
-training, and the answer stays the model's own -- only the thumb is taken off the scale.
+Some option tokens win before the question is asked. `yes` is a commoner continuation than `no`, `A` a commoner one
+than `D`, and a long option name's first token is rarer than a short one's. None of that is about the context, and all
+of it lands in the score. Subtracting it is the cheapest improvement available above the raw read-out: it needs no
+labels, no training, and the answer stays the model's own -- only the thumb is taken off the scale.
 
-The prior is measured rather than assumed. The same question is asked against a **content-free context** -- text of the
-same shape carrying no information about anything -- and whatever the model prefers there is what it prefers for reasons
-other than the context. That is the number subtracted.
+The prior is measured rather than assumed. The same question is asked against a **content-free context** -- text of
+the same shape carrying no information about anything -- and whatever the model prefers there is what it prefers for
+reasons other than the context. That is the number subtracted.
 
 Cost, and why it is nearly free in the case this package is for: a prior depends on the question, not on the document.
 Ask the same eight questions of a thousand contracts and the priors are computed once. They are cached per question
 text and option set, so the second document onwards pays nothing.
 
-Whether this helps is an empirical question and `evals/run.py` answers it. It is not on by default until the numbers say
-it should be.
+Whether this helps is an empirical question and `evals/run.py` answers it. It is not on by default until the numbers
+say it should be.
 """
 
 from __future__ import annotations
@@ -57,12 +57,13 @@ class Calibration:
     def priors(self, engine, questions: list, plans: list) -> list[torch.Tensor]:
         """One vector per question: what each option scored with nothing to go on.
 
-        Keyed by the question's rendered text and its option tokens rather than by its id, because an id is the caller's
-        label and two callers may use the same one for different questions. The text and the tokens are what the number
-        actually depends on.
+        Keyed by the question's rendered text and its option tokens rather than by its id, because an id is the
+        caller's label and two callers may use the same one for different questions. The text and the tokens are what
+        the number actually depends on.
         """
-        # Deduplicated before measuring. The same question twice in one call would otherwise have its prior added twice
-        # and divided only by the number of null contexts, leaving a correction scaled by however many copies arrived.
+        # Deduplicated before measuring. The same question twice in one call would otherwise have its prior added
+        # twice and divided only by the number of null contexts, leaving a correction scaled by however many copies
+        # arrived.
         missing: dict[tuple, object] = {}
         for plan in plans:
             key = self._key(plan)
@@ -115,8 +116,8 @@ class Calibration:
     def _score_all(self, engine, plans: list, context: str) -> list[torch.Tensor]:
         """The raw option scores for these questions against one content-free context.
 
-        Uses the engine's own context pass and branch pass, so the prior is measured through the same code path the real
-        answer comes through. A prior measured any other way would correct for something else.
+        Uses the engine's own context pass and branch pass, so the prior is measured through the same code path the
+        real answer comes through. A prior measured any other way would correct for something else.
         """
         from .readout import logits_for
 

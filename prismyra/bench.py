@@ -7,9 +7,9 @@ Two commands, because measuring and judging are different jobs:
     prismyra-bench compare --against FILE     # measure, then say whether anything moved
 
 `sweep` measures only what a machine can measure about itself: the whole-job curve, the fit of the cost model, and the
-per-kernel swap counts. The per-kernel profiles and the baseline engine's numbers in `results/*.json` come from separate
-runs against that other engine and are recorded by hand; `--update` merges the measured keys into such a file and leaves
-the hand-recorded ones alone, so a refresh cannot silently invent a baseline.
+per-kernel swap counts. The per-kernel profiles and the baseline engine's numbers in `results/*.json` come from
+separate runs against that other engine and are recorded by hand; `--update` merges the measured keys into such a file
+and leaves the hand-recorded ones alone, so a refresh cannot silently invent a baseline.
 
 `compare` is the regression gate. CI cannot run it -- there is no GPU there -- so it is run by hand on the machine the
 file names, and it fails loudly rather than printing a table nobody reads.
@@ -59,8 +59,9 @@ def build_questions(n: int):
 def measure(engine, context: str, counts=COUNTS, repeats=REPEATS, discard=DISCARD) -> dict:
     """The whole-job curve: read the context and answer N questions, end to end, N times over.
 
-    Wall time around the whole call, which includes tokenising and assembling the answers as well as the device. That is
-    deliberate -- it is what a caller waits for -- but it is not the same as device time, and the result file says so.
+    Wall time around the whole call, which includes tokenising and assembling the answers as well as the device. That
+    is deliberate -- it is what a caller waits for -- but it is not the same as device time, and the result file says
+    so.
     """
     out: dict[str, float] = {}
     for n in counts:
@@ -173,8 +174,8 @@ def merge_into(path: Path, measured: dict) -> None:
 def compare(measured: dict, reference: Path, tolerance: float) -> int:
     """Fail on any point that got slower by more than `tolerance`.
 
-    One-sided on purpose. Getting faster is not a regression, but it is reported, because an unexplained improvement is
-    usually a measurement that stopped measuring the same thing.
+    One-sided on purpose. Getting faster is not a regression, but it is reported, because an unexplained improvement
+    is usually a measurement that stopped measuring the same thing.
     """
     want = json.loads(reference.read_text())["whole_job"]["prismyra_ms"]
     got = measured["whole_job"]["prismyra_ms"]

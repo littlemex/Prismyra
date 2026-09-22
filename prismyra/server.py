@@ -1,8 +1,9 @@
 """An HTTP front end: one worker owns the device, callers queue.
 
 Thin on purpose. The interesting decisions are all in the core -- the queue is in `prismyra.queue` because it is a
-property of using one device from several threads, not an HTTP concern, and the question types are in `prismyra.schema`
-because the wire format and the library's contract must not be allowed to drift apart. What is left here is translation.
+property of using one device from several threads, not an HTTP concern, and the question types are in
+`prismyra.schema` because the wire format and the library's contract must not be allowed to drift apart. What is left
+here is translation.
 
 Two choices worth stating:
 
@@ -19,9 +20,9 @@ half-built version of them away. In-process callers that want follow-ups use `Pr
 
 # No `from __future__ import annotations` here, and that is load-bearing. It turns annotations into strings, which the
 # web framework then resolves against this module's globals -- and the request models below are defined inside
-# `create_app`, so they are not there. The framework finds an unresolvable name, decides the parameter cannot be a body,
-# and every request is rejected with "field required" for a field the caller did send. Keeping the annotations as real
-# objects is what makes the body a body.
+# `create_app`, so they are not there. The framework finds an unresolvable name, decides the parameter cannot be a
+# body, and every request is rejected with "field required" for a field the caller did send. Keeping the annotations
+# as real objects is what makes the body a body.
 import argparse
 import base64
 import dataclasses
@@ -168,8 +169,9 @@ def create_app(
 
     @app.post("/ask")
     def ask(body: AskIn) -> dict:
-        # Refused before admission, so an oversized request costs the queue nothing. 413 rather than 422: the request is
-        # well formed, there is just too much of it. Tokenising to find out is cheap next to what admitting it costs.
+        # Refused before admission, so an oversized request costs the queue nothing. 413 rather than 422: the request
+        # is well formed, there is just too much of it. Tokenising to find out is cheap next to what admitting it
+        # costs.
         if not body.context.strip() and not body.images and not body.videos:
             raise HTTPException(status_code=422, detail="a request needs a context, an image or a video")
         encoded = body.images + body.videos
