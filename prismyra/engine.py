@@ -171,7 +171,7 @@ class Prismyra:
         Exposed because the number is large: the fan-out that lets branches be written independently means every row
         carries its own copy of the context, so this grows with the group as well as with the context.
         """
-        return cache_bytes(self.config, context_tokens + WIDTHS[-1], self.group, self.dtype)
+        return cache_bytes(self.config, context_tokens + WIDTHS[-1], self.group, self.dtype, WIDTHS[-1])
 
     def open_context(self, context: str, *, images: list | None = None, videos: list | None = None) -> Context:
         """Read a context and keep it open. The expensive half happens here, once.
@@ -259,13 +259,14 @@ class Prismyra:
         if wanted >= free:
             raise PrismyraError(
                 f"a context of {context_tokens} tokens needs {wanted / 1024**3:.1f} GiB of key-value cache at "
-                f"group={self.group}, and {free / 1024**3:.1f} GiB of {total / 1024**3:.1f} GiB is free. Every branch "
-                f"holds its own copy of the context, so halving the group halves this; a shorter context does too."
+                f"group={self.group}, and {free / 1024**3:.1f} GiB of {total / 1024**3:.1f} GiB is free. The context "
+                f"is held once, so a shorter context is what reduces this; lowering the group only shrinks the branch "
+                f"part, which is the smaller half."
             )
 
     def _read(self, encoded) -> Prefill:
         # Room for the context plus the widest branch, since the same cache carries both.
-        cache = build_cache(self.config, encoded.tokens + WIDTHS[-1], self.group, self.dtype, self.device)
+        cache = build_cache(self.config, encoded.tokens + WIDTHS[-1], self.group, self.dtype, self.device, WIDTHS[-1])
         self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
         # Read after the forward, not before: the offset is something the model works out while reading the context.
         position_from = position_offset(self.backbone, encoded.tokens) if encoded.has_media else encoded.tokens

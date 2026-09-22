@@ -17,11 +17,21 @@ After reading a context, the model holds two kinds of state, and they behave dif
 rows the caller brought. Writing broadly and reading narrowly is what removes the separate copy step, and each
 row then owns storage it can write without aliasing its neighbours.
 
-**The context is physically replicated, not shared.** Being read-only is what makes one write correct for every row; it
-is not what makes it cheap. Each of the `group` rows holds its own copy of the context's keys and values, so an open
-context costs `group` times the context's key-value cache -- about 3.4 GiB at 5,000 tokens with the default group of 32
-on the supported model. Storing the context once and giving each branch only its own tail is the obvious improvement and
-is not done here. [PERFORMANCE.md](PERFORMANCE.md) has the formula.
+**The context is stored once; each branch stores only its own tokens.** Being read-only is what makes that correct. A
+read hands the attention kernel the two joined together, which costs a copy that lives for one layer and is freed before
+the next -- 222 MiB at 3,040 tokens and a group of 32 -- rather than 2.17 GiB held for as long as the context is open.
+
+It was not always so. Until recently a one-row context write was copied into all `group` rows of a batch-shaped buffer,
+because that is what a preallocated buffer forces, and the consequence was that only three contexts fitted on a 48 GiB
+card beside the weights. Nineteen fit now. The measurement that decided the change is in
+[PERFORMANCE.md](PERFORMANCE.md), and the reason it was safe to make is that joining two buffers is bit-identical to
+replicating them -- the same bytes in the same order.
+
+The copy could go too. The kernel accepts a table of pages, and many rows may name the same pages: that is measured, in
+`tests/test_gpu_paging.py`, and it is the next step rather than this one. A paged read reduces in a different order,
+so it would change answers by a rounding step -- and in a 40-layer mixture of experts one changed routing logit picks
+a different expert, which is not a rounding difference by the time it reaches an answer. So the storage was fixed
+first, against a baseline that did not move.
 
 The primitive underneath is ordinary: selecting along the batch dimension, which is what beam search does to reorder
 candidates. A constant index gives the fork; a non-constant one gives several contexts in one batch.

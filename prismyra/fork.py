@@ -71,7 +71,7 @@ def snapshot(cache) -> dict:
             d = getattr(layer, attr, None)
             if isinstance(d, dict):
                 entry[attr] = {k: (None if v is None else v.clone()) for k, v in d.items()}
-        if getattr(layer, "max_cache_len", None) is None:
+        if not _holds_attention(layer):
             for attr in ("keys", "values"):
                 t = getattr(layer, attr, None)
                 if torch.is_tensor(t):
@@ -79,6 +79,16 @@ def snapshot(cache) -> dict:
         entry[LENGTHS] = _lengths(layer)
         snap[i] = entry
     return snap
+
+
+def _holds_attention(layer) -> bool:
+    """Whether this layer stores keys and values rather than a recurrent state.
+
+    Asked by a class attribute rather than by guessing from the presence of `max_cache_len`. The guess worked until
+    the attention layer's storage changed shape, at which point these two functions would have started cloning buffers
+    that are not per-row -- silently, and with the wrong answers arriving a group later.
+    """
+    return bool(getattr(layer, "holds_attention", False))
 
 
 #: Where a layer's own record of how many tokens it holds is kept in a snapshot. A private key rather than an
@@ -145,8 +155,9 @@ def restore_and_fork(cache, snap: dict, rows: int) -> None:
                     cur.copy_(v.expand(want) if v.shape[0] == 1 else v)
                 else:
                     d[k] = (v.expand(want) if v.shape[0] == 1 else v).contiguous()
-        if getattr(layer, "max_cache_len", None) is not None:
-            # Preallocated: the context is already in every row, so there is nothing to fan out.
+        if _holds_attention(layer):
+            # This layer keeps the context in one row and each branch's own tokens in another, and joins them on read.
+            # There is nothing to fan out and nothing to restore beyond the length, which was done above.
             continue
         for attr in ("keys", "values"):
             if attr not in entry:

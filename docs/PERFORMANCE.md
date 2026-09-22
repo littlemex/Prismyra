@@ -128,19 +128,34 @@ whatever arrives, and every millisecond added by concurrency is queueing. That i
 for multiple users, because it says what such work could and could not achieve -- it can decide who waits, not how many
 are served.
 
-What binds instead is memory. **Three contexts can be open at once**, each holding about 2.17 GiB, and the fourth is
-refused by name. That is the number a session-based service would live inside, and it is the number single-copy storage
-would change: this model has two key-value heads, so one copy is about a thirtieth of what the group replicates.
+What bound instead was memory, and that has been fixed. **Nineteen contexts of 3,040 tokens can be open at once, where
+three could**, because the context is now held once rather than once per branch:
 
-Two measurements decide whether that is worth building, and both have been made:
+| | held per open context | contexts on one 48 GiB card |
+|---|---|---|
+| a copy per branch | 2.17 GiB | 3 |
+| the context once | **0.37 GiB** | **19** |
+
+The answers did not change, to the bit, and the clock barely did: 991 ms against 962 ms for one caller, and 168.2
+against 167.7 ms per question on RACE. What the change costs is a copy that lives for one layer -- the context and the
+branch rows joined for that layer's read, 222 MiB at these sizes -- rather than 2.17 GiB held for as long as the
+context is open.
+
+Two measurements decided how to do it, and both are worth keeping:
 
 * **A narrow batch reclaims nothing.** A branch pass costs 245 ms at one row and 246 ms at thirty-two -- a factor of
-  1.01, which is the design's central premise holding exactly. So the replication costs memory and not time, and
-  there is
+  1.01, which is the design's central premise holding exactly. So the replication cost memory and not time, and
+  there was
   no latency to recover by arranging smaller batches. `prismyra-bench widths` is that measurement.
 * **The attention kernel tolerates aliased pages.** Rows whose page tables name the same prefix pages answer as rows
   holding their own copies, within two steps of bfloat16. `tests/test_gpu_paging.py` is that measurement, and it is a
-  kill criterion rather than a feature test: had it failed, single-copy storage would not have been available.
+  kill criterion rather than a feature test: had it failed, the next step would not be available.
+
+That next step is to remove the transient join by handing the kernel a page table instead. It is deliberately not done
+yet. Joining two buffers is bit-identical to replicating them, so this change could be made against a baseline that did
+not move; a paged read reduces in a different order, and in a forty-layer mixture of experts a rounding step in a
+routing logit picks a different expert. Doing them at once would have left no way to tell a storage bug from a
+rounding one.
 
 ## Concurrency, as first measured
 

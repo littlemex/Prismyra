@@ -93,20 +93,21 @@ with engine.open_context(ticket_text) as context:
         detail = context.ask([Boolean(id="refund_ok", prompt="Does this qualify for a refund?")])
 ```
 
-**An open context holds device memory until it is closed.** Each branch carries its own copy of the context's keys and
-values -- that is what lets branches be written independently -- so an open context costs the context's key-value cache
-multiplied by the group:
+**An open context holds device memory until it is closed**, and the context itself is held once however many questions
+read it:
 
-| context | group 8 | group 32 |
-|---|---|---|
-| 1,000 tokens | 0.23 GiB | 0.92 GiB |
-| 5,000 tokens | 0.84 GiB | 3.36 GiB |
-| 20,000 tokens | 3.13 GiB | 12.52 GiB |
-| 100,000 tokens | 15.34 GiB | 61.35 GiB |
+| context | group 8 | group 32 | group 32, before the context was stored once |
+|---|---|---|---|
+| 1,000 tokens | 0.10 GiB | 0.33 GiB | 0.92 GiB |
+| 5,000 tokens | 0.17 GiB | 0.41 GiB | 3.36 GiB |
+| 20,000 tokens | 0.46 GiB | 0.69 GiB | 12.52 GiB |
+| 100,000 tokens | 1.99 GiB | 2.22 GiB | 61.35 GiB |
 
-Modest at ordinary lengths and not at long ones. `engine.cache_bytes(tokens)` gives the figure for your configuration,
-and a context that will not fit is refused by name rather than by an allocator. Lowering `group` lowers this
-proportionally at the cost of one extra traversal per group of questions. Use `close()` or a `with` block.
+Measured on one 48 GiB card: **19 contexts of 3,040 tokens can be open at once**, where three could before. The last
+column is what it cost when each branch held its own copy of the context, which is what changed; the answers did not, to
+the bit. `engine.cache_bytes(tokens)` gives the figure for your configuration, and a context that will not fit is
+refused by name rather than by an allocator. Lowering `group` now shrinks only the per-branch part, which is the
+smaller half. Use `close()` or a `with` block.
 
 ## Images and video
 
