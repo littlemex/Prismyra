@@ -80,6 +80,30 @@ topic, so treating them as independent draws would make every interval several t
 numbers are stated with intervals at all: the same BoolQ measurement at sixty passages and a different seed gave 95.0%
 for both methods rather than 89.5% and 88.8%, a ten point swing from the sample alone.
 
+## A decision loop, where the mechanism works and the model does not
+
+Everything above asks about a document. `examples/tetris/` asks about a state the previous answer produced, which is the
+other thing a one-pass typed decision gets built into: a loop that looks at a state, picks one of a few dozen moves, and
+lives with the consequence. A tetromino has up to 34 legal placements, so one board is one context and every placement
+is one row -- the shape this design is best at.
+
+| agent | pieces placed | rows cleared | ms per move |
+|---|---|---|---|
+| five features and five weights | **261.0 / 300** | **96.0** | 0.4 |
+| read-out, placements described | 26.0 / 60 | 0.0 | 555.8 |
+| read-out, resulting board shown | 20.5 / 60 | 0.0 | 809.2 |
+| random placements | 22.7 / 300 | 0.3 | 0.1 |
+
+**The model agents are at the random floor**, and showing them the board each placement would produce does not help, so
+this is not prompt wording. Ranking the placements directly rather than through a game gives a rank correlation with the
+arithmetic reference of +0.096 +/- 0.070 and -0.105 +/- 0.083 for the two framings -- neither distinguishable from zero.
+
+The floor is in that table for a reason. Without it, "26 pieces placed at 556 ms a move" reads as a working agent with a
+latency figure, and it is a latency figure for not playing. The mechanism did its part: 34 placements scored in one
+forward pass, where 34 calls would have cost far more. It cannot make the decision good, and a task where decisions
+compound is where that distinction is most expensive to miss. `examples/tetris/README.md` has the framings, the exact
+tail probability of the one marginal number, and what a real attempt would change.
+
 ## Speed is entirely a question of how many questions share a context
 
 Measured in the same runs, against that same unbatched generation loop:
