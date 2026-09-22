@@ -283,3 +283,145 @@ def _ranks(values: list[float]) -> list[float]:
             out[order[k]] = shared
         i = j + 1
     return out
+
+
+#: The candidates, their features and optionally a score, as a table in the **shared** context rather than one per row.
+#:
+#: Both reviewers landed on this as the measurement that decides what the earlier framings failed at. Showing a branch
+#: the board its placement produces removes the need to imagine the placement, but not the need to read a grid of text,
+#: and it leaves each row judging its own candidate with no sight of the others. A pointwise score has to be calibrated
+#: across rows that cannot see each other, and comparative judgement is easier than absolute judgement. This framing
+#: removes both at once and still uses one pass: the table is in the prefix every row reads, and each row asks about one
+#: line of it.
+CANDIDATES = """The legal placements, with what each one would do to the board:
+
+{table}
+
+{tail}"""
+
+
+def candidate_table(board: Board, piece: str, with_score: bool = False) -> tuple[str, list[tuple[Move, float]]]:
+    """One line per placement: what it is, and the five numbers a Tetris position is judged by.
+
+    The numbers are exact rather than the model's estimate of them, which is the point: it removes reading the board
+    from the task and leaves choosing. `with_score` also supplies the weighted sum, which makes the answer mechanically
+    determined and turns this into a positive control -- a read-out that cannot rank a utility it was handed is a
+    statement about the read-out and not about Tetris.
+    """
+    outcomes = [(m, apply(board, piece, m)) for m in legal_moves(piece)]
+    playable = [(m, o) for m, o in outcomes if o is not None]
+    lines, scored = [], []
+    header = "  #  placement                                    lines  holes  height  bumpiness  well"
+    if with_score:
+        header += "   score"
+    lines.append(header)
+    for i, (move, (after, cleared)) in enumerate(playable):
+        f = features(board, after, cleared)
+        value = sum(WEIGHTS[k] * v for k, v in f.items())
+        row = (
+            f"{i:3d}  {move.describe(piece):42s} {int(f['lines']):6d} {int(f['holes']):6d} "
+            f"{int(f['height']):7d} {int(f['bumpiness']):10d} {int(f['well']):5d}"
+        )
+        if with_score:
+            row += f"  {value:+7.1f}"
+        lines.append(row)
+        scored.append((move, value))
+    return "\n".join(lines), scored
+
+
+@dataclass
+class ReadOutFeatures:
+    """One pass, the candidates and their exact features in the shared prefix, one row per candidate.
+
+    `with_score` turns it into the positive control: the weighted sum is in the table, so the best candidate is the
+    largest number in a column and choosing it needs no judgement at all.
+    """
+
+    engine: object
+    with_score: bool = False
+    name: str = "readout_features"
+
+    def __post_init__(self) -> None:
+        if self.with_score:
+            self.name = "readout_score"
+
+    def choose(self, board: Board, piece: str) -> Choice | None:
+        from prismyra import Boolean
+
+        table, scored = candidate_table(board, piece, with_score=self.with_score)
+        if not scored:
+            return None
+        tail = (
+            "A higher score is better, and the best placement is the one with the highest score."
+            if self.with_score
+            else "Fewer holes is better, a lower total height is better, less bumpiness is better, and clearing "
+            "lines is better. A hole cannot be filled until the rows above it are cleared."
+        )
+        questions = [
+            Boolean(id=f"c{i}", prompt=f"Is placement {i} the best of the placements listed above?")
+            for i in range(len(scored))
+        ]
+        context = PROMPT.format(board=board.render(), piece=piece) + "\n\n" + CANDIDATES.format(table=table, tail=tail)
+        started = time.perf_counter()
+        result = self.engine.ask(context, questions)  # type: ignore[attr-defined]
+        seconds = time.perf_counter() - started
+        # Ranked by the probability of yes, which for a Boolean read-out **is** the normalised log-odds: the scores are
+        # softmaxed over the two declared options, so p(yes) + p(no) = 1 and log(p/1-p) is monotone in p. A reviewer
+        # asked for log-odds ranking; it is the same ranking, and saying so is cheaper than implementing it twice.
+        best = max(range(len(scored)), key=lambda i: result[f"c{i}"].probabilities["yes"])
+        return Choice(scored[best][0], seconds, len(scored))
+
+
+def perception(engine, board: Board) -> dict:
+    """Whether the model reads the board it is shown, asked with questions whose answers are mechanically known.
+
+    The gap in the first conclusion published from this example. Showing a branch the board its placement produces
+    removes the need to *imagine* a placement and not the need to *read* a grid of text, so "cannot judge positions" and
+    "cannot see positions" were not separated. These separate them: the same rendering, the same one-pass read-out, and
+    questions with a right answer that does not depend on any policy.
+    """
+    from prismyra import Boolean
+
+    heights = board.heights()
+    holes = board.holes()
+    asked: list[tuple[str, str, bool]] = []
+    # Around the true count on both sides, so a model answering "no" to everything scores half rather than well. The
+    # id counts the question rather than naming the threshold: on a board with no holes, `holes - 1` clamped to zero and
+    # `holes` are the same number, which made two questions share an id -- caught by the package's own duplicate guard
+    # rather than by a test, which is what that guard is for.
+    for n, k in enumerate((max(0, holes - 1), holes, holes + 1)):
+        asked.append((f"h{n}", f"Does this board have more than {k} holes?", holes > k))
+    for a, b in ((0, 5), (2, 7), (3, 4), (1, 8), (6, 9)):
+        asked.append((f"t{a}{b}", f"Is column {a} taller than column {b}?", heights[a] > heights[b]))
+    for x in (0, 4, 9):
+        asked.append((f"e{x}", f"Is column {x} completely empty?", heights[x] == 0))
+
+    result = engine.ask(
+        "Row 0 is the top and row 19 is the floor. A '#' is a filled cell and a '.' is empty. A hole is an empty cell "
+        "with at least one filled cell somewhere above it in the same column. A column's height is measured from the "
+        f"floor to its highest filled cell.\n\nThe board:\n\n{board.render()}",
+        [Boolean(id=i, prompt=q) for i, q, _ in asked],
+    )
+    right = sum(result[i].value is truth for i, _, truth in asked)
+    return {
+        "asked": len(asked),
+        "right": right,
+        "accuracy": round(right / len(asked), 4),
+        "always_no_would_score": round(sum(not truth for _, _, truth in asked) / len(asked), 4),
+        "wrong": [q for i, q, truth in asked if result[i].value is not truth],
+    }
+
+
+def regret(board: Board, piece: str, chosen: Move) -> float:
+    """How much heuristic value the chosen placement gave up against the best one available.
+
+    Reported instead of rank correlation where possible. Correlation over a full ranking is dominated by the middle,
+    where placements are near-ties whose order is arbitrary, and it has a ceiling below 1.0 for that reason. Regret is
+    continuous, indifferent to ties, and is the thing survival depends on.
+    """
+    _, scored = candidate_table(board, piece)
+    if not scored:
+        return 0.0
+    best = max(value for _, value in scored)
+    mine = next(value for move, value in scored if move == chosen)
+    return round(best - mine, 3)
