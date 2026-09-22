@@ -118,6 +118,147 @@ def environment() -> dict:
     return {"machine": machine, "software": software}
 
 
+def measure_concurrency(engine, context: str, callers: tuple[int, ...], questions_each: int) -> list[dict]:
+    """What arriving together costs, now that one worker owns the device.
+
+    Worth measuring rather than assuming, because the answer decides whether multi-user work is worth doing. One
+    device serves one request at a time whatever the arrival pattern, so concurrency cannot raise throughput here --
+    what it can do is decide who waits. This reports the queueing delay separately from the service time, because
+    those have different fixes: waiting is answered by another device, working only by kernels.
+    """
+    import statistics
+    import threading
+    import time
+
+    from .queue import Worker
+
+    out = []
+    for count in callers:
+        worker = Worker(lambda payload: engine.ask(payload[0], payload[1])).start()
+        try:
+            questions = build_questions(questions_each)
+            jobs: list = []
+            errors: list = []
+
+            def call(worker=worker, questions=questions, jobs=jobs, errors=errors) -> None:
+                # Bound as defaults rather than closed over: a closure here would read whichever loop iteration's
+                # values happened to be current when the thread ran, which is a different measurement each time.
+                try:
+                    jobs.append(worker.submit((context, questions)))
+                except Exception as e:  # noqa: BLE001 - a refused caller is a result, not a crash
+                    errors.append(e)
+
+            started = time.perf_counter()
+            threads = [threading.Thread(target=call) for _ in range(count)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            elapsed = time.perf_counter() - started
+
+            latencies = sorted((job.queue_ms + job.service_ms) for job in jobs)
+            out.append(
+                {
+                    "callers": count,
+                    "answered": len(jobs),
+                    "refused": len(errors),
+                    "wall_s": round(elapsed, 2),
+                    "requests_per_second": round(len(jobs) / elapsed, 2),
+                    "first_home_ms": round(latencies[0], 1) if latencies else None,
+                    "median_ms": round(statistics.median(latencies), 1) if latencies else None,
+                    "last_home_ms": round(latencies[-1], 1) if latencies else None,
+                    "median_queue_ms": round(statistics.median(job.queue_ms for job in jobs), 1) if jobs else None,
+                    "median_service_ms": round(statistics.median(job.service_ms for job in jobs), 1) if jobs else None,
+                }
+            )
+        finally:
+            worker.stop()
+    return out
+
+
+def measure_open_contexts(engine, context: str, limit: int = 64) -> dict:
+    """How many contexts can be open at once, which is the memory ceiling as it stands.
+
+    Each open context holds `group` physical copies of its keys and values, so this is the number paged single-copy
+    storage would change. Measured by opening them until the engine refuses, which it does by name rather than by
+    letting the allocator fail.
+    """
+    import torch
+
+    from .schema import PrismyraError
+
+    opened, refused = [], None
+    try:
+        for _ in range(limit):
+            opened.append(engine.open_context(context))
+    except PrismyraError as e:
+        refused = str(e)
+    except torch.OutOfMemoryError as e:  # pragma: no cover - the case the refusal exists to prevent
+        refused = f"the allocator refused first, which the engine should have: {e}"
+    finally:
+        held = len(opened)
+        for handle in opened:
+            handle.close()
+
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {
+        "open_at_once": held,
+        "each_holds_gib": round(engine.cache_bytes(len(engine.tokenizer(context)["input_ids"])) / 1024**3, 2),
+        "refused_with": refused,
+    }
+
+
+def measure_widths(model: str, context: str, widths: tuple[int, ...], repeats: int = 5) -> list[dict]:
+    """What a branch pass costs at each batch width, which decides whether a narrow one is worth arranging.
+
+    The premise of the whole design is that a traversal costs about the same whatever it carries, because the cost is
+    reading the experts' weights rather than the rows' tokens. If that is true, a one-question request pays for
+    thirty-two rows and there is nothing to reclaim. If it is not true, the engine is doing thirty-two rows of work
+    for one answer and the smallest useful fix in the package is to stop.
+
+    One engine at a time, rebuilt per width, because the cache is preallocated for the group and two copies of these
+    weights do not fit on one card. That makes this slow and unavoidable.
+    """
+    import gc
+    import statistics
+    import time
+
+    import torch
+
+    from . import Prismyra
+
+    out = []
+    for width in widths:
+        engine = Prismyra(model, group=width)
+        try:
+            questions = build_questions(width)
+            samples = []
+            for _ in range(repeats + 2):
+                started = time.perf_counter()
+                result = engine.ask(context, questions)
+                samples.append((time.perf_counter() - started) * 1e3)
+            kept = samples[2:]
+            out.append(
+                {
+                    "width": width,
+                    "total_ms": round(statistics.median(kept), 1),
+                    "context_ms": round(result.timing.context_ms, 1),
+                    "branch_ms": round(result.timing.readout_ms, 1),
+                    "branch_ms_per_question": round(result.timing.readout_ms / width, 2),
+                }
+            )
+        finally:
+            del engine
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    return out
+
+
 def run_sweep(args) -> dict:
     from . import Prismyra
 
@@ -156,6 +297,32 @@ def print_table(measured: dict) -> None:
         f"\ncost model: {model['context_ms']} ms + {model['per_group_ms']} ms x "
         f"ceil(questions / {model['questions_per_group']})   worst residual "
         f"{model['worst_residual_ms']} ms"
+    )
+
+
+def _print_concurrency(measured: dict) -> None:
+    contexts = measured["open_contexts"]
+    print(
+        f"\n{measured['model']} on {measured['machine'].get('gpu', 'cpu')}, "
+        f"{measured['context_tokens']} context tokens, group {measured['group']}\n"
+    )
+    print(f"contexts open at once: {contexts['open_at_once']}, each holding about {contexts['each_holds_gib']} GiB")
+    if contexts["refused_with"]:
+        print(f"  refused with: {contexts['refused_with'][:150]}")
+
+    print(
+        f"\n{'callers':>8} {'answered':>9} {'req/s':>7} {'first home':>11} {'median':>9} {'last home':>10} "
+        f"{'median queue':>13} {'median service':>15}"
+    )
+    for row in measured["concurrency"]:
+        print(
+            f"{row['callers']:>8} {row['answered']:>9} {row['requests_per_second']:>7.2f} "
+            f"{row['first_home_ms']:>11.0f} {row['median_ms']:>9.0f} {row['last_home_ms']:>10.0f} "
+            f"{row['median_queue_ms']:>13.0f} {row['median_service_ms']:>15.0f}"
+        )
+    print(
+        "\nOne device serves one request at a time, so concurrency cannot raise throughput here. What it decides is\n"
+        "who waits: queueing delay is answered by another device, service time only by kernels."
     )
 
 
@@ -202,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="prismyra-bench", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("command", choices=["sweep", "compare"])
+    parser.add_argument("command", choices=["sweep", "compare", "concurrency", "widths"])
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B-FP8")
     parser.add_argument("--counts", type=int, nargs="+", default=list(COUNTS))
     parser.add_argument("--repeats", type=int, default=REPEATS)
@@ -220,11 +387,61 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--update", type=Path, help="merge the measured keys into this result file")
     parser.add_argument("--against", type=Path, help="the result file to compare with")
     parser.add_argument("--tolerance", type=float, default=0.10)
+    parser.add_argument(
+        "--callers",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8, 16],
+        help="how many arrive together, for the concurrency command",
+    )
+    parser.add_argument("--questions", type=int, default=8, help="questions per caller, for the concurrency command")
     parser.add_argument("--json", action="store_true", help="print the measurement as JSON instead of a table")
     args = parser.parse_args(argv)
 
     if args.command == "compare" and args.against is None:
         parser.error("compare needs --against FILE")
+
+    if args.command == "widths":
+        context = PARAGRAPH * args.repeat_paragraph
+        rows = measure_widths(args.model, context, tuple(args.callers))
+        print(f"\n{'width':>6} {'total ms':>9} {'context ms':>11} {'branch ms':>10} {'branch ms/question':>19}")
+        for row in rows:
+            print(
+                f"{row['width']:>6} {row['total_ms']:>9.1f} {row['context_ms']:>11.1f} "
+                f"{row['branch_ms']:>10.1f} {row['branch_ms_per_question']:>19.2f}"
+            )
+        narrow, wide = rows[0]["branch_ms"], rows[-1]["branch_ms"]
+        print(
+            f"\nA branch pass at width {rows[0]['width']} costs {narrow:.0f} ms and at width {rows[-1]['width']} "
+            f"{wide:.0f} ms, a factor of {wide / narrow:.2f}."
+        )
+        print(
+            "Near 1.00 means a traversal costs the same whatever it carries, so a narrow batch reclaims nothing and\n"
+            "the design's premise holds. Much above 1.00 means a one-question request is paying for rows it does not\n"
+            "have, and the engine should use the narrowest batch that fits."
+        )
+        if args.json:
+            print(json.dumps(rows, indent=2))
+        return 0
+
+    if args.command == "concurrency":
+        from . import Prismyra
+
+        engine = Prismyra(args.model, require_kernels=args.require_kernels)
+        context = PARAGRAPH * args.repeat_paragraph
+        measured = {
+            **environment(),
+            "model": args.model,
+            "context_tokens": len(engine.tokenizer(context)["input_ids"]),
+            "group": engine.group,
+            "open_contexts": measure_open_contexts(engine, context),
+            "concurrency": measure_concurrency(engine, context, tuple(args.callers), args.questions),
+        }
+        _print_concurrency(measured)
+        if args.json:
+            args.json.write_text(json.dumps(measured, indent=2, ensure_ascii=False))
+            print(f"\nwritten to {args.json}")
+        return 0
 
     measured = run_sweep(args)
     if args.json:
