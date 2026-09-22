@@ -171,3 +171,30 @@ def bag(seed: int, count: int) -> list[str]:
         rng.shuffle(seven)
         out.extend(seven)
     return out[:count]
+
+
+def draw(board: Board, cell: int = 24, margin: int = 28):
+    """The board as an image, for the path that has a vision tower behind it.
+
+    Here because rendering it as characters and concluding the model cannot see it left out the obvious alternative. A
+    grid written in text loses the one thing that matters: tokenisation merges runs of dots into pieces whose boundaries
+    differ from row to row, so nothing tells the model that the fifth character of one line is above the fifth character
+    of the next. Image patches carry two-dimensional positions in this model's own position scheme; text carries one.
+
+    Drawn plainly and large: filled cells as solid squares, a one-pixel grid so empty cells are countable, and the
+    column numbers along the top because every move names a column.
+    """
+    from PIL import Image, ImageDraw
+
+    width, height = WIDTH * cell + 2 * margin, HEIGHT * cell + 2 * margin
+    image = Image.new("RGB", (width, height), "white")
+    pen = ImageDraw.Draw(image)
+    for x in range(WIDTH):
+        pen.text((margin + x * cell + cell // 3, margin // 3), str(x), fill="black")
+    for y in range(HEIGHT):
+        pen.text((margin // 4, margin + y * cell + cell // 4), f"{y:2d}", fill="black")
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            box = (margin + x * cell, margin + y * cell, margin + (x + 1) * cell, margin + (y + 1) * cell)
+            pen.rectangle(box, fill="black" if board.rows[y][x] else "white", outline="grey")
+    return image

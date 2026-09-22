@@ -94,23 +94,57 @@ is one row -- the shape this design is best at.
 | read-out | the candidate table, no score | **51.7 +/- 2.1** | **6.0 +/- 1.7** | -- |
 | read-out | the board drawn, placements described | 26.3 +/- 2.7 | 0.3 +/- 0.5 | p = 0.16 |
 | read-out | the board each placement would produce | 24.0 +/- 6.2 | 0.2 +/- 0.4 | p = 0.68 |
+| read-out | the board as an image, through the vision tower | 24.5 +/- 4.2 | 0.0 +/- 0.0 | p = 0.88 |
 | random placements | -- | 23.7 +/- 3.4 | 0.2 +/- 0.4 | -- |
 
 Two framings play and two are indistinguishable from random, and the difference between them is **how the state is
 written down**, not what is asked or how the answer is taken out. Given the five numbers per candidate and no score, the
 model still has to decide what they are worth, and it survives 51.7 pieces where random survives 23.7.
 
-What separates the halves of that table is perception. Asked questions about a rendered board whose answers are
-mechanically known -- more than *k* holes, is column *a* taller than column *b*, is column *x* empty -- the model scores
-**71.4% against 69.5% for answering "no" to everything**, which is indistinguishable from not reading the board at all.
-The row with the score supplied is the positive control that rules out the mechanism: choosing the largest number in a
-column needs no judgement, and the read-out does it.
+What separates the halves of that table is not one thing. Asked questions about a board whose answers are mechanically
+known -- more than *k* holes, is column *a* taller than column *b*, is column *x* empty -- the model scores 92 of 132
+with the board written out in characters, which **is** the 69.7% that answering "no" to everything scores, and 112 of
+132 = 84.8% with the same board drawn as an image. Text does not reach the constant-answer baseline; a picture beats
+it decisively (P = 0.00005).
+
+And the picture still does not play: 24.5 +/- 4.2 pieces, nothing cleared, p = 0.88 against random. So the failure has
+three links and only the middle one is broken. It can see the board when the board is a picture; it can judge a position
+when the aggregates are handed to it; it cannot compute five aggregates over ten columns for each of 34 candidates and
+compare them. Per-question accuracy of 84.8% does not survive that many combinations. The row with the score supplied is
+the positive control that keeps the mechanism out of it: choosing the largest number in a column needs no judgement, and
+the read-out places 57.3 of 60.
 
 This example first published the opposite conclusion -- that the model could see the positions and not judge them --
 from the bottom half of the table alone. `examples/tetris/README.md` keeps that mistake, what was wrong with the
 inference, and the two measurements that corrected it. The short version is worth carrying into any use of this
 package: **measure whether the input is being read before measuring whether the decision is good**, and put a floor
 and a positive control in every table, because without them a latency figure for not playing looks like a result.
+
+## The probability, and one scalar that makes it honest
+
+Accuracy says whether the chosen option was right. It says nothing about the number attached to it, and a caller routing
+on confidence is reading that number. Fitting one temperature -- divide the scores by it before the softmax -- halves
+the gap between what the read-out claims and what it delivers:
+
+| task | answers | accuracy | expected calibration error | Brier |
+|---|---|---|---|---|
+| RACE-middle | 472 | 0.936 both ways | 0.031 -> **0.016** | 0.105 -> 0.104 |
+| BoolQ | 300 | 0.907 both ways | 0.025 -> **0.013** | 0.145 -> 0.145 |
+
+Cross-fitted, so every answer is scaled by a temperature chosen on the answers it was not part of. **The accuracy is
+identical on both sides by construction** and is printed for exactly that reason: scaling every option by the same
+positive number cannot reorder them, so no decision changes and nothing here is a better answer. It is the same answers
+with an honest number attached.
+
+The fitted temperatures are 0.90 on RACE and 1.05 on BoolQ. Below one means this read-out is slightly *under*-confident,
+which is the opposite of what the idea's usual presentation assumes, and is worth a sentence: this read-out softmaxes
+over only the options a question declared, where reading letters out of the whole vocabulary leaves mass elsewhere. The
+support is narrower, so the distribution starts closer to honest -- and one fitted scalar still halves what is left.
+
+This is borrowed from [`ikermoel/open-alternative-jev`](https://github.com/ikermoel/open-alternative-jev) (Apache-2.0),
+which measured temperatures of 1.3 to 1.5 halving the same error. `prismyra.Temperature` is the implementation and it is
+deliberately separate from `prismyra.Thresholds`: a threshold moves where a decision changes, which is what a rare class
+needs, and a temperature moves no decision at all.
 
 ## Speed is entirely a question of how many questions share a context
 

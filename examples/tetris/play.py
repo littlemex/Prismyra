@@ -25,13 +25,22 @@ from agents import (
     ReadOut,
     ReadOutFeatures,
     ReadOutOutcome,
+    ReadOutPicture,
     agreement,
     perception,
+    perception_picture,
     regret,
 )
 from game import Board, apply, bag
 
-NEEDS_MODEL = {"readout", "readout_outcome", "readout_features", "readout_score", "generate"}
+NEEDS_MODEL = {
+    "readout",
+    "readout_outcome",
+    "readout_picture",
+    "readout_features",
+    "readout_score",
+    "generate",
+}
 
 
 def play(agent, seed: int, pieces: int) -> dict:
@@ -78,24 +87,34 @@ def _perception(engine, args) -> int:
     reference = Heuristic()
     rows = []
     for piece in bag(args.seed, args.perception):
-        found = perception(engine, board)
-        rows.append(found)
-        print(
-            f"{found['right']:3d}/{found['asked']:<3d} right ({found['accuracy']:.2f}), answering no to everything "
-            f"would score {found['always_no_would_score']:.2f}"
-        )
+        for channel, probe in (("text", perception), ("picture", perception_picture)):
+            found = probe(engine, board)
+            found["channel"] = channel
+            rows.append(found)
+            print(
+                f"{channel:8s} {found['right']:3d}/{found['asked']:<3d} right ({found['accuracy']:.2f}), answering no "
+                f"to everything would score {found['always_no_would_score']:.2f}"
+            )
         choice = reference.choose(board, piece)
         if choice is None:
             break
         board, _ = apply(board, piece, choice.move)
 
-    right = sum(r["right"] for r in rows)
-    asked = sum(r["asked"] for r in rows)
-    lazy = statistics.mean(r["always_no_would_score"] for r in rows)
+    for channel in ("text", "picture"):
+        mine = [r for r in rows if r["channel"] == channel]
+        if not mine:
+            continue
+        right = sum(r["right"] for r in mine)
+        asked = sum(r["asked"] for r in mine)
+        lazy = statistics.mean(r["always_no_would_score"] for r in mine)
+        print(
+            f"\n{channel}: {right}/{asked} = {right / asked:.1%} over {len(mine)} boards, against {lazy:.1%} for "
+            f"answering no to everything"
+        )
     print(
-        f"\n{right}/{asked} = {right / asked:.1%} over {len(rows)} boards, against {lazy:.1%} for answering no to\n"
-        f"everything. These answers are mechanically known and depend on no policy, so this separates 'cannot judge a\n"
-        f"position' from 'cannot see one' -- which the first conclusion from this example did not."
+        "\nThese answers are mechanically known and depend on no policy, so this separates 'cannot judge a position'\n"
+        "from 'cannot see one'. Splitting it by channel separates 'cannot see a grid' from 'cannot read one written\n"
+        "out in characters', which the first conclusion here missed entirely."
     )
     if args.json:
         args.json.write_text(json.dumps(rows, indent=2))
@@ -227,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         "heuristic": Heuristic,
         "readout": lambda: ReadOut(engine=engine),
         "readout_outcome": lambda: ReadOutOutcome(engine=engine),
+        "readout_picture": lambda: ReadOutPicture(engine=engine),
         "readout_features": lambda: ReadOutFeatures(engine=engine),
         "readout_score": lambda: ReadOutFeatures(engine=engine, with_score=True),
         "generate": lambda: Generate(engine=engine),

@@ -53,9 +53,26 @@ def run_readout(engine, items) -> tuple[list[dict], dict]:
                     # Carried so `companions` can compare distributions and not only decisions. A decision that holds
                     # while the probability behind it moves by a tenth is worth knowing about.
                     "probabilities": dict(answer.probabilities),
+                    # Which option is the right one, recorded here because this is the only place the question is still
+                    # in scope to ask. Matching the gold against option strings downstream looked like it worked and
+                    # silently failed for booleans, where the gold is True and the option is "yes".
+                    "gold_index": _gold_index(question, item.gold[question.id]),
                 }
             )
     return rows, timings
+
+
+def _gold_index(question, gold) -> int | None:
+    """Which of a question's own options is the right answer, by the question's own mapping.
+
+    `Question.value_of` is what turns an option into the value a caller compares against gold, so it is what decides
+    this. Comparing the gold to the option text instead works for a choice and quietly fails for a boolean.
+    """
+    options = list(question.options)
+    for i, option in enumerate(options):
+        if question.value_of(option) == gold:
+            return i
+    return None
 
 
 def run_alone(engine, items) -> tuple[list[dict], dict]:
@@ -84,6 +101,7 @@ def run_alone(engine, items) -> tuple[list[dict], dict]:
                     "confidence": max(answer.probabilities.values()),
                     "questions_in_item": 1,
                     "probabilities": dict(answer.probabilities),
+                    "gold_index": _gold_index(question, item.gold[question.id]),
                 }
             )
     return rows, timings
@@ -394,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
         result["wall_s"] = statistics.median(result["passes"])
 
     _print_table(args.task, items, results)
+    if "readout" in results:
+        _print_calibration(results["readout"]["rows"])
     if "readout" in results and "alone" in results:
         # Printed beside the accuracy table rather than folded into it, because it is not an accuracy claim. It says
         # what a group's width does to an answer, which is the cost of letting a group use only the rows it needs.
@@ -415,6 +435,51 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"\nwritten to {args.json}")
     return 0
+
+
+def _print_calibration(rows: list[dict]) -> None:
+    """Whether the probability a read-out reports means what it says, and whether one scalar fixes it.
+
+    Cross-fitted rather than fitted once on everything: a temperature chosen on the same answers it is then scored on
+    flatters itself. The accuracy is printed on both sides because it cannot move -- scaling every option by the same
+    positive number cannot reorder them -- and printing it is how a reader can see that no decision changed.
+    """
+    from prismyra.temperature import Temperature, cross_fit
+
+    usable = [r for r in rows if r.get("probabilities") and r.get("gold_index") is not None]
+    # Said out loud rather than skipped. A calibration section that silently disappears is indistinguishable from one
+    # that was never asked for, and that is how a boolean task went unreported: the gold is True and the option is
+    # "yes", so matching them by string found nothing and the whole section vanished.
+    if len(usable) < 20:
+        print(
+            f"\ncalibration: not reported, {len(usable)} of {len(rows)} answers carry both a distribution and a known "
+            f"right option, and fitting a temperature on fewer than twenty is fitting it on noise"
+        )
+        return
+    probabilities = [[r["probabilities"][o] for o in r["probabilities"]] for r in usable]
+    correct = [r["gold_index"] for r in usable]
+
+    fitted = Temperature.fit(probabilities, correct)
+    scaled, temperatures = cross_fit(probabilities, correct, folds=2)
+    honest = Temperature(value=fitted.value)
+    honest.before = fitted.before
+    honest.after = Temperature.fit(scaled, correct).before  # the metrics of the cross-fitted probabilities
+
+    print(f"\ncalibration of the read-out, over {len(correct)} answers")
+    print(f"{'':22} {'accuracy':>9} {'ECE':>7} {'Brier':>7} {'NLL':>7}")
+    for label, side in (("raw", honest.before), ("cross-fitted temperature", honest.after)):
+        print(
+            f"{label:22} {side['accuracy']:>9.3f} {side['expected_calibration_error']:>7.3f} "
+            f"{side['brier']:>7.3f} {side['negative_log_likelihood']:>7.3f}"
+        )
+    print(
+        f"  one temperature fitted on everything is {fitted.value:.2f}; the two folds chose "
+        f"{temperatures[0]:.2f} and {temperatures[1]:.2f}"
+    )
+    print(
+        "  Accuracy is identical on both rows by construction, so nothing here is a better answer -- it is the same\n"
+        "  answers with an honest number attached. Folds far apart mean there is not enough labelled data to fit one."
+    )
 
 
 def _print_per_question(items, results: dict) -> None:
