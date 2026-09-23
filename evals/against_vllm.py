@@ -158,6 +158,67 @@ def widen(items, questions: int, seed: int = 0):
     return out
 
 
+def run_batched(items, model: str, engine=None, documents: int = 8) -> dict:
+    """This package with several documents in one pass -- the arm that answers vLLM's own arrangement.
+
+    vLLM's concurrency is many requests' tokens packed into one forward pass. This is the same idea with the roles
+    swapped: the documents share a pass and each one's questions are rows of it.
+
+    Documents are packed **greedily up to the group** rather than a fixed count, because that is what decides whether a
+    batch fits: RACE articles carry three to five questions, so eight of them can be 35 questions against a group of 32.
+    `documents` is a ceiling on how many share a batch, not a promise.
+    """
+    from prismyra import Prismyra
+
+    engine = engine or Prismyra(model, paged=True)
+    tokenizer = engine.tokenizer
+
+    batches, current, carried = [], [], 0
+    for item in items:
+        if len(item.questions) > engine.group:
+            raise SystemExit(f"one document carries {len(item.questions)} questions and the group is {engine.group}")
+        if current and (carried + len(item.questions) > engine.group or len(current) >= documents):
+            batches.append(current)
+            current, carried = [], 0
+        current.append(item)
+        carried += len(item.questions)
+    if current:
+        batches.append(current)
+
+    rows, seconds, tokens, asked = [], [], 0, 0
+    for n, chunk in enumerate(batches):
+        started = time.perf_counter()
+        with engine.open_batch([item.context for item in chunk]) as batch:
+            results = batch.ask([item.questions for item in chunk])
+        seconds.append(time.perf_counter() - started)
+        for item, result in zip(chunk, results, strict=True):
+            context_tokens = len(tokenizer(item.context)["input_ids"])
+            suffix = max(len(tokenizer("\n" + q.prompt)["input_ids"]) for q in item.questions)
+            tokens += context_tokens + suffix * len(item.questions)
+            asked += len(item.questions)
+            for question in item.questions:
+                if question.id not in item.gold:
+                    continue
+                rows.append(
+                    {
+                        "item": n,
+                        "id": question.id,
+                        "got": result[question.id].value,
+                        "want": item.gold[question.id],
+                    }
+                )
+    widths = [len(chunk) for chunk in batches]
+    print(f"  {len(batches)} batches of {min(widths)} to {max(widths)} documents")
+    return {
+        "arm": f"batched to {documents}",
+        "rows": rows,
+        "seconds": seconds,
+        "tokens": tokens,
+        "model": model,
+        "asked": asked,
+    }
+
+
 def run_fork(items, model: str, engine=None, graphs: bool = False) -> dict:
     """This package. One context pass per item, every question a row.
 
@@ -334,6 +395,11 @@ def summarise(run: dict, questions: int) -> dict:
     """
     seconds = run["seconds"][1:] or run["seconds"]
     asked = run.get("asked", len(run["rows"]))
+    if run["arm"].startswith("batched") and len(run["seconds"]) > 1:
+        # One entry covers a whole batch, so dropping the first as warm-up drops that many documents' worth of
+        # questions too. Scaled rather than left alone: questions per second is asked over seconds and the two must
+        # describe the same work.
+        asked = round(asked * len(seconds) / len(run["seconds"]))
     answered = [r for r in run["rows"] if r["item"] > 0] or run["rows"]
     right = sum(r["got"] == r["want"] for r in answered)
     return {
@@ -370,6 +436,9 @@ def main(argv: list[str] | None = None) -> int:
         "--at", help="comma-separated question counts to sweep instead of the default, for locating the crossing"
     )
     parser.add_argument("--graphs", action="store_true", help="record and replay the branch pass (fork arm only)")
+    parser.add_argument(
+        "--documents", type=int, help="answer this many documents in one pass (fork arm only; needs the paged storage)"
+    )
     args = parser.parse_args(argv)
 
     # Identical items in both processes, because both load the same task with the same seed. Passing the items through
@@ -412,7 +481,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.record:
-        run = run_fork(items, args.model, graphs=args.graphs)
+        run = (
+            run_batched(items, args.model, documents=args.documents)
+            if args.documents
+            else run_fork(items, args.model, graphs=args.graphs)
+        )
         args.record.write_text(json.dumps(run, indent=2, default=str))
         print(json.dumps(summarise(run, questions), indent=2))
         print(f"\nwritten to {args.record}")
