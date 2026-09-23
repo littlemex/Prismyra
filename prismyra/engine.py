@@ -22,6 +22,7 @@ from .fork import (
     TooWide,
     build_suffixes,
     restore_and_fork,
+    restore_and_fork_many,
     round_width,
     snapshot,
 )
@@ -66,6 +67,49 @@ REPLAY_CHECKS = 2
 #: have to be retuned per model. The largest is what `open_context` will refuse above, and refusing by name is what this
 #: engine already does when a context will not fit.
 CONTEXT_SIZES = (1024, 2048, 4096, 8192, 16384, 32768, 65536)
+
+
+@dataclass
+class Batch:
+    """Several documents read into one cache, answered in one forward pass.
+
+    `context_ms` is the reading of all of them, reported once. The documents were read one at a time -- reading is one
+    pass over one document and there is nothing to share there -- and what this object exists for is that **answering**
+    them is one pass.
+    """
+
+    _engine: Prismyra
+    _prefills: list[Prefill] | None
+    _room: int | None
+    context_ms: float
+
+    @property
+    def tokens(self) -> list[int]:
+        if self._prefills is None:
+            raise PrismyraError("this batch has been closed")
+        return [p.tokens for p in self._prefills]
+
+    def ask(self, questions: list[list[Question]]) -> list[Result]:
+        """One list of questions per document, in the order the documents were given. One pass answers all of them."""
+        if self._prefills is None:
+            raise PrismyraError("this batch has been closed")
+        if len(questions) != len(self._prefills):
+            raise PrismyraError(
+                f"{len(questions)} lists of questions for {len(self._prefills)} documents; a batch answers every "
+                f"document it holds, so pass one list each"
+            )
+        return self._engine._answer_batch(self._prefills, questions, context_ms=self.context_ms)
+
+    def close(self) -> None:
+        if self._prefills is not None:
+            self._engine._release_cache(self._prefills[0])
+            self._prefills = None
+
+    def __enter__(self) -> Batch:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 @dataclass
@@ -514,6 +558,131 @@ class Prismyra:
             last_position=torch.tensor([encoded.tokens - 1], device=self.device),
             position_from=position_from,
         )
+
+    def open_batch(self, contexts: list[str]) -> Batch:
+        """Read several documents into one cache, so that one forward pass can answer about all of them.
+
+        This is the answer to the measurement that says one card serves 1.08 requests a second however many arrive: the
+        batch's width was being spent entirely on questions about one document, so a second caller waited. Here the
+        width is divided between documents, which is what a serving engine does with its own batch and what this
+        package could not do while the storage joined one context with every row.
+
+        Requires the paged storage -- `Prismyra(paged=True)` -- and says so rather than quietly serving one document,
+        because the joined storage puts the context in a row that every row reads and there is no arrangement of it that
+        holds two.
+
+        The documents are read one at a time, which is unchanged: reading is one pass over one document and there is
+        nothing to share. What is shared is the **answering**.
+        """
+        if not contexts:
+            raise PrismyraError("a batch needs at least one document")
+        if not self.paged:
+            raise PrismyraError(
+                "a batch of documents needs the paged storage, because the joined storage keeps the context in one row "
+                "that every row reads. Build the engine with Prismyra(..., paged=True)."
+            )
+        if len(contexts) > self.group:
+            raise PrismyraError(
+                f"{len(contexts)} documents and a group of {self.group}: every document needs at least one row. Build "
+                f"the engine with a larger group, or read them in batches of {self.group}."
+            )
+
+        encoded = [encode(text, None, None, self.processor, self.tokenizer, self.device) for text in contexts]
+        total = sum(e.tokens for e in encoded)
+        cache, room = self._claim_cache(total)
+        started = _now(self.torch_device)
+        prefills = []
+        with torch.inference_mode():
+            for handle, one in enumerate(encoded):
+                for layer in cache.layers:
+                    begin = getattr(layer, "begin_document", None)
+                    if begin is not None:
+                        begin(handle)
+                self.backbone(input_ids=one.input_ids, use_cache=True, past_key_values=cache, **one.media)
+                position_from = position_offset(self.backbone, one.tokens) if one.has_media else one.tokens
+                prefills.append(
+                    Prefill(
+                        snapshot=snapshot(cache),
+                        cache=cache,
+                        room=room if handle == 0 else None,
+                        tokens=one.tokens,
+                        last_position=torch.tensor([one.tokens - 1], device=self.device),
+                        position_from=position_from,
+                    )
+                )
+        return Batch(_engine=self, _prefills=prefills, _room=room, context_ms=_since(started, self.torch_device))
+
+    def _answer_batch(self, prefills: list[Prefill], asked: list[list[Question]], context_ms: float) -> list[Result]:
+        """One forward pass carrying questions about several documents, one row per question.
+
+        Rows are laid out document by document, contiguously, because a row's page range and a row's state come from two
+        different pieces of arithmetic and laying them out the same way is what keeps those two in agreement.
+        """
+        for questions in asked:
+            self.validate(questions)
+        counts = [len(q) for q in asked]
+        if sum(counts) > self.group:
+            raise PrismyraError(
+                f"{sum(counts)} questions across {len(asked)} documents and a group of {self.group}. A batch answers "
+                f"in one pass, so its questions have to fit one group."
+            )
+        if any(count == 0 for count in counts):
+            raise PrismyraError("every document in a batch needs at least one question; drop it from the batch instead")
+
+        flat = [q for questions in asked for q in questions]
+        plans = [plan(q, self.tokenizer) for q in flat]
+        width = self._width_for(plans)
+        rows_for = [handle for handle, count in enumerate(counts) for _ in range(count)]
+
+        start = _now(self.torch_device)
+        with self._lock, torch.inference_mode():
+            hidden = self._branch_across(prefills, counts, rows_for, [p.text for p in plans], width)
+            probabilities = score(hidden, self.unembedding, [p.token_ids for p in plans], None)
+        readout_ms = _since(start, self.torch_device)
+
+        results, at = [], 0
+        for handle, questions in enumerate(asked):
+            answers = {}
+            for q, values in zip(questions, probabilities[at : at + len(questions)], strict=True):
+                numbers = values.tolist()
+                best = max(range(len(numbers)), key=lambda i: numbers[i])
+                option = q.options[best]
+                answers[q.id] = Answer(
+                    id=q.id,
+                    kind=q.kind,
+                    value=q.value_of(option),
+                    option=option,
+                    probabilities=dict(zip(q.options, numbers, strict=True)),
+                )
+            at += len(questions)
+            results.append(
+                Result(
+                    answers=answers,
+                    model=self.model_name,
+                    context_tokens=prefills[handle].tokens,
+                    scoring="raw",
+                    timing=Timing(context_ms=context_ms, readout_ms=readout_ms),
+                )
+            )
+        return results
+
+    def _branch_across(self, prefills, counts: list[int], rows_for: list[int], texts: list[str], width: int):
+        """The pass itself. Every row's positions start at its own document's end, which is per row not per batch."""
+        rows = sum(counts)
+        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, rows, width)
+        starts = [prefills[handle].position_from or prefills[handle].tokens for handle in rows_for]
+        offsets = torch.tensor(starts, device=self.device).unsqueeze(1)
+        positions = offsets + torch.arange(ids.shape[1], device=self.device).unsqueeze(0)
+
+        restore_and_fork_many(
+            prefills[0].cache,
+            [(prefills[handle].snapshot, count) for handle, count in enumerate(counts)],
+            width=self.group,
+            rows_for=rows_for,
+        )
+        out = self.backbone(input_ids=ids, position_ids=positions, use_cache=True, past_key_values=prefills[0].cache)
+        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
         # Already validated: both public entry points call `validate` before the context is read, and repeating it
