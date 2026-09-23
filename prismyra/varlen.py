@@ -72,7 +72,7 @@ class Boundaries:
     def longest(self) -> int:
         return max(self.lengths)
 
-    def tails(self, tokens_major: torch.Tensor, width: int) -> torch.Tensor:
+    def tails(self, tokens_major: torch.Tensor, width: int, extra: int = 0) -> torch.Tensor:
         """Each document's last `width` tokens of a flat run, padded at the front when a document is shorter.
 
         `tokens_major` is `(total_tokens, channels)` and the result is `(documents, channels, width)`, the layout
@@ -80,13 +80,28 @@ class Boundaries:
         would have nothing: a document of two tokens has no third-from-last.
         """
         out = tokens_major.new_zeros((self.documents, tokens_major.shape[1], width))
-        at = 0
+        # Past whatever the framework prepended. The prefix is the first document's left context and is not part of it.
+        at = extra
         for d, n in enumerate(self.lengths):
             take = min(width, n)
             piece = tokens_major[at + n - take : at + n]
             out[d, :, width - take :] = piece.t()
             at += n
         return out
+
+    def with_prefix(self, extra: int, device: str | torch.device) -> torch.Tensor:
+        """Cumulative offsets for a run that carries `extra` leading tokens belonging to the first document.
+
+        The framework's linear-attention layer prepends the convolution state it was holding, convolves, and then drops
+        the prefix again. On a cache that has never held anything there is nothing to prepend and the run is exactly the
+        documents; on a cache that already holds documents -- a shelf -- the run is `kernel - 1` zeros longer.
+
+        Those leading tokens are the first document's left context, so its start stays at zero and every later boundary
+        moves by `extra`. Getting this wrong does not raise: the second document's convolution would begin three tokens
+        inside the first one.
+        """
+        moved = [0, *[int(x) + extra for x in self.offsets[1:].tolist()]]
+        return torch.tensor(moved, dtype=torch.int32, device=device)
 
     def positions(self, device: str | torch.device) -> torch.Tensor:
         """One row of positions for the flat run, restarting at zero for each document.

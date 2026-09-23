@@ -9,14 +9,19 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:  # pragma: no cover - the framework's cache type, for the annotation only
+    from transformers.cache_utils import Cache
 
 from . import kernels, varlen
 from .cache import build_cache, cache_bytes, join_bytes_per_token
 from .calibration import Calibration
 from .fork import (
+    LENGTH_ATTRS,
     WIDTHS,
     Prefill,
     TooWide,
@@ -68,6 +73,148 @@ REPLAY_CHECKS = 2
 #: have to be retuned per model. The largest is what `open_context` will refuse above, and refusing by name is what this
 #: engine already does when a context will not fit.
 CONTEXT_SIZES = (1024, 2048, 4096, 8192, 16384, 32768, 65536)
+
+
+@dataclass
+class Shelved:
+    """One document on a shelf: where it is, how long it is, and the state a branch forks from."""
+
+    handle: int
+    tokens: int
+    snapshot: dict = field(repr=False)
+    position_from: int = 0
+
+
+@dataclass
+class Shelf:
+    """Documents kept on the device across requests, answered a batch at a time.
+
+    The difference from `Batch` is what outlives a request. A batch owns its cache, so a second question about the same
+    document reads it again; a shelf owns the cache and the documents are what come and go. That is the shape a server
+    wants, and it is what makes `Pool`'s page reuse load-bearing: a dropped document gives its pages back for the next
+    one.
+
+    What a shelf holds per document is its pages and **a snapshot of the recurrent state its read ended in**. The pages
+    are the attention layers' share and live in the pool; the recurrent layers keep one state per row rather than per
+    document, so a document's state has to be kept aside and copied into its rows when it is answered. That is the same
+    snapshot a single context has always taken -- `fork.snapshot` -- and the only new part is that several are alive at
+    once.
+    """
+
+    _engine: Prismyra
+    _cache: Cache | None
+    room: int
+    #: Documents on the shelf, by the handle `put` returned.
+    documents: dict[int, Shelved] = field(default_factory=dict)
+    _next_handle: int = 0
+
+    # ---------------------------------------------------------------- putting documents on
+    def put(self, context: str) -> int:
+        """Read one document onto the shelf and return its handle."""
+        return self.put_many([context])[0]
+
+    def put_many(self, contexts: list[str]) -> list[int]:
+        """Read several documents in one pass and return their handles, in order.
+
+        One pass, because reading is mostly fixed cost -- 110 ms plus 11 ms a thousand tokens -- so reading five
+        documents together costs about what reading one costs.
+        """
+        if self._cache is None:
+            raise PrismyraError("this shelf has been closed")
+        if not contexts:
+            raise PrismyraError("putting nothing on a shelf is not an operation")
+        engine = self._engine
+        encoded = [engine.encode_context(one) for one in contexts]
+        if any(one.has_media for one in encoded):
+            raise PrismyraError(
+                "a shelf is text only for now, for the same reason a batch is: media move the positions"
+            )
+        handles = list(range(self._next_handle, self._next_handle + len(encoded)))
+        self._next_handle += len(encoded)
+
+        started = _now(engine.torch_device)
+        with torch.inference_mode():
+            # The read must start from no recurrent state, and the shelf's layers are carrying whatever the last pass
+            # left. Zeroed rather than reset: reset would clear the pages, which is where the documents already on the
+            # shelf live.
+            _forget_recurrent_state(self._cache)
+            for layer in self._cache.layers:
+                begin = getattr(layer, "begin_documents", None)
+                if begin is not None:
+                    begin(handles)
+            ids = torch.cat([one.input_ids for one in encoded], dim=1)
+            with varlen.reading([one.tokens for one in encoded], engine.device) as boundaries:
+                engine.backbone(
+                    input_ids=ids,
+                    position_ids=boundaries.positions(engine.device),
+                    use_cache=True,
+                    past_key_values=self._cache,
+                )
+                _put_back_conv_states(self._cache, boundaries)
+                engine._check_batched_read(self._cache, boundaries)
+            taken = snapshot(self._cache)
+        engine._note_read(_since(started, engine.torch_device), len(encoded))
+        for at, (handle, one) in enumerate(zip(handles, encoded, strict=True)):
+            self.documents[handle] = Shelved(
+                handle=handle, tokens=one.tokens, snapshot=pick(taken, at), position_from=one.tokens
+            )
+        return handles
+
+    def drop(self, handle: int) -> None:
+        """Take a document off the shelf and give its pages back."""
+        if self._cache is None:
+            raise PrismyraError("this shelf has been closed")
+        if handle not in self.documents:
+            raise PrismyraError(f"this shelf does not hold document {handle}")
+        # The engine's lock, because a pass running on another thread has rows naming this document's pages and the run
+        # would be handed to the next one underneath it.
+        with self._engine._lock:
+            for layer in self._cache.layers:
+                release = getattr(layer, "release_document", None)
+                if release is not None:
+                    release(handle)
+            del self.documents[handle]
+
+    # ---------------------------------------------------------------- answering
+    def ask(self, asked: dict[int, list[Question]]) -> dict[int, Result]:
+        """Answer questions about documents already on the shelf, in one pass. No reading happens here."""
+        if self._cache is None:
+            raise PrismyraError("this shelf has been closed")
+        if not asked:
+            raise PrismyraError("a pass needs at least one document to answer about")
+        missing = [handle for handle in asked if handle not in self.documents]
+        if missing:
+            raise PrismyraError(f"this shelf does not hold {missing}; put the document on it or use its handle")
+        engine = self._engine
+        handles = list(asked)
+        prefills = [
+            Prefill(
+                snapshot=self.documents[handle].snapshot,
+                cache=self._cache,
+                room=None,
+                tokens=self.documents[handle].tokens,
+                last_position=torch.tensor([self.documents[handle].tokens - 1], device=engine.device),
+                position_from=self.documents[handle].position_from,
+            )
+            for handle in handles
+        ]
+        results = engine._answer_batch(
+            prefills, [asked[handle] for handle in handles], context_ms=0.0, rows_for=handles
+        )
+        return dict(zip(handles, results, strict=True))
+
+    # ---------------------------------------------------------------- lifecycle
+    def close(self) -> None:
+        if self._cache is not None:
+            self._engine._forget_recordings(self._cache)
+            self._cache = None
+            self.documents.clear()
+
+    def __enter__(self) -> Shelf:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 @dataclass
@@ -248,6 +395,10 @@ class Prismyra:
         #: Proportional to the length with no constant worth keeping: measured at 1.96e-4 GiB per token at both 3,040
         #: and 24,327 tokens, and independent of the group, which is what makes one observation usable at any length.
         self._observed_reading_per_token: int | None = None
+        #: The largest transient any read has cost, whatever its length. A read's cost has a constant part, and a budget
+        #: that is only a slope in the tokens under-states a short read and -- when the slope is learned *from* a short
+        #: read -- wildly over-states a long one.
+        self._observed_reading_floor: int | None = None
 
         if require_kernels and not (fast_kernels and on_cuda):
             raise PrismyraError(
@@ -329,7 +480,14 @@ class Prismyra:
         the group -- but a branch pass allocates several times this much transiently, and that peak is what decides how
         many contexts can be answered at once. `answering_bytes` is that number, and `stats()` reports both.
         """
-        return cache_bytes(self.config, self.room_for(context_tokens) + WIDTHS[-1], self.group, self.dtype, WIDTHS[-1])
+        return cache_bytes(
+            self.config,
+            self.room_for(context_tokens) + WIDTHS[-1],
+            self.group,
+            self.dtype,
+            WIDTHS[-1],
+            paged=self.paged,
+        )
 
     def answering_bytes(self, context_tokens: int, questions: int | None = None) -> int:
         """What a branch pass will transiently allocate on top of the held cache.
@@ -372,9 +530,12 @@ class Prismyra:
         asking fewer questions. Extrapolated, a context somewhere near 48,000 tokens needs more of it than a 44 GiB
         card has left after the weights -- which is a limit worth refusing by name rather than discovering.
         """
+        floor = self._observed_reading_floor or 0
         if self._observed_reading_per_token is None:
-            return 0
-        return int(self._observed_reading_per_token * context_tokens * ANSWERING_MARGIN)
+            return int(floor * ANSWERING_MARGIN)
+        # The larger of the floor and the slope's prediction, not their sum: the floor was measured at a short read and
+        # already contains whatever proportional part that read had, so adding them would count it twice.
+        return int(max(floor, self._observed_reading_per_token * context_tokens) * ANSWERING_MARGIN)
 
     def budget_is_evidenced(self, questions: int | None = None) -> bool:
         """Whether `answering_bytes` is an estimate this engine has seen a pass wide enough to support.
@@ -486,6 +647,7 @@ class Prismyra:
             ),
             "answering_observed_at_rows": self._observed_at_rows,
             "reading_bytes_per_context_token": self._observed_reading_per_token or 0,
+            "reading_bytes_floor": self._observed_reading_floor or 0,
         }
 
     # ------------------------------------------------------------------ internals
@@ -586,6 +748,42 @@ class Prismyra:
         """
         return encode(context, None, None, self.processor, self.tokenizer, self.device)
 
+    def open_shelf(self, room: int | None = None) -> Shelf:
+        """One cache held open, with documents put on it and taken off as callers come and go.
+
+        A `Batch` reads its documents, answers them and drops the cache, so asking twice about one document reads it
+        twice -- and page reuse has nothing to reuse pages for, since nothing outlives a batch. A shelf is the other
+        shape: the pages stay, a document stays until it is dropped, and a second question about a document already on
+        the shelf costs a branch pass and no read at all.
+
+        `room` is how many context tokens the shelf holds altogether, rounded up to a bucket. Default is the largest
+        bucket that admission will accept, because a shelf that holds two documents is barely a shelf.
+        """
+        if not self.paged:
+            raise PrismyraError(
+                "a shelf needs the paged storage: documents share the pages and each row's table names its own. Build "
+                "the engine with Prismyra(..., paged=True)."
+            )
+        wanted = room if room is not None else self._largest_shelf()
+        self._check_fits(wanted)
+        cache, held = self._claim_cache(wanted)
+        return Shelf(_engine=self, _cache=cache, room=held)
+
+    def _largest_shelf(self) -> int:
+        """The biggest bucket this engine can hold a shelf of, from its own admission figures.
+
+        Asked rather than assumed, because the answer is a fact about the card and the weights on it. Falls back to the
+        smallest bucket, which admission will then refuse by name if even that does not fit -- a refusal naming the
+        figures beats a shelf that appears to exist and fails on its first document.
+        """
+        for size in reversed(CONTEXT_SIZES):
+            try:
+                self._check_fits(size)
+            except PrismyraError:
+                continue
+            return size
+        return CONTEXT_SIZES[0]
+
     def open_batch(self, contexts: list[str] | list[Encoded]) -> Batch:
         """Read several documents into one cache, so that one forward pass can answer about all of them.
 
@@ -639,6 +837,12 @@ class Prismyra:
         with torch.inference_mode():
             # One pass over all of them. Reading is 110 ms of fixed cost plus 11 ms per thousand tokens on this
             # model, so what this removes is that fixed cost paid per document rather than per batch.
+            # Named even though a batch's handles are its positions, so the layer's "already held" check runs rather
+            # than being skipped on the one path that could get away with skipping it.
+            for layer in cache.layers:
+                begin = getattr(layer, "begin_documents", None)
+                if begin is not None:
+                    begin(list(range(len(encoded))))
             ids = torch.cat([one.input_ids for one in encoded], dim=1)
             with varlen.reading(lengths, self.device) as boundaries:
                 self.backbone(
@@ -690,7 +894,13 @@ class Prismyra:
                         f"continue from another."
                     )
 
-    def _answer_batch(self, prefills: list[Prefill], asked: list[list[Question]], context_ms: float) -> list[Result]:
+    def _answer_batch(
+        self,
+        prefills: list[Prefill],
+        asked: list[list[Question]],
+        context_ms: float,
+        rows_for: list[int] | None = None,
+    ) -> list[Result]:
         """One forward pass carrying questions about several documents, one row per question.
 
         Rows are laid out document by document, contiguously, because a row's page range and a row's state come from two
@@ -710,12 +920,26 @@ class Prismyra:
         flat = [q for questions in asked for q in questions]
         plans = [plan(q, self.tokenizer) for q in flat]
         width = self._width_for(plans)
-        rows_for = [handle for handle, count in enumerate(counts) for _ in range(count)]
+        # Which document each row answers about, named by the handle the **cache** knows it as. A batch admits its
+        # documents in order so the handles are the positions; a shelf holds whatever was put on it, which is why this
+        # is given rather than derived.
+        names = rows_for if rows_for is not None else list(range(len(counts)))
+        if len(names) != len(counts):
+            raise PrismyraError(f"{len(names)} document names for {len(counts)} lists of questions")
+        rows_for = [names[at] for at, count in enumerate(counts) for _ in range(count)]
 
         start = _now(self.torch_device)
         with self._lock, torch.inference_mode():
-            hidden = self._branch_across(prefills, counts, rows_for, [p.text for p in plans], width)
-            probabilities = score(hidden, self.unembedding, [p.token_ids for p in plans], None)
+            try:
+                hidden = self._branch_across(prefills, counts, rows_for, [p.text for p in plans], width)
+                probabilities = score(hidden, self.unembedding, [p.token_ids for p in plans], None)
+            finally:
+                # Whether it answered or raised, no row is set up to read anything now, so a document nobody is
+                # reading can be dropped. In a `finally`: a failed pass must not leave a shelf unable to drop anything.
+                for layer in prefills[0].cache.layers:
+                    finish = getattr(layer, "finish_branches", None)
+                    if finish is not None:
+                        finish()
         readout_ms = _since(start, self.torch_device)
 
         results, at = [], 0
@@ -748,13 +972,15 @@ class Prismyra:
         """The pass itself. Every row's positions start at its own document's end, which is per row not per batch."""
         rows = sum(counts)
         ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, rows, width)
-        starts = [prefills[handle].position_from or prefills[handle].tokens for handle in rows_for]
+        starts = [
+            prefills[at].position_from or prefills[at].tokens for at, count in enumerate(counts) for _ in range(count)
+        ]
         offsets = torch.tensor(starts, device=self.device).unsqueeze(1)
         positions = offsets + torch.arange(ids.shape[1], device=self.device).unsqueeze(0)
 
         restore_and_fork_many(
             prefills[0].cache,
-            [(prefills[handle].snapshot, count) for handle, count in enumerate(counts)],
+            [(prefills[at].snapshot, count) for at, count in enumerate(counts)],
             width=self.group,
             rows_for=rows_for,
         )
@@ -865,6 +1091,15 @@ class Prismyra:
             return
         peak = int(torch.cuda.max_memory_allocated(self.torch_device)) - before
         transient = max(0, peak - self.cache_bytes(context_tokens))
+        # The floor, from any read. A read has a constant part and dividing it by the tokens is what went wrong: at
+        # 3,040 and 24,327 tokens the transient is 1.96e-4 GiB a token both times, so a constant is invisible there --
+        # and at thirty tokens the same division said 20 MiB a token, refusing a 1,024-token context at 23 GiB.
+        floor = self._observed_reading_floor
+        self._observed_reading_floor = transient if floor is None else max(floor, transient)
+        # The slope, only from reads long enough for the constant not to dominate. One bucket is the bar: below it the
+        # division is a measurement of the constant divided by an arbitrary number.
+        if context_tokens < CONTEXT_SIZES[0]:
+            return
         per_token = transient // context_tokens
         seen = self._observed_reading_per_token
         self._observed_reading_per_token = per_token if seen is None else max(seen, per_token)
@@ -992,6 +1227,10 @@ class Prismyra:
         )
         self._made_caches += 1
         return cache, room
+
+    def _forget_recordings(self, cache) -> None:
+        """Drop the recordings taken on this cache. They hold its addresses, and the cache is about to go."""
+        self._cache_recordings.pop(id(cache), None)
 
     def _release_cache(self, prefill) -> None:
         """Where a closed context would hand its cache back for the next one. There is no pool yet; `_claim_cache` says
@@ -1154,3 +1393,37 @@ def _put_back_conv_states(cache, boundaries) -> None:
                 f"a recorded convolution window is {tuple(tails.shape)} and the layer keeps {tuple(held.shape)}"
             )
         layer.conv_states[key] = tails.to(dtype=held.dtype) if held is not None else tails
+
+
+def _forget_recurrent_state(cache) -> None:
+    """Put the recurrent and convolution state back to one row of zeros, so the next read starts from nothing.
+
+    A shelf's cache carries whatever the last pass left, and a document read on top of that would begin from the last
+    document's state -- the failure this package treats most seriously, since it answers plausibly rather than raising.
+    `reset` would do it and would also clear the pages, which is where the documents already on the shelf live.
+
+    **One row of zeros, not a missing key and not the buffer zeroed in place**, and both alternatives were tried on the
+    device. A key set to None reaches `torch.cat([None, ...])` in the framework's convolution and raises four frames
+    down; a key removed raises `KeyError` in the same line, because the framework expects the entry a fresh cache was
+    given. And the live buffers are the full group width, which a one-row read cannot be concatenated with, so the
+    shape has to come back to one row as well as the values to zero.
+
+    A fresh tensor rather than a slice, because the documents on the shelf hold clones of what was there and a fresh one
+    cannot be written through to reach them.
+    """
+    for layer in cache.layers:
+        for attr in ("recurrent_states", "conv_states"):
+            held = getattr(layer, attr, None)
+            if not isinstance(held, dict):
+                continue
+            for key, state in list(held.items()):
+                held[key] = None if state is None else torch.zeros_like(state[:1])
+        # And the counters, or the framework reads the new document as a continuation of the last one. That is not a
+        # detail: the layer picks its single-token path when the cache says it already holds tokens, so the second
+        # document on a shelf went through the decode convolution and the boundary machinery recorded nothing.
+        for name in LENGTH_ATTRS:
+            current = getattr(layer, name, None)
+            if torch.is_tensor(current):
+                current.zero_()
+            elif isinstance(current, int):
+                setattr(layer, name, 0)

@@ -18,7 +18,7 @@ Prefill only: nothing here generates text. The scope, and the point below which 
 are stated in the README.
 """
 
-from .engine import Batch, Context, Prismyra
+from .engine import Batch, Context, Prismyra, Shelf
 from .schedule import Batcher
 from .schema import (
     SCORING,
@@ -55,6 +55,7 @@ __all__ = [
     "Request",
     "Result",
     "Scale",
+    "Shelf",
     "Temperature",
     "Thresholds",
     "Timing",
