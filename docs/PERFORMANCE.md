@@ -373,6 +373,14 @@ they cost to build:
   engine refuses a context by name from a budget it measures, so a feature that quietly takes device memory behind
   that budget would make the refusal wrong.
 
+  **A recording is accepted only if its first replay reproduces the pass it was taken from.** That check is not a
+  formality and it is the reason this is safe to have at all. A recording that reproduced its pass exactly on a fresh
+  engine stopped doing so once the test suite had run its video and companion tests first -- measured, repeatable, and
+  **the cause is not identified**. Checking that the recording still holds the tensors the layers point at did not catch
+  it. So the check is the thing itself: replay once, compare against the answer already in hand, and throw the recording
+  away if it moved. `stats()["graphs_declined"]` says which shape was refused and why. A wrong answer that looks right
+  is the worst outcome available here, and this is what makes it impossible rather than unlikely.
+
   What it took to get right is worth more than the speed-up. A replay **runs no Python**, and two separate things
   depended on Python running. The cache's host-side length -- the integer each layer keeps so the framework can ask how
   many tokens it holds without a device read -- is not advanced by a replay, so it is recorded alongside the graph and
@@ -381,7 +389,27 @@ they cost to build:
   when it was taken. Both bindings are kept and swapped around each replay, so the fork writes the context into what the
   recording reads. Getting either wrong gives a plausible answer rather than an error, which is why the device test
   compares probabilities across four groups rather than decisions on one.
-* **the paged path made shapes constant**, and the graph measurement is what gives that a number. Its memory saving was
+* **the paged path is back, and it runs.** Its memory saving was measured and was zero, so it was deleted; the reason
+  to restore it is that the read's shape stops depending on the context's length, which is what a recording needs. On a
+  fingerprint-verified tree, over nine groups across three contexts of different lengths:
+
+  | | decisions changed | largest probability move | ms per group | reads served |
+  |---|---|---|---|---|
+  | joined against paged | **0** | **0.0000** | 108 -> 112 | 90 |
+
+  Two things to take from that. The paged read is **bit-identical** to the joined one, which corrects what the deleted
+  version of the file assumed -- it said a paged read reduces in a different order and would move answers, and it does
+  not. And `reads served = 90` is nine groups times ten attention layers, which is the number that says the path ran:
+  the first version of this file reported itself installed and served none, and its measurements were the joined path
+  compared with itself.
+
+  It is 4 ms per group **slower**, which is expected: the join was never the bottleneck. The value is entirely the
+  constant shape, and collecting it needs one more step. A recording holds the addresses of a cache, and a cache is
+  built per open context, so a recording still cannot cross contexts even with the shape settled. Reusing one page pool
+  across contexts would finish the job and trades against holding nineteen contexts open at once, which is a decision
+  rather than an optimisation.
+
+* **what the shape constancy is worth**, and the graph measurement is what gives that a number. Its memory saving was
   measured and was zero, which is why deleting it was right on the evidence available. The reason to want it back is
   not memory: a page pool is a fixed allocation with the lengths carried in `seqused_k` as data, so **one graph would
   serve every context length** rather than one per open context -- which is the difference between a session workload

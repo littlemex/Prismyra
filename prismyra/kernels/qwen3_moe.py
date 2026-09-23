@@ -211,10 +211,33 @@ class FlashAttention(nn.Module):
         query, key, value, gate, shape = self._project(hidden_states, position_embeddings)
 
         if past_key_values is not None:
+            layer = past_key_values.layers[a.layer_idx]
             key, value = past_key_values.update(key, value, a.layer_idx)
             rows, _, q_len, _ = query.shape
             q = query.transpose(1, 2).reshape(rows * q_len, -1, a.head_dim)
             cu_q = torch.arange(0, rows * q_len + 1, q_len, device=q.device, dtype=torch.int32)
+
+            if key is None:
+                # A paged layer returns nothing contiguous for a branch write, because there is nothing contiguous: the
+                # context's pages are named by every row's table and never copied. `seqused_k` replaces `cu_seqlens_k`
+                # here and passing both is not allowed, and `max_seqlen_k` is the pool's capacity rather than the real
+                # length -- an upper bound is what that argument is for, and reading the real one would mean a
+                # device-to-host copy on the request path.
+                pool_keys, pool_values, table, seqused, capacity = layer.paged_read(rows)
+                out = flash_attn_varlen_func(
+                    q,
+                    pool_keys,
+                    pool_values,
+                    cu_seqlens_q=cu_q,
+                    max_seqlen_q=q_len,
+                    max_seqlen_k=capacity,
+                    softmax_scale=a.scaling,
+                    causal=True,
+                    block_table=table,
+                    seqused_k=seqused,
+                )
+                return self._finish(out[0] if isinstance(out, tuple) else out, gate, shape)
+
             k_len = key.shape[-2]
             k = key.transpose(1, 2).reshape(rows * k_len, -1, a.head_dim)
             v = value.transpose(1, 2).reshape(rows * k_len, -1, a.head_dim)

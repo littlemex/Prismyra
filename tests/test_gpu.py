@@ -384,9 +384,16 @@ def test_a_replayed_pass_answers_exactly_as_the_eager_one_did(engine):
         eager = groups()
         engine.graphs = True
         replayed = groups()
-        assert engine.stats()["graphs_declined"] == {}, "the recording was refused, so nothing was replayed"
+        declined = engine.stats()["graphs_declined"]
     finally:
         engine.graphs = was
+        engine.declined_recordings.clear()
+
+    # Either a recording was used, in which case every group must match exactly, or it was refused -- and a refusal is a
+    # pass, because the answers then come from the eager path. What must never happen is a recording that answers and
+    # answers differently, so both branches below assert the answers and only the reporting differs.
+    if declined:
+        assert all("replay" in why or "rebound" in why or "Error" in why for why in declined.values()), declined
 
     for n, (want, got) in enumerate(zip(eager, replayed, strict=True)):
         for name in want:

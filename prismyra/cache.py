@@ -359,6 +359,7 @@ def build_cache(
     dtype: torch.dtype,
     device: str,
     max_branch_len: int = 512,
+    paged: bool = False,
 ):
     """A cache for one backbone: `ForkLayer` where attention needs keys and values, the framework's own layer elsewhere.
 
@@ -366,6 +367,8 @@ def build_cache(
     they are already preallocated in everything but name.
     """
     from transformers.cache_utils import STATIC_LAYER_TYPE_MAPPING, Cache
+
+    from .paged import PagedForkLayer
 
     decoder = getattr(config, "text_config", config)
     layer_types, kwargs = _layer_types(decoder)
@@ -375,7 +378,8 @@ def build_cache(
     layers: list = []
     for kind in layer_types:
         if kind == "full_attention":
-            layer = ForkLayer(max_cache_len=max_cache_len, max_batch_size=rows, max_branch_len=max_branch_len)
+            made = PagedForkLayer if paged else ForkLayer
+            layer = made(max_cache_len=max_cache_len, max_batch_size=rows, max_branch_len=max_branch_len)
             layer.early_initialization(rows, heads, head_dim, dtype, device)
         else:
             cls = STATIC_LAYER_TYPE_MAPPING[kind]
