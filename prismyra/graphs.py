@@ -49,6 +49,11 @@ def pays_from(replay_ms: float = REPLAY_MS, eager_ms: float = EAGER_MS, warmups:
 
     which on the measured ratio of 0.268 gives R > 6.20, so **seven**.
 
+    The result is very sensitive near a ratio of one, because it divides by one minus the ratio: a tenth of a
+    millisecond moves the count at a suffix of 128 tokens by two hundred. That is a property of the situation rather
+    than of this function -- when a replay saves almost nothing, "how many passes would pay for it" has no precise
+    answer, and a caller should read the ratio rather than the count.
+
     The first version of this said three, from a figure of 151.3 ms for "recording costs". That figure cannot be right
     and the arithmetic is what shows it: three warm-up passes at 107.7 ms each is 323 ms before the capture begins, so
     a cost of 151 ms had left the warm-ups out. Expressed in milliseconds the error was invisible; expressed in passes
@@ -84,8 +89,8 @@ def keeping_pays(eager_ms: float, replay_ms: float, expected: int) -> str | None
     |---|---|---|---|---|
     | 16 | 109.4 ms | 74.8 ms | 0.684 | 17 |
     | 32 | 110.7 ms | 94.7 ms | 0.855 | 40 |
-    | 64 | 144.2 ms | 142.1 ms | **0.986** | 414 |
-    | 128 | 268.1 ms | 267.3 ms | **0.997** | 2,190 |
+    | 64 | 144.2 ms | 142.1 ms | **0.986** | about 400 |
+    | 128 | 268.1 ms | 267.3 ms | **0.997** | about 2,000 |
 
     A recording removes the time the device spends waiting to be told what to do next, and **kernel launches are
     asynchronous**: once each kernel takes longer than the call that launches it, the host stays ahead of the device
