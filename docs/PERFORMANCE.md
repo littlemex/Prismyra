@@ -312,12 +312,12 @@ vLLM sends it once per question and leans on the prefix cache not to recompute i
 
 Not a faster kernel. One branch pass, profiled:
 
-| | as first measured |
-|---|---|
-| wall clock | 268.4 ms |
-| sum of all kernel time | 112.7 ms, **42% of the wall clock** |
-| kernel launches | **32,873**, which is 820 per layer across 40 layers |
-| largest single kernel | routed experts, 16.3 ms -- already level with vLLM's 29.97 against our 29.5 |
+| | as first measured | with the recurrence kernel |
+|---|---|---|
+| wall clock | 268.4 ms | 109.4 ms |
+| sum of all kernel time | 112.7 ms, **42% of the wall clock** | 55.1 ms, **50%** |
+| kernel launches | **32,873**, 820 per layer across 40 layers | **6,438**, 161 per layer |
+| largest single kernel | routed experts, 16.3 ms | the fp8 dense matmul, 5.47 ms across 250 calls |
 
 Fifty-eight percent of a pass was the device waiting to be told what to do next, and that also explains the measurement
 which never made sense alone: a branch pass costing the same at width 1 and width 32. A cost that does not move with the
@@ -350,12 +350,30 @@ they cost to build:
 
 * **the convolution kernel covers only the context pass.** A branch pass arrives as many rows and keeps the framework's
   path, which is recorded where it is installed and is the next cheap thing to look at.
-* **CUDA graphs.** Tried once and abandoned -- "one recording works (83.9 ms to 51.7); a second in the same process
-  faults on replay" -- and 1.62x is the right order for what is left. The blocker is shape: the joined read is
-  `(rows, context + suffix, heads, dim)`, so every context length is a different graph. The widths are already pinned.
-* **the paged path made shapes constant.** Its memory saving was measured and was zero, which is why deleting it was
-  right on the evidence available. The reason to want it back is not memory: a page pool is a fixed allocation with the
-  lengths carried as data, and constant shapes are what a graph needs.
+* **CUDA graphs work, measured.** The earlier note said a recording faulted on replay, and the reason was what was
+  being recorded. Capturing `ask` fails immediately -- `cudaErrorStreamCaptureInvalidated` -- because the read-out
+  converts probabilities to host values and the suffix ids are copied in from pageable memory. Capturing **only the
+  forward**, with the ids written into a static buffer and three warm-up passes on a side stream, works:
+
+  | | |
+  |---|---|
+  | the forward, eagerly | 107.7 ms |
+  | capturing it, once | 151.3 ms |
+  | replaying it | **28.9 ms** |
+
+  3.7x, and the capture pays for itself after two passes of the same shape. Two things stand between that and shipping
+  it. **Replay runs no Python**, so the cache's host-side length bookkeeping -- the integer each layer keeps so the
+  framework can ask how many tokens it holds without a device read -- is not updated by a replay and has to be set
+  afterwards to what the pass would have left. Getting that wrong produces a plausible answer rather than an error,
+  which is the failure this package treats most seriously. And the shape is per context length, so a graph serves one
+  open context: a session asking many groups about one document gets the 3.7x, and a request asking one group about a
+  document it will not revisit pays the capture for nothing. Captured lazily on the second group of a key, that second
+  case costs nothing either.
+* **the paged path made shapes constant**, and the graph measurement is what gives that a number. Its memory saving was
+  measured and was zero, which is why deleting it was right on the evidence available. The reason to want it back is
+  not memory: a page pool is a fixed allocation with the lengths carried in `seqused_k` as data, so **one graph would
+  serve every context length** rather than one per open context -- which is the difference between a session workload
+  getting 3.7x and every workload getting it.
 
 ## Concurrency, as first measured
 
