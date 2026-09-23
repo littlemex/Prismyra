@@ -143,3 +143,81 @@ def test_the_staging_page_is_never_inside_another_documents_run():
     second = p.admit(4 * BLOCK)
     assert first.staging_page not in second.pages()
     assert set(first.pages()).isdisjoint(second.pages())
+
+
+def test_a_released_run_is_handed_out_again():
+    """Without reuse the cursor only moves forward, so the pool refuses a document while holding released pages."""
+    p = pool(total_pages=64, rows=4, branch_tokens=32)
+    room = p.free_pages
+    first = p.admit(BLOCK * 2)
+    p.release(first)
+    again = p.admit(BLOCK * 2)
+    assert again.first_page == first.first_page
+    assert p.free_pages == room - 2, "reuse should not consume more of the cursor"
+
+
+def test_releasing_the_newest_document_gives_its_pages_back_to_the_cursor():
+    """A run that reaches the cursor is not a run, it is unallocated space, and a pool that empties should be as good as
+    a fresh one."""
+    p = pool(total_pages=64)
+    room = p.free_pages
+    held = [p.admit(BLOCK * 2) for _ in range(3)]
+    assert p.free_pages == room - 6
+    for one in reversed(held):
+        p.release(one)
+    assert p.free_pages == room, "an emptied pool kept pages it no longer owes anyone"
+    assert p.released == []
+
+
+def test_released_runs_that_touch_are_joined():
+    """Otherwise a pool that has held and released many documents cannot admit a large one while holding twice its pages
+    in small runs."""
+    p = pool(total_pages=64)
+    a = p.admit(BLOCK)
+    b = p.admit(BLOCK)
+    c = p.admit(BLOCK)
+    keep = p.admit(BLOCK * 8)  # so releasing a, b and c does not simply rewind the cursor
+    p.release(a)
+    p.release(c)
+    p.release(b)
+    assert p.released == [(a.first_page, 3)], p.released
+    # And the joined run can hold a document none of the three could.
+    wide = p.admit(BLOCK * 3)
+    assert wide.first_page == a.first_page
+    assert keep.first_page not in wide.pages()
+
+
+def test_a_document_reusing_a_larger_run_gives_the_whole_run_back():
+    """Otherwise the run shrinks to the size of whatever last used it, and a pool degrades every time it is reused."""
+    p = pool(total_pages=64)
+    big = p.admit(BLOCK * 6)
+    keep = p.admit(BLOCK)
+    p.release(big)
+    assert p.released == [(big.first_page, 6)]
+    small = p.admit(BLOCK)
+    assert small.first_page == big.first_page
+    p.release(small)
+    assert p.released == [(big.first_page, 6)], "the run shrank to the size of the document that reused it"
+    assert keep.reserved_pages == 1
+
+
+def test_a_refusal_names_the_largest_released_run():
+    """A caller refused while the pool holds released pages needs to know whether any of them could have helped."""
+    p = pool(total_pages=32, rows=4, branch_tokens=32)
+    small = p.admit(BLOCK)
+    p.admit(BLOCK)
+    p.release(small)
+    with pytest.raises(Full) as raised:
+        p.admit(BLOCK * (p.free_pages + 2))
+    assert "largest released run is 1" in str(raised.value), str(raised.value)
+
+
+def test_reuse_does_not_hand_the_same_run_to_two_documents():
+    """The failure that would not raise. Two documents on one run would read each other's tokens."""
+    p = pool(total_pages=64)
+    one = p.admit(BLOCK * 2)
+    p.release(one)
+    a = p.admit(BLOCK)
+    b = p.admit(BLOCK)
+    assert a.first_page != b.first_page
+    assert set(a.pages()).isdisjoint(b.pages())
