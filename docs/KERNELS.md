@@ -19,7 +19,7 @@ one change -- so the chain is not continuous and both ends are given.
 | dense projections on a block-scaled fp8 kernel | 204.5 ms | 185.7 ms | 22.2 |
 | normalisation on a faster kernel | 185.2 ms | 174.7 ms | 10.5 |
 | head duplication deleted | 175.1 ms | 166.6 ms | 9 |
-| convolution on a Triton kernel | 166.7 ms | 138.3 ms | 21.6 |
+| convolution on a Triton kernel | 166.7 ms | 138.3 ms | 21.6, withdrawn -- see below |
 
 Against vLLM doing the same work on the same card, three of the five now win:
 
@@ -77,3 +77,16 @@ Recorded because they are cheap to re-propose:
   part with enough arithmetic per byte wants narrow weights; the part without pays for the conversion.
 - **CUDA graphs.** One recording works (83.9 ms to 51.7); a second in the same process faults on replay and the reason was
   never found. Not shipped.
+
+## The convolution's figure is withdrawn
+
+The 21.6% above describes a kernel that was not running. The replacement acts only on weights the adapter tagged, the tag
+was a Python attribute, and the layer passes `weight.squeeze(1)` -- a view, with none of the original's attributes. So
+every call fell through to the framework while `stats()` reported the kernel as applied.
+
+Tagged by data pointer now. Re-measured on a 961-token context: **110.8 ms with the borrowed kernel against 112.2 ms with
+the framework's own, so 1.0 ms rather than 28.4.** The original figure may have been taken on a framework version that
+passed the weight itself; that is a guess and is labelled as one.
+
+The kernel is kept for something the framework's own cannot do: it takes `seq_starts`, so it does not convolve across a
+document boundary, and that is what lets several documents be read in one pass.

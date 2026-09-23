@@ -77,12 +77,35 @@ Five changes, each measured as its own paired run: the same process, the same in
 | dense projections on a block-scaled fp8 kernel | 204.5 | 185.7 | 18.8 |
 | normalisation on a faster kernel | 185.2 | 174.7 | 10.5 |
 | head duplication deleted, bit-identically | 175.1 | 166.6 | 8.5 |
-| convolution on a kernel written for it | 166.7 | 138.3 | 28.4 |
+| convolution on a kernel written for it | 166.7 | 138.3 | 28.4, and see below |
 
 **The chain is deliberately not continuous.** One step's "after" and the next step's "before" differ by a few
 milliseconds, and both are printed rather than smoothed. Subtracting one column from the other across rows does not
 work, and `benchmarks/check_results.py` enforces the gap staying small enough to be run-to-run variation -- a large gap
 would mean the steps came from different configurations and do not describe one sequence.
+
+**The convolution row above is wrong, and what replaced it is more interesting than the number.** The replacement is
+installed on the framework's module-level name and acts only on weights this adapter tagged, and the tag was a Python
+attribute -- but the layer does not pass the weight, it passes `weight.squeeze(1)`. A view is a new object carrying none
+of the original's attributes, so the wrapper deferred to the framework on **every call** while `stats()` reported the
+kernel as applied. The shape the wrapper saw, `(8192, 4)` against `nn.Conv1d`'s `(8192, 1, 4)`, is the whole diagnosis.
+
+Tagged by data pointer now, which a view shares, and measured again on a 961-token context:
+
+| | read |
+|---|---|
+| the borrowed convolution | 110.8 ms |
+| the framework's own | 112.2 ms |
+| the borrowed one again | 111.8 ms |
+
+**It is worth 1.0 ms, not 28.4.** Which framework version the original figure belongs to is not known and is not worth
+chasing; what is worth saying is that the figure survived in this document while describing a kernel that was not
+running, and that the check which would have caught it -- a witness that the replacement actually served a call -- exists
+for the paged path and did not exist here.
+
+The kernel stays, and its value moved from milliseconds to capability: it takes `seq_starts`, so it does not convolve
+across a document boundary, which is what makes [reading several documents in one pass](#reading-several-documents-in-one-pass)
+possible. The framework's own has no such argument.
 
 What each change is and what was measured and rejected on the way is in [KERNELS.md](KERNELS.md).
 
@@ -110,6 +133,74 @@ Same work, same card, read from profiles of both. Lower is better.
 
 Three are faster and the convolution is also more accurate than the one it replaces. The dense projections are slower
 and that is the honest remaining gap.
+
+## Reading several documents in one pass
+
+One card served 1.08 requests a second whatever arrived, and the cause was not the device. **The batch's whole width went
+to questions about one document**, so a second caller waited for the first. vLLM's concurrency comes from the opposite
+arrangement: one engine, one forward pass at a time, many requests' tokens packed into it.
+
+`Prismyra(paged=True).open_batch([...])` does that here. Two halves, and they were built in that order because the second
+one is where most of the time was:
+
+* **answering** several documents in one pass. Rows are named per page, so a row's table names its own document's pages
+  and nothing else. This is the third price of the paged path, after a memory saving that measured zero and the shape
+  constancy a recording needs;
+* **reading** them in one pass. The documents are concatenated into one flat run and the boundaries are carried as data.
+
+The second half is where the numbers are, and the reason is that reading is almost all fixed cost:
+
+| tokens | read |
+|---|---|
+| 289 | 113.2 ms |
+| 545 | 113.2 ms |
+| 1,057 | 116.0 ms |
+| 2,081 | 132.5 ms |
+
+which fits **110.1 ms plus 10.8 ms per thousand tokens**. At 289 tokens, 97% of reading a document is paying for kernel
+launches rather than for the document, and reading eight of them one at a time pays that eight times.
+
+Measured, eight documents of about 290 tokens with four questions each:
+
+| | separately | together | |
+|---|---|---|---|
+| reading | 0.989 s | **0.154 s** | 6.4x |
+| reading and answering | 1.968 s | **0.372 s** | 5.3x |
+| documents per second | 4.06 | **21.52** | |
+| questions per second | 13.72 | **72.64** | |
+
+Answering alone was 1.77x; reading is what took it to 5.3x.
+
+Three kernels have to be told where a boundary is, and **all three already take an argument for it**, which is why this
+is wiring rather than a rewrite. The attention kernel takes `cu_seqlens_q` and `cu_seqlens_k`. The borrowed recurrence
+takes `cu_seqlens`, and with it returns one final state per document -- so the argument that makes a batched read possible
+is the same one that makes it useful. The convolution is this package's own kernel and takes `seq_starts`.
+
+### Three things that had to be right, and two would not have raised
+
+* **The convolution state was one row for the whole batch.** The framework builds it by slicing the end of the pass's
+  input, and the end of a flat run is the end of the last document, so every row of every earlier document would have
+  started its branch convolution from the last document's tail. The per-document tails are recorded as the convolutions
+  run and written back afterwards, and a read that leaves any state with the wrong number of rows is refused by name.
+* **The convolution replacement had never run at all.** See [above](#how-the-context-pass-got-from-288-ms-to-138-ms): the
+  tag was a Python attribute and the layer passes a view. It is worth 1.0 ms rather than 28.4, and it is kept because it
+  takes the boundaries.
+* **The shared page region had no room for staging pages.** A document reserves one page for a leftover that does not
+  fill a page, and the allocation counted only whole pages: two documents of 67 tokens need five pages each, and nine is
+  what 134 tokens rounds up to.
+
+The boundaries are ambient -- a module-level window the kernels read -- because the kernels are reached through the
+framework's own module-level names and there is no argument to thread down from the engine. The window is a context
+manager so it cannot be left open, and "no boundaries" is the only default, so a pass that forgets to open one reads a
+single document, which is the behaviour that was already there.
+
+A batch is text only for now: media widen a context's positions by a grid rather than by a token count, and a flat run of
+several would need each document's own offset threaded through. It refuses by name when the borrowed convolution or
+recurrence is not installed, because the framework's own have no argument for a boundary and would scan across it.
+
+**What is not measured is a scheduler.** A batch that answers eight documents in one pass is not the same thing as a
+server that fills one from arrivals, and the throughput above is what the mechanism allows rather than what a queue would
+achieve.
 
 ## Concurrency, and the ceiling that actually binds
 
