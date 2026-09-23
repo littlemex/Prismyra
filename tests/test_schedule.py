@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
 
 import pytest
 
@@ -21,6 +22,14 @@ class FakeResult(dict):
     """Enough of a `Result` for the scheduler: the jobs only carry it back to their callers."""
 
 
+@dataclass
+class FakeEncoded:
+    """What `encode_context` returns: the tokens counted once, for the forming rule and the read to share."""
+
+    text: str
+    tokens: int
+
+
 class FakeEngine:
     """A stand-in that records the batches it was handed, and answers instantly.
 
@@ -30,10 +39,19 @@ class FakeEngine:
 
     paged = True
 
-    def __init__(self, group: int = 8, longest_context: int = 64, per_call: float = 0.0):
+    def __init__(
+        self,
+        group: int = 8,
+        longest_context: int = 64,
+        per_call: float = 0.0,
+        fastest_read_ms: float | None = None,
+    ):
         self.group = group
         self.longest_context = longest_context
-        self.fastest_read_ms: float | None = None
+        # None means "nothing has been read yet", and the scheduler must not make anybody wait on no evidence. A figure
+        # here is what a warmed engine looks like, and is what exercises the linger.
+        self.fastest_read_ms = fastest_read_ms
+        self.encoded = 0
         self.batches: list[list[str]] = []
         self.per_call = per_call
         self.opened = threading.Event()
@@ -49,18 +67,22 @@ class FakeEngine:
         # One token per word, which makes the token limit easy to write tests against.
         return {"input_ids": text.split()}
 
-    def open_batch(self, contexts: list[str]):
-        self.batches.append(list(contexts))
+    def encode_context(self, text: str) -> FakeEncoded:
+        self.encoded += 1
+        return FakeEncoded(text=text, tokens=len(text.split()))
+
+    def open_batch(self, contexts: list):
+        self.batches.append([one.text if isinstance(one, FakeEncoded) else one for one in contexts])
         self.opened.set()
         self.release.wait(5)
         if self.per_call:
             time.sleep(self.per_call)
-        return FakeBatch(contexts)
+        return FakeBatch(list(contexts))
 
 
 class FakeBatch:
-    def __init__(self, contexts: list[str]):
-        self.contexts = contexts
+    def __init__(self, contexts: list):
+        self.contexts = [one.text if isinstance(one, FakeEncoded) else one for one in contexts]
 
     def ask(self, questions: list[list]) -> list[FakeResult]:
         return [
@@ -220,3 +242,44 @@ def test_every_request_in_a_pass_is_counted_with_its_own_wait():
     queue_stats = batcher.stats()["queue"]
     assert queue_stats["completed"] == 4, queue_stats
     assert "queue_ms" in queue_stats
+
+
+def test_a_document_is_tokenised_once_per_request():
+    """Twice was the measured cost on the thread that owns the device: once to count it while forming a pass and once
+    inside the read. Counted here rather than timed, because the count is the claim."""
+    engine = FakeEngine(group=8)
+    batcher = Batcher(engine)
+    jobs = [batcher.submit(words(3), asking(2)) for _ in range(4)]
+    batcher.start()
+    try:
+        answered(batcher, jobs)
+    finally:
+        batcher.stop()
+    assert engine.encoded == 4, engine.encoded
+
+
+def test_nothing_waits_before_the_engine_has_read_anything():
+    """The linger is bounded by what the engine has measured, and an engine that has read nothing has measured nothing.
+    A scheduler with no evidence must not make anybody wait."""
+    engine = FakeEngine(group=8, fastest_read_ms=None)
+    batcher = Batcher(engine, linger_ms=50.0)
+    assert batcher.limits.worth_waiting_ms(engine) == 0.0
+    with batcher:
+        started = time.perf_counter()
+        batcher.ask(words(3), asking(2), timeout=5)
+        took = (time.perf_counter() - started) * 1e3
+    assert took < 40, took
+
+
+def test_the_linger_is_capped_by_what_a_pass_costs():
+    """Waiting longer than a pass's fixed cost cannot pay: by then the pass could have run. So the setting is a request
+    and the engine's own figure is the ceiling."""
+    engine = FakeEngine(group=8, fastest_read_ms=3.0)
+    batcher = Batcher(engine, linger_ms=1000.0)
+    assert batcher.limits.worth_waiting_ms(engine) == 3.0
+    with batcher:
+        started = time.perf_counter()
+        batcher.ask(words(3), asking(2), timeout=5)
+        took = (time.perf_counter() - started) * 1e3
+    # Waited the ceiling rather than the setting. A second would have been the setting.
+    assert took < 200, took

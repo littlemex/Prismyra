@@ -28,7 +28,7 @@ from .fork import (
     snapshot,
 )
 from .graphs import keeping_pays, pays_from, record
-from .media import encode, position_offset
+from .media import Encoded, encode, position_offset
 from .readout import load_unembedding, plan, score
 from .schema import (
     Answer,
@@ -577,7 +577,16 @@ class Prismyra:
         if self.fastest_read_ms is None or each < self.fastest_read_ms:
             self.fastest_read_ms = each
 
-    def open_batch(self, contexts: list[str]) -> Batch:
+    def encode_context(self, context: str) -> Encoded:
+        """Tokenise a document without reading it, so a caller can do that work off the request path.
+
+        The scheduler does: it encodes on the caller's thread when a request is submitted, and hands the result to
+        `open_batch`. Without this the scheduler tokenised each document twice on the one thread that owns the device --
+        once to count its tokens while forming a pass and once inside the read -- and both were on the critical path.
+        """
+        return encode(context, None, None, self.processor, self.tokenizer, self.device)
+
+    def open_batch(self, contexts: list[str] | list[Encoded]) -> Batch:
         """Read several documents into one cache, so that one forward pass can answer about all of them.
 
         This is the answer to the measurement that says one card serves 1.08 requests a second however many arrive: the
@@ -617,7 +626,7 @@ class Prismyra:
                 f"about a document that was never written. What the adapter reported: "
                 f"{self.applied.skipped or self.applied.summary()}."
             )
-        encoded = [encode(text, None, None, self.processor, self.tokenizer, self.device) for text in contexts]
+        encoded = [one if isinstance(one, Encoded) else self.encode_context(one) for one in contexts]
         if any(one.has_media for one in encoded):
             raise PrismyraError(
                 "a batch of documents is text only for now: media widen a context's positions by a grid rather than by "
