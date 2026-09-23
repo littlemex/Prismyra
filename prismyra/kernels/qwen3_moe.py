@@ -59,6 +59,8 @@ def expected_counts(decoder) -> dict[str, int]:
         "attention": attention_layers,
         "head_duplication": recurrent_layers,
         "convolution": recurrent_layers,
+        # Two, and not per layer: the replacement is a module-level name that every layer's call site reads.
+        "gated_delta_rule": len(DELTA_PATHS),
     }
 
 
@@ -240,6 +242,164 @@ class FlashAttention(nn.Module):
         return self._finish(out[0] if isinstance(out, tuple) else out, gate, shape)
 
 
+#: Replacements named here are not installed, and the skip says so. A measurement tool, not a feature: the only honest
+#: way to price one replacement is to run the same work with and without it, and `fast_kernels=False` turns off
+#: all of them at once. Read from the environment because it has to be set before the weights load.
+#:
+#:     PRISMYRA_WITHOUT=gated_delta_rule python evals/run.py --task race --methods readout
+def _withheld() -> set[str]:
+    import os
+
+    return {name.strip() for name in os.environ.get("PRISMYRA_WITHOUT", "").split(",") if name.strip()}
+
+
+# --------------------------------------------------------------------------- the gated delta rule
+#: How far the borrowed recurrence may sit from the one it replaces before it is refused. Loose, and deliberately: the
+#: framework's own implementation promotes to float32 and scans in chunks of sixty-four, and the kernel does neither, so
+#: the two disagree by more than bfloat16 rounding while computing the same recurrence.
+DELTA_TOLERANCE = 5e-2
+
+#: What the framework calls the two paths, and which borrowed kernel replaces each. Long sequences take the chunked
+#: scan and a single token takes the recurrent step, and a branch pass uses the first of them.
+DELTA_PATHS = (
+    ("torch_chunk_gated_delta_rule", "chunk", "chunk_gated_delta_rule"),
+    ("torch_recurrent_gated_delta_rule", "fused_recurrent", "fused_recurrent_gated_delta_rule"),
+)
+
+
+def _borrowed_delta(where: str, what: str):
+    """One of vLLM's vendored flash-linear-attention kernels, or None with the reason it is unavailable."""
+    import importlib
+
+    try:
+        module = importlib.import_module(f"vllm.third_party.flash_linear_attention.ops.{where}")
+    except ImportError as e:
+        return None, f"vllm's flash-linear-attention is not importable: {e}"
+    kernel = getattr(module, what, None)
+    if kernel is None:
+        return None, f"{what} is not in vllm's flash-linear-attention build"
+    return kernel, None
+
+
+def _delta_wrapper(kernel, original):
+    """The borrowed kernel behind the framework's own signature.
+
+    Arguments are filtered by the kernel's signature rather than forwarded: the two paths take slightly different sets
+    -- the recurrent one has no `output_final_state`, because it always returns the state -- and forwarding everything
+    would raise on the first forward rather than at install time. `original` is kept on the wrapper so a caller can see
+    what was replaced, and so this can be undone.
+    """
+    import functools
+    import inspect
+
+    takes = set(inspect.signature(kernel).parameters)
+
+    @functools.wraps(original)
+    def call(query, key, value, g=None, beta=None, **kwargs):
+        passed = {name: value_ for name, value_ in kwargs.items() if name in takes}
+        return kernel(query, key, value, g=g, beta=beta, **passed)
+
+    call.replaced = original
+    return call
+
+
+def _delta_inputs(decoder, device, tokens: int = 128):
+    """Shapes the real layer produces, from the config rather than from a guess.
+
+    The verification runs before any forward, so there is nothing to observe; the numbers that decide the shapes are
+    declared -- sixteen key heads of 128, thirty-two value heads of 128 on the supported model -- and the layer repeats
+    the query and key across the value heads before it calls either path, which is why every tensor here has the value
+    head count.
+    """
+    import torch
+
+    heads = decoder.linear_num_value_heads
+    key_dim = decoder.linear_key_head_dim
+    value_dim = decoder.linear_value_head_dim
+    generator = torch.Generator(device=device).manual_seed(0)
+
+    def make(*shape):
+        return torch.randn(*shape, generator=generator, device=device, dtype=torch.bfloat16)
+
+    return {
+        "query": make(1, tokens, heads, key_dim),
+        "key": make(1, tokens, heads, key_dim),
+        "value": make(1, tokens, heads, value_dim),
+        # In log space and negative, which is what the layer produces: a decay, not a gain. Positive values here would
+        # make the scan diverge and the comparison meaningless.
+        "g": -make(1, tokens, heads).abs().float(),
+        "beta": make(1, tokens, heads).sigmoid().float(),
+    }
+
+
+def _install_gated_delta_rule(decoder, device, verify: bool = True) -> tuple[int, str | None]:
+    """Route the linear-attention recurrence through the borrowed kernel.
+
+    This is where a branch pass spends itself. Thirty of the forty layers are gated delta nets, one of them issues
+    **1,021 kernel launches** against a full-attention layer's 114, and a whole pass spends 58% of its wall clock
+    waiting for launches rather than computing -- 32,873 of them, 93% from these thirty layers. The framework's
+    implementation is a chunked scan written in PyTorch: 218 copies, 191 elementwise kernels, 82 multiplies and 66 sums
+    for a single layer.
+
+    It is also not the implementation the framework wants. Both paths are decorated to ask a kernel hub first and fall
+    back to this one, so the slow path is what runs when the hub has nothing installed -- and vLLM ships the kernel the
+    hub would have provided.
+
+    Installed on the framework's module-level names, which is how both of the layer's call sites pick it up. That is
+    process-wide rather than engine-wide, which is the same trade the convolution replacement makes and is recorded
+    there for the same reason. Verified against the implementation it replaces before being kept, because a recurrence
+    that is subtly wrong produces a plausible answer rather than an error.
+    """
+    import importlib
+
+    import torch
+
+    try:
+        modeling = importlib.import_module("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
+    except ImportError as e:
+        return 0, f"the framework has no qwen3_5_moe module to patch: {e}"
+
+    installed = 0
+    for name, where, what in DELTA_PATHS:
+        original = getattr(modeling, name, None)
+        if original is None:
+            return installed, f"the framework has no {name} to replace"
+        if getattr(original, "replaced", None) is not None:
+            installed += 1  # already installed in this process, by this engine or another
+            continue
+        kernel, why = _borrowed_delta(where, what)
+        if kernel is None:
+            return installed, why
+        wrapper = _delta_wrapper(kernel, original)
+        if verify and where == "chunk":
+            # Only the chunked path is verified. The recurrent one is a single token and this engine never takes it:
+            # a branch carries a whole suffix, so the chunked path is what a read-out runs.
+            moved = _delta_disagreement(original, wrapper, decoder, device)
+            if moved is None:
+                return installed, "the framework's own implementation raised, so there is nothing to verify against"
+            if moved > DELTA_TOLERANCE:
+                return installed, f"the borrowed {what} disagreed by {moved:.3e}, above {DELTA_TOLERANCE:.0e}"
+        setattr(modeling, name, wrapper)
+        installed += 1
+    del torch
+    return installed, None
+
+
+def _delta_disagreement(original, wrapper, decoder, device) -> float | None:
+    """How far the two implementations are apart on the same inputs, relative to the output's own scale."""
+    import torch
+
+    inputs = _delta_inputs(decoder, device)
+    try:
+        with torch.inference_mode():
+            want, _ = original(**inputs, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=True)
+            got, _ = wrapper(**inputs, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=True)
+    except Exception:  # noqa: BLE001 - either side may refuse these shapes, and that is a decline rather than a fault
+        return None
+    scale = want.float().abs().amax().clamp(min=1e-6)
+    return float((got.float() - want.float()).abs().amax() / scale)
+
+
 # --------------------------------------------------------------------------- convolution
 #: Set on the convolution weights of the layers this adapter owns. The replacement is installed on a framework-wide
 #: name, so it needs a way to tell a tensor it was measured on from one that merely has the same shape.
@@ -386,6 +546,20 @@ class Qwen3MoeAdapter:
             applied.swaps.append(Swap("head_duplication", dropped, expected["head_duplication"]))
         else:
             applied.skipped.append(f"head duplication left in place: {declined}")
+        withheld = _withheld()
+        paths, declined = (
+            (0, "withheld by PRISMYRA_WITHOUT")
+            if "gated_delta_rule" in withheld
+            else _install_gated_delta_rule(decoder, next(model.parameters()).device)
+        )
+        if declined is None:
+            applied.swaps.append(Swap("gated_delta_rule", paths, len(DELTA_PATHS)))
+            applied.notes.append(
+                "the recurrence kernel covers both passes and is where a branch pass spends itself: thirty of forty "
+                "layers are gated delta nets and 93% of a pass's kernel launches came from them"
+            )
+        else:
+            applied.skipped.append(f"the recurrence keeps the framework's path: {declined}")
         if not _install_conv():
             applied.skipped.append("triton is not available: the convolution keeps the framework's path")
         else:
