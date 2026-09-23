@@ -47,6 +47,12 @@ GROUP = 32
 #: One number in one place, so there is one thing to argue with.
 ANSWERING_MARGIN = 1.15
 
+#: How far a recording's first replay may sit from the pass it was taken from before the recording is thrown away. Tight
+#: on purpose: a replay runs the same kernels on the same addresses, so the honest expectation is zero and anything else
+#: is a symptom. Not zero exactly, because the comparison is of bf16 hidden states and an exact test would reject a
+#: recording for a rounding step that cannot reach an answer.
+REPLAY_TOLERANCE = 1e-3
+
 
 @dataclass
 class Context:
@@ -102,6 +108,7 @@ class Prismyra:
         group: int = GROUP,
         calibrate: bool = False,
         graphs: bool = False,
+        paged: bool = False,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -124,6 +131,21 @@ class Prismyra:
         #: measures, so a feature that quietly takes device memory behind that budget would make the refusal wrong.
         #: Measured worth: a recorded pass replays in 28.9 ms against 107.7 eagerly, and recording costs 151.3 ms once.
         self.graphs = graphs
+        #: Whether the attention read goes through a page table. Off by default. Its point is not memory -- that was
+        #: measured at zero -- but that the read's shape stops depending on the context's length, so one recorded graph
+        #: serves every context instead of one per open context. See `prismyra/paged.py`.
+        self.paged = paged
+        if paged:
+            from .paged import PagedUnavailable, kernel_supports_pages
+
+            usable, why = kernel_supports_pages()
+            if not (usable and fast_kernels and on_cuda):
+                raise PagedUnavailable(
+                    f"paged storage was asked for and cannot be provided: {why}"
+                    if not usable
+                    else f"paged storage needs the borrowed kernels on CUDA, and this is fast_kernels={fast_kernels} "
+                    f"on {self.device}"
+                )
         #: Shapes a recording was attempted on and refused, with the reason. Attempted once per shape, not once per
         #: group, and reported through `stats()` rather than retried in silence.
         self.declined_recordings: dict = {}
@@ -347,7 +369,10 @@ class Prismyra:
             "group": self.group,
             "kernels": self.applied.as_dict(),
             "scoring": self.calibration.mode if self.calibration else "raw",
-            "storage": "joined",
+            "storage": "paged" if self.paged else "joined",
+            # Counted by the layers themselves rather than taken from the flag. A previous version of the paged path
+            # reported itself as installed and never ran, and this is the number that would have said so.
+            "paged_reads_served": self._paged_reads(),
             "graphs": self.graphs,
             "graphs_declined": dict(self.declined_recordings),
             # Measured on this engine rather than derived, and zero until a question has been answered. Reported
@@ -419,7 +444,15 @@ class Prismyra:
 
     def _read(self, encoded) -> Prefill:
         # Room for the context plus the widest branch, since the same cache carries both.
-        cache = build_cache(self.config, encoded.tokens + WIDTHS[-1], self.group, self.dtype, self.device, WIDTHS[-1])
+        cache = build_cache(
+            self.config,
+            encoded.tokens + WIDTHS[-1],
+            self.group,
+            self.dtype,
+            self.device,
+            WIDTHS[-1],
+            paged=self.paged,
+        )
         self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
         # Read after the forward, not before: the offset is something the model works out while reading the context.
         position_from = position_offset(self.backbone, encoded.tokens) if encoded.has_media else encoded.tokens
@@ -498,6 +531,15 @@ class Prismyra:
             scoring=self.calibration.mode if self.calibration else "raw",
             timing=Timing(context_ms=context_ms, readout_ms=readout_ms),
         )
+
+    def _paged_reads(self) -> int:
+        """Branch reads the paged layers have actually served in this process. Zero with the flag on means the flag is a
+        lie, which is exactly what happened the first time this path was written -- and what the first version of this
+        method reported, because it summed over an attribute that never existed. A counter that can only ever return
+        zero is worse than no counter, since it reads as evidence."""
+        from .paged import PagedForkLayer
+
+        return PagedForkLayer.reads_served
 
     def _peak_baseline(self) -> int | None:
         """Where the allocator stood before a pass, or None off CUDA. Resets the peak so the next reading is this
@@ -609,7 +651,14 @@ class Prismyra:
             # and after the last pass those are not the ones the layers point at.
             recorded.before_fork(prefill.cache)
             self.fork(prefill, rows)
-            return recorded.replay(prefill.cache, ids)
+            wrong = recorded.usable(prefill.cache)
+            if wrong is None:
+                return recorded.replay(prefill.cache, ids)
+            # A recording that no longer describes the cache is discarded rather than replayed. The alternative is a
+            # plausible answer, and this package treats that as the worst outcome available.
+            del prefill.recordings[key]
+            self.declined_recordings[key] = wrong
+            return run(ids)
 
         self.fork(prefill, rows)
         hidden = run(ids)
@@ -621,7 +670,23 @@ class Prismyra:
                 # retried in silence.
                 self.declined_recordings[key] = why or "unknown"
             else:
-                prefill.recordings[key] = taken
+                # Replayed once and checked against the pass it was taken from, before it is allowed to answer anything.
+                #
+                # Not a formality. A recording that reproduced the eager pass perfectly on a fresh engine stopped doing
+                # so once other passes at other row counts had run first -- measured, and the cause is not yet
+                # identified. Checking the bindings it holds was not enough to catch that, so the check is the thing
+                # itself: if the first replay does not reproduce the answer already in hand, the recording is discarded.
+                # A wrong answer that looks right is the worst outcome available here, and this is what makes it
+                # impossible rather than unlikely.
+                taken.before_fork(prefill.cache)
+                self.fork(prefill, rows)
+                moved = float((taken.replay(prefill.cache, ids).float() - hidden.float()).abs().amax())
+                if moved > REPLAY_TOLERANCE:
+                    self.declined_recordings[key] = (
+                        f"the first replay moved a hidden state by {moved:.3e}, above {REPLAY_TOLERANCE:.0e}"
+                    )
+                else:
+                    prefill.recordings[key] = taken
                 # The recording ran the pass again while writing itself down, which left the cache where that pass
                 # left it -- not where the eager pass above left it. They are the same state by construction, and
                 # `hidden` was read before any of it, so the answer this call returns is the eager one.

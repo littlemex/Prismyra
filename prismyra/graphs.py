@@ -126,6 +126,30 @@ class Recording:
         """Point the layers back at the tensors the recording reads, so the caller's fork fills those."""
         _rebind(cache, self.reads)
 
+    def usable(self, cache) -> str | None:
+        """None if this recording still describes the cache, or what is wrong if it does not.
+
+        Checked before every replay rather than trusted. A recording holds tensors by identity, and anything that
+        rebinds one of them without going through `before_fork` -- another code path, a reallocation, a layer the
+        framework changed -- leaves the recording reading bytes nobody is writing. The result of that is a plausible
+        answer, which is worse than an error, so the answer is an error: this returns a reason and the caller runs the
+        pass eagerly instead.
+        """
+        for n, (layer, want) in enumerate(zip(cache.layers, self.reads, strict=True)):
+            for attr, value in want.items():
+                held = getattr(layer, attr, None)
+                if isinstance(value, dict):
+                    for key, tensor in value.items():
+                        if held is None or held.get(key) is not tensor:
+                            return f"layer {n} rebound {attr}[{key}] away from the tensor the recording reads"
+                elif isinstance(value, list):
+                    for i, tensor in enumerate(value):
+                        if held is None or i >= len(held) or held[i] is not tensor:
+                            return f"layer {n} rebound {attr}[{i}] away from the tensor the recording reads"
+                elif held is not value:
+                    return f"layer {n} rebound {attr} away from the tensor the recording reads"
+        return None
+
     def replay(self, cache, ids: torch.Tensor) -> torch.Tensor:
         """Run the recorded pass on new suffix tokens, and leave the cache as that pass would have left it.
 
