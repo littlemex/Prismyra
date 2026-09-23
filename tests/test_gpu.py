@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from prismyra import Boolean, Choice, Prismyra, PrismyraError, Scale
+from prismyra.graphs import pays_from
 
 pytestmark = pytest.mark.gpu
 
@@ -73,6 +74,15 @@ COMPANION_MOVEMENT = 0.3
 #: it came back five with 0.349 on six -- so asserting a single integer on it was asserting which side of a coin landed
 #: up. `PRISMYRA_WITHOUT=gated_delta_rule` runs the other implementation if that comparison needs repeating.
 NEARLY_SIX = 5
+
+#: Groups one context is asked in the replay test. Enough that a recording is attempted, and enough that two replays
+#: follow it -- two being the minimum that can show a host-side count left stale by the one before.
+#:
+#: The engine will normally refuse to *keep* a recording at these shapes, because it measures what a replay saves and at
+#: a short context a replay of a four-row pass does not save enough to pay for the recording. The test suspends that
+#: judgement, because whether a replay answers correctly and whether it answers economically are separate claims and
+#: only the first one is a promise.
+GROUPS_FOR_A_REPLAY = pays_from() + 3
 
 
 def test_an_answer_does_not_depend_on_its_companions(engine):
@@ -354,14 +364,20 @@ def _six_second_clip(seconds: int = 6, fps: int = 30, size: int = 224) -> bytes:
         return open(path, "rb").read()
 
 
-def test_a_replayed_pass_answers_exactly_as_the_eager_one_did(engine):
+def test_a_replayed_pass_answers_exactly_as_the_eager_one_did(engine, monkeypatch):
     """The promise a recording has to keep, and it is not a tolerance.
 
     A replay runs no Python. Each cache layer keeps a host-side count of the tokens it holds so the framework can ask
     for the length without a device read, and a replay moves the bytes and leaves that integer where it was; the next
     group then advances from the wrong offset and answers **plausibly**. That is why this compares probabilities and not
-    only decisions, over four groups rather than one -- a recording is taken on a shape's second use, so the
-    first replay is the third group, and the group after it is where a stale count would show.
+    only decisions, over **six** groups rather than one. A recording is taken once three more passes at the shape are
+    still expected (`graphs.pays_from`), so with six groups the recording is taken on the fourth and the fifth and sixth
+    replay -- and the sixth is where a stale host-side count from the fifth would show.
+
+    Four groups was not enough and that is not a detail: under the rule this test was written against, a recording was
+    taken on a shape's second use, and four groups gave two replays. Under the arithmetic that replaced it, four groups
+    take a recording on the last one and replay nothing, so the test would have compared the eager path against itself
+    and passed while testing nothing. Hence the assertion below that a replay actually happened.
 
     One engine with the flag flipped between contexts, not two engines. The flag is read per pass, and two copies of
     these weights do not fit on one card beside the one this file's fixture already holds -- which is the same limit the
@@ -374,29 +390,74 @@ def test_a_replayed_pass_answers_exactly_as_the_eager_one_did(engine):
     def groups() -> list[dict]:
         out = []
         with engine.open_context(context) as opened:
-            for _ in range(4):
+            for _ in range(GROUPS_FOR_A_REPLAY):
                 result = opened.ask(asked)
                 out.append({q.id: (result[q.id].option, dict(result[q.id].probabilities)) for q in asked})
         return out
 
+    # The economics suspended for the duration, so that this tests only whether a replay answers correctly. Whether one
+    # is worth keeping is `graphs.keeping_pays`, tested on the CPU against the measured costs.
+    monkeypatch.setattr("prismyra.engine.keeping_pays", lambda *a, **k: None)
     try:
         engine.graphs = False
         eager = groups()
         engine.graphs = True
+        engine.replays.clear()
         replayed = groups()
         declined = engine.stats()["graphs_declined"]
+        replays = sum(engine.stats()["graphs_replays"].values())
     finally:
         engine.graphs = was
         engine.declined_recordings.clear()
+        engine.replays.clear()
 
     # Either a recording was used, in which case every group must match exactly, or it was refused -- and a refusal is a
     # pass, because the answers then come from the eager path. What must never happen is a recording that answers and
     # answers differently, so both branches below assert the answers and only the reporting differs.
     if declined:
         assert all("replay" in why or "rebound" in why or "Error" in why for why in declined.values()), declined
+    else:
+        # Without this the test passes when nothing was recorded, which is how it would have gone silently dead when the
+        # rule for taking a recording changed.
+        taken = engine.stats()["graphs_verified"]
+        assert replays > 0, f"no recording answered anything, so this compared the eager path with itself: {taken}"
 
     for n, (want, got) in enumerate(zip(eager, replayed, strict=True)):
         for name in want:
             assert got[name][0] == want[name][0], f"group {n}, question {name} changed its answer"
             for option, p in want[name][1].items():
                 assert got[name][1][option] == pytest.approx(p, abs=1e-4), f"group {n}, {name}, option {option}"
+
+
+def test_the_engine_measures_what_a_replay_costs_before_it_trusts_one(engine):
+    """The measurement the recording decision is made from has to actually happen.
+
+    Whether a recording pays is arithmetic over two figures -- what the pass costs eagerly and what a replay of it costs
+    -- and `tests/test_pays_from.py` tests that arithmetic against the measured figures. What needs a device is that the
+    engine takes those figures from this card rather than from a constant, which is the failure that shipped twice: a
+    threshold of three and then of seven, each derived from one short suffix and each losing about two-fold.
+
+    At these shapes -- four rows, a short question, a three-hundred-token context -- the pass is host-bound and a
+    recording does pay, so this asserts the pair was measured and reported, not that it was refused.
+    """
+    asked = questions(4)
+    was = engine.graphs
+    try:
+        engine.graphs = True
+        with engine.open_context(CONTEXT * 6) as opened:
+            for _ in range(GROUPS_FOR_A_REPLAY):
+                opened.ask(asked)
+        cost = dict(engine.stats()["graphs_cost"])
+        declined = dict(engine.stats()["graphs_declined"])
+    finally:
+        engine.graphs = was
+        engine.declined_recordings.clear()
+        engine.replays.clear()
+        engine.replay_cost.clear()
+
+    assert cost, f"no recording was attempted, so nothing was measured; declined: {declined}"
+    (eager_ms, replay_ms) = next(iter(cost.values()))
+    assert eager_ms > 0 and replay_ms > 0
+    # A replay slower than the pass is not a tolerance question: it would mean the mechanism is a pure cost and the
+    # engine should have refused. Whether it refused is `keeping_pays`, tested on the CPU against measured figures.
+    assert replay_ms < eager_ms * 1.5, (eager_ms, replay_ms)
