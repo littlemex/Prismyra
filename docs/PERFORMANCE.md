@@ -210,34 +210,52 @@ questions, each waiting for its own answer -- the same closed-loop shape the fig
 
 | callers | arm | seconds | requests / s | first answer | median | last answer |
 |---|---|---|---|---|---|---|
-| 1 | one at a time | 0.407 | 2.45 | 407.2 ms | 407.2 | 407.2 |
-| 1 | batched | 0.257 | **3.89** | 257.0 ms | 257.0 | 257.0 |
-| 2 | one at a time | 0.469 | 4.26 | 233.8 ms | 351.3 | 468.8 |
-| 2 | batched | 0.275 | **7.28** | 274.5 ms | 274.6 | 274.6 |
-| 4 | one at a time | 0.941 | 4.25 | 240.6 ms | 590.4 | 940.6 |
-| 4 | batched | 0.527 | **7.58** | 246.9 ms | 526.4 | 526.9 |
-| 8 | one at a time | 2.213 | 3.62 | 228.6 ms | 1,218.1 | 2,211.6 |
-| 8 | batched | 1.192 | **6.71** | 238.1 ms | 1,189.5 | **1,190.8** |
+| 1 | one at a time | 0.407 | 2.46 | 406.7 ms | 406.7 | 406.7 |
+| 1 | batched | 0.262 | **3.82** | 261.7 ms | 261.7 | 261.7 |
+| 2 | one at a time | 0.482 | 4.15 | 239.7 ms | 360.8 | 481.9 |
+| 2 | batched | 0.289 | **6.92** | 288.8 ms | 288.8 | 288.9 |
+| 4 | one at a time | 0.949 | 4.22 | 236.4 ms | 592.6 | 948.1 |
+| 4 | batched | 0.297 | **13.45** | 296.2 ms | 296.9 | 297.0 |
+| 8 | one at a time | 1.926 | 4.15 | 248.1 ms | 1,092.7 | 1,924.6 |
+| 8 | batched | 0.387 | **20.68** | 383.1 ms | 385.4 | **386.3** |
 
-**1.85x at eight callers, and the first answer is not later for it** -- 238.1 ms against 228.6. That second fact is the one
-worth checking, because a batching scheduler usually buys throughput with latency and this one does not.
+**5.0x at eight callers.** The median answer goes from 1,093 ms to 385, and every caller's answer lands within 3 ms of
+every other, because they are all in the same pass.
 
-### There is no linger, and that is a decision
+The first answer is later -- 383 ms against 248 -- and the obvious explanation for that is wrong, so it is worth being
+precise. It is not the wait, which is two milliseconds. It is that the first caller now travels in a pass carrying eight
+documents, which takes 386 ms, instead of being answered alone in a pass that takes 262. **The first request pays for the
+throughput of the other seven.** That is the trade this scheduler makes, and it is the right one when callers are waiting
+and the wrong one when the first caller's latency is the product.
 
-The usual knob is to wait a few milliseconds in case more arrives. There is none here, and the eight-caller run shows why
-it is not needed: two passes of one and seven documents. The first request arrived alone and was answered alone; the other
-seven arrived while that pass ran and travelled together. **Waiting would have delayed the first request to widen a pass
-that widened by itself.**
+### The wait, and the argument it overturned
 
-Lingering only changes anything when the queue is nearly empty, and that is the case where the device is not the
-bottleneck and a batch of one is fine. What a linger could buy is also bounded, and the bound is derivable rather than
-chosen: adding a document to a pass costs about 11 ms per thousand of its tokens, and starting a second pass costs about
-110 ms whatever it carries, so waiting longer than the fixed cost of a pass cannot pay -- by then the pass could have run.
-`Limits.worth_waiting_ms` is that ceiling, from the fastest read this engine has actually served, and nothing uses it yet.
+The first version had no wait, on the reasoning that a batch fills from what has already arrived so waiting only helps
+when the queue is nearly empty -- and that is when the device is not the bottleneck. **The measurement disagreed.** Eight
+callers arriving together produced passes of one and seven documents, because requests that arrive together do not arrive
+at the same instant: the first is some microseconds ahead, finds nothing waiting, and starts a pass alone. The queue was
+not nearly empty; it was about to be full, and the scheduler could not tell the difference.
 
-`why_passes_stopped` says which limit ended each pass, and in this run it was **"nothing else was waiting"** both times.
-That distinction is why the counter exists: a scheduler whose passes are narrow because nothing arrived and one whose
-passes are narrow because a limit binds look identical in the widths and need opposite work.
+| | passes formed | eight callers |
+|---|---|---|
+| no wait | 1 document, then 7 | 640 ms, 1.85x |
+| a wait | 8 | **387 ms, 5.0x** |
+| the same eight in one pass, in a loop | 8 | 367 ms |
+
+`linger_ms` is not how long a pass waits. It is **how long a pass waits with nothing arriving**, and it refreshes each
+time a request joins, so a lone request waits two milliseconds and a burst is collected for as long as the burst lasts.
+Bounded above by `Limits.worth_waiting_ms`, which is a pass's fixed cost taken from the fastest read this engine has
+served: waiting longer than that cannot pay, because by then the pass could have run. Nothing waits at all before the
+engine has read anything, because before then there is no evidence for any wait.
+
+**A fixed wait was tried and broke, and what broke it is the useful part.** Tokenising each document once instead of twice
+is an obvious saving -- 0.44 ms a document, twice a document, 7 ms a pass on the one thread there is only one of -- and
+the obvious way to do it is on the caller's thread when the request is submitted. That made throughput **worse**: 20.37
+requests a second fell to 13.44 and the passes split into two of four again. Encoding copies the token ids to the device,
+and eight caller threads take their turns at that, so the arrivals spread wider than the wait. The work moved to where
+there were more threads to do it on rather than to where it is done once. Encoding on the scheduler's thread, cached on
+the request, gives 20.68 -- and a wait that a 0.44 ms change can break is tuned rather than derived, which is why the wait
+now refreshes rather than counting down.
 
 Three limits bound a pass, all read off the engine rather than configured: the questions, by the group; the documents, by
 the group again, since every document needs a row; and the tokens, by what the pool holds. A request too wide for any pass

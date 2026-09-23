@@ -3,17 +3,35 @@
 `Batch` answers several documents in one forward pass, and a batch is not a scheduler. This is the scheduler: a queue,
 one thread that owns the device, and a rule for which of the waiting requests go into the next pass.
 
-**The rule is work-conserving, and that is a decision rather than an omission.** A batching scheduler usually has a
-"linger" knob -- wait a few milliseconds in case more arrives -- and the reason there is none here is that the case it
-helps is the case where batching does not matter. Lingering only changes anything when the queue is nearly empty,
-because when requests are waiting there is nothing to wait for: the batch fills from what has already arrived. And when
-the queue is nearly empty the device is not the bottleneck, so a batch of one is fine. The loop takes what is there.
+**A pass waits a little for company, and the first version of this file argued that it should not.** That argument was
+wrong, and how it was wrong is worth keeping. It said a batch fills from what has already arrived, so lingering only
+changes the case where the queue is nearly empty -- and that is the case where the device is not the bottleneck anyway.
+What it missed is that requests arriving *together* do not arrive at the same instant. The first one arrives some
+microseconds ahead, finds nothing waiting, and starts a pass alone; the rest then travel in a second pass. Measured,
+eight callers arriving together:
 
-What a linger would buy is bounded, and the bound is worth writing down. Adding a document to a pass costs about 11 ms
-per thousand of its tokens; starting a second pass costs about 110 ms whatever it carries. So waiting up to the
-fixed cost of a pass can pay in total work, and waiting longer than that cannot -- by then the pass could have run. If a
-linger is ever added, `Limits.worth_waiting_ms` is that ceiling, and it is derived from what this engine has measured
-rather than chosen.
+| | passes | total |
+|---|---|---|
+| no linger | one document, then seven | 640 ms |
+| the same eight in one pass, in a loop | eight | **367 ms** |
+
+The queue was not nearly empty. It was about to be full, and the scheduler could not tell the difference.
+
+So there is a linger, and what bounds it is arithmetic rather than taste. Adding a document to a pass costs about 11 ms
+per thousand of its tokens; a second pass costs a pass's fixed cost, about 110 ms, whatever it carries. **Waiting up to
+that can pay for itself and waiting longer cannot**, because by then the pass could have run. That ceiling is
+`Limits.worth_waiting_ms`, taken from the fastest read this engine has actually served.
+
+`linger_ms` is not how long a pass waits. It is **how long a pass waits with nothing arriving**, and it refreshes every
+time a request joins: a quiet stretch of that length ends the wait and a busy one extends it, up to the ceiling, which
+does not move. So a lone request waits `linger_ms` and a burst is collected however long the burst takes, which is the
+distinction a fixed wait cannot draw.
+
+That shape was arrived at by breaking a fixed wait. Tokenising each document on the caller's thread rather than twice on
+the device's -- an unrelated saving, worth 7 ms a pass -- spread the arrivals out, because eight callers tokenising take
+their turns at it. Eight callers that had fitted inside a 2 ms wait no longer did, and the throughput fell from 20.37
+requests a second back to 13.52 with the passes splitting into two again. **A wait that a 0.44 ms change breaks is tuned
+rather than derived**, and a refreshing wait is not: it ends when arrivals do.
 
 Three things bound a batch, and all three come from the engine rather than from a caller:
 
@@ -31,17 +49,31 @@ import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from .queue import Job, QueueFull, Worker, WorkerStopped
 from .schema import PrismyraError, Question, Result
 
 
-@dataclass(frozen=True)
+@dataclass
 class Request:
-    """One caller's document and the questions they want answered about it."""
+    """One caller's document and the questions they want answered about it.
+
+    Not frozen, because `encoded` is filled in later. See there.
+    """
 
     context: str
     questions: Sequence[Question]
+    #: The document tokenised, filled the first time the scheduler needs to know how long it is and reused by the read.
+    #: It used to be tokenised twice -- once to count it while forming a pass and once inside the read, 0.44 ms each, so
+    #: 7 ms a pass on the one thread there is only one of.
+    #:
+    #: **Filled on the scheduler's thread rather than the caller's, and that was measured rather than assumed.** Moving
+    #: it to the caller looks obviously better and is worse: encoding copies the ids to the device, and eight caller
+    #: threads doing that take their turns at it, which spread the arrivals wider than any wait and split a pass of
+    #: eight into two of four. Throughput went from 20.37 requests a second to 13.44. The work belongs where it is done
+    #: once, not where there are more threads to do it on.
+    encoded: Any = None
 
 
 @dataclass(frozen=True)
@@ -55,10 +87,19 @@ class Limits:
     questions: int
     documents: int
     tokens: int
+    #: How long a forming pass waits for another request before running. Small on purpose: what it covers is the jitter
+    #: between callers that meant to arrive together, not the arrival of a request nobody has sent. Bounded by
+    #: `worth_waiting_ms`, which is the fixed cost of a pass -- beyond that the pass could have run instead.
+    linger_ms: float = 2.0
 
     @classmethod
-    def of(cls, engine) -> Limits:
-        return cls(questions=engine.group, documents=engine.group, tokens=engine.longest_context)
+    def of(cls, engine, linger_ms: float = 2.0) -> Limits:
+        return cls(
+            questions=engine.group,
+            documents=engine.group,
+            tokens=engine.longest_context,
+            linger_ms=linger_ms,
+        )
 
     def worth_waiting_ms(self, engine) -> float:
         """The longest a linger could pay for, from what this engine has measured. Zero until it has read anything.
@@ -93,14 +134,14 @@ class Batcher:
     Requires the paged storage, because that is what lets rows of one pass belong to different documents.
     """
 
-    def __init__(self, engine, max_queue: int = 512):
+    def __init__(self, engine, max_queue: int = 512, linger_ms: float | None = None):
         if not getattr(engine, "paged", False):
             raise PrismyraError(
                 "a batching scheduler needs the paged storage, because the joined storage keeps a document in one row "
                 "that every row reads. Build the engine with Prismyra(..., paged=True)."
             )
         self.engine = engine
-        self.limits = Limits.of(engine)
+        self.limits = Limits.of(engine) if linger_ms is None else Limits.of(engine, linger_ms=linger_ms)
         self._worker = Worker(drive=self._drive, max_queue=max_queue)
         self._lock = threading.Lock()
         #: How wide each pass turned out to be, in order. The point of the whole exercise, so it is recorded rather than
@@ -155,18 +196,29 @@ class Batcher:
     def form(self, first: Job) -> Formed:
         """The batch this job will travel in: itself, plus whatever else is already waiting and fits.
 
-        Nothing is waited for. See the module docstring: lingering only changes the case where the queue is nearly
-        empty, and that is the case where a batch of one is fine.
+        Waits up to `Limits.linger_ms` for another request, and stops the moment the pass is full. The module
+        docstring says why there is a wait at all and what bounds it: the first version of this method did not wait, and
+        paid a whole pass's fixed cost to answer one request that seven others were microseconds behind.
         """
         formed = Formed(jobs=[first])
         tokens = self._tokens(first)
+        # Bounded by what the engine has measured as well as by the setting. A linger longer than a pass's fixed cost
+        # cannot pay, and before anything has been read there is no evidence for any wait at all.
+        quiet = min(self.limits.linger_ms, self.limits.worth_waiting_ms(self.engine)) / 1e3
+        ceiling = time.perf_counter() + self.limits.worth_waiting_ms(self.engine) / 1e3
+        deadline = time.perf_counter() + quiet
         while True:
             if formed.documents >= self.limits.documents:
                 formed.reason = f"the pass holds {self.limits.documents} documents"
                 return formed
             nxt = self._worker.peek()
             if nxt is None:
-                formed.reason = "nothing else was waiting"
+                now = time.perf_counter()
+                if now < deadline and now < ceiling:
+                    # Nothing waiting yet, and there is still time for a straggler from the same burst.
+                    time.sleep(0.0002)
+                    continue
+                formed.reason = "the ceiling was reached" if now >= ceiling else "nothing else was waiting"
                 return formed
             questions = len(nxt.payload.questions)
             more = self._tokens(nxt)
@@ -182,9 +234,16 @@ class Batcher:
                 return formed
             formed.jobs.append(taken)
             tokens += more
+            # The wait refreshes when a request joins. A burst is defined by requests still arriving rather than by a
+            # duration, so a quiet stretch ends the wait and a busy one extends it -- up to the ceiling, which does not
+            # move.
+            deadline = time.perf_counter() + quiet
 
     def _tokens(self, job: Job) -> int:
-        return len(self.engine.tokenizer(job.payload.context)["input_ids"])
+        """How long this document is, encoding it once and keeping the result for the read."""
+        if job.payload.encoded is None:
+            job.payload.encoded = self.engine.encode_context(job.payload.context)
+        return job.payload.encoded.tokens
 
     def _drive(self, first: Job) -> None:
         """Form a batch around `first`, answer it, and give every job its own result."""
@@ -193,7 +252,7 @@ class Batcher:
             self.widths.append(formed.documents)
             self.reasons.append(formed.reason)
         try:
-            with self.engine.open_batch([job.payload.context for job in formed.jobs]) as batch:
+            with self.engine.open_batch([job.payload.encoded for job in formed.jobs]) as batch:
                 results = batch.ask([list(job.payload.questions) for job in formed.jobs])
         except BaseException as e:  # noqa: BLE001 - one failure must not leave the rest of the batch waiting for ever
             for job in formed.jobs:
@@ -222,6 +281,7 @@ class Batcher:
             "passes": len(widths),
             "documents": answered,
             "mean_documents_per_pass": round(answered / len(widths), 2) if widths else 0.0,
+            "widths_seen": widths,
             "widest_pass": max(widths, default=0),
             "narrowest_pass": min(widths, default=0),
             # Counted, because a scheduler whose passes are narrow for lack of arrivals and one whose passes are narrow
@@ -231,6 +291,8 @@ class Batcher:
                 "questions": self.limits.questions,
                 "documents": self.limits.documents,
                 "tokens": self.limits.tokens,
+                "linger_ms": self.limits.linger_ms,
+                "worth_waiting_ms": round(self.limits.worth_waiting_ms(self.engine), 1),
             },
             "queue": self._worker.stats(),
         }
