@@ -290,54 +290,72 @@ rather than allocated per layer, and running rows through attention in chunks so
 first trades transient memory for held memory, which is the figure the storage work bought in the first place, so it
 needs measuring rather than assuming.
 
-## Against a serving engine, and losing by four times
+## Against a serving engine
 
 `evals/generate.py` says in its own docstring that the speed it measures is an upper bound, because "a serving engine
 can batch the questions and share the article's prefix without using this read-out at all". `evals/against_vllm.py` is
 that engine: vLLM, the same weights, the same card, the same RACE questions, prefix caching on, one request per
-question.
+question, the output restricted to the letter tokens so both arms score declared answers and normalise over them.
 
 | arm | answers | accuracy | questions / s | ms per context | tokens sent |
 |---|---|---|---|---|---|
-| this package, forked | 234 | 0.953 | **7.36** | 536.7 | **28,421** |
-| vLLM, one request per question | 234 | 0.936 | **29.39** | 126.3 | 76,556 |
+| this package, as first measured | 234 | 0.953 | 7.36 | 536.7 | **28,421** |
+| this package, with the recurrence kernel | 234 | 0.953 | **16.44** | 220.2 | **28,421** |
+| vLLM, one request per question | 234 | 0.936 | 31.64 | 125.0 | 76,556 |
 
-**Four times slower.** The token column is the only one this package wins: it sends the context once per document where
-vLLM sends it once per question and leans on the prefix cache not to recompute it. Accuracy is not a like-for-like
-comparison and no claim is made from it -- the arms score different tokens, since a request returning one token can only
-score the letters while this package scores the option text.
+**Still 1.9x behind, from 4.3x behind.** Accuracy is not a like-for-like comparison and no claim is made from it: the
+arms score different tokens, since a request returning one token can only score the letters while this package scores
+the option text. The token column is what this package wins, by 2.7x -- it sends the context once per document where
+vLLM sends it once per question and leans on the prefix cache not to recompute it.
 
-### Where the four times goes, measured
+### What closed half the gap, and how the rest of it looks
 
-Not in the kernels. One branch pass, profiled:
+Not a faster kernel. One branch pass, profiled:
 
-| | |
+| | as first measured |
 |---|---|
 | wall clock | 268.4 ms |
 | sum of all kernel time | 112.7 ms, **42% of the wall clock** |
 | kernel launches | **32,873**, which is 820 per layer across 40 layers |
 | largest single kernel | routed experts, 16.3 ms -- already level with vLLM's 29.97 against our 29.5 |
 
-**Fifty-eight percent of a branch pass is the device waiting to be told what to do next.** The launch count is the
-finding: 6,744 `copy_`, 5,912 elementwise kernels, 2,532 `mul`, 1,990 `sum`. That is a framework assembling a forward
-pass out of small pieces, and it explains the other measurement that never made sense on its own -- a branch pass
-costing the same at width 1 and width 32. A cost that does not move with the work is not the work.
+Fifty-eight percent of a pass was the device waiting to be told what to do next, and that also explains the measurement
+which never made sense alone: a branch pass costing the same at width 1 and width 32. A cost that does not move with the
+work is not the work.
 
-So making a kernel faster cannot fix this, and the five kernel replacements in [KERNELS.md](KERNELS.md) have already
-taken what there was to take. What fixes it is collapsing the launches, which means CUDA graphs. That was tried once
-and abandoned -- "one recording works (83.9 ms to 51.7); a second in the same process faults on replay" -- and the
-1.62x it showed is the right order for a 58% overhead.
+The launches were not spread evenly. **One gated delta net layer issues 1,021 of them against a full-attention layer's
+114**, and thirty of the forty layers are gated delta nets, so 93% of a pass came from them: 218 copies, 191 elementwise
+kernels, 82 multiplies and 66 sums, for one layer. That is a chunked scan written in PyTorch -- and it is there as a
+*fallback*. The framework decorates both of its gated-delta-rule paths to ask a kernel hub first, and the slow one runs
+when the hub has nothing installed. vLLM ships the kernel the hub would have provided.
 
-The blocker is shape. A graph replays one set of shapes, and the joined read is `(rows, context + suffix, heads, dim)`,
-so every context length is a different graph. Two ways out, and the second is the one worth noting:
+Borrowing it took a branch pass from **268.4 ms to 111.8 ms**, and the whole read-out from 137.5 to 57.6 ms per
+question. It is a numerical change, not a bit-identical one, because the framework promotes to float32 and scans in
+chunks of sixty-four and the kernel does neither. What that costs, measured over 472 RACE questions with
+`PRISMYRA_WITHOUT=gated_delta_rule` running the other implementation in the same harness:
 
-* **bucket the joined length.** The borrowed kernel is a variable-length one: the buffer can be larger than the
-  sequences it holds, with the true lengths passed as data in `cu_seqlens`. Rounding the join up to a bucket makes the
-  shape depend on the bucket rather than the context, and the widths are already pinned for the same reason.
-* **the paged path made shapes constant.** Its page pool is a fixed allocation and the lengths live in `seqused_k` as
-  data. That was deleted, correctly, because it was never wired to anything and its measurements were this path compared
-  with itself -- but the reason to want it back is not the memory. The memory saving was measured and was zero. It is
-  that a page table is how a serving engine keeps shapes constant, and constant shapes are what a graph needs.
+| | ms per question | accuracy | decisions identical |
+|---|---|---|---|
+| the borrowed kernel | **57.6** | 0.9407 | -- |
+| the framework's own scan | 137.5 | 0.9364 | **465 / 472 = 98.5%** |
+
+Seven decisions moved out of 472 and accuracy did not fall. Two video tests had asserted an exact integer on a question
+whose top two options are 0.35 apart from each other and one of the seven; they now assert what they were written to
+catch, which is that the clip's timing reached the model at all. `tests/test_gpu.py` says so at the assertion.
+
+### The rest of the gap
+
+The same diagnosis still applies, one layer down. What remains is launch count, and the routes to it are ordered by what
+they cost to build:
+
+* **the convolution kernel covers only the context pass.** A branch pass arrives as many rows and keeps the framework's
+  path, which is recorded where it is installed and is the next cheap thing to look at.
+* **CUDA graphs.** Tried once and abandoned -- "one recording works (83.9 ms to 51.7); a second in the same process
+  faults on replay" -- and 1.62x is the right order for what is left. The blocker is shape: the joined read is
+  `(rows, context + suffix, heads, dim)`, so every context length is a different graph. The widths are already pinned.
+* **the paged path made shapes constant.** Its memory saving was measured and was zero, which is why deleting it was
+  right on the evidence available. The reason to want it back is not memory: a page pool is a fixed allocation with the
+  lengths carried as data, and constant shapes are what a graph needs.
 
 ## Concurrency, as first measured
 
