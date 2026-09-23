@@ -290,6 +290,55 @@ rather than allocated per layer, and running rows through attention in chunks so
 first trades transient memory for held memory, which is the figure the storage work bought in the first place, so it
 needs measuring rather than assuming.
 
+## Against a serving engine, and losing by four times
+
+`evals/generate.py` says in its own docstring that the speed it measures is an upper bound, because "a serving engine
+can batch the questions and share the article's prefix without using this read-out at all". `evals/against_vllm.py` is
+that engine: vLLM, the same weights, the same card, the same RACE questions, prefix caching on, one request per
+question.
+
+| arm | answers | accuracy | questions / s | ms per context | tokens sent |
+|---|---|---|---|---|---|
+| this package, forked | 234 | 0.953 | **7.36** | 536.7 | **28,421** |
+| vLLM, one request per question | 234 | 0.936 | **29.39** | 126.3 | 76,556 |
+
+**Four times slower.** The token column is the only one this package wins: it sends the context once per document where
+vLLM sends it once per question and leans on the prefix cache not to recompute it. Accuracy is not a like-for-like
+comparison and no claim is made from it -- the arms score different tokens, since a request returning one token can only
+score the letters while this package scores the option text.
+
+### Where the four times goes, measured
+
+Not in the kernels. One branch pass, profiled:
+
+| | |
+|---|---|
+| wall clock | 268.4 ms |
+| sum of all kernel time | 112.7 ms, **42% of the wall clock** |
+| kernel launches | **32,873**, which is 820 per layer across 40 layers |
+| largest single kernel | routed experts, 16.3 ms -- already level with vLLM's 29.97 against our 29.5 |
+
+**Fifty-eight percent of a branch pass is the device waiting to be told what to do next.** The launch count is the
+finding: 6,744 `copy_`, 5,912 elementwise kernels, 2,532 `mul`, 1,990 `sum`. That is a framework assembling a forward
+pass out of small pieces, and it explains the other measurement that never made sense on its own -- a branch pass
+costing the same at width 1 and width 32. A cost that does not move with the work is not the work.
+
+So making a kernel faster cannot fix this, and the five kernel replacements in [KERNELS.md](KERNELS.md) have already
+taken what there was to take. What fixes it is collapsing the launches, which means CUDA graphs. That was tried once
+and abandoned -- "one recording works (83.9 ms to 51.7); a second in the same process faults on replay" -- and the
+1.62x it showed is the right order for a 58% overhead.
+
+The blocker is shape. A graph replays one set of shapes, and the joined read is `(rows, context + suffix, heads, dim)`,
+so every context length is a different graph. Two ways out, and the second is the one worth noting:
+
+* **bucket the joined length.** The borrowed kernel is a variable-length one: the buffer can be larger than the
+  sequences it holds, with the true lengths passed as data in `cu_seqlens`. Rounding the join up to a bucket makes the
+  shape depend on the bucket rather than the context, and the widths are already pinned for the same reason.
+* **the paged path made shapes constant.** Its page pool is a fixed allocation and the lengths live in `seqused_k` as
+  data. That was deleted, correctly, because it was never wired to anything and its measurements were this path compared
+  with itself -- but the reason to want it back is not the memory. The memory saving was measured and was zero. It is
+  that a page table is how a serving engine keeps shapes constant, and constant shapes are what a graph needs.
+
 ## Concurrency, as first measured
 
 Eight requests arriving together, from a run predating the kernel work -- the shape is what matters, not the levels:
