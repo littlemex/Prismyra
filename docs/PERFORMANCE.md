@@ -424,6 +424,41 @@ they cost to build:
   serve every context length** rather than one per open context -- which is the difference between a session workload
   getting 3.7x and every workload getting it.
 
+## What a recording can and cannot outlive
+
+A recording is worth 32.5 ms against 114, so the question of how long one lasts is the question of how often that
+applies. Two things bind it, and only one of them turned out to be the allocation.
+
+**A recording belongs to one context length.** Not to one shape -- to one length. The shapes are already arranged to be
+constant: the widths are pinned to buckets and the allocation is now bucketed too, so a context of 900 tokens and one of
+1,000 get the same 1,024-token cache. That is not enough, and the reason is arithmetic rather than bookkeeping: a
+branch's tokens are written at an offset measured from the end of the context, and with pages that offset carries the
+context length modulo the page size. A context thirteen tokens longer puts the branch in different slots, and the
+recorded writes go to the slots from before.
+
+Measured, on five documents of 251 to 302 tokens with one group each:
+
+| | answers against eager | what the engine reported |
+|---|---|---|
+| before the length was checked | wrong by up to **0.15** | agreement to zero, nothing refused |
+| after | **0.0 everywhere** | `the context is 276 tokens and this recording was taken at 263` |
+
+That is the fourth time a check here reported agreement while the answers were wrong, and the pattern in all four is the
+same: the check compared something narrower than the claim. This one only ever replayed on the context the recording
+came from. `Recording.usable` now tests the length first, because a pooled cache's next context is rarely the same
+length.
+
+**Pooling the caches works and is not shipped.** A closed context returning its cache to a pool, reset for the next one,
+is what would let a recording outlive one document -- and it was implemented and measured: five documents, one group
+each, replaying from the third at 33.4 ms against 109 eagerly, answers identical. Then ten device tests failed.
+`reset()` on the framework's own recurrent layers clears their contents and keeps their batch dimension, so a cache
+returned by a three-row pass still holds three-row state and the next context's fork tries to widen three rows to
+thirty-two. Making that work means owning the shape of state this package deliberately hands to the framework, so it
+is its own change. The bucketed allocation stayed, because it costs nothing and is half of what the sharing needs.
+
+So today a recording pays for a session asking many groups about one document, and for a sequence of documents that
+happen to be the same length. It is refused by name otherwise.
+
 ## How these numbers were taken
 
 Every figure above was measured on one borrowed L40S with the weights on it, which means a deployment step, and that

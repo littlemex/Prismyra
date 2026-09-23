@@ -54,13 +54,10 @@ class Prefill:
     last_position: torch.Tensor
     #: Where a branch's positions start. Equal to `tokens` for text; larger when the context held images or video,
     #: whose three-axis positions advance by a grid rather than by a token count. See `media.position_offset`.
+    #: The bucket its cache was allocated for, which is how `Context.close` knows where to return it.
+    room: int | None = None
     position_from: int = 0
     snapshot: dict | None = field(default=None, repr=False)
-    #: Recorded branch passes for this context, keyed by (rows, width). Kept here rather than on the engine because the
-    #: one shape a recording cannot generalise over is the context's own length, and that is fixed for as long as this
-    #: context is open. The count of how many times each key has been seen decides when a recording is worth taking.
-    recordings: dict = field(default_factory=dict, repr=False)
-    seen: dict = field(default_factory=dict, repr=False)
 
 
 def snapshot(cache) -> dict:

@@ -116,6 +116,15 @@ class Recording:
     hidden: torch.Tensor
     rows: int
     width: int
+    #: The context length the recording was taken at. A recording is valid for that length and no other, and this is
+    #: checked rather than hoped for.
+    #:
+    #: It is not enough that the *shapes* match. A branch's tokens are written at an offset measured from the end of the
+    #: context, and with pages that offset includes the context length modulo the page size -- so a context thirteen
+    #: tokens longer puts the branch in different slots, and the recorded writes go to the slots from before. Measured:
+    #: five documents of 251 to 302 tokens, answers wrong by up to 0.15, with the recording reporting agreement to zero
+    #: because the check had only ever compared replays taken on the context the recording came from.
+    context_length: int = 0
     #: Everything else the recorded pass reads that Python allocated. Held for the recording's whole life, because a
     #: graph bakes in addresses and does not keep the tensors at them alive: the position ids were a local of the call
     #: that took the recording, so they were freed when it returned and the replay went on reading memory the allocator
@@ -135,12 +144,19 @@ class Recording:
     def usable(self, cache) -> str | None:
         """None if this recording still describes the cache, or what is wrong if it does not.
 
+        The context's length is checked first and is the common case: a pooled cache is reused by the next context, and
+        the next context is rarely the same length.
+
         Checked before every replay rather than trusted. A recording holds tensors by identity, and anything that
         rebinds one of them without going through `before_fork` -- another code path, a reallocation, a layer the
         framework changed -- leaves the recording reading bytes nobody is writing. The result of that is a plausible
         answer, which is worse than an error, so the answer is an error: this returns a reason and the caller runs the
         pass eagerly instead.
         """
+        for layer in cache.layers:
+            held = getattr(layer, "context_length", None)
+            if held is not None and held != self.context_length:
+                return f"the context is {held} tokens and this recording was taken at {self.context_length}"
         for n, (layer, want) in enumerate(zip(cache.layers, self.reads, strict=True)):
             for attr, value in want.items():
                 held = getattr(layer, attr, None)
@@ -219,6 +235,9 @@ def record(run, cache, ids: torch.Tensor, fork, keep: tuple = ()) -> tuple[Recor
         rows=ids.shape[0],
         width=ids.shape[1],
         kept=tuple(keep),
+        context_length=next(
+            (held for layer in cache.layers if (held := getattr(layer, "context_length", None)) is not None), 0
+        ),
         after=_host_state(cache),
         reads=reads,
         writes=writes,

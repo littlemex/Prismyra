@@ -57,6 +57,16 @@ REPLAY_TOLERANCE = 1e-3
 #: exactly the state the recording was taken in, and a recording that diverges does so from the second replay onwards.
 REPLAY_CHECKS = 2
 
+#: Context lengths a cache is allocated for. A context of 900 tokens and one of 1,000 both get the 1,024 allocation, and
+#: that is the point: an allocation shared between contexts keeps its addresses, and addresses are what a recording
+#: holds. Without this every context built its own cache and freed it on close, so a recording could never outlive the
+#: document it was taken on -- which gave a session asking many groups the 3.5x and a request asking one group nothing.
+#:
+#: Powers of two, because the waste is bounded at half the allocation and the alternative is a tuned ladder that would
+#: have to be retuned per model. The largest is what `open_context` will refuse above, and refusing by name is what this
+#: engine already does when a context will not fit.
+CONTEXT_SIZES = (1024, 2048, 4096, 8192, 16384, 32768, 65536)
+
 
 @dataclass
 class Context:
@@ -85,6 +95,8 @@ class Context:
         `Prismyra.cache_bytes` reports the figure for a given length. It used to be 3.4 and 12.5 GiB, when every branch
         held its own copy.
         """
+        if self._prefill is not None:
+            self._engine._release_cache(self._prefill)
         self._prefill = None
 
     def __enter__(self) -> Context:
@@ -156,6 +168,10 @@ class Prismyra:
         #: What each accepted recording's replays disagreed with their own pass by. Reported so that "it was accepted"
         #: and "it agreed" are separate statements: a check that silently measures the wrong thing reads as the second.
         self.verified_recordings: dict = {}
+        self._made_caches = 0
+        #: Recordings by the identity of the cache they were taken on. Keyed by `id` because a cache is not hashable and
+        #: because identity is exactly the right test: a recording is valid for one allocation and no other.
+        self._cache_recordings: dict[int, dict] = {}
         #: The largest per-row transient seen with the context-proportional part taken out -- activations and kernel
         #: workspace for one row -- and the widest pass it was seen at. None until the first pass.
         #:
@@ -383,6 +399,7 @@ class Prismyra:
             "graphs": self.graphs,
             "graphs_declined": dict(self.declined_recordings),
             "graphs_verified": dict(self.verified_recordings),
+            "caches_allocated": self._made_caches,
             # Measured on this engine rather than derived, and zero until a question has been answered. Reported
             # because it is the number that decides how many contexts can be answered at once, and it is several times
             # the held cache.
@@ -451,21 +468,13 @@ class Prismyra:
             )
 
     def _read(self, encoded) -> Prefill:
-        # Room for the context plus the widest branch, since the same cache carries both.
-        cache = build_cache(
-            self.config,
-            encoded.tokens + WIDTHS[-1],
-            self.group,
-            self.dtype,
-            self.device,
-            WIDTHS[-1],
-            paged=self.paged,
-        )
+        cache, room = self._claim_cache(encoded.tokens)
         self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
         # Read after the forward, not before: the offset is something the model works out while reading the context.
         position_from = position_offset(self.backbone, encoded.tokens) if encoded.has_media else encoded.tokens
         return Prefill(
             cache=cache,
+            room=room,
             tokens=encoded.tokens,
             last_position=torch.tensor([encoded.tokens - 1], device=self.device),
             position_from=position_from,
@@ -648,6 +657,54 @@ class Prismyra:
             worst = max(worst, float((replayed.float() - reference.float()).abs().amax()))
         return worst
 
+    def _recordings_for(self, cache) -> dict:
+        """The recordings taken on this cache, and how many times each shape has been seen on it.
+
+        Attached to the cache rather than to the context because the cache outlives the context now, and a recording is
+        only valid for the allocation it was taken on. Identity, not equality: two caches of the same size are different
+        allocations and a recording from one must never answer on the other.
+        """
+        held = self._cache_recordings.get(id(cache))
+        if held is None:
+            held = {"taken": {}, "seen": {}}
+            self._cache_recordings[id(cache)] = held
+        return held
+
+    def _claim_cache(self, tokens: int):
+        """A cache for this context, allocated at a bucketed size.
+
+        Bucketed because a recording holds the addresses of the cache it was taken on, and an allocation shared between
+        contexts of similar length would let a recording outlive one document. **The sharing is not here yet**, and the
+        reason it is not is worth recording rather than rediscovering.
+
+        Pooling the caches and resetting them on reuse was implemented and measured, and it worked: five documents, one
+        group each, replaying from the third at 33.4 ms against 109 eagerly, with identical answers. Then ten device
+        tests failed. `reset()` on the framework's own recurrent layers clears their contents and **keeps their batch
+        dimension**, so a cache returned by a three-row pass still holds three-row state, and the next context's fork
+        tries to widen three rows to thirty-two. Making that work means owning the recurrent state's shape, which this
+        package deliberately does not -- `build_cache` hands those layers to the framework -- so it is its own change
+        rather than a line in this one.
+
+        What the bucket still buys is that the allocation does not depend on the exact context length, which is one of
+        the two things a recording needs. The other is the length itself, and `graphs.Recording` checks it.
+        """
+        room = next((size for size in CONTEXT_SIZES if tokens <= size), None)
+        if room is None:
+            raise PrismyraError(
+                f"a context of {tokens} tokens is longer than this engine allocates for ({CONTEXT_SIZES[-1]}); "
+                f"the allocation is bucketed so that a recorded pass can serve more than one context, and a longer "
+                f"context would need its own"
+            )
+        cache = build_cache(
+            self.config, room + WIDTHS[-1], self.group, self.dtype, self.device, WIDTHS[-1], paged=self.paged
+        )
+        self._made_caches += 1
+        return cache, room
+
+    def _release_cache(self, prefill) -> None:
+        """Nothing to return while caches are not pooled. Kept as the place that would do it, and as the place this
+        engine's own accounting of open contexts would live."""
+
     def fork(self, prefill, rows: int) -> None:
         """Put every layer back to the end of the context and widen it to `rows`.
 
@@ -669,8 +726,12 @@ class Prismyra:
             self.fork(prefill, rows)
             return run(ids)
 
+        # Keyed on the cache rather than on the context, because the cache is what a recording holds the addresses of.
+        # A context that closes returns its cache to the pool with its recordings attached, so the next context of the
+        # same size replays instead of recording again.
+        store = self._recordings_for(prefill.cache)
         key = (rows, width)
-        recorded = prefill.recordings.get(key)
+        recorded = store["taken"].get(key)
         if recorded is not None:
             # The bindings first, then the fork: the fork must write the context into the tensors the recording reads,
             # and after the last pass those are not the ones the layers point at.
@@ -681,7 +742,7 @@ class Prismyra:
                 return recorded.replay(prefill.cache, ids)
             # A recording that no longer describes the cache is discarded rather than replayed. The alternative is a
             # plausible answer, and this package treats that as the worst outcome available.
-            del prefill.recordings[key]
+            del store["taken"][key]
             self.declined_recordings[key] = wrong
             return run(ids)
 
@@ -692,8 +753,8 @@ class Prismyra:
         # the replay's values as this call's answer. The bug was found by a replay that gave a wrong answer while the
         # check reported agreement to zero.
         hidden = run(ids).clone()
-        prefill.seen[key] = prefill.seen.get(key, 0) + 1
-        if prefill.seen[key] >= 2 and key not in self.declined_recordings:
+        store["seen"][key] = store["seen"].get(key, 0) + 1
+        if store["seen"][key] >= 2 and key not in self.declined_recordings:
             taken, why = record(run, prefill.cache, ids, fork=lambda: self.fork(prefill, rows), keep=(positions,))
             if taken is None:
                 # Remembered so it is attempted once per shape rather than once per group, and reported rather than
@@ -715,7 +776,7 @@ class Prismyra:
                         f"a replay moved a hidden state by {moved:.3e}, above {REPLAY_TOLERANCE:.0e}"
                     )
                 else:
-                    prefill.recordings[key] = taken
+                    store["taken"][key] = taken
                 # The recording ran the pass again while writing itself down, which left the cache where that pass
                 # left it -- not where the eager pass above left it. They are the same state by construction, and
                 # `hidden` was read before any of it, so the answer this call returns is the eager one.
