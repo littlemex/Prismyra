@@ -29,6 +29,83 @@ import torch
 
 from .fork import LENGTH_ATTRS
 
+#: What a pass costs eagerly and replayed, measured on the supported model at a short suffix. Only their **ratio** is
+#: used, because the absolute figures belong to one suffix width and the ratio is what survives a change of width.
+REPLAY_MS = 28.9
+EAGER_MS = 107.7
+
+#: Replays spent proving a recording before it may answer. `engine.REPLAY_CHECKS` is the same number; it is a cost here.
+PROVING_REPLAYS = 2
+
+
+def pays_from(replay_ms: float = REPLAY_MS, eager_ms: float = EAGER_MS, warmups: int = 3) -> int:
+    """How many passes at one shape must still be coming for recording it to be cheaper than not recording it.
+
+    Counted **in passes, not milliseconds**, and that is the whole correction. Taking a recording runs `warmups` passes
+    on a side stream, then one more under capture, then `PROVING_REPLAYS` replays that answer nothing. So with a ratio
+    ``r = replay_ms / eager_ms`` and R passes still to run:
+
+        (warmups + 1) + PROVING_REPLAYS x r  <  R x (1 - r)
+
+    which on the measured ratio of 0.268 gives R > 6.20, so **seven**.
+
+    The first version of this said three, from a figure of 151.3 ms for "recording costs". That figure cannot be right
+    and the arithmetic is what shows it: three warm-up passes at 107.7 ms each is 323 ms before the capture begins, so
+    a cost of 151 ms had left the warm-ups out. Expressed in milliseconds the error was invisible; expressed in passes
+    it is not expressible. Measured, at 128 questions about one context -- four groups, where three-says-yes and
+    seven-says-no:
+
+    | | questions per second |
+    |---|---|
+    | recording on, threshold of three | 47.21 |
+    | recording off | **102.07** |
+
+    A 2.16x loss where the arithmetic had promised a saving. That is the second time this mechanism has cost more than
+    it saved, and both times the cause was a cost model with a term missing rather than a kernel behaving unexpectedly.
+    """
+    if eager_ms <= 0:
+        raise ValueError(f"a pass cannot cost {eager_ms} ms")
+    r = replay_ms / eager_ms
+    if r >= 1:
+        # A replay no cheaper than the pass cannot pay for itself at any count. "Never" is the honest answer, rather
+        # than a large number a long enough session would eventually cross.
+        return 1 << 30
+    return int(((warmups + 1) + PROVING_REPLAYS * r) / (1 - r)) + 1
+
+
+def keeping_pays(eager_ms: float, replay_ms: float, expected: int) -> str | None:
+    """None if this recording will pay for itself, or why it will not.
+
+    Asked **after** the recording exists, because the number it needs cannot be known before: how much a replay
+    saves depends on the shape, and by more than a little. Measured on the supported model at a 3,000-token context
+    and thirty-two rows:
+
+    | suffix width | eager pass | replayed pass | ratio | passes needed to pay |
+    |---|---|---|---|---|
+    | 16 | 109.4 ms | 74.8 ms | 0.684 | 17 |
+    | 32 | 110.7 ms | 94.7 ms | 0.855 | 40 |
+    | 64 | 144.2 ms | 142.1 ms | **0.986** | 414 |
+    | 128 | 268.1 ms | 267.3 ms | **0.997** | 2,190 |
+
+    A recording removes the time the device spends waiting to be told what to do next, and **kernel launches are
+    asynchronous**: once each kernel takes longer than the call that launches it, the host stays ahead of the device
+    and there is no waiting left to remove. That is the whole story of the table. The 55.1 ms of kernel time inside
+    a 109.4 ms pass that motivated this mechanism was a short suffix, where the pass is host-bound; at a suffix of
+    128 tokens the same pass is device-bound and a recording is worth 0.8 ms of 268.
+
+    So a fixed threshold cannot work, and two of them have now been measured failing -- three passes, then seven,
+    each losing about two-fold at 128 and 256 questions per context. This replaces both. The cost of finding out is
+    one recording per shape per engine, remembered in `declined_recordings` so it is paid once.
+    """
+    needed = pays_from(replay_ms, eager_ms)
+    if expected >= needed:
+        return None
+    return (
+        f"a replay of this shape costs {replay_ms:.1f} ms against {eager_ms:.1f} eagerly, so recording it pays "
+        f"from {needed} more passes and {expected} are expected"
+    )
+
+
 #: Passes run before a recording is taken. Three, on a side stream, which is what the recording needs: allocators,
 #: autotuners and any kernel that compiles on first use must have finished, or they happen inside the capture and it
 #: fails -- `cudaErrorStreamCaptureInvalidated`, with nothing to say which of them did it.

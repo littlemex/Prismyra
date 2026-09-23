@@ -15,6 +15,13 @@ Three arms, and the middle one is the one that matters:
   to try and because its accuracy cost is the reason this package forks instead: in that repository's measurement,
   packing moved 8.0% of individual answers and cost 2.8 points of accuracy.
 
+**The number of questions per context is the axis this comparison lives on**, and the tasks do not vary it: a RACE
+article carries four questions and a terms-of-service clause carries eight. Both arms cost a constant plus something per
+question, and the constants and the slopes are different, so which arm wins is a function of that number and quoting one
+task's ratio is quoting one point on a line. `--questions N` fills each context up to N by borrowing questions from the
+other contexts in the sample -- real questions, real token shapes, asked about the wrong document. Accuracy is not
+reported for a borrowed question and the count of scored answers says so.
+
 Two processes, because two copies of these weights do not fit on one card:
 
     python evals/against_vllm.py --record fork.json --limit 60
@@ -113,11 +120,53 @@ def read_letters(output, options: int, back: dict[int, str]) -> tuple[int, list[
     return max(range(options), key=lambda i: probabilities[i]), probabilities
 
 
-def run_fork(items, model: str) -> dict:
-    """This package. One context pass per item, every question a row."""
+def widen(items, questions: int, seed: int = 0):
+    """Each context carrying `questions` questions, the borrowed ones marked.
+
+    Borrowed from the other contexts in the same sample rather than generated, so that the suffix lengths are the
+    distribution the task actually has. A borrowed question is nonsense about this context and is not scored; it is here
+    because the cost of answering it is the same as the cost of answering a real one, and cost is what this file
+    measures.
+
+    Refused rather than truncated when the sample cannot supply that many. A pool of twenty RACE articles holds about
+    eighty questions, so asking for 128 silently produced eighty and a row labelled 128 -- the questions-per-second was
+    right and the axis it was plotted against was not, which is the same class of mistake as a check that compares
+    something narrower than its claim.
+    """
+    import dataclasses
+    import random
+
+    pool = [(n, q) for n, item in enumerate(items) for q in item.questions]
+    thinnest = min(len(item.questions) for item in items)
+    available = thinnest + len(pool) - max(len(item.questions) for item in items)
+    if questions > available:
+        raise SystemExit(
+            f"{len(items)} contexts can supply at most {available} questions for the thinnest of them, "
+            f"not {questions}; raise --limit"
+        )
+    out = []
+    for n, item in enumerate(items):
+        borrowed = [q for source, q in pool if source != n]
+        random.Random(seed + n).shuffle(borrowed)
+        asked = list(item.questions)
+        for taken, spare in enumerate(borrowed):
+            if len(asked) >= questions:
+                break
+            # A new id, because an id that repeats is refused by the package and would be scored against the wrong gold.
+            asked.append(dataclasses.replace(spare, id=f"borrowed{taken}"))
+        out.append(dataclasses.replace(item, questions=asked[:questions]))
+    return out
+
+
+def run_fork(items, model: str, engine=None, graphs: bool = False) -> dict:
+    """This package. One context pass per item, every question a row.
+
+    `engine` is passed in by the sweep, which asks several question counts of one loaded engine. Reloading between them
+    would put a fresh engine's unbudgeted first context inside every point on the curve.
+    """
     from prismyra import Prismyra
 
-    engine = Prismyra(model)
+    engine = engine or Prismyra(model, graphs=graphs)
     tokenizer = engine.tokenizer
     rows, seconds, tokens = [], [], 0
     for n, item in enumerate(items):
@@ -131,6 +180,8 @@ def run_fork(items, model: str) -> dict:
         suffix = max(len(tokenizer("\n" + q.prompt)["input_ids"]) for q in item.questions)
         tokens += context_tokens + suffix * len(item.questions)
         for question in item.questions:
+            if question.id not in item.gold:
+                continue
             answer = result[question.id]
             rows.append(
                 {
@@ -140,14 +191,21 @@ def run_fork(items, model: str) -> dict:
                     "want": item.gold[question.id],
                 }
             )
-    return {"arm": "fork", "rows": rows, "seconds": seconds, "tokens": tokens, "model": model}
+    return {
+        "arm": "fork",
+        "rows": rows,
+        "seconds": seconds,
+        "tokens": tokens,
+        "model": model,
+        "asked": sum(len(item.questions) for item in items[1:]) or sum(len(item.questions) for item in items),
+    }
 
 
-def run_vllm(items, model: str, mode: str, max_len: int, utilisation: float) -> dict:
+def run_vllm(items, model: str, mode: str, max_len: int, utilisation: float, llm=None) -> dict:
     """vLLM, with prefix caching on. `separate` sends one request per question, `packed` one per item."""
     from vllm import LLM, SamplingParams
 
-    llm = LLM(
+    llm = llm or LLM(
         model=model,
         max_model_len=max_len,
         gpu_memory_utilization=utilisation,
@@ -179,6 +237,8 @@ def run_vllm(items, model: str, mode: str, max_len: int, utilisation: float) -> 
 
         if mode == "separate":
             for question, output in zip(item.questions, outputs, strict=True):
+                if question.id not in item.gold:
+                    continue
                 pick, _ = read_letters(output, len(question.options), back)
                 rows.append(
                     {
@@ -203,21 +263,87 @@ def run_vllm(items, model: str, mode: str, max_len: int, utilisation: float) -> 
                     "note": "packed: only the final position is readable through the request API",
                 }
             )
-    return {"arm": mode, "rows": rows, "seconds": seconds, "tokens": tokens, "model": model}
+    return {
+        "arm": mode,
+        "rows": rows,
+        "seconds": seconds,
+        "tokens": tokens,
+        "model": model,
+        "asked": sum(len(item.questions) for item in items[1:]) or sum(len(item.questions) for item in items),
+    }
+
+
+#: Questions per context the sweep measures. Four is what a RACE article carries and eight is a terms-of-service clause,
+#: so the first two points are the tasks as they come; thirty-two is the shipped group, which is the largest number of
+#: questions this package answers in one pass and therefore where its per-question cost is lowest.
+SWEEP = (1, 2, 4, 8, 16, 32)
+
+
+def sweep(items, args) -> list[dict]:
+    """One arm, at each question count, on one loaded model.
+
+    The axis, not a point. Both arms cost a constant per context plus something per question; a single question count
+    reports one point on two lines and cannot say where they cross.
+    """
+    counts = tuple(int(x) for x in args.at.split(",")) if getattr(args, "at", None) else SWEEP
+    engine, llm = None, None
+    if args.record:
+        from prismyra import Prismyra
+
+        engine = Prismyra(args.model, graphs=args.graphs)
+    else:
+        from vllm import LLM
+
+        llm = LLM(
+            model=args.model,
+            max_model_len=args.max_len,
+            gpu_memory_utilization=args.utilisation,
+            enforce_eager=True,
+            enable_prefix_caching=True,
+            limit_mm_per_prompt={"image": 0, "video": 0},
+        )
+
+    out = []
+    for count in counts:
+        wide = widen(items, count, seed=args.seed)
+        asked = sum(len(item.questions) for item in wide)
+        if engine is not None:
+            run = run_fork(wide, args.model, engine=engine, graphs=args.graphs)
+        else:
+            run = run_vllm(wide, args.model, args.mode, args.max_len, args.utilisation, llm=llm)
+        point = summarise(run, asked)
+        point["questions_per_context"] = count
+        print(
+            f"  {count:>3} questions/context: {point['questions_per_second']:>8.2f} questions/s, "
+            f"{point['median_ms_per_item']:>7.1f} ms/context, accuracy {point['accuracy']:.3f} "
+            f"on {point['answers']} scored"
+        )
+        out.append(point)
+    if engine is not None and getattr(args, "graphs", False):
+        stats = engine.stats()
+        print(f"  recordings verified: {stats.get('graphs_verified')}")
+        print(f"  recordings declined: {stats.get('graphs_declined')}")
+    return out
 
 
 def summarise(run: dict, questions: int) -> dict:
-    """Questions per second and accuracy, with the first item dropped as warm-up in every arm."""
+    """Questions per second and accuracy, with the first item dropped as warm-up in every arm.
+
+    Two different counts, and conflating them is how a borrowed question would inflate an accuracy: `asked` is the work
+    that the seconds bought, and `scored` is the subset with a gold answer. Questions per second uses the first.
+    """
     seconds = run["seconds"][1:] or run["seconds"]
+    asked = run.get("asked", len(run["rows"]))
     answered = [r for r in run["rows"] if r["item"] > 0] or run["rows"]
     right = sum(r["got"] == r["want"] for r in answered)
     return {
         "arm": run["arm"],
         "items": len(seconds),
+        "asked": asked,
         "answers": len(answered),
         "accuracy": round(right / len(answered), 4) if answered else 0.0,
         "seconds": round(sum(seconds), 1),
-        "questions_per_second": round(len(answered) / sum(seconds), 2) if sum(seconds) else 0.0,
+        "questions_per_second": round(asked / sum(seconds), 2) if sum(seconds) else 0.0,
         "median_ms_per_item": round(statistics.median(seconds) * 1e3, 1),
         "tokens": run["tokens"],
         "tokens_per_question": round(run["tokens"] / max(1, questions)),
@@ -236,16 +362,57 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", default="separate", choices=["separate", "packed"])
     parser.add_argument("--max-len", type=int, default=4096)
     parser.add_argument("--utilisation", type=float, default=0.86)
+    parser.add_argument(
+        "--questions", type=int, help="fill each context up to this many questions, borrowing from the other contexts"
+    )
+    parser.add_argument("--sweep", action="store_true", help=f"measure this arm at {SWEEP} questions per context")
+    parser.add_argument(
+        "--at", help="comma-separated question counts to sweep instead of the default, for locating the crossing"
+    )
+    parser.add_argument("--graphs", action="store_true", help="record and replay the branch pass (fork arm only)")
     args = parser.parse_args(argv)
 
     # Identical items in both processes, because both load the same task with the same seed. Passing the items through
     # the recording instead would let a prompt difference hide in the file.
     items = tasks.load(args.task, args.limit, split=args.split, seed=args.seed)
+    if args.questions:
+        items = widen(items, args.questions, seed=args.seed)
     questions = sum(len(item.questions) for item in items)
     print(f"{args.task} [{args.split}, seed {args.seed}]: {len(items)} contexts, {questions} questions\n")
 
+    if args.sweep:
+        if args.record:
+            print("fork, at each question count:")
+            points = sweep(items, args)
+            args.record.write_text(json.dumps({"arm": "fork", "sweep": points, "model": args.model}, indent=2))
+            print(f"\nwritten to {args.record}")
+            return 0
+        if not args.against:
+            raise SystemExit("a sweep needs --record or --against, the same as a single point")
+        recorded = json.loads(args.against.read_text())
+        print(f"vLLM {args.mode}, at each question count:")
+        points = sweep(items, args)
+        print(
+            f"\n{'questions/context':>18} {'fork q/s':>10} {'vllm q/s':>10} {'ratio':>7} {'fork ms':>9} {'vllm ms':>9}"
+        )
+        for mine, theirs in zip(recorded["sweep"], points, strict=True):
+            assert mine["questions_per_context"] == theirs["questions_per_context"]
+            ratio = (
+                mine["questions_per_second"] / theirs["questions_per_second"] if theirs["questions_per_second"] else 0
+            )
+            print(
+                f"{mine['questions_per_context']:>18} {mine['questions_per_second']:>10.2f} "
+                f"{theirs['questions_per_second']:>10.2f} {ratio:>7.2f} "
+                f"{mine['median_ms_per_item']:>9.1f} {theirs['median_ms_per_item']:>9.1f}"
+            )
+        print(
+            "\nRatio above one is this package answering more questions per second than vLLM. The crossing point, if\n"
+            "there is one, is the number of questions per context above which the fork is the faster way to ask."
+        )
+        return 0
+
     if args.record:
-        run = run_fork(items, args.model)
+        run = run_fork(items, args.model, graphs=args.graphs)
         args.record.write_text(json.dumps(run, indent=2, default=str))
         print(json.dumps(summarise(run, questions), indent=2))
         print(f"\nwritten to {args.record}")
@@ -260,10 +427,11 @@ def main(argv: list[str] | None = None) -> int:
     mine = run_vllm(items, args.model, args.mode, args.max_len, args.utilisation)
 
     left, right = summarise(recorded, questions), summarise(mine, questions)
-    print(f"\n{'arm':>10} {'answers':>8} {'accuracy':>9} {'questions/s':>12} {'ms/context':>11} {'tokens':>10}")
+    head = f"{'arm':>10} {'asked':>7} {'scored':>7} {'accuracy':>9}"
+    print(f"\n{head} {'questions/s':>12} {'ms/context':>11} {'tokens':>10}")
     for side in (left, right):
         print(
-            f"{side['arm']:>10} {side['answers']:>8} {side['accuracy']:>9.3f} "
+            f"{side['arm']:>10} {side['asked']:>7} {side['answers']:>7} {side['accuracy']:>9.3f} "
             f"{side['questions_per_second']:>12.2f} {side['median_ms_per_item']:>11.1f} {side['tokens']:>10}"
         )
     if right["questions_per_second"]:

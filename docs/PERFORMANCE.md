@@ -336,10 +336,47 @@ question, the output restricted to the letter tokens so both arms score declared
 | this package, with the recurrence kernel | 234 | 0.953 | **16.44** | 220.2 | **28,421** |
 | vLLM, one request per question | 234 | 0.936 | 31.64 | 125.0 | 76,556 |
 
-**Still 1.9x behind, from 4.3x behind.** Accuracy is not a like-for-like comparison and no claim is made from it: the
-arms score different tokens, since a request returning one token can only score the letters while this package scores
-the option text. The token column is what this package wins, by 2.7x -- it sends the context once per document where
-vLLM sends it once per question and leans on the prefix cache not to recompute it.
+**1.9x behind, from 4.3x behind** -- at four questions per context, which is what a RACE article carries and which is
+the wrong place to read that ratio. See the next section: the two arms cross at twelve.
+
+Accuracy is not a like-for-like comparison and no claim is made from it: the arms score different tokens, since a
+request returning one token can only score the letters while this package scores the option text. The token column is
+what this package wins, by 2.7x -- it sends the context once per document where vLLM sends it once per question and
+leans on the prefix cache not to recompute it.
+
+### The ratio is a function, and the crossing is at twelve
+
+Both arms cost something per context and something per question, and the constants and the slopes are different, so a
+single question count reports one point on two lines. `--questions N` and `--sweep` fill each context up to N by
+borrowing questions from the other contexts in the sample -- real questions with real suffix lengths, asked about the
+wrong document, not scored, and counted in the throughput because answering one costs exactly what answering a real one
+costs. Twenty RACE articles, one L40S, recording off in both arms:
+
+| questions per context | fork q/s | vLLM q/s | ratio | fork ms/context | vLLM ms/context |
+|---|---|---|---|---|---|
+| 1 | 4.48 | 8.30 | 0.54 | 223.8 | 119.6 |
+| 4 | 17.63 | 32.37 | 0.54 | 226.9 | 122.9 |
+| 8 | 34.77 | 49.27 | 0.71 | 229.7 | 154.0 |
+| 10 | 43.80 | 50.35 | 0.87 | 228.1 | 192.1 |
+| **12** | **52.25** | **50.30** | **1.04** | 229.5 | 230.0 |
+| 16 | 64.98 | 49.13 | 1.32 | 241.1 | 311.2 |
+| 32 | 85.28 | 48.01 | 1.78 | 347.2 | 633.8 |
+| 64 | 91.08 | 48.34 | 1.88 | 703.0 | 1293.8 |
+
+Read the two `ms/context` columns rather than the ratio. **vLLM's cost is linear in the questions and this package's is
+nearly flat**: from one question to sixteen, vLLM goes from 119.6 ms to 311.2 and the fork goes from 223.8 to 241.1 --
+seventeen milliseconds for fifteen more questions, because they are fifteen more rows of one batch. vLLM's throughput is
+the same 48 to 50 questions per second at every count, which is what a saturated engine looks like: it is doing the work
+well and there is simply more of it.
+
+So the two numbers to quote are the crossing and the asymptote. **Below twelve questions per context vLLM is the faster
+way to ask, above twelve this package is, and the ratio tends to about 1.9x.** Neither of those is the 1.9x in the table
+above, which was a coincidence of reading a limit at a point far below the crossing.
+
+One wrong row was published before this table was right: a point labelled 128 questions per context which was really
+about eighty, because twenty articles cannot supply 128 questions for one context and `widen` truncated in silence. It
+now refuses and says to raise `--limit`. The questions per second was correct; the axis it was plotted against was not,
+which is the same failure as a check that compares something narrower than its claim.
 
 ### What closed half the gap, and how the rest of it looks
 
@@ -398,13 +435,59 @@ they cost to build:
   | 5 | 113.4 ms | **32.6 ms** |
 
   **3.5x from the third group, and every group answers identically** -- not within a tolerance, the same probabilities
-  to six decimals. The recording is taken lazily on a shape's second use, so a caller asking one group about a
-  document it will not revisit pays nothing. The 491 ms the recording costs above an eager pass is repaid by the
-  seventh group.
+  to six decimals. That table is at four rows and a short suffix, and **the 3.5x is a property of that shape rather than
+  of the mechanism**, which is the next section and cost three attempts to establish.
 
   Off by default, and the reason is memory rather than doubt: a recording holds a private allocator pool, and this
   engine refuses a context by name from a budget it measures, so a feature that quietly takes device memory behind
   that budget would make the refusal wrong.
+
+#### What a replay saves, and where it saves nothing
+
+A recording removes the time the device spends waiting to be told what to do next. **Kernel launches are asynchronous**,
+so once each kernel outlasts the call that launches it, the host is already ahead of the device and there is no waiting
+left to remove. Measured on this model at thirty-two rows and a 3,000-token context, the same pass eagerly and replayed:
+
+| suffix width | eager pass | replayed pass | ratio | recording cost | passes needed to pay |
+|---|---|---|---|---|---|
+| 16 | 109.4 ms | 74.8 ms | 0.684 | 493.6 ms | 17 |
+| 32 | 110.7 ms | 94.7 ms | 0.855 | 462.1 ms | 40 |
+| 64 | 144.2 ms | 142.1 ms | **0.986** | 562.4 ms | 414 |
+| 128 | 268.1 ms | 267.3 ms | **0.997** | 948.2 ms | 2,190 |
+
+At a suffix of 128 tokens a recording is worth **0.8 ms of 268** and costs 948 ms to take. The 55.1 ms of kernel time
+inside a 109.4 ms pass that motivated the whole mechanism was a short suffix, where the pass is host-bound; the same pass
+at a longer suffix is device-bound, and there is nothing for a graph to do.
+
+So the question "is this worth recording" cannot have a constant answer, and **two constants were shipped and measured
+losing**:
+
+| rule | what it predicted | what it measured, at 128 questions per context |
+|---|---|---|
+| record on a shape's second use | a saving | 47.21 questions/s against **102.07** with recording off |
+| record when three more passes are coming | a saving | the same 2.16x loss |
+| record when seven more are coming | a saving | 64.49 against **103.44**, at 256 questions per context |
+
+The first rule recorded on the second sighting of a shape and there was usually no third, so every recording was taken,
+proved and thrown away unused. The second and third came from a cost of "151.3 ms to record", a figure that cannot be
+right and whose wrongness is only visible once the cost is counted in **passes**: three warm-up passes at 107.7 ms each
+is 323 ms before the capture begins. Expressed in milliseconds the missing term was invisible. Expressed in passes it is
+not expressible.
+
+What ships instead measures. The engine times the eager pass it just ran and the proving replays it runs anyway, and
+`graphs.keeping_pays` compares them: a recording is kept only if the passes still expected can pay for the four passes
+and two proving replays it cost. A refusal names both figures --
+
+    a replay of this shape costs 267.3 ms against 268.1 eagerly, so recording it pays from 2009 more passes and 7 are
+    expected
+
+-- and is remembered per shape, so finding out costs one recording per shape per engine rather than one per context.
+`stats()["graphs_cost"]` reports the pair for every shape it measured.
+
+Two figures supply "passes still expected", and neither is a guess: how many more groups of this shape the call in
+progress will run, which a caller has already declared by handing over all its questions at once, and how many times the
+shape has come back on this cache. **Neither can be the cost model.** That was the lesson: all three failures were a cost
+model with a term missing or a term assumed constant, and none was a kernel behaving unexpectedly.
 
   **A graph stores addresses and keeps nothing alive at them.** That sentence cost most of a day. The recorded pass
   reads the position ids, and those were a local of the call that took the recording, so they were freed when it

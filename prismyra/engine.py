@@ -25,7 +25,7 @@ from .fork import (
     round_width,
     snapshot,
 )
-from .graphs import record
+from .graphs import keeping_pays, pays_from, record
 from .media import encode, position_offset
 from .readout import load_unembedding, plan, score
 from .schema import (
@@ -168,6 +168,15 @@ class Prismyra:
         #: What each accepted recording's replays disagreed with their own pass by. Reported so that "it was accepted"
         #: and "it agreed" are separate statements: a check that silently measures the wrong thing reads as the second.
         self.verified_recordings: dict = {}
+        #: How many times each recording has answered. Reported because "a recording was taken" and "a recording was
+        #: used" are different claims, and a test that asserts the first while meaning the second is the mistake this
+        #: package keeps finding: with the old rule every recording was taken on a shape's second use and there was no
+        #: third use, so the count here would have been zero everywhere.
+        self.replays: dict = {}
+        #: What a pass at each shape cost eagerly and replayed, as measured. The recording decision is made from these
+        #: rather than from a constant, because the ratio between them runs from 0.684 at a suffix of sixteen tokens to
+        #: 0.997 at 128 -- see `_worth_keeping`.
+        self.replay_cost: dict = {}
         self._made_caches = 0
         #: Recordings by the identity of the cache they were taken on. Keyed by `id` because a cache is not hashable and
         #: because identity is exactly the right test: a recording is valid for one allocation and no other.
@@ -414,6 +423,8 @@ class Prismyra:
             "graphs": self.graphs,
             "graphs_declined": dict(self.declined_recordings),
             "graphs_verified": dict(self.verified_recordings),
+            "graphs_replays": dict(self.replays),
+            "graphs_cost": dict(self.replay_cost),
             "caches_allocated": self._made_caches,
             # Measured on this engine rather than derived, and zero until a question has been answered. Reported
             # because it is the number that decides how many contexts can be answered at once, and it is several times
@@ -532,7 +543,13 @@ class Prismyra:
                 for lo in range(0, len(questions), largest_group):
                     chunk = [p.text for p in plans[lo : lo + largest_group]]
                     widest_chunk = max(widest_chunk, len(chunk))
-                    hidden = self._branch(prefill, chunk, len(chunk), width)
+                    # How many more groups of this exact shape this call will run, which is what decides whether
+                    # recording the pass can pay for itself. Only full groups share the shape: the last chunk is
+                    # narrower unless the questions divide evenly.
+                    full_left = (len(questions) - lo - largest_group) // largest_group
+                    hidden = self._branch(
+                        prefill, chunk, len(chunk), width, remaining=full_left if len(chunk) == largest_group else 0
+                    )
                     probabilities.extend(
                         score(
                             hidden,
@@ -635,7 +652,7 @@ class Prismyra:
         except TooWide as e:
             raise PrismyraError(str(e)) from e
 
-    def _branch(self, prefill: Prefill, texts: list[str], rows: int, width: int) -> torch.Tensor:
+    def _branch(self, prefill: Prefill, texts: list[str], rows: int, width: int, remaining: int = 0) -> torch.Tensor:
         # The snapshot is taken on the first branch, when the cache holds exactly the context, so restoring it also
         # puts every layer's token count back to the end of the context. One mechanism, not a state restore plus a
         # separate rewind: two of them can disagree, and the one that is wrong answers plausibly.
@@ -660,12 +677,15 @@ class Prismyra:
             out = self.backbone(input_ids=suffix, position_ids=positions, use_cache=True, past_key_values=prefill.cache)
             return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
-        hidden = self._run_branch(prefill, run, ids, rows, width, positions)
+        hidden = self._run_branch(prefill, run, ids, rows, width, positions, remaining)
         # Each row is read at its own last real token, which is why the padding cannot reach an answer.
         return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
 
-    def _replay_disagreement(self, taken, prefill, ids, rows: int, reference) -> float:
-        """The worst a recording's replays are from the pass it was taken from, over **two** replays rather than one.
+    def _replay_disagreement(self, taken, prefill, ids, rows: int, reference) -> tuple[float, float]:
+        """The worst a recording's replays are from the pass it was taken from, and what a replay costs -- both measured
+        here because both need a replay and these are the only replays that answer nothing.
+
+        Two replays rather than one.
 
         Two, because one is not enough and that was measured rather than supposed. A recording can reproduce its pass
         perfectly the first time it is replayed and then diverge, by the same amount, on every replay after -- 0.123 on
@@ -674,12 +694,15 @@ class Prismyra:
         Python, which is the state every real use is in. Checking only the first proves the easy case.
         """
         worst = 0.0
+        # The fork is outside the recording and a real replay pays for it too, so it is inside the timing. What is being
+        # measured is the cost of one replayed pass as a caller would experience it.
+        started = _now(self.torch_device)
         for _ in range(REPLAY_CHECKS):
             taken.before_fork(prefill.cache)
             self.fork(prefill, rows)
             replayed = taken.replay(prefill.cache, ids)
             worst = max(worst, float((replayed.float() - reference.float()).abs().amax()))
-        return worst
+        return worst, _since(started, self.torch_device) / REPLAY_CHECKS
 
     def _recordings_for(self, cache) -> dict:
         """The recordings taken on this cache, and how many times each shape has been seen on it.
@@ -738,13 +761,19 @@ class Prismyra:
         assert prefill.snapshot is not None
         restore_and_fork(prefill.cache, prefill.snapshot, rows, width=self.group)
 
-    def _run_branch(self, prefill, run, ids, rows: int, width: int, positions):
+    def _run_branch(self, prefill, run, ids, rows: int, width: int, positions, remaining: int = 0):
         """The pass, replayed from a recording where there is one and recorded where a second one is worth taking.
 
         The order is what makes this safe. A recording is not a result: under stream capture the kernels are written
-        down rather than run, so the pass is executed eagerly for its answer *first* and recorded afterwards, on a shape
-        that has now been seen twice. A key seen once records nothing, so a caller asking one group about a
-        document it will not revisit pays nothing for machinery it never uses.
+        down rather than run, so the pass is executed eagerly for its answer *first* and recorded afterwards.
+
+        **Whether to record is arithmetic, not a habit.** `graphs.pays_from` says three passes at this shape must still
+        be coming, because a recording costs 151 ms plus two proving replays and each replay after that saves 79. Two
+        things can supply that number, and neither is a guess: `remaining` is how many more groups of this shape the
+        call in progress will run, which the caller has already told the engine by handing over all its questions at
+        once; and the count of times this shape has come back on this cache, which is evidence about a session asking
+        group after group. A shape that has neither records nothing, so a caller asking one group about a document it
+        will not revisit pays nothing for machinery it never uses.
         """
         if not self.graphs or self.torch_device.type != "cuda":
             self.fork(prefill, rows)
@@ -763,6 +792,7 @@ class Prismyra:
             self.fork(prefill, rows)
             wrong = recorded.usable(prefill.cache)
             if wrong is None:
+                self.replays[key] = self.replays.get(key, 0) + 1
                 return recorded.replay(prefill.cache, ids)
             # A recording that no longer describes the cache is discarded rather than replayed. The alternative is a
             # plausible answer, and this package treats that as the worst outcome available.
@@ -776,9 +806,14 @@ class Prismyra:
         # first version of the check below compare a tensor against itself and pass every time, and would have returned
         # the replay's values as this call's answer. The bug was found by a replay that gave a wrong answer while the
         # check reported agreement to zero.
+        # Timed, because whether a recording can pay is a question about this shape on this card and the answer is not a
+        # constant. See `_worth_keeping`.
+        started = _now(self.torch_device)
         hidden = run(ids).clone()
+        eager_ms = _since(started, self.torch_device)
         store["seen"][key] = store["seen"].get(key, 0) + 1
-        if store["seen"][key] >= 2 and key not in self.declined_recordings:
+        expected = max(remaining, store["seen"][key] - 1)
+        if expected >= pays_from() and key not in self.declined_recordings:
             taken, why = record(run, prefill.cache, ids, fork=lambda: self.fork(prefill, rows), keep=(positions,))
             if taken is None:
                 # Remembered so it is attempted once per shape rather than once per group, and reported rather than
@@ -793,9 +828,14 @@ class Prismyra:
                 # itself: if the first replay does not reproduce the answer already in hand, the recording is discarded.
                 # A wrong answer that looks right is the worst outcome available here, and this is what makes it
                 # impossible rather than unlikely.
-                moved = self._replay_disagreement(taken, prefill, ids, rows, hidden)
+                moved, replay_ms = self._replay_disagreement(taken, prefill, ids, rows, hidden)
                 self.verified_recordings[key] = moved
-                if moved > REPLAY_TOLERANCE:
+                self.replay_cost[key] = (round(eager_ms, 1), round(replay_ms, 1))
+                slow = keeping_pays(eager_ms, replay_ms, expected)
+                if slow is not None:
+                    del store["taken"][key]
+                    self.declined_recordings[key] = slow
+                elif moved > REPLAY_TOLERANCE:
                     self.declined_recordings[key] = (
                         f"a replay moved a hidden state by {moved:.3e}, above {REPLAY_TOLERANCE:.0e}"
                     )
