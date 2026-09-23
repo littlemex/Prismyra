@@ -257,6 +257,30 @@ there were more threads to do it on rather than to where it is done once. Encodi
 the request, gives 20.68 -- and a wait that a 0.44 ms change can break is tuned rather than derived, which is why the wait
 now refreshes rather than counting down.
 
+### Recording the batched pass is not the next thing, and why
+
+A recorded pass replays for 0.684 of its cost at a short suffix, the batched answer pass is 289 ms of a 444 ms batch, and
+the page pool exists partly so that a recording's addresses survive a change of document. So this looked like the next
+thing. Two findings, and the second closes it for now.
+
+**The batched pass never reaches the recording machinery at all.** `_answer_batch` calls the backbone directly rather than
+through `_run_branch`, so `graphs=True` records nothing on this path: measured over eight batches, `graphs_verified` empty.
+That is a wiring gap and wiring it is a few lines.
+
+**But a recording would not be reusable across batches even wired.** A branch's tokens are written at an offset measured
+from the end of its own document, and with pages that offset is the document's length modulo the page size. Those offsets
+are computed in Python inside the forward pass, so a recording bakes in **one tuple of per-row remainders**. Two batches
+share a recording only if every row's document has the same length modulo sixteen, which for eight rows is one arrangement
+in 16^8.
+
+Making the remainders constant means padding every document to a page boundary, and padding a context is not free: adding
+whitespace to a context moved answers by 0.075 to 0.108 in a separate measurement, which is larger than the gap between
+options on some questions. Left padding is the safe form and it is its own change with its own verification.
+
+So the honest accounting is that the prize is about 91 ms of 444 -- **1.26x** -- and the price is a padding scheme that
+touches answers. It is written down here rather than attempted, and the wiring gap is written down because it would
+otherwise read as "recording does not help on batches", which is not what was measured.
+
 ### A wider group does not buy throughput
 
 The per-row cost of a branch pass is flat in the width -- 0.109 GiB at width 1 and at width 32 -- so a wider group looked
