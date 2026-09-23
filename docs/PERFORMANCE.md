@@ -350,25 +350,37 @@ they cost to build:
 
 * **the convolution kernel covers only the context pass.** A branch pass arrives as many rows and keeps the framework's
   path, which is recorded where it is installed and is the next cheap thing to look at.
-* **CUDA graphs work, measured.** The earlier note said a recording faulted on replay, and the reason was what was
-  being recorded. Capturing `ask` fails immediately -- `cudaErrorStreamCaptureInvalidated` -- because the read-out
-  converts probabilities to host values and the suffix ids are copied in from pageable memory. Capturing **only the
-  forward**, with the ids written into a static buffer and three warm-up passes on a side stream, works:
+* **CUDA graphs are shipped, behind `Prismyra(graphs=True)`.** The earlier note said a recording faulted on replay and
+  the reason was never found. The reason was what was being recorded: capturing `ask` fails immediately --
+  `cudaErrorStreamCaptureInvalidated` -- because the read-out converts probabilities to host values and the suffix ids
+  are copied in from pageable memory. Capturing **only the forward**, with the ids in a static buffer and three warm-up
+  passes on a side stream:
 
-  | | |
-  |---|---|
-  | the forward, eagerly | 107.7 ms |
-  | capturing it, once | 151.3 ms |
-  | replaying it | **28.9 ms** |
+  | group | eagerly | with recording |
+  |---|---|---|
+  | 1 | 147.1 ms | 114.6 ms |
+  | 2 | 115.1 ms | 605.8 ms, the recording |
+  | 3 | 113.8 ms | **32.8 ms** |
+  | 4 | 113.6 ms | **32.5 ms** |
+  | 5 | 113.4 ms | **32.6 ms** |
 
-  3.7x, and the capture pays for itself after two passes of the same shape. Two things stand between that and shipping
-  it. **Replay runs no Python**, so the cache's host-side length bookkeeping -- the integer each layer keeps so the
-  framework can ask how many tokens it holds without a device read -- is not updated by a replay and has to be set
-  afterwards to what the pass would have left. Getting that wrong produces a plausible answer rather than an error,
-  which is the failure this package treats most seriously. And the shape is per context length, so a graph serves one
-  open context: a session asking many groups about one document gets the 3.7x, and a request asking one group about a
-  document it will not revisit pays the capture for nothing. Captured lazily on the second group of a key, that second
-  case costs nothing either.
+  **3.5x from the third group, and every group answers identically** -- not within a tolerance, the same probabilities
+  to six decimals. The recording is taken lazily on a shape's second use, so a caller asking one group about a
+  document it will not revisit pays nothing. The 491 ms the recording costs above an eager pass is repaid by the
+  seventh group.
+
+  Off by default, and the reason is memory rather than doubt: a recording holds a private allocator pool, and this
+  engine refuses a context by name from a budget it measures, so a feature that quietly takes device memory behind
+  that budget would make the refusal wrong.
+
+  What it took to get right is worth more than the speed-up. A replay **runs no Python**, and two separate things
+  depended on Python running. The cache's host-side length -- the integer each layer keeps so the framework can ask how
+  many tokens it holds without a device read -- is not advanced by a replay, so it is recorded alongside the graph and
+  restored after. And the recurrence **rebinds** its state to a new tensor on every pass, which a replay cannot repeat:
+  after a recording the layers point at the tensor that pass produced, while the recording goes on reading the one bound
+  when it was taken. Both bindings are kept and swapped around each replay, so the fork writes the context into what the
+  recording reads. Getting either wrong gives a plausible answer rather than an error, which is why the device test
+  compares probabilities across four groups rather than decisions on one.
 * **the paged path made shapes constant**, and the graph measurement is what gives that a number. Its memory saving was
   measured and was zero, which is why deleting it was right on the evidence available. The reason to want it back is
   not memory: a page pool is a fixed allocation with the lengths carried in `seqused_k` as data, so **one graph would
