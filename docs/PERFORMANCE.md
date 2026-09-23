@@ -243,6 +243,39 @@ Free memory is the device's free bytes plus the allocator's reserved-but-unalloc
 refused an 18,000-token context that had 9 GiB waiting for it inside the process, because loading these weights leaves
 that pool large.
 
+### The gigabyte the budget had never counted
+
+The held figure was the key-value cache, and on this model the key-value cache is **ten of the forty-eight layers**. The
+other thirty are gated delta net, and what they hold is not keys and values but a recurrent state and a convolution
+window, one of each per row:
+
+| | per row | at group 32 |
+|---|---|---|
+| recurrent state, 30 layers | 1.05 MiB | 33.6 MiB |
+| convolution window, 30 layers | 0.01 MiB | 0.3 MiB |
+| **total** | **1.06 MiB** | **33.9 MiB** |
+
+That is a gigabyte per open context at the shipped group, and admission had been ignoring all of it since admission
+existed. `cache.state_bytes` computes it from the model's own shapes -- value heads times value dim times key dim for the
+recurrence, the kernel width for the window -- and `cache_bytes` includes it, so the number a refusal quotes is now the
+number the pass allocates.
+
+It went uncounted because nothing had ever asked where that state lives. The framework's layers **rebind** it on every
+pass: each pass allocates a new tensor at the width it is running and drops the old one, so there was never an allocation
+to attribute to the context, only a per-pass one that looked like part of the work. `fork.OWNED` changes that -- the
+state is allocated once at the full group width when the context opens, and each pass takes a view of the first *rows* of
+it. Two things follow. A recording can be taken against it, because its address no longer changes between passes. And
+the gigabyte is now visibly held rather than invisibly transient, which is what made it possible to count.
+
+Getting that accounting right took two wrong answers first, both of which refused honest work:
+
+* the allocation happened inside the first branch pass, so it landed in the peak that pass was measured by. Divided by
+  that pass's rows and multiplied by the group, a one-off gigabyte became a **24 GiB** answering estimate;
+* then it was measured at the context's own length while being allocated at the bucket, so a context near the bottom of
+  a bucket under-counted and one near the top over-counted.
+
+Both are why the allocation is now at context-open time and the measurement is `room_for()`, not `len(tokens)`.
+
 ### The paged path that never ran
 
 A paged storage path was written -- `block_table` and `seqused_k`, the context's pages named by every row's table, the
@@ -450,14 +483,21 @@ length.
 
 **Pooling the caches works and is not shipped.** A closed context returning its cache to a pool, reset for the next one,
 is what would let a recording outlive one document -- and it was implemented and measured: five documents, one group
-each, replaying from the third at 33.4 ms against 109 eagerly, answers identical. Then ten device tests failed.
-`reset()` on the framework's own recurrent layers clears their contents and keeps their batch dimension, so a cache
-returned by a three-row pass still holds three-row state and the next context's fork tries to widen three rows to
-thirty-two. Making that work means owning the shape of state this package deliberately hands to the framework, so it
-is its own change. The bucketed allocation stayed, because it costs nothing and is half of what the sharing needs.
+each, replaying from the third at 33.4 ms against 109 eagerly, answers identical. Three attempts have each found
+something real and then failed:
 
-So today a recording pays for a session asking many groups about one document, and for a sequence of documents that
-happen to be the same length. It is refused by name otherwise.
+| | what it found | state |
+|---|---|---|
+| first | `reset()` keeps the batch dimension, so a three-row cache met a thirty-two-row fork | fixed by `fork.OWNED`, shipped |
+| second | the owned gigabyte landed in the first pass's peak and became a 24 GiB estimate | fixed, and the recurrent state is now counted at all |
+| third | six device tests still refuse contexts on memory, with the accounting corrected | **not diagnosed** |
+
+Each fix was worth shipping on its own -- the owned shape is what lets a recording exist at all, and the accounting was
+wrong whether or not anything is ever pooled -- which is the only reason three failed attempts have left the package
+better. A fourth should begin by measuring the held memory of a pooled engine rather than by writing more of it.
+
+So today a recording pays for a session asking many groups about one document, and nothing else. It is refused by name
+otherwise.
 
 ## How these numbers were taken
 

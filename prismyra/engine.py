@@ -247,6 +247,21 @@ class Prismyra:
                     f"question {q.id!r} renders to {len(rendered)} tokens and the widest branch is {WIDTHS[-1]}"
                 )
 
+    def room_for(self, context_tokens: int) -> int:
+        """The bucket a context of this length is allocated at, which is not the same as its length.
+
+        Exposed because every figure about held memory has to use it. Measuring the held cache at the context's own
+        length while allocating at the bucket made the difference look like answering cost: a 51-token context in a
+        1,024-token allocation put nearly a gigabyte per row into the observed constant, which admission then multiplied
+        by the group and refused 24 GiB of work that needed one.
+        """
+        room = next((size for size in CONTEXT_SIZES if context_tokens <= size), None)
+        if room is None:
+            raise PrismyraError(
+                f"a context of {context_tokens} tokens is longer than this engine allocates for ({CONTEXT_SIZES[-1]})"
+            )
+        return room
+
     def cache_bytes(self, context_tokens: int) -> int:
         """The device memory one open context of this length **holds** between questions.
 
@@ -254,7 +269,7 @@ class Prismyra:
         the group -- but a branch pass allocates several times this much transiently, and that peak is what decides how
         many contexts can be answered at once. `answering_bytes` is that number, and `stats()` reports both.
         """
-        return cache_bytes(self.config, context_tokens + WIDTHS[-1], self.group, self.dtype, WIDTHS[-1])
+        return cache_bytes(self.config, self.room_for(context_tokens) + WIDTHS[-1], self.group, self.dtype, WIDTHS[-1])
 
     def answering_bytes(self, context_tokens: int, questions: int | None = None) -> int:
         """What a branch pass will transiently allocate on top of the held cache.
@@ -472,7 +487,16 @@ class Prismyra:
         self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
         # Read after the forward, not before: the offset is something the model works out while reading the context.
         position_from = position_offset(self.backbone, encoded.tokens) if encoded.has_media else encoded.tokens
+        # The fork's state buffers are allocated here rather than on the first branch pass, and the reason is the budget
+        # rather than tidiness. `fork.OWNED` allocates that state once at the full group width -- about a gigabyte on
+        # this model -- and doing it inside the first pass put the whole allocation into the peak that pass was measured
+        # by. Divided by that pass's row count and multiplied by the group, a one-off gigabyte became a 24 GiB answering
+        # estimate and admission refused contexts of fifty tokens. It is held memory, so it is allocated while the
+        # context is being read and counted as held.
+        taken = snapshot(cache)
+        restore_and_fork(cache, taken, self.group, width=self.group)
         return Prefill(
+            snapshot=taken,
             cache=cache,
             room=room,
             tokens=encoded.tokens,
@@ -671,30 +695,28 @@ class Prismyra:
         return held
 
     def _claim_cache(self, tokens: int):
-        """A cache for this context, allocated at a bucketed size.
+        """A cache sized for a bucket rather than for this context, reused if one is free.
 
-        Bucketed because a recording holds the addresses of the cache it was taken on, and an allocation shared between
-        contexts of similar length would let a recording outlive one document. **The sharing is not here yet**, and the
-        reason it is not is worth recording rather than rediscovering.
+        **Bucketed** means the allocation stops depending on the exact context length, so contexts of similar length
+        share one size. That is shipped, and it is one of the two things a recorded pass needs to outlive one document.
 
-        Pooling the caches and resetting them on reuse was implemented and measured, and it worked: five documents, one
-        group each, replaying from the third at 33.4 ms against 109 eagerly, with identical answers. Then ten device
-        tests failed. `reset()` on the framework's own recurrent layers clears their contents and **keeps their batch
-        dimension**, so a cache returned by a three-row pass still holds three-row state, and the next context's fork
-        tries to widen three rows to thirty-two. Making that work means owning the recurrent state's shape, which this
-        package deliberately does not -- `build_cache` hands those layers to the framework -- so it is its own change
-        rather than a line in this one.
+        **Pooled** -- keeping a closed context's cache and resetting it for the next one, so its addresses survive -- is
+        not. Three attempts, and each found something real before failing:
 
-        What the bucket still buys is that the allocation does not depend on the exact context length, which is one of
-        the two things a recording needs. The other is the length itself, and `graphs.Recording` checks it.
+        * `reset()` on the framework's own recurrent layers clears their contents and keeps their batch dimension, so a
+          cache returned by a three-row pass held three-row state and the next context's fork tried to widen three rows
+          to thirty-two. `fork.OWNED` fixes that and is shipped for its own sake;
+        * owning that state at the full group width allocated about a gigabyte, and doing it inside the first branch
+          pass put the whole allocation into the peak that pass was measured by -- divided by that pass's rows and
+          multiplied by the group, a one-off gigabyte became a 24 GiB answering estimate. It is allocated while the
+          context is read now, and `cache.state_bytes` counts it as held, which **admission had never done**;
+        * with all of that fixed, six device tests still refuse contexts on memory, and that is **not diagnosed**.
+
+        What the pool is worth is measured: five documents of the same length, one group each, replaying from the third
+        at 33.4 ms against 109 eagerly with identical answers. What it costs is still unknown, which is why a fourth
+        attempt should begin by measuring the held memory of a pooled engine rather than by writing more of it.
         """
-        room = next((size for size in CONTEXT_SIZES if tokens <= size), None)
-        if room is None:
-            raise PrismyraError(
-                f"a context of {tokens} tokens is longer than this engine allocates for ({CONTEXT_SIZES[-1]}); "
-                f"the allocation is bucketed so that a recorded pass can serve more than one context, and a longer "
-                f"context would need its own"
-            )
+        room = self.room_for(tokens)
         cache = build_cache(
             self.config, room + WIDTHS[-1], self.group, self.dtype, self.device, WIDTHS[-1], paged=self.paged
         )
@@ -702,8 +724,10 @@ class Prismyra:
         return cache, room
 
     def _release_cache(self, prefill) -> None:
-        """Nothing to return while caches are not pooled. Kept as the place that would do it, and as the place this
-        engine's own accounting of open contexts would live."""
+        """Where a closed context would hand its cache back for the next one. There is no pool yet; `_claim_cache` says
+        what three attempts at one cost and what is still unexplained."""
+        if prefill is not None:
+            self._cache_recordings.pop(id(prefill.cache), None)
 
     def fork(self, prefill, rows: int) -> None:
         """Put every layer back to the end of the context and widen it to `rows`.
@@ -712,7 +736,7 @@ class Prismyra:
         passes would have the second and third continuing from the first.
         """
         assert prefill.snapshot is not None
-        restore_and_fork(prefill.cache, prefill.snapshot, rows)
+        restore_and_fork(prefill.cache, prefill.snapshot, rows, width=self.group)
 
     def _run_branch(self, prefill, run, ids, rows: int, width: int, positions):
         """The pass, replayed from a recording where there is one and recorded where a second one is worth taking.

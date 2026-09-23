@@ -125,7 +125,45 @@ def _restore_lengths(layer, lengths: dict) -> None:
             setattr(layer, attr, value)
 
 
-def restore_and_fork(cache, snap: dict, rows: int) -> None:
+#: Where a layer's full-width state buffers are kept, and the views of them handed to the framework.
+#:
+#: The framework allocates this state at whatever batch it first saw -- one row, during the context pass -- and a fork
+#: then needs it at the group's width. Reallocating per width is what it used to do, and that is why a cache could not
+#: be reused: `reset()` clears the contents and keeps the batch dimension, so a cache returned by a three-row pass holds
+#: three-row state and the next context's fork tries to widen three rows to thirty-two.
+#:
+#: Owned here instead. One buffer per layer and key, allocated once at the full width, with a cached view per row count.
+#: The addresses never move, which is what lets a recorded pass outlive the context it was taken on, and the cached
+#: views mean the tensor identity the framework holds is stable for a given width -- a recording checks that identity.
+OWNED = "_prismyra_state"
+
+
+def _owned(layer, attr: str, key, like: torch.Tensor, width: int, rows: int) -> torch.Tensor:
+    """The full-width buffer for this piece of state, and the view of its first `rows` rows.
+
+    `like` is the snapshot's one-row tensor, which gives the shape of everything but the batch. Allocated on first use
+    and never again: a caller may hold the view, and a recorded pass holds the address.
+    """
+    store = getattr(layer, OWNED, None)
+    if store is None:
+        store = {}
+        setattr(layer, OWNED, store)
+    slot = store.get((attr, key))
+    full = slot["full"] if slot else None
+    want = (width, *like.shape[1:])
+    if not torch.is_tensor(full) or tuple(full.shape) != want or full.dtype != like.dtype:
+        full = torch.empty(want, dtype=like.dtype, device=like.device)
+        slot = {"full": full, "views": {}}
+        store[(attr, key)] = slot
+    assert slot is not None
+    view = slot["views"].get(rows)
+    if view is None:
+        view = full[:rows]
+        slot["views"][rows] = view
+    return view
+
+
+def restore_and_fork(cache, snap: dict, rows: int, width: int | None = None) -> None:
     """Put the one-row state back, then widen it to `rows`.
 
     The two kinds of state widen differently, and that difference is the design:
@@ -155,14 +193,12 @@ def restore_and_fork(cache, snap: dict, rows: int) -> None:
                 if v is None:
                     d[k] = None
                     continue
-                want = (rows, *v.shape[1:])
-                cur = d.get(k)
-                if torch.is_tensor(cur) and tuple(cur.shape) == want:
-                    # Written in place rather than replaced: reallocating on every group would put allocator work on
-                    # the request path, and would invalidate any reference already taken to the old buffer.
-                    cur.copy_(v.expand(want) if v.shape[0] == 1 else v)
-                else:
-                    d[k] = (v.expand(want) if v.shape[0] == 1 else v).contiguous()
+                # Into a buffer this package owns at the full width, with a cached view of the rows this group needs.
+                # See `OWNED`: the alternative reallocated whenever the row count changed, which moved the addresses a
+                # recorded pass had written down and left a reused cache holding the previous group's batch dimension.
+                held = _owned(layer, attr, k, v, width or rows, rows)
+                held.copy_(v.expand((rows, *v.shape[1:])) if v.shape[0] == 1 else v[:rows])
+                d[k] = held
         if _holds_attention(layer):
             # This layer keeps the context in one row and each branch's own tokens in another, and joins them on read.
             # There is nothing to fan out and nothing to restore beyond the length, which was done above.
@@ -174,7 +210,9 @@ def restore_and_fork(cache, snap: dict, rows: int) -> None:
             # Materialised, not a view of the snapshot. A layer that writes its own keys in place would otherwise
             # write through every row at once and through the snapshot, making every later group wrong rather than
             # failing.
-            setattr(layer, attr, t.expand(rows, *t.shape[1:]).contiguous())
+            held = _owned(layer, attr, attr, t, width or rows, rows)
+            held.copy_(t.expand((rows, *t.shape[1:])))
+            setattr(layer, attr, held)
 
 
 def build_suffixes(
