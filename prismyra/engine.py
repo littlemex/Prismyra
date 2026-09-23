@@ -25,6 +25,7 @@ from .fork import (
     round_width,
     snapshot,
 )
+from .graphs import record
 from .media import encode, position_offset
 from .readout import load_unembedding, plan, score
 from .schema import (
@@ -100,6 +101,7 @@ class Prismyra:
         require_kernels: bool = False,
         group: int = GROUP,
         calibrate: bool = False,
+        graphs: bool = False,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -117,6 +119,14 @@ class Prismyra:
         # The caches are held by the engine and mutated in place, so two threads asking at once would interleave one
         # another's branches. The lock makes that safe; `prismyra.queue.Worker` is still what makes it fast.
         self._lock = threading.RLock()
+        #: Whether to record a branch pass and replay it. Off by default, and the reason is memory rather than doubt: a
+        #: recording holds a private allocator pool, and this engine refuses a context by name from a budget it
+        #: measures, so a feature that quietly takes device memory behind that budget would make the refusal wrong.
+        #: Measured worth: a recorded pass replays in 28.9 ms against 107.7 eagerly, and recording costs 151.3 ms once.
+        self.graphs = graphs
+        #: Shapes a recording was attempted on and refused, with the reason. Attempted once per shape, not once per
+        #: group, and reported through `stats()` rather than retried in silence.
+        self.declined_recordings: dict = {}
         #: The largest per-row transient seen with the context-proportional part taken out -- activations and kernel
         #: workspace for one row -- and the widest pass it was seen at. None until the first pass.
         #:
@@ -338,6 +348,8 @@ class Prismyra:
             "kernels": self.applied.as_dict(),
             "scoring": self.calibration.mode if self.calibration else "raw",
             "storage": "joined",
+            "graphs": self.graphs,
+            "graphs_declined": dict(self.declined_recordings),
             # Measured on this engine rather than derived, and zero until a question has been answered. Reported
             # because it is the number that decides how many contexts can be answered at once, and it is several times
             # the held cache.
@@ -546,16 +558,74 @@ class Prismyra:
         # separate rewind: two of them can disagree, and the one that is wrong answers plausibly.
         if prefill.snapshot is None:
             prefill.snapshot = snapshot(prefill.cache)
-        restore_and_fork(prefill.cache, prefill.snapshot, rows)
 
         ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, rows, width)
         # From where the model thinks the context reached, which is past its token count when media widened it.
         start = prefill.position_from or prefill.tokens
         positions = torch.arange(start, start + ids.shape[1], device=self.device).expand(rows, -1)
-        out = self.backbone(input_ids=ids, position_ids=positions, use_cache=True, past_key_values=prefill.cache)
-        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+
+        def run(suffix: torch.Tensor) -> torch.Tensor:
+            """One branch pass, with the fork done by the caller.
+
+            The fork is deliberately **not** in here, and that was found by measurement rather than reasoned out. With
+            it inside, one replay disagreed with the eager pass and two replays disagreed with each other -- the
+            signature of a buffer a recording both reads and writes without resetting. The layer rebinds its recurrent
+            state to a new tensor on every pass, and a rebinding is Python: a recording keeps the tensor it saw and a
+            replay cannot repeat the assignment. So the fork runs eagerly every time, at the cost of a few copies per
+            layer, and the recording covers only what is pure device work.
+            """
+            out = self.backbone(input_ids=suffix, position_ids=positions, use_cache=True, past_key_values=prefill.cache)
+            return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+
+        hidden = self._run_branch(prefill, run, ids, rows, width)
         # Each row is read at its own last real token, which is why the padding cannot reach an answer.
         return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
+
+    def fork(self, prefill, rows: int) -> None:
+        """Put every layer back to the end of the context and widen it to `rows`.
+
+        Its own method because a recording's warm-up and capture passes each need it, and a fork done once for three
+        passes would have the second and third continuing from the first.
+        """
+        assert prefill.snapshot is not None
+        restore_and_fork(prefill.cache, prefill.snapshot, rows)
+
+    def _run_branch(self, prefill, run, ids, rows: int, width: int):
+        """The pass, replayed from a recording where there is one and recorded where a second one is worth taking.
+
+        The order is what makes this safe. A recording is not a result: under stream capture the kernels are written
+        down rather than run, so the pass is executed eagerly for its answer *first* and recorded afterwards, on a shape
+        that has now been seen twice. A key seen once records nothing, so a caller asking one group about a
+        document it will not revisit pays nothing for machinery it never uses.
+        """
+        if not self.graphs or self.torch_device.type != "cuda":
+            self.fork(prefill, rows)
+            return run(ids)
+
+        key = (rows, width)
+        recorded = prefill.recordings.get(key)
+        if recorded is not None:
+            # The bindings first, then the fork: the fork must write the context into the tensors the recording reads,
+            # and after the last pass those are not the ones the layers point at.
+            recorded.before_fork(prefill.cache)
+            self.fork(prefill, rows)
+            return recorded.replay(prefill.cache, ids)
+
+        self.fork(prefill, rows)
+        hidden = run(ids)
+        prefill.seen[key] = prefill.seen.get(key, 0) + 1
+        if prefill.seen[key] >= 2 and key not in self.declined_recordings:
+            taken, why = record(run, prefill.cache, ids, fork=lambda: self.fork(prefill, rows))
+            if taken is None:
+                # Remembered so it is attempted once per shape rather than once per group, and reported rather than
+                # retried in silence.
+                self.declined_recordings[key] = why or "unknown"
+            else:
+                prefill.recordings[key] = taken
+                # The recording ran the pass again while writing itself down, which left the cache where that pass
+                # left it -- not where the eager pass above left it. They are the same state by construction, and
+                # `hidden` was read before any of it, so the answer this call returns is the eager one.
+        return hidden
 
 
 def row_constant(seen: int | None, per_row: int, at_tokens: int, per_token: int) -> int:

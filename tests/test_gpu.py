@@ -352,3 +352,44 @@ def _six_second_clip(seconds: int = 6, fps: int = 30, size: int = 224) -> bytes:
             writer.write(frame)
         writer.release()
         return open(path, "rb").read()
+
+
+def test_a_replayed_pass_answers_exactly_as_the_eager_one_did(engine):
+    """The promise a recording has to keep, and it is not a tolerance.
+
+    A replay runs no Python. Each cache layer keeps a host-side count of the tokens it holds so the framework can ask
+    for the length without a device read, and a replay moves the bytes and leaves that integer where it was; the next
+    group then advances from the wrong offset and answers **plausibly**. That is why this compares probabilities and not
+    only decisions, over four groups rather than one -- a recording is taken on a shape's second use, so the
+    first replay is the third group, and the group after it is where a stale count would show.
+
+    One engine with the flag flipped between contexts, not two engines. The flag is read per pass, and two copies of
+    these weights do not fit on one card beside the one this file's fixture already holds -- which is the same limit the
+    skipped test above records.
+    """
+    asked = questions(4)
+    context = CONTEXT * 6
+    was = engine.graphs
+
+    def groups() -> list[dict]:
+        out = []
+        with engine.open_context(context) as opened:
+            for _ in range(4):
+                result = opened.ask(asked)
+                out.append({q.id: (result[q.id].option, dict(result[q.id].probabilities)) for q in asked})
+        return out
+
+    try:
+        engine.graphs = False
+        eager = groups()
+        engine.graphs = True
+        replayed = groups()
+        assert engine.stats()["graphs_declined"] == {}, "the recording was refused, so nothing was replayed"
+    finally:
+        engine.graphs = was
+
+    for n, (want, got) in enumerate(zip(eager, replayed, strict=True)):
+        for name in want:
+            assert got[name][0] == want[name][0], f"group {n}, question {name} changed its answer"
+            for option, p in want[name][1].items():
+                assert got[name][1][option] == pytest.approx(p, abs=1e-4), f"group {n}, {name}, option {option}"
