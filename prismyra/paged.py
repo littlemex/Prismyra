@@ -36,7 +36,7 @@ replaces.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from transformers.cache_utils import CacheLayerMixin
@@ -125,6 +125,163 @@ class Layout:
         return 2 * self.total_pages * self.block * heads * head_dim * element_size
 
 
+@dataclass(frozen=True)
+class Held:
+    """One document in the pool: where its pages start, and how many tokens it holds.
+
+    A document reserves its whole pages **and**, when its length is not a multiple of the page size, one more to hold
+    the leftover tokens until they are copied into each row. That page is reserved rather than borrowed: the single
+    document version wrote the leftover into the page just past its own, which is unowned when there is one document and
+    is the **next document's first page** when there are two. The failure would have been rows reading another
+    document's opening tokens as the end of their own.
+    """
+
+    first_page: int
+    tokens: int
+    block: int = BLOCK
+
+    @property
+    def whole_pages(self) -> int:
+        return self.tokens // self.block
+
+    @property
+    def remainder(self) -> int:
+        return self.tokens % self.block
+
+    @property
+    def reserved_pages(self) -> int:
+        """Pages this document holds in the shared region, including the one staging its leftover."""
+        return self.whole_pages + (1 if self.remainder else 0)
+
+    @property
+    def staging_page(self) -> int:
+        """Where the leftover tokens are written, to be copied into each row. Only meaningful when there is a
+        remainder, and asking for it when there is none is a bug rather than a no-op."""
+        if not self.remainder:
+            raise ValueError(f"a document of {self.tokens} tokens ends on a page boundary and stages nothing")
+        return self.first_page + self.whole_pages
+
+    def pages(self) -> list[int]:
+        """The run of whole pages every row answering about this document names. The staging page is not among them:
+        a page that is half document cannot sit inside a row's run."""
+        return list(range(self.first_page, self.first_page + self.whole_pages))
+
+
+class Full(RuntimeError):
+    """The pool has no room for another document. Raised before anything is written, so a refused admission leaves the
+    pool exactly as it was -- a partial write across ten layers has no rollback."""
+
+
+@dataclass
+class Pool:
+    """How a page pool divides between several documents and the rows answering about them.
+
+    This is the arithmetic that lets **one forward pass carry questions about different documents**, which is the one
+    thing the joined storage cannot do: `ForkLayer` puts the context in one row and joins it with each branch's own
+    tokens, so every row in a pass reads the same context by construction. Pages are named per row, so they do not.
+
+    The layout is fixed at two ends and grows in the middle:
+
+    * the **tail** holds each row's private pages -- its copy of its document's remainder, then its own tokens. Sized
+      for the worst remainder (`block - 1`) rather than for a particular document's, so a row's private pages are at the
+      same addresses whatever document it is answering about. A recording holds addresses;
+    * the **head** holds documents' whole pages, handed out by a cursor as documents are admitted.
+
+    A row's table is then `[its document's pages] + [its own private pages]` and the rest of the row is padding that is
+    never named, because `seqused_k` says how far along each row the kernel reads. Two rows answering about different
+    documents therefore differ in the **contents** of a rectangular table and not in its shape, which is what keeps one
+    recording valid.
+    """
+
+    total_pages: int
+    rows: int
+    branch_tokens: int
+    block: int = BLOCK
+    #: Admitted documents, in admission order.
+    documents: list[Held] = field(default_factory=list)
+    #: Which document each row answers about, by index into `documents`. Shorter than `rows` while rows are unassigned.
+    assignment: list[int] = field(default_factory=list)
+
+    @property
+    def private_pages(self) -> int:
+        """Pages one row owns. Sized for the worst remainder so the addresses do not depend on the document."""
+        return -(-(self.block - 1 + self.branch_tokens) // self.block)
+
+    @property
+    def private_first(self) -> int:
+        """Where the private region begins. Everything below this is shared between rows."""
+        return self.total_pages - self.rows * self.private_pages
+
+    def private_range(self, row: int) -> tuple[int, int]:
+        first = self.private_first + row * self.private_pages
+        return first, first + self.private_pages
+
+    @property
+    def used_pages(self) -> int:
+        return sum(d.reserved_pages for d in self.documents)
+
+    @property
+    def free_pages(self) -> int:
+        return self.private_first - self.used_pages
+
+    def pages_for(self, tokens: int) -> int:
+        """Pages a document of this length would reserve: its whole pages, plus one to stage a leftover."""
+        return -(-tokens // self.block)
+
+    def room_for(self, tokens: int) -> bool:
+        return self.pages_for(tokens) <= self.free_pages
+
+    def admit(self, tokens: int) -> Held:
+        """Reserve the whole pages for a document and return where they are. Refuses before writing anything."""
+        if tokens < 0:
+            raise ValueError(f"a document cannot hold {tokens} tokens")
+        if not self.room_for(tokens):
+            raise Full(
+                f"a document of {tokens} tokens needs {self.pages_for(tokens)} pages and {self.free_pages} are free; "
+                f"close a document or build the cache for a longer context"
+            )
+        held = Held(first_page=self.used_pages, tokens=tokens, block=self.block)
+        self.documents.append(held)
+        return held
+
+    def assign(self, per_document: list[int]) -> None:
+        """Say how many rows answer about each admitted document, in admission order.
+
+        Given rather than inferred. A row count per document is the caller's scheduling decision, and a pool that
+        guessed it would answer the wrong document's questions plausibly.
+        """
+        if len(per_document) > len(self.documents):
+            raise ValueError(f"{len(per_document)} row counts for {len(self.documents)} documents")
+        assignment: list[int] = []
+        for d, count in enumerate(per_document):
+            assignment += [d] * count
+        if len(assignment) > self.rows:
+            raise ValueError(f"{len(assignment)} rows asked for and this pool holds {self.rows}")
+        self.assignment = assignment
+
+    def width(self) -> int:
+        """Columns the table needs: the longest document's pages plus one row's private pages."""
+        longest = max((d.whole_pages for d in self.documents), default=0)
+        return longest + self.private_pages
+
+    def table(self) -> list[list[int]]:
+        """One row per assigned row: its document's pages, then its own, then padding that is never named."""
+        width = self.width()
+        rows = []
+        for row, d in enumerate(self.assignment):
+            named = self.documents[d].pages() + list(range(*self.private_range(row)))
+            rows.append(named + [0] * (width - len(named)))
+        return rows
+
+    def lengths(self, branch_progress: int = 0) -> list[int]:
+        """Tokens each row holds: its document's, plus however far its branch has got."""
+        return [self.documents[d].tokens + branch_progress for d in self.assignment]
+
+    def branch_offset(self, row: int) -> int:
+        """Where a row's own tokens begin inside its private pages -- after its copy of its document's remainder."""
+        return self.documents[self.assignment[row]].remainder
+
+
 class PagedForkLayer(CacheLayerMixin):
     """Keys and values in pages: the context's read by every branch, each branch's own written only by it."""
 
@@ -153,6 +310,19 @@ class PagedForkLayer(CacheLayerMixin):
         self.pages_read = 0
         self.last_branch_rows = 0
         self.layout: Layout | None = None
+        #: The same pages, described as a pool several documents can share. `None` until allocation.
+        self.pool: Pool | None = None
+        #: Documents admitted and not yet released, by the handle the engine gave them. A handle rather than an index so
+        #: that releasing one cannot silently renumber another.
+        self.held: dict[int, Held] = {}
+        #: Which document each row of the group being answered belongs to, as handles in row order.
+        self.rows_for: list[int] = []
+        #: The document being written. A handle chosen by the caller; zero is the one a single-context caller gets
+        #: without naming it.
+        self._writing = 0
+        #: How far the group being answered has advanced past its documents. Counted rather than derived from
+        #: `_host_length`, because with several documents in the batch there is no single length to subtract.
+        self._branch_progress = 0
         self.keys: torch.Tensor | None = None
         self.values: torch.Tensor | None = None
         #: Static, filled in place when a context is finished. A recording bakes in addresses, so these are never
@@ -171,24 +341,30 @@ class PagedForkLayer(CacheLayerMixin):
         self._allocate(num_heads, head_dim, dtype, device)
 
     def _allocate(self, heads: int, head_dim: int, dtype, device) -> None:
-        """Sized for the longest context this cache was built for, because the pages are fixed rather than pooled.
+        """Sized for the longest context this cache was built for, plus one row's worth of private pages per row.
 
-        A pool shared between contexts would fit more of them, and is deliberately not here: it needs admission by free
-        pages, rollback when an allocation fails part way through ten layers, and a rule for reusing a page while
-        earlier
-        work may still be reading it. Those are their own commit.
+        The pages are a pool, so the allocation that holds one long context also holds several short ones. What is not
+        here is **reuse**: a page a released document held is not handed out again, because that needs a rule for
+        reusing a page while earlier work may still be reading it. Until then the cursor only moves forward and
+        `Pool.admit` refuses when it reaches the private region.
         """
         room = max(1, self.max_cache_len - self.max_branch_len)
-        self.layout = Layout(
-            context_tokens=room, rows=self.max_batch_size, branch_tokens=self.max_branch_len, block=BLOCK
-        )
         self.device, self.dtype = device, dtype
-        self.keys = torch.zeros((self.layout.total_pages, BLOCK, heads, head_dim), dtype=dtype, device=device)
+        # Sized by the pool, which is the only description of these pages. The single-document `Layout` remains as the
+        # arithmetic a reader can check by hand, and is no longer what the storage is built from: two descriptions of
+        # one allocation is how a row ends up naming a page that belongs to something else.
+        rows = self.max_batch_size
+        private = -(-(BLOCK - 1 + self.max_branch_len) // BLOCK)
+        total = -(-room // BLOCK) + rows * private
+        self.pool = Pool(total_pages=total, rows=rows, branch_tokens=self.max_branch_len, block=BLOCK)
+        assert self.pool.private_pages == private
+        self.layout = Layout(context_tokens=room, rows=rows, branch_tokens=self.max_branch_len, block=BLOCK)
+        self.keys = torch.zeros((total, BLOCK, heads, head_dim), dtype=dtype, device=device)
         self.values = torch.zeros_like(self.keys)
         # Allocated at the widest layout so a recording's addresses stay valid whatever context is opened next. The
         # table's own width shrinks with the context; the tensor's does not, and the unused columns are never named
         # because `seqused` says how far along each row the kernel should read.
-        pages = self.layout.shared_pages + self.layout.private_pages
+        pages = -(-room // BLOCK) + private
         self.block_table = torch.zeros((self.max_batch_size, pages), dtype=torch.int32, device=device)
         self.seqused = torch.zeros((self.max_batch_size,), dtype=torch.int32, device=device)
         self.cumulative_length = self.cumulative_length.to(device)
@@ -214,8 +390,8 @@ class PagedForkLayer(CacheLayerMixin):
                 raise ValueError(f"a context arrives as one row and this one arrived as {rows}")
             if self._host_length:
                 raise NotImplementedError(
-                    "this cache takes its context in one piece; a second context write would have to gather the first "
-                    "back out of its pages"
+                    "this cache takes a document in one piece; a second write to the same one would have to gather "
+                    "the first back out of its pages. Another document is admitted with begin_document()."
                 )
             self._write_context(key_states, value_states)
             self._advance(count)
@@ -231,73 +407,133 @@ class PagedForkLayer(CacheLayerMixin):
         return None, None
 
     def _write_context(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
-        """Into the shared pages, in page order. One row, so there is one copy."""
-        assert self.keys is not None and self.values is not None
+        """Into the pages this document reserved, in page order. One row, so there is one copy.
+
+        The document is admitted here rather than earlier, because the token count that decides how many pages it needs
+        is what arrives with the write. An admission that will not fit raises before anything is written.
+        """
+        assert self.keys is not None and self.values is not None and self.pool is not None
         count = key_states.shape[-2]
+        held = self.pool.admit(count)
+        self.held[self._writing] = held
         # (1, heads, tokens, dim) -> (tokens, heads, dim), which is the page layout's own order.
         keys = key_states[0].transpose(0, 1)
         values = value_states[0].transpose(0, 1)
-        whole = count // BLOCK
+        whole = held.whole_pages
+        at = held.first_page
         if whole:
-            self.keys[:whole] = keys[: whole * BLOCK].view(whole, BLOCK, *keys.shape[1:])
-            self.values[:whole] = values[: whole * BLOCK].view(whole, BLOCK, *values.shape[1:])
-        left = count - whole * BLOCK
-        if left:
-            self.keys[whole, :left] = keys[whole * BLOCK :]
-            self.values[whole, :left] = values[whole * BLOCK :]
+            self.keys[at : at + whole] = keys[: whole * BLOCK].view(whole, BLOCK, *keys.shape[1:])
+            self.values[at : at + whole] = values[: whole * BLOCK].view(whole, BLOCK, *values.shape[1:])
+        if held.remainder:
+            # Into this document's own staging page. Writing it just past the whole pages would be writing into whatever
+            # is admitted next.
+            page = held.staging_page
+            self.keys[page, : held.remainder] = keys[whole * BLOCK :]
+            self.values[page, : held.remainder] = values[whole * BLOCK :]
 
-    def begin_branches(self) -> None:
-        """The context is finished. The table and the lengths are filled here, because both need to know how long the
-        context turned out to be, and filled **in place** because a recording holds their addresses."""
-        if self.writing_branches:
+    def begin_document(self, handle: int) -> None:
+        """About to write the document called `handle`. Its pages are reserved when its tokens arrive.
+
+        A handle rather than a position, so that releasing one document cannot renumber another. A caller that never
+        names one writes document zero, which is what a single-context caller does.
+        """
+        if handle in self.held:
+            raise ValueError(f"document {handle} is already in this cache")
+        self._writing = handle
+        self._host_length = 0
+        self.cumulative_length.zero_()
+        self.writing_branches = False
+
+    def begin_branches(self, rows_for: list[int] | None = None) -> None:
+        """The documents are finished and a group is starting. Build the table and the lengths, in place.
+
+        `rows_for` names the document each row answers about, in row order. Without it every row answers about the last
+        document written, which is the single-context case and is what every existing caller means.
+
+        In place because a recording holds these tensors' addresses. Both need to know how long each document turned out
+        to be, which is why this cannot happen at allocation.
+        """
+        if self.writing_branches and rows_for is None:
             return
-        self.context_length = self._host_length
-        self.writing_branches = True
         assert self.keys is not None and self.block_table is not None and self.seqused is not None
-        layout = Layout(
-            context_tokens=self.context_length, rows=self.max_batch_size, branch_tokens=self.max_branch_len, block=BLOCK
-        )
-        self.layout = layout
-        table = torch.tensor(layout.table(), dtype=torch.int32, device=self.keys.device)
+        assert self.pool is not None
+        if not self.held:
+            # No document was ever admitted -- a group asked for before anything was read. The caller's mistake, and
+            # saying so beats a table of zeros that reads page zero as though it held something.
+            raise ValueError("this cache holds no document, so there is nothing for a branch to read")
+        if rows_for is None:
+            rows_for = [self._writing] * self.max_batch_size
+        unknown = [h for h in rows_for if h not in self.held]
+        if unknown:
+            raise ValueError(f"rows were assigned to documents this cache does not hold: {sorted(set(unknown))}")
+
+        self.rows_for = list(rows_for)
+        self.writing_branches = True
+        self._branch_progress = 0
+        # The longest document in the batch. Reported to the framework, which has one length to ask about; the per-row
+        # truth is in `seqused` and that is what the kernel reads.
+        self.context_length = max(self.held[h].tokens for h in rows_for)
+        self._host_length = self.context_length
+
+        order = list(dict.fromkeys(rows_for))
+        self.pool.documents = [self.held[h] for h in order]
+        self.pool.assign([sum(1 for h in rows_for if h == handle) for handle in order])
+        table = torch.tensor(self.pool.table(), dtype=torch.int32, device=self.keys.device)
         self.block_table.zero_()
-        self.block_table[:, : table.shape[1]] = table
+        self.block_table[: table.shape[0], : table.shape[1]] = table
+        self.layout = Layout(
+            context_tokens=self.context_length,
+            rows=self.max_batch_size,
+            branch_tokens=self.max_branch_len,
+            block=BLOCK,
+        )
         self._copy_remainder()
         self._set_lengths()
 
     def _copy_remainder(self) -> None:
-        assert self.keys is not None and self.values is not None and self.layout is not None
-        layout = self.layout
-        if not layout.remainder:
-            return
-        source = layout.shared_pages
-        for row in range(layout.rows):
-            first, _ = layout.private_range(row)
-            self.keys[first, : layout.remainder] = self.keys[source, : layout.remainder]
-            self.values[first, : layout.remainder] = self.values[source, : layout.remainder]
+        """Each row's copy of its own document's leftover tokens, from that document's staging page.
+
+        Per row and from that row's **own** document. Taking one document's leftover for every row is the failure
+        this whole file is arranged around, and it would not raise.
+        """
+        assert self.keys is not None and self.values is not None and self.pool is not None
+        for row, handle in enumerate(self.rows_for):
+            held = self.held[handle]
+            if not held.remainder:
+                continue
+            first, _ = self.pool.private_range(row)
+            self.keys[first, : held.remainder] = self.keys[held.staging_page, : held.remainder]
+            self.values[first, : held.remainder] = self.values[held.staging_page, : held.remainder]
 
     def _set_lengths(self) -> None:
-        """How many tokens each row holds, as device data rather than as a shape. This is the mechanism: the context's
-        length moves a number in this tensor and moves nothing about the read's shape."""
-        assert self.seqused is not None and self.layout is not None
-        layout = self.layout
-        used = layout.shared_pages * BLOCK + layout.remainder + (self._host_length - self.context_length)
-        self.seqused.fill_(used)
+        """How many tokens each row holds, as device data rather than as a shape. This is the mechanism: a document's
+        length moves a number in this tensor and moves nothing about the read's shape -- and with several documents
+        the numbers differ from row to row while the shape does not."""
+        assert self.seqused is not None and self.pool is not None
+        if not self.rows_for:
+            return
+        lengths = self.pool.lengths(branch_progress=self._branch_progress)
+        # Rows beyond the group keep the first row's length rather than zero: a zero here would make the kernel read
+        # nothing for a row that is never queried, which is harmless, and a wrong non-zero would not be. Filled first so
+        # that no slot is left from a previous group.
+        self.seqused.fill_(lengths[0])
+        self.seqused[: len(lengths)] = torch.tensor(lengths, dtype=torch.int32, device=self.seqused.device)
 
     def _write_branches(self, key_states: torch.Tensor, value_states: torch.Tensor, rows: int) -> None:
-        """Into each row's own pages, at an offset measured from the context's length and never from a position."""
-        assert self.keys is not None and self.values is not None and self.layout is not None
-        layout = self.layout
+        """Into each row's own pages, at an offset measured from **that row's** document, never from a position."""
+        assert self.keys is not None and self.values is not None and self.pool is not None
+        pool = self.pool
         count = key_states.shape[-2]
-        at = layout.remainder + (self._host_length - self.context_length)
-        if at + count > layout.private_pages * BLOCK:
-            raise ValueError(
-                f"a branch reached token {at + count} of {layout.private_pages * BLOCK} private slots; the widest "
-                f"branch is what these pages were sized for"
-            )
         keys = key_states.transpose(1, 2)  # (rows, tokens, heads, dim)
         values = value_states.transpose(1, 2)
         for row in range(rows):
-            first, _ = layout.private_range(row)
+            at = pool.branch_offset(row) + self._branch_progress
+            if at + count > pool.private_pages * BLOCK:
+                raise ValueError(
+                    f"row {row} reached token {at + count} of {pool.private_pages * BLOCK} private slots; the widest "
+                    f"branch is what these pages were sized for"
+                )
+            first, _ = pool.private_range(row)
             written = 0
             while written < count:
                 page = first + (at + written) // BLOCK
@@ -311,6 +547,7 @@ class PagedForkLayer(CacheLayerMixin):
         self._host_length += count
         self.cumulative_length.add_(count)
         if self.writing_branches:
+            self._branch_progress += count
             self._set_lengths()
 
     # ---------------------------------------------------------------- reading
@@ -360,6 +597,8 @@ class PagedForkLayer(CacheLayerMixin):
         return self._host_length + query_length, 0
 
     def reset(self) -> None:
+        """Empty, and empty of documents. The pool's cursor goes back to the start too: a reset that cleared the bytes
+        and kept the admissions would refuse the next document for room it no longer owes anyone."""
         if self.is_initialized:
             assert self.keys is not None and self.values is not None
             self.keys.zero_()
@@ -368,26 +607,39 @@ class PagedForkLayer(CacheLayerMixin):
             self._host_length = 0
             self.context_length = 0
             self.writing_branches = False
+            self._branch_progress = 0
+            self._writing = 0
+            self.held.clear()
+            self.rows_for = []
+            if self.pool is not None:
+                self.pool.documents = []
+                self.pool.assignment = []
             if self.block_table is not None:
                 self.block_table.zero_()
             if self.seqused is not None:
                 self.seqused.zero_()
 
     def rewind_to(self, length: int) -> None:
-        """Start another group from the end of the context, re-copying each row's remainder.
+        """Start another group from the end of the documents, re-copying each row's own remainder.
 
-        The re-copy matters: the previous group wrote over the remainder's slots with its own first tokens if the
-        context
-        did not end on a page boundary. Without it the next group reads the last group's tokens as context.
+        The re-copy matters: if a document did not end on a page boundary, the previous group wrote its own first tokens
+        over the slots holding that document's leftover. Without the re-copy the next group reads the last group's
+        tokens as the end of its document, and answers plausibly.
+
+        `length` is the longest document in the batch, which is what this layer reports holding. It is checked rather
+        than used: each row's own length is `Pool.lengths`, and rewinding to anything but the end of the documents is
+        not something this storage can do.
         """
         if not self.is_initialized:
             return
         if self.context_length and length != self.context_length:
             raise ValueError(
-                f"this layer can only rewind to the end of its context ({self.context_length} tokens), not to {length}"
+                f"this layer can only rewind to the end of its documents ({self.context_length} tokens, the longest in "
+                f"the batch), not to {length}"
             )
         self.cumulative_length.fill_(length)
         self._host_length = int(length)
+        self._branch_progress = 0
         self._copy_remainder()
         if self.writing_branches:
             self._set_lengths()

@@ -50,11 +50,14 @@ def test_the_remainder_is_copied_into_each_row_rather_than_shared():
     context = tokens(BLOCK + 5)
     held.update(context, context * -1)
     held.begin_branches()
-    layout = held.layout
-    assert layout.remainder == 5
-    for row in range(layout.rows):
-        first, _ = layout.private_range(row)
-        assert torch.equal(held.keys[first, :5], held.keys[layout.shared_pages, :5])
+    # The pool is where the pages are, and it is the only description of them: `Layout` is arithmetic a reader can check
+    # by hand, and asking it where a row's pages are gave the answer from before documents could share a pool.
+    pool = held.pool
+    document = held.held[0]
+    assert document.remainder == 5
+    for row in range(pool.rows):
+        first, _ = pool.private_range(row)
+        assert torch.equal(held.keys[first, :5], held.keys[document.staging_page, :5])
 
 
 def test_the_read_does_not_present_a_shape_that_depends_on_the_context_length():
@@ -114,3 +117,93 @@ def test_cropping_is_refused_because_there_is_no_single_run_to_take_from():
     held = layer(context=BLOCK)
     with pytest.raises(NotImplementedError, match="cannot be cropped"):
         held.crop(3)
+
+
+def two_documents(
+    first: int, second: int, rows: int = 4, branch: int = 8, capacity: int | None = None
+) -> PagedForkLayer:
+    """One layer holding two documents, written one after the other, with distinguishable bytes.
+
+    A cache big enough for both: the pool's cursor only moves forward, so the capacity has to cover the sum. `capacity`
+    is separate from the documents' lengths so that two cases can be compared at the **same** allocation -- sizing it
+    from the documents made the shape comparison below compare two different pools and fail for that reason.
+    """
+    held = layer(context=capacity if capacity is not None else first + second + 2 * BLOCK, rows=rows, branch=branch)
+    held.begin_document(0)
+    a = tokens(first, start=1000.0)
+    held.update(a, a * -1)
+    held.begin_document(1)
+    b = tokens(second, start=90000.0)
+    held.update(b, b * -1)
+    return held
+
+
+def test_two_documents_live_in_one_pool_without_overlapping():
+    held = two_documents(BLOCK * 2, BLOCK * 3)
+    one, two = held.held[0], held.held[1]
+    assert set(one.pages()).isdisjoint(two.pages())
+    # And the bytes are where the table says. Document zero opens with 1000.0 and document one with 90000.0.
+    assert held.keys[one.pages()[0], 0, 0, 0].item() == 1000.0
+    assert held.keys[two.pages()[0], 0, 0, 0].item() == 90000.0
+
+
+def test_each_row_reads_only_its_own_document():
+    """The property continuous batching across documents rests on. A row's table must name its own document's pages and
+    no others, and this is asserted on the tensor the kernel is handed rather than on the arithmetic behind it."""
+    held = two_documents(BLOCK * 2, BLOCK * 3)
+    held.begin_branches([0, 0, 1, 1])
+    _, _, table, seqused, _ = held.paged_read(rows=4)
+    one, two = held.held[0], held.held[1]
+    for row in (0, 1):
+        named = set(table[row].tolist()[: one.whole_pages])
+        assert named == set(one.pages())
+        assert named.isdisjoint(two.pages())
+    for row in (2, 3):
+        named = set(table[row].tolist()[: two.whole_pages])
+        assert named == set(two.pages())
+        assert named.isdisjoint(one.pages())
+    # And each row is told its own document's length, which is how one shape serves two lengths.
+    assert seqused.tolist() == [BLOCK * 2, BLOCK * 2, BLOCK * 3, BLOCK * 3]
+
+
+def test_a_mixed_batch_keeps_one_shape_across_two_document_lengths():
+    """Two documents of different lengths, and the read presents the same shapes as one document would. Without this a
+    mixed batch would need its own recording, which is the cost the paged path exists to avoid."""
+    room = BLOCK * 32
+    same = two_documents(BLOCK * 2, BLOCK * 2, capacity=room)
+    mixed = two_documents(BLOCK * 2, BLOCK * 5, capacity=room)
+    same.begin_branches([0, 0, 1, 1])
+    mixed.begin_branches([0, 0, 1, 1])
+    shapes = []
+    for held in (same, mixed):
+        keys, values, table, seqused, bound = held.paged_read(rows=4)
+        shapes.append((keys.shape, values.shape, table.shape, seqused.shape, bound))
+    assert shapes[0] == shapes[1], shapes
+
+
+def test_each_row_copies_its_own_documents_leftover():
+    """Two documents whose lengths differ modulo the page size. A row taking the other document's leftover would read
+    that document's last tokens as the end of its own, and would not raise."""
+    held = two_documents(BLOCK * 2 + 5, BLOCK * 3 + 2)
+    held.begin_branches([0, 1, 1, 1])
+    one, two = held.held[0], held.held[1]
+    assert (one.remainder, two.remainder) == (5, 2)
+    first, _ = held.pool.private_range(0)
+    assert torch.equal(held.keys[first, :5], held.keys[one.staging_page, :5])
+    for row in (1, 2, 3):
+        at, _ = held.pool.private_range(row)
+        assert torch.equal(held.keys[at, :2], held.keys[two.staging_page, :2])
+
+
+def test_a_row_assigned_to_a_document_that_was_never_written_is_refused():
+    held = two_documents(BLOCK, BLOCK)
+    with pytest.raises(ValueError) as raised:
+        held.begin_branches([0, 1, 2, 2])
+    assert "does not hold" in str(raised.value)
+
+
+def test_a_document_cannot_be_admitted_twice_under_one_handle():
+    held = two_documents(BLOCK, BLOCK)
+    with pytest.raises(ValueError) as raised:
+        held.begin_document(0)
+    assert "already in this cache" in str(raised.value)
