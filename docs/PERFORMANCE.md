@@ -452,8 +452,14 @@ left to remove. Measured on this model at thirty-two rows and a 3,000-token cont
 |---|---|---|---|---|---|
 | 16 | 109.4 ms | 74.8 ms | 0.684 | 493.6 ms | 17 |
 | 32 | 110.7 ms | 94.7 ms | 0.855 | 462.1 ms | 40 |
-| 64 | 144.2 ms | 142.1 ms | **0.986** | 562.4 ms | 414 |
-| 128 | 268.1 ms | 267.3 ms | **0.997** | 948.2 ms | 2,190 |
+| 64 | 144.2 ms | 142.1 ms | **0.986** | 562.4 ms | about 400 |
+| 128 | 268.1 ms | 267.3 ms | **0.997** | 948.2 ms | about 2,000 |
+
+The last column is deliberately not exact. It divides by one minus the ratio, so at a ratio of 0.997 a tenth of a
+millisecond in either measurement moves it by two hundred: the run's own output printed 414 and 2,190 from its unrounded
+timings where the rounded figures above give 411 and 2,009. **Near the point where a replay saves nothing, how many
+passes would pay for a recording is not a quantity worth a precise figure** -- which is the same fact as the column
+itself, seen from the arithmetic instead of from the card.
 
 At a suffix of 128 tokens a recording is worth **0.8 ms of 268** and costs 948 ms to take. The 55.1 ms of kernel time
 inside a 109.4 ms pass that motivated the whole mechanism was a short suffix, where the pass is host-bound; the same pass
