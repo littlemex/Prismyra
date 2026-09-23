@@ -257,6 +257,33 @@ there were more threads to do it on rather than to where it is done once. Encodi
 the request, gives 20.68 -- and a wait that a 0.44 ms change can break is tuned rather than derived, which is why the wait
 now refreshes rather than counting down.
 
+### A wider group does not buy throughput
+
+The per-row cost of a branch pass is flat in the width -- 0.109 GiB at width 1 and at width 32 -- so a wider group looked
+like free width. Sixteen callers, four questions each, one engine per group because the group is fixed when the cache is
+allocated:
+
+| group | requests / s | passes | mean documents per pass | held per context |
+|---|---|---|---|---|
+| 8 | 6.26 | 9 | 1.78 | 0.347 GiB |
+| 16 | 7.32 | 5 | 3.20 | 0.674 GiB |
+| **32** | **13.13** | 3 | 5.33 | 1.328 GiB |
+| 64 | 9.07 | 2 | 8.00 | 2.637 GiB |
+
+Group 64 forms wider passes and fewer of them and is still slower, which is the opposite of the premise. **The pass is not
+where it loses.** The same eight documents, repeated five times each:
+
+| group | cache | read | read and answer | answer |
+|---|---|---|---|---|
+| 32 | 4.1 ms | 155.1 ms | 444.5 ms | 289.3 ms |
+| 64 | 4.6 ms | 149.2 ms | 433.3 ms | 284.1 ms |
+
+Identical within run-to-run variation. So whatever the scheduler run measured is in the scheduling rather than in the
+work, and **it is one run at each group against five repeats at the pass level, so the 13.13 against 9.07 is not a result**
+-- it is a reason not to widen the group, which is a different and weaker claim. The default of 32 stays, the memory it
+holds is half of what 64 holds, and the idea is closed rather than pursued: a wider group has to earn its memory with
+throughput and it did not.
+
 Three limits bound a pass, all read off the engine rather than configured: the questions, by the group; the documents, by
 the group again, since every document needs a row; and the tokens, by what the pool holds. A request too wide for any pass
 is refused when it is submitted rather than when it reaches the front, because a caller who will be refused should not
