@@ -116,6 +116,12 @@ class Recording:
     hidden: torch.Tensor
     rows: int
     width: int
+    #: Everything else the recorded pass reads that Python allocated. Held for the recording's whole life, because a
+    #: graph bakes in addresses and does not keep the tensors at them alive: the position ids were a local of the call
+    #: that took the recording, so they were freed when it returned and the replay went on reading memory the allocator
+    #: had handed to something else. That failed in exactly the way that is hardest to catch -- the replays taken
+    #: immediately after the recording were right, because the tensor was still alive, and every later one was wrong.
+    kept: tuple = ()
     after: list[dict] = field(default_factory=list)
     #: The bindings the recording reads from, and the ones the pass it recorded left behind. Swapped around a replay so
     #: that the caller's fork writes into what the recording reads, and what the caller reads afterwards is the output.
@@ -164,13 +170,16 @@ class Recording:
         return self.hidden
 
 
-def record(run, cache, ids: torch.Tensor, fork) -> tuple[Recording | None, str | None]:
+def record(run, cache, ids: torch.Tensor, fork, keep: tuple = ()) -> tuple[Recording | None, str | None]:
     """Warm up, record the pass, and return something replayable -- or None and the reason it could not be recorded.
 
     `run` takes the static ids tensor and returns the pass's hidden states, and `fork` puts the cache back to the end of
     the context. `run` is called `WARMUPS` times on a side stream and then once inside the recording, with `fork` before
     each of them -- without that the warm-ups continue from one another and the recording is taken against a state no
     real pass is ever in.
+
+    `keep` is every other tensor the pass reads that Python allocated -- the position ids, anything else a closure
+    captured. The recording holds them so they cannot be freed, because a graph stores addresses and nothing else.
 
     `fork` is outside the recording on purpose. With it inside, one replay disagreed with the eager pass and two replays
     disagreed with each other, because the layer rebinds its recurrent state to a new tensor on each pass and a
@@ -209,6 +218,7 @@ def record(run, cache, ids: torch.Tensor, fork) -> tuple[Recording | None, str |
         hidden=hidden,
         rows=ids.shape[0],
         width=ids.shape[1],
+        kept=tuple(keep),
         after=_host_state(cache),
         reads=reads,
         writes=writes,

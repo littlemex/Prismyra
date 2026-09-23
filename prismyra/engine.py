@@ -53,6 +53,10 @@ ANSWERING_MARGIN = 1.15
 #: recording for a rounding step that cannot reach an answer.
 REPLAY_TOLERANCE = 1e-3
 
+#: Replays run before a recording is trusted. Two, because the first one is the easy case: it happens with the device in
+#: exactly the state the recording was taken in, and a recording that diverges does so from the second replay onwards.
+REPLAY_CHECKS = 2
+
 
 @dataclass
 class Context:
@@ -149,6 +153,9 @@ class Prismyra:
         #: Shapes a recording was attempted on and refused, with the reason. Attempted once per shape, not once per
         #: group, and reported through `stats()` rather than retried in silence.
         self.declined_recordings: dict = {}
+        #: What each accepted recording's replays disagreed with their own pass by. Reported so that "it was accepted"
+        #: and "it agreed" are separate statements: a check that silently measures the wrong thing reads as the second.
+        self.verified_recordings: dict = {}
         #: The largest per-row transient seen with the context-proportional part taken out -- activations and kernel
         #: workspace for one row -- and the widest pass it was seen at. None until the first pass.
         #:
@@ -375,6 +382,7 @@ class Prismyra:
             "paged_reads_served": self._paged_reads(),
             "graphs": self.graphs,
             "graphs_declined": dict(self.declined_recordings),
+            "graphs_verified": dict(self.verified_recordings),
             # Measured on this engine rather than derived, and zero until a question has been answered. Reported
             # because it is the number that decides how many contexts can be answered at once, and it is several times
             # the held cache.
@@ -619,9 +627,26 @@ class Prismyra:
             out = self.backbone(input_ids=suffix, position_ids=positions, use_cache=True, past_key_values=prefill.cache)
             return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
-        hidden = self._run_branch(prefill, run, ids, rows, width)
+        hidden = self._run_branch(prefill, run, ids, rows, width, positions)
         # Each row is read at its own last real token, which is why the padding cannot reach an answer.
         return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
+
+    def _replay_disagreement(self, taken, prefill, ids, rows: int, reference) -> float:
+        """The worst a recording's replays are from the pass it was taken from, over **two** replays rather than one.
+
+        Two, because one is not enough and that was measured rather than supposed. A recording can reproduce its pass
+        perfectly the first time it is replayed and then diverge, by the same amount, on every replay after -- 0.123 on
+        this model, repeatable, and the cause is not identified. The first replay happens with the device in exactly the
+        state the recording was taken in; the second happens after the fork and the bindings have been put back by
+        Python, which is the state every real use is in. Checking only the first proves the easy case.
+        """
+        worst = 0.0
+        for _ in range(REPLAY_CHECKS):
+            taken.before_fork(prefill.cache)
+            self.fork(prefill, rows)
+            replayed = taken.replay(prefill.cache, ids)
+            worst = max(worst, float((replayed.float() - reference.float()).abs().amax()))
+        return worst
 
     def fork(self, prefill, rows: int) -> None:
         """Put every layer back to the end of the context and widen it to `rows`.
@@ -632,7 +657,7 @@ class Prismyra:
         assert prefill.snapshot is not None
         restore_and_fork(prefill.cache, prefill.snapshot, rows)
 
-    def _run_branch(self, prefill, run, ids, rows: int, width: int):
+    def _run_branch(self, prefill, run, ids, rows: int, width: int, positions):
         """The pass, replayed from a recording where there is one and recorded where a second one is worth taking.
 
         The order is what makes this safe. A recording is not a result: under stream capture the kernels are written
@@ -661,10 +686,15 @@ class Prismyra:
             return run(ids)
 
         self.fork(prefill, rows)
-        hidden = run(ids)
+        # Copied, and this is not defensive housekeeping. A recording replays into buffers the allocator may have handed
+        # out for this pass's own output, so a replay can overwrite the answer that was just computed -- which made the
+        # first version of the check below compare a tensor against itself and pass every time, and would have returned
+        # the replay's values as this call's answer. The bug was found by a replay that gave a wrong answer while the
+        # check reported agreement to zero.
+        hidden = run(ids).clone()
         prefill.seen[key] = prefill.seen.get(key, 0) + 1
         if prefill.seen[key] >= 2 and key not in self.declined_recordings:
-            taken, why = record(run, prefill.cache, ids, fork=lambda: self.fork(prefill, rows))
+            taken, why = record(run, prefill.cache, ids, fork=lambda: self.fork(prefill, rows), keep=(positions,))
             if taken is None:
                 # Remembered so it is attempted once per shape rather than once per group, and reported rather than
                 # retried in silence.
@@ -678,12 +708,11 @@ class Prismyra:
                 # itself: if the first replay does not reproduce the answer already in hand, the recording is discarded.
                 # A wrong answer that looks right is the worst outcome available here, and this is what makes it
                 # impossible rather than unlikely.
-                taken.before_fork(prefill.cache)
-                self.fork(prefill, rows)
-                moved = float((taken.replay(prefill.cache, ids).float() - hidden.float()).abs().amax())
+                moved = self._replay_disagreement(taken, prefill, ids, rows, hidden)
+                self.verified_recordings[key] = moved
                 if moved > REPLAY_TOLERANCE:
                     self.declined_recordings[key] = (
-                        f"the first replay moved a hidden state by {moved:.3e}, above {REPLAY_TOLERANCE:.0e}"
+                        f"a replay moved a hidden state by {moved:.3e}, above {REPLAY_TOLERANCE:.0e}"
                     )
                 else:
                     prefill.recordings[key] = taken

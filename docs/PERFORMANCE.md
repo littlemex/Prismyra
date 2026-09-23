@@ -373,13 +373,22 @@ they cost to build:
   engine refuses a context by name from a budget it measures, so a feature that quietly takes device memory behind
   that budget would make the refusal wrong.
 
-  **A recording is accepted only if its first replay reproduces the pass it was taken from.** That check is not a
-  formality and it is the reason this is safe to have at all. A recording that reproduced its pass exactly on a fresh
-  engine stopped doing so once the test suite had run its video and companion tests first -- measured, repeatable, and
-  **the cause is not identified**. Checking that the recording still holds the tensors the layers point at did not catch
-  it. So the check is the thing itself: replay once, compare against the answer already in hand, and throw the recording
-  away if it moved. `stats()["graphs_declined"]` says which shape was refused and why. A wrong answer that looks right
-  is the worst outcome available here, and this is what makes it impossible rather than unlikely.
+  **A graph stores addresses and keeps nothing alive at them.** That sentence cost most of a day. The recorded pass
+  reads the position ids, and those were a local of the call that took the recording, so they were freed when it
+  returned and every later replay read memory the allocator had since handed to something else. The recording now
+  holds every tensor the pass reads that Python allocated, and the answers are identical again -- 0.0 across four
+  groups and four repeats, with three different warm-up histories.
+
+  The shape of that failure is why it took so long. **The replays taken immediately after the recording were right**,
+  because the tensor was still alive; every later one was wrong. So a check that replayed once and compared against the
+  pass it was taken from passed every time, and so did a check that replayed twice. Two earlier attempts at a check were
+  worse than nothing: one compared the eager output against itself, because the replay had overwritten the buffer
+  holding it, and one counted paged reads by summing an attribute that never existed, so it could only ever return
+  zero. **A check that can only return the answer you hope for reads as evidence and is not.**
+
+  The check is still there and still runs -- two replays against a copy of the pass, with `stats()["graphs_verified"]`
+  reporting what it measured and `graphs_declined` naming anything refused. It did not catch this, so it is a guard
+  rather than a proof.
 
   What it took to get right is worth more than the speed-up. A replay **runs no Python**, and two separate things
   depended on Python running. The cache's host-side length -- the integer each layer keeps so the framework can ask how
@@ -414,6 +423,25 @@ they cost to build:
   not memory: a page pool is a fixed allocation with the lengths carried in `seqused_k` as data, so **one graph would
   serve every context length** rather than one per open context -- which is the difference between a session workload
   getting 3.7x and every workload getting it.
+
+## How these numbers were taken
+
+Every figure above was measured on one borrowed L40S with the weights on it, which means a deployment step, and that
+step produced three wrong answers before it produced a right one. What it takes to trust one of these numbers:
+
+* **the source has to be the source.** The deployment untarred over an existing directory, so files deleted from the
+  repository stayed on the machine -- a test file removed two commits earlier was still being collected. It now extracts
+  into a fresh directory, and the fingerprint of every `.py` is compared on both sides before a number is believed.
+* **the import has to resolve to it.** The package is installed editable against one directory while the clean copy sits
+  in another, and `python3 script.py` does not put the working directory on the search path. Half a day of measurements
+  were taken against the stale tree while the test suite, which runs with the working directory on the path, read the
+  fresh one. Every measurement script now prints `prismyra.__file__` as its first line.
+* **errors have to be visible.** `kubectl cp` was failing on file ownership with its output discarded, so the machine
+  kept an older copy while reporting success. Suppressing that is what kept the first two invisible for as long as they
+  were.
+
+None of this is interesting engineering. It is here because two measurements in this document's history were taken
+against code that does not exist in this repository, and a reader deserves to know which discipline produced the rest.
 
 ## Concurrency, as first measured
 
