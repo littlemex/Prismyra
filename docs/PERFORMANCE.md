@@ -337,6 +337,53 @@ Two things were wrong and both are fixed:
 
 `stats()["admission"]` reports both.
 
+### The scheduler on a shelf
+
+The scheduler read every request's document, so two callers asking about the same one read it twice. It holds a shelf now:
+a document is read the first time somebody asks about it and stays until it is displaced. Twenty-four requests either way,
+eight callers a round, four questions each:
+
+| load | requests | requests / s | median | documents read | answered without reading | passes |
+|---|---|---|---|---|---|---|
+| a different set of documents each round | 24 | 14.60 | 436.8 ms | 24 | 0 | 4 |
+| the same set each round | 24 | **19.00** | 331.3 ms | 8 | **16** | 6 |
+
+**1.30x on a repeating working set**, and the ceiling is worth stating beside it: a pass of eight documents is 155 ms of
+reading and 289 of answering, so removing the reading entirely is 1.54x. The measured 1.30 is below that because the
+repeating run happened to form six narrower passes against the other's four, which is arrival timing rather than the
+shelf. One run each.
+
+Three decisions inside it, and the second is the one that would have answered plausibly:
+
+* **documents are recognised by a digest of their text.** A cryptographic one rather than `hash`, which is randomised per
+  process and truncated, because a collision would answer about the wrong document;
+* **two callers asking about one document in one pass are merged.** They cannot be two rows of two documents, because
+  there is one document; their questions share its rows. Without the merge the pass read the same document once per
+  caller, each into its own pages -- three reads of one document, which is the waste the shelf exists to remove;
+* **what is displaced is the document nobody has asked about for longest**, and never one in the pass being formed. If
+  everything on the shelf is in the pass, nothing is dropped and the shelf refuses by name, which is the right outcome:
+  the pass is too large for the pool.
+
+`stats()` reports `documents_read` and `documents_answered_without_reading`, because the second is the point and a
+throughput figure alone cannot show whether the shelf is doing anything.
+
+### Reading into a cache that already holds documents
+
+Worth its own note, because none of it is visible from the outside and all of it was found by running. The framework
+allocates each recurrent state **once**, with the shape of the first one it sees, and thereafter copies into it in place
+to keep the address stable for CUDA graphs. A shelf reads one document and then six, so the shape has to be allowed to
+change -- and four things have to be cleared together for that:
+
+| left alone | what happens |
+|---|---|
+| the state entries | the kernel gets one initial state for six sequences: "expected 6 rather than 1" |
+| the entries, set to None | `update_recurrent_state` copies in place and needs a tensor |
+| `has_previous_state` | the layer reads an entry that is no longer there, and raises `KeyError` |
+| `is_recurrent_states_initialized` | nothing is reallocated, so the `KeyError` moves one line down |
+
+With all four cleared the layer is in exactly the state a cache that has never held anything is in. That also means the
+convolution takes its prefill branch, which pads rather than concatenating, so a read carries no prefix from the last one.
+
 ### A wider group does not buy throughput
 
 The per-row cost of a branch pass is flat in the width -- 0.109 GiB at width 1 and at width 32 -- so a wider group looked

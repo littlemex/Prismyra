@@ -21,7 +21,6 @@ from . import kernels, varlen
 from .cache import build_cache, cache_bytes, join_bytes_per_token
 from .calibration import Calibration
 from .fork import (
-    LENGTH_ATTRS,
     WIDTHS,
     Prefill,
     TooWide,
@@ -1396,34 +1395,38 @@ def _put_back_conv_states(cache, boundaries) -> None:
 
 
 def _forget_recurrent_state(cache) -> None:
-    """Put the recurrent and convolution state back to one row of zeros, so the next read starts from nothing.
+    """Put a cache's recurrent layers back into the state a fresh one is in, so the next read starts from nothing.
 
-    A shelf's cache carries whatever the last pass left, and a document read on top of that would begin from the last
-    document's state -- the failure this package treats most seriously, since it answers plausibly rather than raising.
+    A shelf's cache carries whatever the last read left, and a document read on top of that would begin from the last
+    one's state -- the failure this package treats most seriously, since it answers plausibly rather than raising.
     `reset` would do it and would also clear the pages, which is where the documents already on the shelf live.
 
-    **One row of zeros, not a missing key and not the buffer zeroed in place**, and both alternatives were tried on the
-    device. A key set to None reaches `torch.cat([None, ...])` in the framework's convolution and raises four frames
-    down; a key removed raises `KeyError` in the same line, because the framework expects the entry a fresh cache was
-    given. And the live buffers are the full group width, which a one-row read cannot be concatenated with, so the
-    shape has to come back to one row as well as the values to zero.
+    **Four things, and not one of them is optional.** The framework allocates each state once, with the shape of the
+    first one it sees, and thereafter copies into it in place to keep the address stable for CUDA graphs. A shelf reads
+    one document and then six, so the shape has to be allowed to change, which means clearing the "initialised" flags
+    and not only the entries. Each combination short of all four fails in a different line of the framework:
 
-    A fresh tensor rather than a slice, because the documents on the shelf hold clones of what was there and a fresh one
-    cannot be written through to reach them.
+    | left alone | what happens |
+    |---|---|
+    | the entries | one initial state for six sequences: "expected 6 rather than 1" |
+    | the entries, as None | `update_recurrent_state` copies in place and needs a tensor |
+    | `has_previous_state` | the layer reads an entry that is gone: `KeyError` |
+    | `is_..._initialized` | nothing is reallocated, so the `KeyError` moves a line down |
+
+    With all four, the layer is in exactly the state a cache that has never held anything is in, and a read of any
+    number of documents allocates what it needs. It also means the convolution takes its prefill branch, which pads
+    rather than concatenating, so a read carries no prefix from the last one.
     """
     for layer in cache.layers:
-        for attr in ("recurrent_states", "conv_states"):
-            held = getattr(layer, attr, None)
-            if not isinstance(held, dict):
-                continue
-            for key, state in list(held.items()):
-                held[key] = None if state is None else torch.zeros_like(state[:1])
-        # And the counters, or the framework reads the new document as a continuation of the last one. That is not a
-        # detail: the layer picks its single-token path when the cache says it already holds tokens, so the second
-        # document on a shelf went through the decode convolution and the boundary machinery recorded nothing.
-        for name in LENGTH_ATTRS:
-            current = getattr(layer, name, None)
-            if torch.is_tensor(current):
-                current.zero_()
-            elif isinstance(current, int):
-                setattr(layer, name, 0)
+        for entries, flags in (
+            ("recurrent_states", ("is_recurrent_states_initialized", "has_previous_state")),
+            ("conv_states", ("is_conv_states_initialized",)),
+        ):
+            held = getattr(layer, entries, None)
+            if isinstance(held, dict):
+                held.clear()
+            for name in flags:
+                marked = getattr(layer, name, None)
+                if isinstance(marked, dict):
+                    for key in marked:
+                        marked[key] = False

@@ -52,6 +52,11 @@ class FakeEngine:
         # here is what a warmed engine looks like, and is what exercises the linger.
         self.fastest_read_ms = fastest_read_ms
         self.encoded = 0
+        self.shelves = 0
+        #: Which documents each read pass carried, and which handles each answering pass carried.
+        self.reads: list[list[str]] = []
+        self.passes: list[list[int]] = []
+        self.dropped: list[int] = []
         self.batches: list[list[str]] = []
         self.per_call = per_call
         self.opened = threading.Event()
@@ -79,6 +84,48 @@ class FakeEngine:
             time.sleep(self.per_call)
         return FakeBatch(list(contexts))
 
+    def open_shelf(self, room: int | None = None) -> FakeShelf:
+        self.shelves += 1
+        return FakeShelf(self)
+
+
+@dataclass
+class FakeShelved:
+    tokens: int
+
+
+class FakeShelf:
+    """Enough of a shelf to see the scheduler's decisions: which documents were read, and which were answered."""
+
+    def __init__(self, engine: FakeEngine):
+        self.engine = engine
+        self.documents: dict[int, FakeShelved] = {}
+        self._next = 0
+
+    def put_many(self, contexts: list[str]) -> list[int]:
+        self.engine.reads.append(list(contexts))
+        handles = []
+        for one in contexts:
+            self.documents[self._next] = FakeShelved(tokens=len(one.split()))
+            handles.append(self._next)
+            self._next += 1
+        self.engine.opened.set()
+        self.engine.release.wait(5)
+        if self.engine.per_call:
+            time.sleep(self.engine.per_call)
+        return handles
+
+    def ask(self, asked: dict) -> dict:
+        self.engine.passes.append(sorted(asked))
+        return {handle: FakeResult({q.id: handle for q in questions}) for handle, questions in asked.items()}
+
+    def drop(self, handle: int) -> None:
+        self.engine.dropped.append(handle)
+        del self.documents[handle]
+
+    def close(self) -> None:
+        self.documents.clear()
+
 
 class FakeBatch:
     def __init__(self, contexts: list):
@@ -103,8 +150,14 @@ def asking(n: int) -> list[Boolean]:
     return [Boolean(id=f"q{i}", prompt=f"Is clause {i} about shipping?") for i in range(n)]
 
 
-def words(n: int) -> str:
-    return " ".join(["word"] * n)
+def words(n: int, of: str = "word") -> str:
+    return " ".join([of] * n)
+
+
+#: Distinct documents of the same length. The scheduler recognises the same document by a digest of its text, so a test
+#: that means "four callers, four documents" has to say four different things, or it is testing the merge instead.
+def distinct(count: int, length: int = 3) -> list[str]:
+    return [words(length, of=f"doc{i}") for i in range(count)]
 
 
 def answered(batcher: Batcher, jobs, timeout: float = 5.0) -> None:
@@ -118,13 +171,15 @@ def test_everything_waiting_that_fits_travels_together():
     engine = FakeEngine(group=8)
     batcher = Batcher(engine)
     # Queued before the loop starts, so they are all waiting when the first pass forms.
-    jobs = [batcher.submit(words(3), asking(2)) for _ in range(4)]
+    contexts = distinct(4)
+    jobs = [batcher.submit(one, asking(2)) for one in contexts]
     batcher.start()
     try:
         answered(batcher, jobs)
     finally:
         batcher.stop()
-    assert engine.batches == [[words(3)] * 4], engine.batches
+    assert engine.reads == [contexts], engine.reads
+    assert engine.passes == [[0, 1, 2, 3]], engine.passes
     assert batcher.stats()["mean_documents_per_pass"] == 4.0
 
 
@@ -132,13 +187,13 @@ def test_a_pass_stops_at_the_group_and_says_so():
     """Four requests of three questions each against a group of eight: three fit, the fourth does not."""
     engine = FakeEngine(group=8)
     batcher = Batcher(engine)
-    jobs = [batcher.submit(words(2), asking(3)) for _ in range(4)]
+    jobs = [batcher.submit(one, asking(3)) for one in distinct(4, length=2)]
     batcher.start()
     try:
         answered(batcher, jobs)
     finally:
         batcher.stop()
-    assert [len(b) for b in engine.batches] == [2, 2], engine.batches
+    assert [len(p) for p in engine.passes] == [2, 2], engine.passes
     why = batcher.stats()["why_passes_stopped"]
     assert any("would pass 8 rows" in reason for reason in why), why
 
@@ -147,13 +202,13 @@ def test_a_pass_stops_when_the_pool_would_overflow():
     """The other limit. Documents of forty words against a pool of a hundred: two fit and the third does not."""
     engine = FakeEngine(group=32, longest_context=100)
     batcher = Batcher(engine)
-    jobs = [batcher.submit(words(40), asking(1)) for _ in range(3)]
+    jobs = [batcher.submit(one, asking(1)) for one in distinct(3, length=40)]
     batcher.start()
     try:
         answered(batcher, jobs)
     finally:
         batcher.stop()
-    assert [len(b) for b in engine.batches] == [2, 1], engine.batches
+    assert [len(p) for p in engine.passes] == [2, 1], engine.passes
     why = batcher.stats()["why_passes_stopped"]
     assert any("in the pool" in reason for reason in why), why
 
@@ -162,13 +217,13 @@ def test_a_pass_stops_at_one_document_per_row():
     """A batch cannot hold more documents than a pass has rows, because every document needs at least one."""
     engine = FakeEngine(group=2, longest_context=1000)
     batcher = Batcher(engine)
-    jobs = [batcher.submit(words(1), asking(1)) for _ in range(5)]
+    jobs = [batcher.submit(one, asking(1)) for one in distinct(5, length=1)]
     batcher.start()
     try:
         answered(batcher, jobs)
     finally:
         batcher.stop()
-    assert max(len(b) for b in engine.batches) == 2, engine.batches
+    assert max(len(p) for p in engine.passes) == 2, engine.passes
     why = batcher.stats()["why_passes_stopped"]
     assert any("holds 2 documents" in reason for reason in why), why
 
@@ -181,7 +236,7 @@ def test_a_lone_request_does_not_wait_for_company():
         result = batcher.ask(words(3), asking(2), timeout=5)
         took = (time.perf_counter() - started) * 1e3
     assert result
-    assert engine.batches == [[words(3)]]
+    assert engine.reads == [[words(3)]]
     # Nothing about this figure is a performance claim; it is the absence of a linger, which would be tens of
     # milliseconds even on a stub.
     assert took < 200, took
@@ -213,12 +268,12 @@ def test_a_failing_pass_fails_every_request_in_it():
     worker handed over were completed."""
 
     class Broken(FakeEngine):
-        def open_batch(self, contexts):
+        def open_shelf(self, room: int | None = None):
             raise RuntimeError("the pass failed")
 
     engine = Broken(group=8)
     batcher = Batcher(engine)
-    jobs = [batcher.submit(words(2), asking(2)) for _ in range(3)]
+    jobs = [batcher.submit(one, asking(2)) for one in distinct(3, length=2)]
     batcher.start()
     try:
         for job in jobs:
@@ -233,7 +288,7 @@ def test_every_request_in_a_pass_is_counted_with_its_own_wait():
     looks free because only the first request's wait is ever recorded."""
     engine = FakeEngine(group=8)
     batcher = Batcher(engine)
-    jobs = [batcher.submit(words(2), asking(2)) for _ in range(4)]
+    jobs = [batcher.submit(one, asking(2)) for one in distinct(4, length=2)]
     batcher.start()
     try:
         answered(batcher, jobs)
@@ -249,7 +304,7 @@ def test_a_document_is_tokenised_once_per_request():
     inside the read. Counted here rather than timed, because the count is the claim."""
     engine = FakeEngine(group=8)
     batcher = Batcher(engine)
-    jobs = [batcher.submit(words(3), asking(2)) for _ in range(4)]
+    jobs = [batcher.submit(one, asking(2)) for one in distinct(4)]
     batcher.start()
     try:
         answered(batcher, jobs)
@@ -283,3 +338,49 @@ def test_the_linger_is_capped_by_what_a_pass_costs():
         took = (time.perf_counter() - started) * 1e3
     # Waited the ceiling rather than the setting. A second would have been the setting.
     assert took < 200, took
+
+
+def test_a_document_already_on_the_shelf_is_not_read_again():
+    """What the shelf is for. The second request about a document costs a pass and no read."""
+    engine = FakeEngine(group=8)
+    batcher = Batcher(engine)
+    with batcher:
+        batcher.ask(words(3), asking(2), timeout=5)
+        batcher.ask(words(3), asking(2), timeout=5)
+        batcher.ask(words(3), asking(2), timeout=5)
+        stats = batcher.stats()
+    assert engine.reads == [[words(3)]], engine.reads
+    assert len(engine.passes) == 3
+    assert stats["documents_read"] == 1
+    assert stats["documents_answered_without_reading"] == 2
+
+
+def test_two_callers_asking_about_one_document_in_a_pass_are_merged():
+    """They cannot be two rows of two documents, because there is one document. Their questions share its rows, and the
+    failure this prevents is one caller receiving the other's answers."""
+    engine = FakeEngine(group=8)
+    batcher = Batcher(engine)
+    jobs = [batcher.submit(words(3), asking(2)) for _ in range(3)]
+    batcher.start()
+    try:
+        answered(batcher, jobs)
+    finally:
+        batcher.stop()
+    assert engine.reads == [[words(3)]], engine.reads
+    assert engine.passes == [[0]], engine.passes
+    # Every caller got an answer to each of its own questions.
+    for job in jobs:
+        assert set(job.result) == {"q0", "q1"}
+
+
+def test_the_least_recently_used_document_is_dropped_to_make_room():
+    """A shelf holds what fits. What goes is the document nobody has asked about for longest, and never one in the
+    pass being formed."""
+    engine = FakeEngine(group=8, longest_context=6)
+    batcher = Batcher(engine)
+    with batcher:
+        batcher.ask(words(3, of="first"), asking(1), timeout=5)
+        batcher.ask(words(3, of="second"), asking(1), timeout=5)
+        # The shelf holds six tokens and each document is three, so this one has to displace something.
+        batcher.ask(words(3, of="third"), asking(1), timeout=5)
+    assert engine.dropped == [0], engine.dropped
