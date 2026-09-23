@@ -201,6 +201,13 @@ class Pool:
     block: int = BLOCK
     #: Admitted documents, in admission order.
     documents: list[Held] = field(default_factory=list)
+    #: Where the shared region has been handed out up to. Released runs live below it and are reused by `admit`.
+    cursor: int = 0
+    #: Runs of pages that released documents held, as (first page, pages), merged where they touch.
+    released: list[tuple[int, int]] = field(default_factory=list)
+    #: The size of a reused run, by its first page. A document reusing a larger run keeps the run's size rather than
+    #: its own, so releasing it hands the whole run back instead of a smaller one that would shrink on every reuse.
+    reused: dict[int, int] = field(default_factory=dict)
     #: Which document each row answers about, by index into `documents`. Shorter than `rows` while rows are unassigned.
     assignment: list[int] = field(default_factory=list)
 
@@ -220,11 +227,18 @@ class Pool:
 
     @property
     def used_pages(self) -> int:
-        return sum(d.reserved_pages for d in self.documents)
+        """Pages the cursor has handed out, released or not."""
+        return self.cursor
 
     @property
     def free_pages(self) -> int:
-        return self.private_first - self.used_pages
+        """Pages the cursor can still hand out.
+
+        Released runs are deliberately not counted here. `admit` finds them by looking for one large enough, and adding
+        them to a total would promise room that no single document can use -- ten released runs of one page are not ten
+        pages to a document that needs two.
+        """
+        return self.private_first - self.cursor
 
     def pages_for(self, tokens: int) -> int:
         """Pages a document of this length would reserve: its whole pages, plus one to stage a leftover."""
@@ -234,17 +248,69 @@ class Pool:
         return self.pages_for(tokens) <= self.free_pages
 
     def admit(self, tokens: int) -> Held:
-        """Reserve the whole pages for a document and return where they are. Refuses before writing anything."""
+        """Reserve pages for a document and return where they are. Refuses before writing anything.
+
+        Reuses a released run when one is large enough and otherwise takes from the cursor. **Reuse is what lets a pool
+        hold documents for as long as callers keep asking about them**, rather than for as long as it has never been
+        full: without it the cursor only moves forward, and the hundredth document is refused while ninety-nine released
+        ones sit in the pool.
+
+        First fit, and a run is taken whole even when it is larger than needed. Splitting it and keeping the remainder
+        is a free-list allocator, and a free-list allocator inside a page pool is a second allocator with its own
+        fragmentation. What taking it whole costs is the tail of the run, which is measurable; what splitting risks is
+        not.
+        """
         if tokens < 0:
             raise ValueError(f"a document cannot hold {tokens} tokens")
-        if not self.room_for(tokens):
+        need = self.pages_for(tokens)
+        for n, (first, size) in enumerate(self.released):
+            if size >= need:
+                del self.released[n]
+                held = Held(first_page=first, tokens=tokens, block=self.block)
+                self.reused[first] = size
+                self.documents.append(held)
+                return held
+        if need > self.free_pages:
+            largest = max((size for _, size in self.released), default=0)
             raise Full(
-                f"a document of {tokens} tokens needs {self.pages_for(tokens)} pages and {self.free_pages} are free; "
-                f"close a document or build the cache for a longer context"
+                f"a document of {tokens} tokens needs {need} pages, {self.free_pages} are free and the largest "
+                f"released run is {largest}; release a document or build the cache for a longer context"
             )
-        held = Held(first_page=self.used_pages, tokens=tokens, block=self.block)
+        held = Held(first_page=self.cursor, tokens=tokens, block=self.block)
+        self.cursor += need
         self.documents.append(held)
         return held
+
+    def release(self, held: Held) -> None:
+        """Give a document's pages back to be handed out again.
+
+        The bytes are not cleared. No row's table names a released page, so nothing reads it, and clearing would be
+        work proportional to the document for a guarantee nothing depends on: whatever reuses the run overwrites what
+        it needs, and `seqused` stops the kernel before the rest.
+        """
+        size = self.reused.pop(held.first_page, None) or held.reserved_pages
+        if held in self.documents:
+            self.documents.remove(held)
+        self.released.append((held.first_page, size))
+        self._merge()
+
+    def _merge(self) -> None:
+        """Join released runs that touch, and give back to the cursor any that reaches it.
+
+        Without the join, a pool that has held and released many documents cannot admit a large one while holding twice
+        its pages in small runs. Without the second part, a pool that empties completely is worse than a fresh one.
+        """
+        merged: list[tuple[int, int]] = []
+        for first, size in sorted(self.released):
+            if merged and merged[-1][0] + merged[-1][1] == first:
+                was_first, was_size = merged[-1]
+                merged[-1] = (was_first, was_size + size)
+            else:
+                merged.append((first, size))
+        while merged and merged[-1][0] + merged[-1][1] == self.cursor:
+            self.cursor = merged[-1][0]
+            merged.pop()
+        self.released = merged
 
     def assign(self, per_document: list[int]) -> None:
         """Say how many rows answer about each admitted document, in admission order.
@@ -473,6 +539,22 @@ class PagedForkLayer(CacheLayerMixin):
         self.cumulative_length.zero_()
         self.writing_branches = False
 
+    def release_document(self, handle: int) -> None:
+        """Give one document's pages back to the pool. Its rows must not be in the batch being answered.
+
+        Refused rather than allowed while a row still names it, because the pages would be handed to the next document
+        while a table still points at them -- two documents on one run, reading each other's tokens, without an error.
+        """
+        if handle not in self.held:
+            raise ValueError(f"this cache does not hold document {handle}")
+        if handle in self.rows_for:
+            raise ValueError(
+                f"document {handle} is being answered by {self.rows_for.count(handle)} rows of the current pass; "
+                f"a released run can be handed to another document and those rows would read it"
+            )
+        assert self.pool is not None
+        self.pool.release(self.held.pop(handle))
+
     def begin_branches(self, rows_for: list[int] | None = None) -> None:
         """The documents are finished and a group is starting. Build the table and the lengths, in place.
 
@@ -641,8 +723,13 @@ class PagedForkLayer(CacheLayerMixin):
             self.held.clear()
             self.rows_for = []
             if self.pool is not None:
+                # The cursor and the released runs as well as the documents. A reset that cleared the bytes and left the
+                # cursor where it was would refuse the next document for room it no longer owes anyone.
                 self.pool.documents = []
                 self.pool.assignment = []
+                self.pool.cursor = 0
+                self.pool.released = []
+                self.pool.reused = {}
             if self.block_table is not None:
                 self.block_table.zero_()
             if self.seqused is not None:

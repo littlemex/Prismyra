@@ -207,3 +207,35 @@ def test_a_document_cannot_be_admitted_twice_under_one_handle():
     with pytest.raises(ValueError) as raised:
         held.begin_document(0)
     assert "already in this cache" in str(raised.value)
+
+
+def test_a_released_documents_pages_are_handed_to_the_next_one():
+    held = two_documents(BLOCK * 2, BLOCK * 3, capacity=BLOCK * 32)
+    first = held.held[0]
+    held.release_document(0)
+    held.begin_document(2)
+    third = tokens(BLOCK * 2, start=7000.0)
+    held.update(third, third * -1)
+    assert held.held[2].first_page == first.first_page
+    assert 0 not in held.held
+
+
+def test_a_document_being_answered_cannot_be_released():
+    """The failure that would not raise: the run would be handed to another document while a row's table still names it,
+    and the two would read each other's tokens."""
+    held = two_documents(BLOCK, BLOCK, capacity=BLOCK * 32)
+    held.begin_branches([0, 0, 1, 1])
+    with pytest.raises(ValueError, match="being answered"):
+        held.release_document(0)
+    # The one no row is answering about can go.
+    held.rows_for = [1, 1, 1, 1]
+    held.release_document(0)
+
+
+def test_a_reset_gives_the_cursor_back():
+    held = two_documents(BLOCK * 2, BLOCK * 2, capacity=BLOCK * 32)
+    assert held.pool.cursor > 0
+    held.reset()
+    assert held.pool.cursor == 0
+    assert held.pool.released == []
+    assert held.held == {}
