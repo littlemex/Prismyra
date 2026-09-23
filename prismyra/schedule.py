@@ -64,6 +64,9 @@ class Request:
 
     context: str
     questions: Sequence[Question]
+    #: How the scheduler recognises two callers asking about the same document. A digest of the text rather than the
+    #: text itself, because the key is compared on every request and a long document is a long comparison.
+    digest: str = ""
     #: The document tokenised, filled the first time the scheduler needs to know how long it is and reused by the read.
     #: It used to be tokenised twice -- once to count it while forming a pass and once inside the read, 0.44 ms each, so
     #: 7 ms a pass on the one thread there is only one of.
@@ -151,6 +154,17 @@ class Batcher:
         #: differently from one that is narrow because nothing arrived, and the two are indistinguishable from the
         #: width.
         self.reasons: list[str] = []
+        #: How many documents each pass had to read. Zero is the shelf working: every document in that pass was already
+        #: on it, so the pass cost a branch and nothing else.
+        self.reads: list[int] = []
+        self._shelf = None
+        #: Documents on the shelf, by digest, and the handle each one is known by.
+        self._resident: dict[str, int] = {}
+        self._digest_of: dict[int, str] = {}
+        #: When each handle was last answered, for choosing what to drop. A counter rather than a clock: only the order
+        #: matters and a counter cannot go backwards.
+        self._used: dict[int, int] = {}
+        self._clock = 0
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> Batcher:
@@ -159,6 +173,12 @@ class Batcher:
 
     def stop(self, timeout: float = 30.0) -> None:
         self._worker.stop(timeout=timeout)
+        if self._shelf is not None:
+            self._shelf.close()
+            self._shelf = None
+        self._resident.clear()
+        self._digest_of.clear()
+        self._used.clear()
 
     def __enter__(self) -> Batcher:
         return self.start()
@@ -181,7 +201,7 @@ class Batcher:
                 f"Split it, or build the engine with a larger group."
             )
         self.engine.validate(list(questions))
-        return self._worker.enqueue(Request(context=context, questions=tuple(questions)))
+        return self._worker.enqueue(Request(context=context, questions=tuple(questions), digest=_digest(context)))
 
     def ask(self, context: str, questions: Sequence[Question], timeout: float | None = None) -> Result:
         """Submit and wait. The convenience a caller wants when it has one thread per request."""
@@ -239,6 +259,74 @@ class Batcher:
             # move.
             deadline = time.perf_counter() + quiet
 
+    def _answer(self, formed: Formed) -> list:
+        """Answer a formed pass, reading only the documents that are not already on the shelf.
+
+        This is where the shelf earns its place. A document nobody has asked about before is read; a document already on
+        the shelf costs nothing, so a second question about it is a branch pass and no more. The documents that do need
+        reading are read **together**, because reading is mostly fixed cost.
+        """
+        shelf = self._on_shelf()
+        # One entry per document, not per request. Three callers asking about the same document at the same moment are
+        # three requests and one read -- without the de-duplication they were three reads of one document, each admitted
+        # into its own pages, which is the waste this whole object exists to remove.
+        fresh: dict[str, Job] = {}
+        for job in formed.jobs:
+            if job.payload.digest not in self._resident:
+                fresh.setdefault(job.payload.digest, job)
+        if fresh:
+            jobs = list(fresh.values())
+            self._make_room(jobs, keep={job.payload.digest for job in formed.jobs})
+            handles = shelf.put_many([job.payload.context for job in jobs])
+            for job, handle in zip(jobs, handles, strict=True):
+                self._resident[job.payload.digest] = handle
+                self._digest_of[handle] = job.payload.digest
+        asked: dict[int, list[Question]] = {}
+        for job in formed.jobs:
+            handle = self._resident[job.payload.digest]
+            self._used[handle] = self._clock
+            self._clock += 1
+            # Two callers asking about the same document in one pass would collide here, and one of them would get the
+            # other's questions. They are merged instead -- one document, both callers' questions, one set of rows.
+            asked.setdefault(handle, []).extend(job.payload.questions)
+        answers = shelf.ask(asked)
+        self.reads.append(len(fresh))
+        return [answers[self._resident[job.payload.digest]] for job in formed.jobs]
+
+    def _on_shelf(self):
+        """The shelf, opened on the first pass rather than at construction, because opening it allocates."""
+        if self._shelf is None:
+            self._shelf = self.engine.open_shelf()
+        return self._shelf
+
+    def _make_room(self, fresh: list[Job], keep: set[str]) -> None:
+        """Drop the least recently used documents until the new ones have somewhere to go.
+
+        Least recently used, and never one in the pass being formed. What decides "enough room" is the pool, so this
+        drops until the tokens fit the shelf's room rather than guessing at pages: the shelf refuses by name if the
+        estimate is still wrong, and a refusal is recoverable where a wrong page is not.
+        """
+        shelf = self._on_shelf()
+        wanted = sum(self._tokens(job) for job in fresh)
+        while self._resident:
+            held = sum(shelf.documents[handle].tokens for handle in shelf.documents)
+            if held + wanted <= self.limits.tokens:
+                return
+            oldest = min(
+                (handle for handle in shelf.documents if self._digest_of.get(handle) not in keep),
+                key=lambda handle: self._used.get(handle, 0),
+                default=None,
+            )
+            if oldest is None:
+                # Everything on the shelf is in the pass being formed. Nothing can be dropped and the shelf will refuse
+                # by name, which is the right outcome: the pass is too large for the pool.
+                return
+            shelf.drop(oldest)
+            digest = self._digest_of.pop(oldest, None)
+            if digest is not None:
+                self._resident.pop(digest, None)
+            self._used.pop(oldest, None)
+
     def _tokens(self, job: Job) -> int:
         """How long this document is, encoding it once and keeping the result for the read."""
         if job.payload.encoded is None:
@@ -252,8 +340,7 @@ class Batcher:
             self.widths.append(formed.documents)
             self.reasons.append(formed.reason)
         try:
-            with self.engine.open_batch([job.payload.encoded for job in formed.jobs]) as batch:
-                results = batch.ask([list(job.payload.questions) for job in formed.jobs])
+            results = self._answer(formed)
         except BaseException as e:  # noqa: BLE001 - one failure must not leave the rest of the batch waiting for ever
             for job in formed.jobs:
                 job.started_at = job.started_at or first.started_at
@@ -276,6 +363,7 @@ class Batcher:
         with self._lock:
             widths = list(self.widths)
             reasons = list(self.reasons)
+            self.reads = list(self.reads)
         answered = sum(widths)
         return {
             "passes": len(widths),
@@ -294,8 +382,23 @@ class Batcher:
                 "linger_ms": self.limits.linger_ms,
                 "worth_waiting_ms": round(self.limits.worth_waiting_ms(self.engine), 1),
             },
+            "documents_read": sum(self.reads),
+            "documents_answered_without_reading": answered - sum(self.reads),
+            "resident": len(self._resident),
             "queue": self._worker.stats(),
         }
 
 
 __all__ = ["Batcher", "Formed", "Limits", "QueueFull", "Request", "WorkerStopped"]
+
+
+def _digest(context: str) -> str:
+    """How the scheduler recognises the same document twice.
+
+    A digest of the text, not the text: the key is looked up on every request and compared against every resident
+    document, and a long document is a long comparison. Collisions would answer about the wrong document, so this is a
+    cryptographic digest rather than `hash`, which is randomised per process and truncated.
+    """
+    import hashlib
+
+    return hashlib.sha256(context.encode("utf-8")).hexdigest()
