@@ -314,7 +314,43 @@ def cache_bytes(config, max_cache_len: int, rows: int, dtype: torch.dtype, max_b
 
     context_room = max(1, max_cache_len - max_branch_len)
     slots = context_room + rows * max_branch_len
-    return 2 * attention_layers * heads * head_dim * slots * per_element
+    keys_and_values = 2 * attention_layers * heads * head_dim * slots * per_element
+    # The thirty recurrent layers hold state too, one copy per row, and leaving it out understated an open context by a
+    # gigabyte at the default group. See `state_bytes`.
+    return keys_and_values + state_bytes(config, rows, dtype)
+
+
+def state_bytes(config, rows: int, dtype: torch.dtype) -> int:
+    """The recurrence and convolution state an open context holds, for every row of the group.
+
+    **Admission never counted this**, and the reason it got away with it is that the state used to be allocated inside
+    the first branch pass, at that pass's row count. It is held memory: allocated when a context is read and kept until
+    it closes, one copy per row because each row advances its own recurrence over its own tokens.
+
+    On the supported model it is about 32 MiB per row -- 1.06 MiB for each of the thirty gated delta net layers -- so a
+    group of thirty-two holds a gigabyte of it. Leaving it out made the budget wrong in both directions: the answering
+    figure absorbed the allocation and multiplied it by the group, and the reading figure divided it by the context's
+    token count and multiplied it by every later length.
+
+        recurrent, per row per layer  =  value heads x value dim x key dim x bytes
+        convolution, per row per layer  =  (2 x key heads x key dim + value heads x value dim) x kernel x bytes
+    """
+    decoder = getattr(config, "text_config", config)
+    layer_types = list(getattr(decoder, "layer_types", []) or [])
+    recurrent_layers = sum(1 for kind in layer_types if kind != "full_attention")
+    if not recurrent_layers:
+        return 0
+    value_heads = getattr(decoder, "linear_num_value_heads", 0)
+    key_heads = getattr(decoder, "linear_num_key_heads", 0)
+    value_dim = getattr(decoder, "linear_value_head_dim", 0)
+    key_dim = getattr(decoder, "linear_key_head_dim", 0)
+    kernel = getattr(decoder, "linear_conv_kernel_dim", 0)
+    if not all((value_heads, key_heads, value_dim, key_dim, kernel)):
+        return 0
+    per_element = torch.empty((), dtype=dtype).element_size()
+    recurrent = value_heads * value_dim * key_dim * per_element
+    convolution = (2 * key_heads * key_dim + value_heads * value_dim) * kernel * per_element
+    return recurrent_layers * rows * (recurrent + convolution)
 
 
 def join_bytes_per_token(config, dtype: torch.dtype, doubled: bool = False) -> int:
