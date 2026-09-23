@@ -163,6 +163,82 @@ def _owned(layer, attr: str, key, like: torch.Tensor, width: int, rows: int) -> 
     return view
 
 
+def restore_and_fork_many(
+    cache, parts: list[tuple[dict, int]], width: int | None = None, rows_for: list[int] | None = None
+) -> None:
+    """Fork several documents into one batch: each document's state into the rows answering about it.
+
+    This is the engine side of a mixed batch, and it is short for a reason worth stating. The recurrent state was
+    already per row and already **copied** from a snapshot rather than broadcast, because each row advances its own over
+    its own tokens -- so a row carrying a different document's state is not a new mechanism, it is the same copy with a
+    different source. What could not be done was the attention side, and that is why the pages exist.
+
+    `parts` is each document's snapshot with the number of rows it gets, in row order. `rows_for` names the document
+    each row belongs to and is handed to the attention layers, which need it to build the page table.
+    """
+    if not parts:
+        raise ValueError("a fork needs at least one document")
+    rows = sum(count for _, count in parts)
+    first = parts[0][0]
+    for i, layer in enumerate(cache.layers):
+        shape = first.get(i, {})
+        # The lengths of the first document. For the attention layers this is overwritten immediately by
+        # `begin_branches`, which sets a length per row from the pool; for the recurrent layers there is one counter,
+        # and every document in a batch has been read to its own end, so any of them says the same thing about where
+        # the next tokens go.
+        _restore_lengths(layer, shape.get(LENGTHS, {}))
+        begin = getattr(layer, "begin_branches", None)
+        if begin is not None:
+            if rows_for is not None and _takes_rows(begin):
+                begin(rows_for)
+            else:
+                begin()
+        for attr in ("recurrent_states", "conv_states"):
+            if attr not in shape:
+                continue
+            bound = getattr(layer, attr)
+            for key, example in shape[attr].items():
+                if example is None:
+                    bound[key] = None
+                    continue
+                held = _owned(layer, attr, key, example, width or rows, rows)
+                _fill_per_document(held, [(snap[i][attr][key], count) for snap, count in parts])
+                bound[key] = held
+        if _holds_attention(layer):
+            continue
+        for attr in ("keys", "values"):
+            if attr not in shape:
+                continue
+            held = _owned(layer, attr, attr, shape[attr], width or rows, rows)
+            _fill_per_document(held, [(snap[i][attr], count) for snap, count in parts])
+            setattr(layer, attr, held)
+
+
+def _fill_per_document(held: torch.Tensor, pieces: list[tuple[torch.Tensor, int]]) -> None:
+    """Write each document's state into its own run of rows.
+
+    One buffer, filled in row order, because the rows of a batch are contiguous per document by construction -- the
+    engine assigns them that way so that a row's page range and its state come from the same arithmetic.
+    """
+    at = 0
+    for state, count in pieces:
+        held[at : at + count].copy_(state.expand((count, *state.shape[1:])) if state.shape[0] == 1 else state[:count])
+        at += count
+    if at != held.shape[0]:
+        raise ValueError(f"{at} rows were filled and this buffer holds {held.shape[0]}")
+
+
+def _takes_rows(begin) -> bool:
+    """Whether a layer's `begin_branches` accepts the row assignment. The recurrent layers do not have one at all and
+    the joined attention layer's takes nothing, so this is asked rather than assumed."""
+    import inspect
+
+    try:
+        return bool(inspect.signature(begin).parameters)
+    except (TypeError, ValueError):  # pragma: no cover - a builtin with no introspectable signature
+        return False
+
+
 def restore_and_fork(cache, snap: dict, rows: int, width: int | None = None) -> None:
     """Put the one-row state back, then widen it to `rows`.
 

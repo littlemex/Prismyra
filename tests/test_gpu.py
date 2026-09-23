@@ -44,6 +44,30 @@ def engine():
     return Prismyra(MODEL)
 
 
+@pytest.fixture
+def engine_paged(engine):
+    """The same weights with the paged storage, by flipping the flag between contexts rather than loading a second copy.
+
+    Two copies of these weights do not fit on one card, which is the same limit the skipped test above records. The flag
+    is read by `_claim_cache` when a cache is built, so flipping it here takes effect for contexts opened inside the
+    test and for none outside it.
+
+    Skipped rather than failed when the installed kernel does not take a page table: the range of vLLM this package
+    declares is wide and those arguments are not in every build of it.
+    """
+    from prismyra.paged import kernel_supports_pages
+
+    supported, why = kernel_supports_pages()
+    if not supported:
+        pytest.skip(f"the paged path needs a kernel that takes a page table: {why}")
+    was = engine.paged
+    engine.paged = True
+    try:
+        yield engine
+    finally:
+        engine.paged = was
+
+
 def questions(n: int) -> list[Boolean]:
     return [Boolean(id=f"q{i}", prompt=f"Is clause {i} about shipping?") for i in range(n)]
 
@@ -461,3 +485,64 @@ def test_the_engine_measures_what_a_replay_costs_before_it_trusts_one(engine):
     # A replay slower than the pass is not a tolerance question: it would mean the mechanism is a pure cost and the
     # engine should have refused. Whether it refused is `keeping_pays`, tested on the CPU against measured figures.
     assert replay_ms < eager_ms * 1.5, (eager_ms, replay_ms)
+
+
+SECOND_CONTEXT = (
+    "Gift cards are valid for twenty-four months from purchase and cannot be exchanged for cash. A lost card is "
+    "replaced once, on proof of purchase. Balances under one pound are forfeited at expiry, and the remainder is "
+    "refunded to the original payment method."
+)
+
+
+def test_one_pass_answers_about_two_documents_exactly_as_two_passes_did(engine_paged):
+    """Continuous batching across documents, and the only assertion that matters is that it changes no answer.
+
+    This is what the pages are for. The joined storage keeps a context in one row that every row reads, so a pass can
+    only ever be about one document; a paged row names its own document's pages, so two rows can be about two. The
+    failure mode is a row reading the other document's tokens, which does not raise -- it answers the wrong document's
+    question fluently -- so the answers are compared, not the tables.
+
+    Probabilities to a tolerance and decisions exactly. The two arrangements put a row at a different index of a
+    different batch, so the reductions happen in a different order; what may not change is which option won.
+    """
+    about_returns = [
+        Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?"),
+        Boolean(id="unopened", prompt="Are unopened items refunded in full?"),
+    ]
+    about_cards = [
+        Boolean(id="cash", prompt="Can a gift card be exchanged for cash?"),
+        Boolean(id="replaced", prompt="Is a lost gift card replaced on proof of purchase?"),
+    ]
+
+    with engine_paged.open_context(CONTEXT) as first:
+        alone_returns = first.ask(about_returns)
+    with engine_paged.open_context(SECOND_CONTEXT) as second:
+        alone_cards = second.ask(about_cards)
+
+    with engine_paged.open_batch([CONTEXT, SECOND_CONTEXT]) as batch:
+        assert batch.tokens == [first.tokens, second.tokens]
+        together = batch.ask([about_returns, about_cards])
+
+    for alone, mixed, asked in ((alone_returns, together[0], about_returns), (alone_cards, together[1], about_cards)):
+        for q in asked:
+            assert mixed[q.id].option == alone[q.id].option, f"{q.id} changed its answer in a mixed batch"
+            for option, p in alone[q.id].probabilities.items():
+                assert abs(mixed[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
+
+
+def test_a_mixed_batch_really_used_the_pages(engine_paged):
+    """The witness, because the whole first version of the paged path reported itself installed and never ran."""
+    from prismyra.paged import PagedForkLayer
+
+    before = PagedForkLayer.reads_served
+    with engine_paged.open_batch([CONTEXT, SECOND_CONTEXT]) as batch:
+        batch.ask(
+            [[Boolean(id="a", prompt="Is this about returns?")], [Boolean(id="b", prompt="Is this about cards?")]]
+        )
+    assert PagedForkLayer.reads_served > before
+
+
+def test_a_batch_is_refused_on_the_joined_storage(engine):
+    """Refused by name rather than quietly serving one document, because the joined storage cannot hold two."""
+    with pytest.raises(PrismyraError, match="paged"):
+        engine.open_batch([CONTEXT, SECOND_CONTEXT])

@@ -18,7 +18,7 @@ Prefill only: nothing here generates text. The scope, and the point below which 
 are stated in the README.
 """
 
-from .engine import Context, Prismyra
+from .engine import Batch, Context, Prismyra
 from .schema import (
     SCORING,
     SCORING_VERSION,
@@ -42,6 +42,7 @@ __all__ = [
     "SCORING",
     "SCORING_VERSION",
     "Answer",
+    "Batch",
     "Boolean",
     "Choice",
     "Context",
