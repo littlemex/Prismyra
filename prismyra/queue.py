@@ -59,8 +59,23 @@ class Worker:
     locking, which is the point, since the model's caches are exactly such state.
     """
 
-    def __init__(self, handler: Callable[[Any], Any], max_queue: int = 512):
+    def __init__(
+        self,
+        handler: Callable[[Any], Any] | None = None,
+        max_queue: int = 512,
+        drive: Callable[[Job], None] | None = None,
+    ):
+        """One of `handler` or `drive`.
+
+        `handler` takes a payload and returns a result and the worker does the bookkeeping around it. `drive` takes the
+        **job** and is responsible for completing it, which is what a batching caller needs: it answers this job and
+        several of its neighbours in one pass and has to set all of their results. Exactly one of them, because a worker
+        with both would silently prefer one and the other would look installed.
+        """
+        if (handler is None) == (drive is None):
+            raise ValueError("a worker takes exactly one of handler or drive")
         self._handler = handler
+        self._drive = drive
         self._q: queue.Queue[Job] = queue.Queue(maxsize=max_queue)
         self._thread = threading.Thread(target=self._run, name="prismyra", daemon=True)
         self._stop = threading.Event()
@@ -106,6 +121,60 @@ class Worker:
     @property
     def alive(self) -> bool:
         return self._thread.is_alive()
+
+    def enqueue(self, payload: Any) -> Job:
+        """Queue a job and return it without waiting. The caller waits on `job.done` when it chooses to.
+
+        `submit` is this plus the wait. They are separate because a caller that wants several requests in flight at once
+        cannot use a call that blocks, and that caller is the reason the batching scheduler exists.
+        """
+        if self._stop.is_set():
+            raise WorkerStopped("the worker has stopped and is not accepting jobs")
+        job = Job(payload=payload)
+        try:
+            self._q.put(job, block=False)
+        except queue.Full:
+            with self._lock:
+                self.rejected += 1
+            raise QueueFull(f"the queue is full at {self._q.maxsize} waiting jobs") from None
+        if self._stop.is_set() and not job.done.is_set():
+            job.error = WorkerStopped("the worker stopped while this job was being queued")
+            job.done.set()
+        return job
+
+    def peek(self) -> Job | None:
+        """The job at the front, without taking it, or None if nothing is waiting.
+
+        For a batching caller deciding whether the next request fits the pass it is assembling. Peeking and then taking
+        is not atomic and does not need to be: this worker is the only thread that takes.
+        """
+        with self._q.mutex:
+            for job in self._q.queue:
+                if not job.cancelled:
+                    return job
+            return None
+
+    def take(self) -> Job | None:
+        """Take the job at the front, or None if nothing is waiting. Cancelled jobs are dropped on the way past."""
+        while True:
+            try:
+                job = self._q.get(block=False)
+            except queue.Empty:
+                return None
+            if job.cancelled:
+                with self._lock:
+                    self.abandoned += 1
+                job.done.set()
+                continue
+            return job
+
+    def note(self, job: Job, depth: int) -> None:
+        """Record a job a driver completed, so its latency appears in `stats` like any other."""
+        with self._lock:
+            self.completed += 1
+            self._history.append({"queue_ms": job.queue_ms, "service_ms": job.service_ms, "depth": depth})
+            if len(self._history) > 2_000:
+                del self._history[:1_000]
 
     def submit(self, payload: Any, timeout: float | None = None) -> Job:
         """Queue a job and wait. Raises whatever the handler raised, in the caller's thread.
@@ -157,16 +226,23 @@ class Worker:
                 continue
             job.started_at = time.perf_counter()
             depth = self._q.qsize()
+            if self._drive is not None:
+                # The driver completes this job and any others it took, and records them. Its own failures still have to
+                # reach a caller, so anything it lets escape is attached here rather than lost in this thread.
+                try:
+                    self._drive(job)
+                except BaseException as e:  # noqa: BLE001
+                    job.error = e
+                    job.finished_at = time.perf_counter()
+                    job.done.set()
+                continue
+            assert self._handler is not None
             try:
                 job.result = self._handler(job.payload)
             except BaseException as e:  # noqa: BLE001 - handed to the caller's thread rather than lost here
                 job.error = e
             job.finished_at = time.perf_counter()
-            with self._lock:
-                self.completed += 1
-                self._history.append({"queue_ms": job.queue_ms, "service_ms": job.service_ms, "depth": depth})
-                if len(self._history) > 2_000:
-                    del self._history[:1_000]
+            self.note(job, depth)
             job.done.set()
 
     def stats(self) -> dict:

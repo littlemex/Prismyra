@@ -19,6 +19,7 @@ are stated in the README.
 """
 
 from .engine import Batch, Context, Prismyra
+from .schedule import Batcher
 from .schema import (
     SCORING,
     SCORING_VERSION,
@@ -43,6 +44,7 @@ __all__ = [
     "SCORING_VERSION",
     "Answer",
     "Batch",
+    "Batcher",
     "Boolean",
     "Choice",
     "Context",
