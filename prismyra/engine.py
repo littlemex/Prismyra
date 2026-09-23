@@ -222,6 +222,12 @@ class Prismyra:
         #: rather than from a constant, because the ratio between them runs from 0.684 at a suffix of sixteen tokens to
         #: 0.997 at 128 -- see `_worth_keeping`.
         self.replay_cost: dict = {}
+        #: The fastest read this engine has served, in milliseconds. An estimate of a pass's fixed cost, which is what
+        #: it is for: reading is that fixed cost plus a slope in the tokens, so the shortest document seen is the
+        #: closest
+        #: thing to the intercept available without fitting a line. `None` until something has been read, and a caller
+        #: that would make somebody wait on this figure should do nothing until it exists.
+        self.fastest_read_ms: float | None = None
         self._made_caches = 0
         #: Recordings by the identity of the cache they were taken on. Keyed by `id` because a cache is not hashable and
         #: because identity is exactly the right test: a recording is valid for one allocation and no other.
@@ -560,6 +566,17 @@ class Prismyra:
             position_from=position_from,
         )
 
+    @property
+    def longest_context(self) -> int:
+        """The largest context a cache is built for. What a scheduler needs to know before it assembles a batch."""
+        return CONTEXT_SIZES[-1]
+
+    def _note_read(self, ms: float, documents: int) -> None:
+        """Remember the fastest read, in per-document terms so a batch and a single read are comparable."""
+        each = ms / max(1, documents)
+        if self.fastest_read_ms is None or each < self.fastest_read_ms:
+            self.fastest_read_ms = each
+
     def open_batch(self, contexts: list[str]) -> Batch:
         """Read several documents into one cache, so that one forward pass can answer about all of them.
 
@@ -637,7 +654,9 @@ class Prismyra:
             )
             for handle, one in enumerate(encoded)
         ]
-        return Batch(_engine=self, _prefills=prefills, _room=room, context_ms=_since(started, self.torch_device))
+        context_ms = _since(started, self.torch_device)
+        self._note_read(context_ms, len(contexts))
+        return Batch(_engine=self, _prefills=prefills, _room=room, context_ms=context_ms)
 
     def _check_batched_read(self, cache, boundaries) -> None:
         """That the pass left one recurrent state and one convolution window per document, not one per batch.

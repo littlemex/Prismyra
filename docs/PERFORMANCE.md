@@ -202,6 +202,53 @@ recurrence is not installed, because the framework's own have no argument for a 
 server that fills one from arrivals, and the throughput above is what the mechanism allows rather than what a queue would
 achieve.
 
+## The scheduler
+
+A batch is not a scheduler. `prismyra.schedule.Batcher` is one: a queue, one thread that owns the device, and a rule for
+which of the waiting requests go into the next pass. Callers arriving together, each with its own document and four
+questions, each waiting for its own answer -- the same closed-loop shape the figures above were taken with:
+
+| callers | arm | seconds | requests / s | first answer | median | last answer |
+|---|---|---|---|---|---|---|
+| 1 | one at a time | 0.407 | 2.45 | 407.2 ms | 407.2 | 407.2 |
+| 1 | batched | 0.257 | **3.89** | 257.0 ms | 257.0 | 257.0 |
+| 2 | one at a time | 0.469 | 4.26 | 233.8 ms | 351.3 | 468.8 |
+| 2 | batched | 0.275 | **7.28** | 274.5 ms | 274.6 | 274.6 |
+| 4 | one at a time | 0.941 | 4.25 | 240.6 ms | 590.4 | 940.6 |
+| 4 | batched | 0.527 | **7.58** | 246.9 ms | 526.4 | 526.9 |
+| 8 | one at a time | 2.213 | 3.62 | 228.6 ms | 1,218.1 | 2,211.6 |
+| 8 | batched | 1.192 | **6.71** | 238.1 ms | 1,189.5 | **1,190.8** |
+
+**1.85x at eight callers, and the first answer is not later for it** -- 238.1 ms against 228.6. That second fact is the one
+worth checking, because a batching scheduler usually buys throughput with latency and this one does not.
+
+### There is no linger, and that is a decision
+
+The usual knob is to wait a few milliseconds in case more arrives. There is none here, and the eight-caller run shows why
+it is not needed: two passes of one and seven documents. The first request arrived alone and was answered alone; the other
+seven arrived while that pass ran and travelled together. **Waiting would have delayed the first request to widen a pass
+that widened by itself.**
+
+Lingering only changes anything when the queue is nearly empty, and that is the case where the device is not the
+bottleneck and a batch of one is fine. What a linger could buy is also bounded, and the bound is derivable rather than
+chosen: adding a document to a pass costs about 11 ms per thousand of its tokens, and starting a second pass costs about
+110 ms whatever it carries, so waiting longer than the fixed cost of a pass cannot pay -- by then the pass could have run.
+`Limits.worth_waiting_ms` is that ceiling, from the fastest read this engine has actually served, and nothing uses it yet.
+
+`why_passes_stopped` says which limit ended each pass, and in this run it was **"nothing else was waiting"** both times.
+That distinction is why the counter exists: a scheduler whose passes are narrow because nothing arrived and one whose
+passes are narrow because a limit binds look identical in the widths and need opposite work.
+
+Three limits bound a pass, all read off the engine rather than configured: the questions, by the group; the documents, by
+the group again, since every document needs a row; and the tokens, by what the pool holds. A request too wide for any pass
+is refused when it is submitted rather than when it reaches the front, because a caller who will be refused should not
+wait first.
+
+**What this does not do.** Arrivals are closed-loop here, which measures the same thing the figures it is compared against
+measured and not what an open arrival process would do. There is no priority and no deadline: the rule is first come,
+first served within the limits. And a failure in one document fails every request in its pass, which is honest but coarse
+-- the alternative is re-running the survivors, and that has not been built.
+
 ## Concurrency, and the ceiling that actually binds
 
 Measured on one L40S at 3,040 context tokens, eight questions each, through `prismyra.queue.Worker`:
