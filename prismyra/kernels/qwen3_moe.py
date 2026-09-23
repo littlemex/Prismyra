@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .. import varlen
 from . import Applied, Swap, register
 from .conv import available as triton_available
 from .conv import causal_depthwise_conv1d, starts_from_boundaries
@@ -210,10 +211,32 @@ class FlashAttention(nn.Module):
 
         query, key, value, gate, shape = self._project(hidden_states, position_embeddings)
 
+        boundaries = varlen.current()
         if past_key_values is not None:
             layer = past_key_values.layers[a.layer_idx]
+            reading_many = boundaries is not None and not getattr(layer, "writing_branches", False)
             key, value = past_key_values.update(key, value, a.layer_idx)
             rows, _, q_len, _ = query.shape
+            if reading_many:
+                # Several documents in one flat row. Nothing may attend across a boundary, so the boundaries are the
+                # cumulative lengths on both sides -- the arrangement a serving engine uses for a batch of prefills,
+                # and the reason this is possible at all is that the kernel already takes them.
+                assert key is not None and rows == 1, "a batched read arrives as one row of concatenated documents"
+                q = query.squeeze(0).transpose(0, 1).contiguous()
+                k = key.squeeze(0).transpose(0, 1).contiguous()
+                v = value.squeeze(0).transpose(0, 1).contiguous()
+                out = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=boundaries.offsets,
+                    cu_seqlens_k=boundaries.offsets,
+                    max_seqlen_q=boundaries.longest,
+                    max_seqlen_k=boundaries.longest,
+                    softmax_scale=a.scaling,
+                    causal=True,
+                )
+                return self._finish(out[0] if isinstance(out, tuple) else out, gate, shape)
             q = query.transpose(1, 2).reshape(rows * q_len, -1, a.head_dim)
             cu_q = torch.arange(0, rows * q_len + 1, q_len, device=q.device, dtype=torch.int32)
 
@@ -320,6 +343,15 @@ def _delta_wrapper(kernel, original):
     @functools.wraps(original)
     def call(query, key, value, g=None, beta=None, **kwargs):
         passed = {name: value_ for name, value_ in kwargs.items() if name in takes}
+        boundaries = varlen.current()
+        # `passed.get` rather than `not in passed`: the framework hands this argument over explicitly as None, so asking
+        # whether the key is present says yes and the boundaries were dropped -- the recurrence then scanned straight
+        # across the boundary and returned one state for two documents, which is a plausible answer and not an error.
+        if boundaries is not None and "cu_seqlens" in takes and passed.get("cu_seqlens") is None:
+            # A batched read. With the boundaries the kernel scans each document separately and returns **one final
+            # state per document**, which is exactly the per-document state a fork needs -- so the thing that makes a
+            # batched read possible and the thing that makes it useful are the same argument.
+            passed["cu_seqlens"] = boundaries.offsets
         return kernel(query, key, value, g=g, beta=beta, **passed)
 
     call.replaced = original
@@ -429,8 +461,29 @@ def _delta_disagreement(original, wrapper, decoder, device) -> float | None:
 MEASURED_MARK = "_prismyra_measured"
 
 
+#: Data pointers of the convolution weights this adapter measured. Addresses rather than attributes, and that is the
+#: whole point: **the layer does not pass the weight, it passes a view of it.** `nn.Conv1d` holds
+#: `(channels, 1, kernel)` and the forward calls the kernel with `weight.squeeze(1)`, a new Python object carrying none
+#: of the original's attributes. So a mark set as an attribute was never seen, the wrapper deferred to the framework on
+#: every call, and `stats()` reported a kernel that had never run -- while the docs credit it with 28.4 ms of 138.
+#:
+#: A view shares its storage, so the address is the identity that survives. Module-level for the same reason the wrapper
+#: is: the name it is installed on is the framework's, and every model of this family in the process reaches it.
+MEASURED_POINTERS: set[int] = set()
+
+
+def _measured_conv(weight: torch.Tensor) -> bool:
+    """Whether this tensor is, or is a view of, a convolution weight this adapter measured."""
+    if getattr(weight, MEASURED_MARK, False):
+        return True
+    try:
+        return weight.data_ptr() in MEASURED_POINTERS
+    except RuntimeError:  # pragma: no cover - a meta or fake tensor has no address
+        return False
+
+
 def _tag_conv_weights(model: nn.Module) -> int:
-    """Mark the convolution weight of every recurrent layer.
+    """Mark the convolution weight of every recurrent layer, by address as well as by attribute.
 
     Found by type rather than by attribute name: a one-dimensional convolution inside a gated linear-attention layer
     is the thing, and depending on an attribute's spelling would silently tag nothing if the framework renamed it --
@@ -444,6 +497,7 @@ def _tag_conv_weights(model: nn.Module) -> int:
             weight = getattr(child, "weight", None)
             if isinstance(child, nn.Conv1d) and weight is not None:
                 setattr(weight, MEASURED_MARK, True)
+                MEASURED_POINTERS.add(weight.data_ptr())
                 tagged += 1
     return tagged
 
@@ -472,7 +526,7 @@ def _install_conv() -> bool:
         # so another model of this family in the same process calls this function too -- and it was not measured on
         # that model. The weights this adapter tagged are the only ones it will act on; everything else goes back to
         # the original, which is the implementation those cases were written for.
-        if not getattr(weight, MEASURED_MARK, False):
+        if not _measured_conv(weight):
             return original(x, weight, bias, activation=activation, **kwargs)
         if bias is not None or x.dim() != 3 or x.shape[0] != 1 or not x.is_cuda:
             return original(x, weight, bias, activation=activation, **kwargs)
@@ -482,8 +536,18 @@ def _install_conv() -> bool:
         starts = kwargs.get("prismyra_seq_starts")
         if starts is None:
             cu = kwargs.get("cu_seq_lens_q")
+            if cu is None:
+                # A batched read: several documents in one flat run, with the boundaries declared by the window the
+                # engine opened rather than by the framework, which is not the one packing them here.
+                boundaries = varlen.current()
+                cu = boundaries.offsets if boundaries is not None else None
             if cu is not None and cu.numel() > 2:
                 starts = starts_from_boundaries(cu, tokens_major.shape[0])
+        boundaries = varlen.current()
+        if boundaries is not None and tokens_major.shape[0] == boundaries.tokens:
+            # The per-document tail of this layer's convolution input, for the engine to put back afterwards. The
+            # framework will set a one-row state from the end of the whole run, which is the end of the last document.
+            boundaries.conv_tails.append(boundaries.tails(tokens_major, weight.shape[-1]))
         out = causal_depthwise_conv1d(
             tokens_major, weight, seq_starts=starts, activation=activation if activation is not None else "silu"
         )

@@ -163,6 +163,28 @@ def _owned(layer, attr: str, key, like: torch.Tensor, width: int, rows: int) -> 
     return view
 
 
+def pick(snap: dict, row: int) -> dict:
+    """One document's slice of a snapshot taken over a batched read.
+
+    A batched read is one pass over several documents, so the recurrence returns **one state per document** and the
+    snapshot of it has a row each. A view rather than a clone: the snapshot is already a clone and nothing writes
+    through these, so copying again would double a gigabyte for no reason.
+    """
+    out: dict = {}
+    for i, entry in snap.items():
+        taken: dict = {}
+        for attr in ("recurrent_states", "conv_states"):
+            if attr in entry:
+                taken[attr] = {k: (None if v is None else v[row : row + 1]) for k, v in entry[attr].items()}
+        for attr in ("keys", "values"):
+            if attr in entry:
+                taken[attr] = entry[attr][row : row + 1]
+        if LENGTHS in entry:
+            taken[LENGTHS] = entry[LENGTHS]
+        out[i] = taken
+    return out
+
+
 def restore_and_fork_many(
     cache, parts: list[tuple[dict, int]], width: int | None = None, rows_for: list[int] | None = None
 ) -> None:

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
-from . import kernels
+from . import kernels, varlen
 from .cache import build_cache, cache_bytes, join_bytes_per_token
 from .calibration import Calibration
 from .fork import (
@@ -21,6 +21,7 @@ from .fork import (
     Prefill,
     TooWide,
     build_suffixes,
+    pick,
     restore_and_fork,
     restore_and_fork_many,
     round_width,
@@ -587,30 +588,79 @@ class Prismyra:
                 f"the engine with a larger group, or read them in batches of {self.group}."
             )
 
+        # The two replacements a batched read depends on, named rather than "all of them". The first version of this
+        # check asked whether anything had been skipped at all, and a skipped head duplication -- nothing to do with
+        # document boundaries -- refused every batch.
+        needed = {"convolution", "gated_delta_rule"}
+        installed = {swap.name for swap in self.applied.swaps}
+        if missing := needed - installed:
+            raise PrismyraError(
+                f"a batch of documents needs the borrowed {' and '.join(sorted(missing))}: the framework's own has no "
+                "argument for where one document ends, so a batched read would scan across the boundary and answer "
+                f"about a document that was never written. What the adapter reported: "
+                f"{self.applied.skipped or self.applied.summary()}."
+            )
         encoded = [encode(text, None, None, self.processor, self.tokenizer, self.device) for text in contexts]
-        total = sum(e.tokens for e in encoded)
+        if any(one.has_media for one in encoded):
+            raise PrismyraError(
+                "a batch of documents is text only for now: media widen a context's positions by a grid rather than by "
+                "a token count, and a flat run of several would need each document's own offset threaded through."
+            )
+        lengths = [one.tokens for one in encoded]
+        total = sum(lengths)
         cache, room = self._claim_cache(total)
         started = _now(self.torch_device)
-        prefills = []
         with torch.inference_mode():
-            for handle, one in enumerate(encoded):
-                for layer in cache.layers:
-                    begin = getattr(layer, "begin_document", None)
-                    if begin is not None:
-                        begin(handle)
-                self.backbone(input_ids=one.input_ids, use_cache=True, past_key_values=cache, **one.media)
-                position_from = position_offset(self.backbone, one.tokens) if one.has_media else one.tokens
-                prefills.append(
-                    Prefill(
-                        snapshot=snapshot(cache),
-                        cache=cache,
-                        room=room if handle == 0 else None,
-                        tokens=one.tokens,
-                        last_position=torch.tensor([one.tokens - 1], device=self.device),
-                        position_from=position_from,
-                    )
+            # One pass over all of them. Reading is 110 ms of fixed cost plus 11 ms per thousand tokens on this
+            # model, so what this removes is that fixed cost paid per document rather than per batch.
+            ids = torch.cat([one.input_ids for one in encoded], dim=1)
+            with varlen.reading(lengths, self.device) as boundaries:
+                self.backbone(
+                    input_ids=ids,
+                    position_ids=boundaries.positions(self.device),
+                    use_cache=True,
+                    past_key_values=cache,
                 )
+                _put_back_conv_states(cache, boundaries)
+                self._check_batched_read(cache, boundaries)
+            # One snapshot with a row per document, because the recurrence returns a state per document when it is told
+            # the boundaries. `fork.pick` is how a document takes its own row of it.
+            taken = snapshot(cache)
+        prefills = [
+            Prefill(
+                snapshot=pick(taken, handle),
+                cache=cache,
+                room=room if handle == 0 else None,
+                tokens=one.tokens,
+                last_position=torch.tensor([one.tokens - 1], device=self.device),
+                position_from=one.tokens,
+            )
+            for handle, one in enumerate(encoded)
+        ]
         return Batch(_engine=self, _prefills=prefills, _room=room, context_ms=_since(started, self.torch_device))
+
+    def _check_batched_read(self, cache, boundaries) -> None:
+        """That the pass left one recurrent state and one convolution window per document, not one per batch.
+
+        Asked rather than assumed, and it is the check that found the defect: the recurrence returns a state per
+        document once it is told the boundaries, and the convolution does not -- the framework slices its state from the
+        end of the pass, and the end of a flat run is the end of the last document. A row of the first document would
+        then have started its branch convolution from the second document's tail, which answers plausibly.
+        """
+        want = boundaries.documents
+        for n, layer in enumerate(cache.layers):
+            for attr in ("recurrent_states", "conv_states"):
+                held = getattr(layer, attr, None)
+                if not isinstance(held, dict):
+                    continue
+                for key, state in held.items():
+                    if state is None or state.shape[0] == want:
+                        continue
+                    raise PrismyraError(
+                        f"a batched read of {want} documents left layer {n}'s {attr}[{key}] with "
+                        f"{state.shape[0]} rows. Every document needs its own, or rows answering about one would "
+                        f"continue from another."
+                    )
 
     def _answer_batch(self, prefills: list[Prefill], asked: list[list[Question]], context_ms: float) -> list[Result]:
         """One forward pass carrying questions about several documents, one row per question.
@@ -1054,3 +1104,25 @@ def _since(start: float, device: torch.device) -> float:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     return (time.perf_counter() - start) * 1e3
+
+
+def _put_back_conv_states(cache, boundaries) -> None:
+    """Replace each convolution state with the per-document tails recorded during the pass.
+
+    The tails arrive in the order the convolutions ran, which is layer order, and the count is checked against the
+    layers that keep a convolution state. A mismatch raises: a wrong window is a plausible answer, and an assertion is
+    the only thing between the two.
+    """
+    wanted = [(layer, key) for layer in cache.layers for key in (getattr(layer, "conv_states", None) or {})]
+    if len(wanted) != len(boundaries.conv_tails):
+        raise PrismyraError(
+            f"{len(boundaries.conv_tails)} convolution windows were recorded during the pass and {len(wanted)} layers "
+            f"keep one. Without one each, a document's rows would convolve from another document's tail."
+        )
+    for (layer, key), tails in zip(wanted, boundaries.conv_tails, strict=True):
+        held = layer.conv_states[key]
+        if held is not None and tails.shape[1:] != held.shape[1:]:
+            raise PrismyraError(
+                f"a recorded convolution window is {tuple(tails.shape)} and the layer keeps {tuple(held.shape)}"
+            )
+        layer.conv_states[key] = tails.to(dtype=held.dtype) if held is not None else tails

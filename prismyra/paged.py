@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 import torch
 from transformers.cache_utils import CacheLayerMixin
 
+from . import varlen
+
 #: Tokens per page. Must be a multiple of 16: the borrowed attention kernel requires it of a paged key-value cache, so a
 #: smaller page to shrink the remainder is not available.
 BLOCK = 16
@@ -355,7 +357,12 @@ class PagedForkLayer(CacheLayerMixin):
         # one allocation is how a row ends up naming a page that belongs to something else.
         rows = self.max_batch_size
         private = -(-(BLOCK - 1 + self.max_branch_len) // BLOCK)
-        total = -(-room // BLOCK) + rows * private
+        # The shared region holds the documents' whole pages **and** one staging page for each document that does
+        # not end on a page boundary. A batch has at most one document per row, so `rows` extra pages is the bound.
+        # Sizing it without them is short by up to a page per document: two documents of 67 tokens need five pages
+        # each, and nine pages is what 134 tokens rounds up to.
+        shared = -(-room // BLOCK) + rows
+        total = shared + rows * private
         self.pool = Pool(total_pages=total, rows=rows, branch_tokens=self.max_branch_len, block=BLOCK)
         assert self.pool.private_pages == private
         self.layout = Layout(context_tokens=room, rows=rows, branch_tokens=self.max_branch_len, block=BLOCK)
@@ -364,7 +371,7 @@ class PagedForkLayer(CacheLayerMixin):
         # Allocated at the widest layout so a recording's addresses stay valid whatever context is opened next. The
         # table's own width shrinks with the context; the tensor's does not, and the unused columns are never named
         # because `seqused` says how far along each row the kernel should read.
-        pages = -(-room // BLOCK) + private
+        pages = shared + private
         self.block_table = torch.zeros((self.max_batch_size, pages), dtype=torch.int32, device=device)
         self.seqused = torch.zeros((self.max_batch_size,), dtype=torch.int32, device=device)
         self.cumulative_length = self.cumulative_length.to(device)
@@ -412,6 +419,28 @@ class PagedForkLayer(CacheLayerMixin):
         The document is admitted here rather than earlier, because the token count that decides how many pages it needs
         is what arrives with the write. An admission that will not fit raises before anything is written.
         """
+        assert self.keys is not None and self.values is not None and self.pool is not None
+        count = key_states.shape[-2]
+        boundaries = varlen.current()
+        if boundaries is not None:
+            # A batched read: one row carrying several documents, one after another. Each is admitted and written into
+            # its own pages, and the handles are the positions in the batch -- the caller declared the order when it
+            # opened the window, so there is no guessing here.
+            if boundaries.tokens != count:
+                raise ValueError(
+                    f"the batched read declared {boundaries.tokens} tokens across {boundaries.documents} documents and "
+                    f"{count} arrived"
+                )
+            at = 0
+            for handle, length in enumerate(boundaries.lengths):
+                self._writing = handle
+                self._write_one(key_states[:, :, at : at + length], value_states[:, :, at : at + length])
+                at += length
+            return
+        self._write_one(key_states, value_states)
+
+    def _write_one(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        """One document into the pages it reserves. The slice of a batched read, or the whole of a single one."""
         assert self.keys is not None and self.values is not None and self.pool is not None
         count = key_states.shape[-2]
         held = self.pool.admit(count)
