@@ -464,6 +464,25 @@ So the two numbers to quote are the crossing and the asymptote. **Below twelve q
 way to ask, above twelve this package is, and the ratio tends to about 1.9x.** Neither of those is the 1.9x in the table
 above, which was a coincidence of reading a limit at a point far below the crossing.
 
+### And then the crossing went away
+
+That whole table is one document per pass. With several documents in a pass -- see
+[above](#reading-several-documents-in-one-pass) -- the crossing has nothing to cross, because the questions per pass no
+longer come from one document. The same forty RACE articles, the same card, documents packed greedily up to the group:
+
+| arm | questions asked | accuracy | questions / s | ms per context | tokens sent |
+|---|---|---|---|---|---|
+| this package, batched to 8 documents | 132 | 0.969 | **42.93** | 400.6 | **19,292** |
+| vLLM, one request per question | 157 | 0.936 | 32.36 | 123.8 | 53,358 |
+
+**1.33x, at four questions per document** -- the shape a RACE article has, and the shape where a single-document pass lost
+by 0.54x. The tokens column is 2.8x, for the same reason as before.
+
+Two things about that table. The arms drop their first unit as warm-up, and for the batched arm a unit is a whole batch,
+so it discards eight documents' worth against vLLM's one -- which is why the asked counts differ, and the throughput is
+per second so it is not distorted by it. And accuracy still is not a like-for-like comparison: the read-outs score
+different tokens, which is said wherever this table appears and is not a claim.
+
 One wrong row was published before this table was right: a point labelled 128 questions per context which was really
 about eighty, because twenty articles cannot supply 128 questions for one context and `widen` truncated in silence. It
 now refuses and says to raise `--limit`. The questions per second was correct; the axis it was plotted against was not,
