@@ -281,6 +281,62 @@ So the honest accounting is that the prize is about 91 ms of 444 -- **1.26x** --
 touches answers. It is written down here rather than attempted, and the wiring gap is written down because it would
 otherwise read as "recording does not help on batches", which is not what was measured.
 
+### A shelf: documents that stay on the device
+
+A `Batch` owns its cache, so asking twice about one document reads it twice and page reuse has nothing to reuse pages for.
+`Prismyra.open_shelf()` is the other shape, and it is the server one: **the cache stays and the documents come and go.**
+
+    shelf = engine.open_shelf()
+    handle = shelf.put(document)          # one read
+    shelf.ask({handle: questions})        # a branch pass, no read
+    shelf.ask({handle: more_questions})   # another branch pass, still no read
+    shelf.drop(handle)                    # the pages go back to the pool
+
+What a shelf keeps per document is its pages and a snapshot of the recurrent state its read ended in. The pages are the
+attention layers' share and live in the pool; the recurrent layers keep one state per **row** rather than per document, so
+each document's state is kept aside and copied into its rows when it is answered. That snapshot is the same one a single
+context has always taken, and the only new thing is that several are alive at once.
+
+Five things had to be right and none of them would have raised on its own:
+
+* **the counters, or the framework reads the next document as a continuation.** A layer picks its single-token path when
+  the cache says it already holds tokens, so the second document put on a shelf went through the decode convolution and
+  the boundary machinery recorded nothing;
+* **the state has to come back to one row of zeros.** Setting the key to `None` reaches `torch.cat([None, ...])` and
+  raises four frames down; removing the key raises `KeyError` in the same line; leaving the full-width buffer cannot be
+  concatenated with a one-row read;
+* **the framework prepends the convolution state it was holding**, convolves, and drops the prefix. On a fresh cache
+  there is nothing to prepend; on a shelf there are `kernel - 1` tokens, so every document boundary after the first moves
+  by that much. Without the shift the second document's convolution would begin three tokens inside the first;
+* **the handles are not the positions.** The third document put on a shelf is handle 2 and position 0 of its own read, and
+  taking the position overwrote handle 0 -- leaving the shelf holding one document under two names, which is the good
+  case. The bad case is a free handle and two documents sharing a run;
+* **a document being answered cannot be dropped**, because its run would be handed to the next document while a row's
+  table still names it. The guard is cleared when a pass ends, in a `finally`, or a failed pass would leave a shelf unable
+  to drop anything ever again.
+
+### The read budget was a slope with no constant
+
+Found by the shelf and worth more than the shelf. Reading a context transiently allocates, and admission modelled that as
+**purely proportional to the tokens** -- which the two measurements behind it supported: 0.602 GiB at 3,040 tokens and
+4.775 at 24,327, both 1.96e-4 GiB a token. A constant is invisible between those two points.
+
+At thirty tokens it is not. Three reads of a short context left admission believing a read costs **32.6 MiB a token**,
+which is 155 times the measured figure, and a shelf that would have held 65,536 tokens was refused above 1,024 with
+"needs 23.1 GiB for reading it".
+
+Two things were wrong and both are fixed:
+
+* `cache_bytes` described the joined storage while the engine was paged. The pool's private region is sized for the worst
+  remainder rather than a document's own, so it does not shrink with the context, and the difference was being attributed
+  to the read's transient -- which is the thing divided by the tokens;
+* the transient is now remembered as **a floor and a slope**. The floor comes from any read and the slope only from reads
+  of at least one bucket, because below that the division measures the constant against an arbitrary number. The budget
+  is the larger of the two rather than their sum: the floor already contains whatever proportional part the read it came
+  from had.
+
+`stats()["admission"]` reports both.
+
 ### A wider group does not buy throughput
 
 The per-row cost of a branch pass is flat in the width -- 0.109 GiB at width 1 and at width 32 -- so a wider group looked

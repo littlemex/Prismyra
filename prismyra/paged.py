@@ -388,6 +388,8 @@ class PagedForkLayer(CacheLayerMixin):
         #: The document being written. A handle chosen by the caller; zero is the one a single-context caller gets
         #: without naming it.
         self._writing = 0
+        #: The handles of the documents in the read in progress, in run order. Empty for a single unnamed document.
+        self._writing_batch: list[int] = []
         #: How far the group being answered has advanced past its documents. Counted rather than derived from
         #: `_host_length`, because with several documents in the batch there is no single length to subtract.
         self._branch_progress = 0
@@ -497,8 +499,14 @@ class PagedForkLayer(CacheLayerMixin):
                     f"the batched read declared {boundaries.tokens} tokens across {boundaries.documents} documents and "
                     f"{count} arrived"
                 )
+            handles = self._writing_batch or list(range(boundaries.documents))
+            if len(handles) != boundaries.documents:
+                raise ValueError(
+                    f"{len(handles)} documents were named for a read of {boundaries.documents}; call begin_documents "
+                    f"with one handle per document"
+                )
             at = 0
-            for handle, length in enumerate(boundaries.lengths):
+            for handle, length in zip(handles, boundaries.lengths, strict=True):
                 self._writing = handle
                 self._write_one(key_states[:, :, at : at + length], value_states[:, :, at : at + length])
                 at += length
@@ -527,16 +535,37 @@ class PagedForkLayer(CacheLayerMixin):
             self.values[page, : held.remainder] = values[whole * BLOCK :]
 
     def begin_document(self, handle: int) -> None:
-        """About to write the document called `handle`. Its pages are reserved when its tokens arrive.
+        """About to write the document called `handle`. Its pages are reserved when its tokens arrive."""
+        self.begin_documents([handle])
 
-        A handle rather than a position, so that releasing one document cannot renumber another. A caller that never
-        names one writes document zero, which is what a single-context caller does.
+    def begin_documents(self, handles: list[int]) -> None:
+        """About to write these documents, in this order, as one flat run.
+
+        The handles are **given** rather than taken from the positions in the run, and that is not a nicety. A batch
+        admits its documents in order so the two coincide; a shelf holds whatever was put on it, so the third document
+        put on a shelf is handle 2 and position 0 of its own read. Taking the position overwrote handle 0 with the new
+        document and left the shelf holding one document under two names, which then failed on the next question -- the
+        good case. The bad case is a handle that happens to be free, and then two documents share a run.
         """
-        if handle in self.held:
-            raise ValueError(f"document {handle} is already in this cache")
-        self._writing = handle
+        already = [h for h in handles if h in self.held]
+        if already:
+            raise ValueError(f"documents {already} are already in this cache")
+        if len(set(handles)) != len(handles):
+            raise ValueError(f"the same handle twice in one read: {handles}")
+        self._writing = handles[0]
+        self._writing_batch = list(handles)
         self._host_length = 0
         self.cumulative_length.zero_()
+        self.writing_branches = False
+
+    def finish_branches(self) -> None:
+        """The pass is over. Nothing is set up to be answered until the next fork.
+
+        Called so that `release_document` can mean "no row names this document **right now**" rather than "no row named
+        it in the last pass". Without it a shelf could never drop anything, because the last pass's assignment stays
+        behind -- which is how it was found.
+        """
+        self.rows_for = []
         self.writing_branches = False
 
     def release_document(self, handle: int) -> None:
@@ -720,6 +749,7 @@ class PagedForkLayer(CacheLayerMixin):
             self.writing_branches = False
             self._branch_progress = 0
             self._writing = 0
+            self._writing_batch = []
             self.held.clear()
             self.rows_for = []
             if self.pool is not None:

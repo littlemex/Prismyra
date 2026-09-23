@@ -533,21 +533,24 @@ def _install_conv() -> bool:
         tokens_major = x.squeeze(0).t()
         if not tokens_major.is_contiguous():
             tokens_major = tokens_major.contiguous()
+        boundaries = varlen.current()
+        # How many tokens the framework prepended: it hands the convolution the state it was holding, convolves, and
+        # drops the prefix. Zero on a cache that has never held anything and `kernel - 1` on one that has, which is what
+        # a shelf always is after its first document.
+        extra = tokens_major.shape[0] - boundaries.tokens if boundaries is not None else 0
         starts = kwargs.get("prismyra_seq_starts")
         if starts is None:
             cu = kwargs.get("cu_seq_lens_q")
-            if cu is None:
+            if cu is None and boundaries is not None and extra >= 0:
                 # A batched read: several documents in one flat run, with the boundaries declared by the window the
                 # engine opened rather than by the framework, which is not the one packing them here.
-                boundaries = varlen.current()
-                cu = boundaries.offsets if boundaries is not None else None
+                cu = boundaries.with_prefix(extra, tokens_major.device)
             if cu is not None and cu.numel() > 2:
                 starts = starts_from_boundaries(cu, tokens_major.shape[0])
-        boundaries = varlen.current()
-        if boundaries is not None and tokens_major.shape[0] == boundaries.tokens:
+        if boundaries is not None and extra >= 0:
             # The per-document tail of this layer's convolution input, for the engine to put back afterwards. The
             # framework will set a one-row state from the end of the whole run, which is the end of the last document.
-            boundaries.conv_tails.append(boundaries.tails(tokens_major, weight.shape[-1]))
+            boundaries.conv_tails.append(boundaries.tails(tokens_major, weight.shape[-1], extra=extra))
         out = causal_depthwise_conv1d(
             tokens_major, weight, seq_starts=starts, activation=activation if activation is not None else "silu"
         )

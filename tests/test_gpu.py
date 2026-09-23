@@ -546,3 +546,84 @@ def test_a_batch_is_refused_on_the_joined_storage(engine):
     """Refused by name rather than quietly serving one document, because the joined storage cannot hold two."""
     with pytest.raises(PrismyraError, match="paged"):
         engine.open_batch([CONTEXT, SECOND_CONTEXT])
+
+
+def test_a_document_on_a_shelf_answers_as_one_read_fresh(engine_paged):
+    """The promise a shelf has to keep. Documents that stay on the device across requests, answered together, must give
+    the answers they would have given read one at a time -- and the failure mode is a document forking from the state of
+    whatever was read after it, which answers plausibly rather than raising.
+    """
+    about_returns = [
+        Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?"),
+        Boolean(id="unopened", prompt="Are unopened items refunded in full?"),
+    ]
+    about_cards = [
+        Boolean(id="cash", prompt="Can a gift card be exchanged for cash?"),
+        Boolean(id="replaced", prompt="Is a lost gift card replaced on proof of purchase?"),
+    ]
+
+    with engine_paged.open_context(CONTEXT) as opened:
+        alone_returns = opened.ask(about_returns)
+    with engine_paged.open_context(SECOND_CONTEXT) as opened:
+        alone_cards = opened.ask(about_cards)
+
+    with engine_paged.open_shelf() as shelf:
+        returns, cards = shelf.put_many([CONTEXT, SECOND_CONTEXT])
+        on_shelf = shelf.ask({returns: about_returns, cards: about_cards})
+
+    for alone, shelved, asked in (
+        (alone_returns, on_shelf[returns], about_returns),
+        (alone_cards, on_shelf[cards], about_cards),
+    ):
+        for q in asked:
+            assert shelved[q.id].option == alone[q.id].option, f"{q.id} changed its answer on a shelf"
+            for option, p in alone[q.id].probabilities.items():
+                assert abs(shelved[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
+
+
+def test_asking_twice_about_a_shelved_document_does_not_read_it_twice(engine_paged):
+    """What the shelf is for. The second question pays a branch pass and no read."""
+    asked = [Boolean(id="faulty", prompt="Does the seller pay on a faulty item?")]
+    with engine_paged.open_shelf() as shelf:
+        handle = shelf.put(CONTEXT)
+        first = shelf.ask({handle: asked})
+        again = shelf.ask({handle: asked})
+        assert len(shelf.documents) == 1
+    # Read once, so the second answer must be identical to the bit rather than within a tolerance: it is the same state,
+    # the same rows and the same suffix.
+    for option, p in first[handle]["faulty"].probabilities.items():
+        assert again[handle]["faulty"].probabilities[option] == p
+
+
+def test_a_document_put_on_a_shelf_after_another_does_not_disturb_it(engine_paged):
+    """The failure this is arranged to prevent. A read runs the recurrence over the new document, and the one already on
+    the shelf must fork from its own state rather than from where that read ended."""
+    asked = [Boolean(id="unopened", prompt="Are unopened items refunded in full?")]
+    with engine_paged.open_shelf() as shelf:
+        first = shelf.put(CONTEXT)
+        before = shelf.ask({first: asked})
+        shelf.put(SECOND_CONTEXT)
+        after = shelf.ask({first: asked})
+    for option, p in before[first]["unopened"].probabilities.items():
+        assert after[first]["unopened"].probabilities[option] == pytest.approx(p, abs=1e-4), option
+
+
+def test_a_dropped_documents_pages_are_used_again(engine_paged):
+    """Page reuse where it is load-bearing: a shelf that holds and drops documents for a long time must not run out of
+    pages it has already given back."""
+    asked = [Boolean(id="faulty", prompt="Does the seller pay on a faulty item?")]
+    with engine_paged.open_shelf(room=1024) as shelf:
+        handles = []
+        for _ in range(12):
+            handle = shelf.put(CONTEXT)
+            shelf.ask({handle: asked})
+            shelf.drop(handle)
+            handles.append(handle)
+        assert shelf.documents == {}
+    # Twelve documents through a shelf sized for far fewer at once. Without reuse the cursor would have run out.
+    assert len(handles) == 12
+
+
+def test_a_shelf_is_refused_on_the_joined_storage(engine):
+    with pytest.raises(PrismyraError, match="paged"):
+        engine.open_shelf()

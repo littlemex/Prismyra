@@ -31,6 +31,8 @@ from __future__ import annotations
 import torch
 from transformers.cache_utils import CacheLayerMixin
 
+from .paged import BLOCK
+
 
 class ForkLayer(CacheLayerMixin):
     """One row of context, `rows` rows of branch tail, joined on read.
@@ -283,7 +285,9 @@ class ForkLayer(CacheLayerMixin):
         pass
 
 
-def cache_bytes(config, max_cache_len: int, rows: int, dtype: torch.dtype, max_branch_len: int = 512) -> int:
+def cache_bytes(
+    config, max_cache_len: int, rows: int, dtype: torch.dtype, max_branch_len: int = 512, paged: bool = False
+) -> int:
     """How much device memory one cache of this shape needs.
 
     Worth a function rather than a comment because the number decides how many contexts fit on a card, and it is not
@@ -299,6 +303,9 @@ def cache_bytes(config, max_cache_len: int, rows: int, dtype: torch.dtype, max_b
 
     What this does not count is the transient join: one layer's context and branch rows concatenated for the read, 222
     MiB at those sizes, allocated and freed inside a layer rather than held.
+
+    `paged` asks for the page pool's figure instead, which is a different and much larger number at short contexts. See
+    the branch below.
     """
     decoder = getattr(config, "text_config", config)
     # Read off the config rather than through the framework's helper: this function needs only the list of layer
@@ -313,7 +320,18 @@ def cache_bytes(config, max_cache_len: int, rows: int, dtype: torch.dtype, max_b
     per_element = torch.empty((), dtype=dtype).element_size()
 
     context_room = max(1, max_cache_len - max_branch_len)
-    slots = context_room + rows * max_branch_len
+    if paged:
+        # The paged pool is not the joined figure and the difference is large. Its private region is sized for the
+        # worst remainder rather than a document's own -- `block - 1 + branch` tokens a row -- so it does not shrink
+        # with the context, and at short lengths the pool is mostly that region. Counting the joined figure instead
+        # attributed the difference to the read's *transient*, which is per token and ratchets: three reads of a
+        # thirty-token context left admission believing a read costs 32.6 MiB a token against a measured 210 KiB, and
+        # a shelf that would hold 65,536 tokens was refused above 1,024.
+        private = -(-(BLOCK - 1 + max_branch_len) // BLOCK)
+        pages = -(-context_room // BLOCK) + rows + rows * private
+        slots = pages * BLOCK
+    else:
+        slots = context_room + rows * max_branch_len
     keys_and_values = 2 * attention_layers * heads * head_dim * slots * per_element
     # The thirty recurrent layers hold state too, one copy per row, and leaving it out understated an open context by a
     # gigabyte at the default group. See `state_bytes`.
