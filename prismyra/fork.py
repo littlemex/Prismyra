@@ -313,6 +313,16 @@ def restore_and_fork(cache, snap: dict, rows: int, width: int | None = None) -> 
             setattr(layer, attr, held)
 
 
+def branch_ids(text: str, tokenizer) -> list[int]:
+    """The token ids a branch reads for one rendered question: a newline after the context, then the question.
+
+    One function because four places need exactly this sequence -- the branch batch, the width a request needs, the
+    width each packed group needs, and the one-pass read of a single question -- and a second copy of the rendering
+    that drifted from this one would size a group too narrow or read different tokens than the fork does.
+    """
+    return tokenizer("\n" + text, add_special_tokens=False)["input_ids"]
+
+
 def build_suffixes(
     texts: list[str], tokenizer, device: str, rows: int | None, width: int | None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -326,7 +336,7 @@ def build_suffixes(
     read by the read-out and cannot be attended to by a real position, whereas one added to the context passes through
     the recurrence where there is nothing to mask it out of.
     """
-    pieces = [tokenizer("\n" + text, add_special_tokens=False)["input_ids"] for text in texts]
+    pieces = [branch_ids(text, tokenizer) for text in texts]
     real = len(pieces)
     longest = max(len(p) for p in pieces)
     target = width or round_width(longest)

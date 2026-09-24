@@ -193,7 +193,7 @@ def test_a_question_wider_than_the_widest_branch_is_refused_before_the_device(en
 def test_the_counted_kernels_match_what_the_config_implies(engine):
     """A swap that matches nothing looks exactly like a swap that worked, so what can be counted is asserted.
 
-    Only the counts that follow from the config. The normalisation and the dense projections are found by structure,
+    Only the counts that follow from the config. The normalisations and the dense projections are found by structure,
     so they carry a verification instead of a number, which this checks is present.
     """
     from prismyra.kernels.qwen3_moe import expected_counts
@@ -208,7 +208,7 @@ def test_the_counted_kernels_match_what_the_config_implies(engine):
     assert got == {k: v for k, v in want.items() if k in got}
 
     verified = {s.name for s in engine.applied.swaps if s.verified}
-    assert verified == {"norm", "dense_matmul"}, engine.applied.as_dict()
+    assert verified == {"norm", "dense_matmul", "gated_norm"}, engine.applied.as_dict()
 
 
 # --------------------------------------------------------------------------- the convolution on its own
@@ -453,6 +453,39 @@ def test_a_replayed_pass_answers_exactly_as_the_eager_one_did(engine, monkeypatc
                 assert got[name][1][option] == pytest.approx(p, abs=1e-4), f"group {n}, {name}, option {option}"
 
 
+def test_a_recording_judged_not_to_pay_is_declined_rather_than_raising(engine, monkeypatch):
+    """A recording that `keeping_pays` refuses is reported and the call still answers.
+
+    The refusal path used to delete the recording from the store it had not yet been put in, so the first call whose
+    recording came back "not worth keeping" raised KeyError instead of answering. It needs a shape seen often enough to
+    be recorded and a verdict of "slow", which is what 64 questions at group 8 produced on a 5,000-token context.
+    """
+    asked = questions(4)
+    was = engine.graphs
+    monkeypatch.setattr("prismyra.engine.keeping_pays", lambda *a, **k: "measured not to pay")
+    try:
+        engine.graphs = False
+        with engine.open_context(CONTEXT * 6) as opened:
+            eager = [opened.ask(asked) for _ in range(GROUPS_FOR_A_REPLAY)]
+        engine.graphs = True
+        with engine.open_context(CONTEXT * 6) as opened:
+            answered = [opened.ask(asked) for _ in range(GROUPS_FOR_A_REPLAY)]
+        declined = dict(engine.stats()["graphs_declined"])
+        replays = sum(engine.stats()["graphs_replays"].values())
+    finally:
+        engine.graphs = was
+        engine.declined_recordings.clear()
+        engine.replays.clear()
+        engine.replay_cost.clear()
+
+    # A recording the capture itself refused is reported with its own reason; either way something was declined.
+    assert declined, "nothing was recorded, so the refusal path this test is for never ran"
+    assert replays == 0, "a recording refused as not paying must never be replayed"
+    for want, got in zip(eager, answered, strict=True):
+        for q in asked:
+            assert got[q.id].option == want[q.id].option
+
+
 def test_the_engine_measures_what_a_replay_costs_before_it_trusts_one(engine):
     """The measurement the recording decision is made from has to actually happen.
 
@@ -627,3 +660,102 @@ def test_a_dropped_documents_pages_are_used_again(engine_paged):
 def test_a_shelf_is_refused_on_the_joined_storage(engine):
     with pytest.raises(PrismyraError, match="paged"):
         engine.open_shelf()
+
+
+class _NoPriors:
+    """Turns packing off without changing any score: `priors` returns nothing to subtract."""
+
+    mode = "raw"
+
+    def priors(self, *_):
+        return None
+
+
+def test_length_packed_groups_answer_as_the_shared_width_did(engine):
+    """Sorting questions by length into groups of their own width must not move an answer beyond the batching bound.
+
+    The packing changes only which rows travel together and how much padding each row carries, and a pad after a row's
+    own tokens is never read. What does move is the reduction order, which is the same movement `COMPANION_MOVEMENT`
+    already bounds, so the bound is shared, and a decision that is clear of that bound must be identical.
+    """
+    short = [Boolean(id=f"s{i}", prompt=f"Is clause {i} about shipping?") for i in range(6)]
+    long = [
+        Choice(
+            id=f"l{i}",
+            prompt=(
+                f"Question {i}: which of the following best describes who pays return shipping for an opened item that "
+                "turns out to have a manufacturing fault confirmed after inspection by the seller's own technician?\n"
+                "A. The buyer\nB. The seller\nC. Nobody, it is refunded\nD. It depends on the courier"
+            ),
+            choices=["A", "B", "C", "D"],
+        )
+        for i in range(6)
+    ]
+    asked = [q for pair in zip(short, long, strict=True) for q in pair]  # interleaved, so the sort has work to do
+    was_group, was_calibration = engine.group, engine.calibration
+    try:
+        engine.group = 4
+        packed = engine.ask(CONTEXT * 6, asked)
+        # A calibrated engine keeps the one shared width per request, which is the arrangement packing replaced; the
+        # calibration object is only consulted for priors, which a stand-in without any returns as none.
+        engine.calibration = _NoPriors()
+        shared = engine.ask(CONTEXT * 6, asked)
+    finally:
+        engine.group, engine.calibration = was_group, was_calibration
+    for q in asked:
+        for option, p in shared[q.id].probabilities.items():
+            assert packed[q.id].probabilities[option] == pytest.approx(p, abs=COMPANION_MOVEMENT)
+        # The decision is asserted where the shared arrangement's decision is not itself within the movement both
+        # arrangements are allowed: "Is clause 3 about shipping?" sits at 0.44 against 0.56 and moved by 0.078, which
+        # crosses a half without anything being wrong.
+        top, second = sorted(shared[q.id].probabilities.values(), reverse=True)[:2]
+        if top - second > 2 * COMPANION_MOVEMENT:
+            assert packed[q.id].option == shared[q.id].option, q.id
+
+
+def test_the_fused_gated_norm_is_installed_and_agrees(engine):
+    """The gated delta net's output normalisation runs on the fused kernel, verified against the module it replaced."""
+    applied = engine.stats()["kernels"]
+    if "gated_norm" not in applied.get("applied", {}):
+        pytest.skip(f"not installed on this checkpoint: {applied.get('skipped')}")
+    from prismyra.kernels.qwen3_moe import BF16_ULP, FusedGatedRMSNorm
+
+    fused = next(m for m in engine.backbone.modules() if isinstance(m, FusedGatedRMSNorm))
+    x = torch.randn(7, 3, fused.weight.shape[0], device=fused.weight.device, dtype=torch.bfloat16)
+    g = torch.randn_like(x)
+    with torch.inference_mode():
+        want, got = fused.inner(x, g), fused(x, g)
+    moved = ((want.float() - got.float()).abs().max() / want.float().abs().max()).item()
+    assert moved <= 2 * BF16_ULP, moved
+
+
+def test_one_question_in_one_pass_answers_as_the_fork_does(engine):
+    """`ask` with a single question reads context and question together; the forked path must agree with it.
+
+    Same tokens, same positions, same read-out position -- the one-pass path skips only the fork. The comparison is
+    against `open_context(...).ask(...)`, which always forks.
+    """
+    for q in [
+        Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?"),
+        Choice(
+            id="opened",
+            prompt="What happens to an opened item?\nA. Refunded\nB. Exchanged\nC. Kept",
+            choices=["A", "B", "C"],
+        ),
+    ]:
+        once = engine.ask(CONTEXT, [q])
+        with engine.open_context(CONTEXT) as opened:
+            forked = opened.ask([q])
+        assert once[q.id].option == forked[q.id].option
+        for option, p in forked[q.id].probabilities.items():
+            assert once[q.id].probabilities[option] == pytest.approx(p, abs=COMPANION_MOVEMENT)
+        assert once.timing.readout_ms == 0.0
+
+
+def test_one_pass_refuses_a_question_wider_than_a_branch_as_the_fork_does(engine):
+    """The one-pass path must not answer what the forked path refuses: a question longer than the widest branch."""
+    wide = Boolean(id="wide", prompt="Is this long? " + "word " * 900)
+    with pytest.raises(PrismyraError):
+        engine.ask(CONTEXT, [wide])
+    with pytest.raises(PrismyraError), engine.open_context(CONTEXT) as opened:
+        opened.ask([wide])

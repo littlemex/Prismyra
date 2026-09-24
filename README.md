@@ -258,6 +258,7 @@ The cost model, at about 5,000 context tokens:
 total ~= 138 ms  +  92 ms x ceil(questions / 32)
 ```
 
+One question is the exception: it is read together with the context in one pass, so it costs the context pass alone.
 Both constants grow with the context length. Numbers come from
 [`benchmarks/results/`](benchmarks/results/) and are refreshed by hand on the machine each file names --
 CI has no GPU and **cannot catch a performance regression**. On such a machine:

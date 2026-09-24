@@ -24,6 +24,7 @@ from .fork import (
     WIDTHS,
     Prefill,
     TooWide,
+    branch_ids,
     build_suffixes,
     pick,
     restore_and_fork,
@@ -47,6 +48,9 @@ from .schema import (
 #: with more than this is answered in several; a request with fewer uses only as many rows as it has questions, which
 #: is not the same as it once was -- see docs/PERFORMANCE.md for the measurement that changed it.
 GROUP = 32
+#: A packed branch group is rounded up to a multiple of this many tokens. Eight keeps the matmul tiles aligned
+#: without giving back much of what packing saves.
+PACK_ALIGN = 8
 
 #: How much more than the model predicts a branch pass is budgeted at. An allocator's peak is blocks rounded up and
 #: reused rather than a sum of tensor sizes, and the prediction is two terms answering to a handful of measurements.
@@ -451,7 +455,7 @@ class Prismyra:
             raise PrismyraError(f"duplicate question ids: {ids}")
         for q in questions:
             chosen = plan(q, self.tokenizer)
-            rendered = self.tokenizer("\n" + chosen.text, add_special_tokens=False)["input_ids"]
+            rendered = branch_ids(chosen.text, self.tokenizer)
             if len(rendered) > WIDTHS[-1]:
                 raise PrismyraError(
                     f"question {q.id!r} renders to {len(rendered)} tokens and the widest branch is {WIDTHS[-1]}"
@@ -592,12 +596,74 @@ class Prismyra:
         images: list | None = None,
         videos: list | None = None,
     ) -> Result:
-        """Read a context and answer questions about it. Sugar for `open_context(...).ask(...)`."""
+        """Read a context and answer questions about it. Sugar for `open_context(...).ask(...)`.
+
+        One question about a text context is answered in **one pass** over the context and the question together. The
+        fork exists so that many questions share one read; with a single question there is nothing to share, and the
+        separate branch pass it would cost is a whole traversal of the model (docs/PERFORMANCE.md). Only when nothing
+        needs the fork: media (whose positions are worked out during the read), calibration (whose priors are measured
+        through branch passes) and the paged storage (whose pages belong to a pool this path does not draw from) keep
+        the forked path. The two paths read the same tokens, and their answers agree to the bound batching already
+        allows (`COMPANION_MOVEMENT` in the device tests): `open_context(...).ask(...)` with one question still forks.
+        """
         self.validate(questions)
+        if len(questions) == 1 and not images and not videos and self.calibration is None and not self.paged:
+            return self._ask_in_one_pass(context, questions[0])
         with self._lock, self.open_context(context, images=images, videos=videos) as opened:
             assert opened._prefill is not None
             answered = self._answer(opened._prefill, questions, opened.tokens, context_ms=opened.context_ms)
         return answered
+
+    def _ask_in_one_pass(self, context: str, question: Question) -> Result:
+        """The context and the question as one sequence, read once, answered at its last position.
+
+        The same tokens at the same positions as the forked path -- the context as `encode` tokenises it, then the
+        question exactly as `build_suffixes` renders a branch -- through the same read the context pass uses, so the
+        kernels are the ones a context read runs. What is skipped is the fork: no snapshot, no widening to the group,
+        no branch pass. The same refusals apply: an empty context, a question wider than a branch may be, and a read
+        that admission says will not fit.
+        """
+        if not context.strip():
+            raise PrismyraError("a context cannot be empty")
+        planned = plan(question, self.tokenizer)
+        self._width_for([planned])  # the forked path's refusal of an over-wide question, so both paths refuse alike
+        suffix = branch_ids(planned.text, self.tokenizer)
+        with self._lock:
+            encoded = encode(context, None, None, self.processor, self.tokenizer, self.device)
+            tokens = encoded.tokens + len(suffix)
+            self._check_fits(tokens)
+            start = _now(self.torch_device)
+            before = self._peak_baseline()
+            try:
+                with torch.inference_mode():
+                    ids = torch.cat([encoded.input_ids, torch.tensor([suffix], device=self.device)], dim=1)
+                    # One row. The branch room is kept at its usual size rather than zero, because the attention layer
+                    # sizes its context room as the total minus the branch room; at one row it is a few megabytes.
+                    cache = build_cache(
+                        self.config, self.room_for(tokens) + WIDTHS[-1], 1, self.dtype, self.device, WIDTHS[-1]
+                    )
+                    out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
+                    hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
+                    (probabilities,) = score(hidden, self.unembedding, [planned.token_ids], None)
+                    values = probabilities.tolist()
+                    # Released here, inside the lock: the output holds the cache, and the next request must not find
+                    # this one's memory still allocated when it is admitted.
+                    del out, cache, hidden, ids
+            except torch.OutOfMemoryError as e:
+                raise PrismyraError(
+                    f"ran out of memory reading a context of {encoded.tokens} tokens with its question; a shorter "
+                    f"context is the only knob"
+                ) from e
+            self._observe_reading(before, tokens)
+            elapsed = _since(start, self.torch_device)
+        return Result(
+            answers={question.id: _answer_for(question, values)},
+            model=self.model_name,
+            context_tokens=encoded.tokens,
+            scoring="raw",
+            # The question is read inside the context pass, so the whole request is `context_ms`.
+            timing=Timing(context_ms=elapsed, readout_ms=0.0),
+        )
 
     def ask_many(self, requests: list[Request]) -> list[Result | PrismyraError]:
         """Answer several independent requests. One request failing does not fail the others.
@@ -943,18 +1009,10 @@ class Prismyra:
 
         results, at = [], 0
         for handle, questions in enumerate(asked):
-            answers = {}
-            for q, values in zip(questions, probabilities[at : at + len(questions)], strict=True):
-                numbers = values.tolist()
-                best = max(range(len(numbers)), key=lambda i: numbers[i])
-                option = q.options[best]
-                answers[q.id] = Answer(
-                    id=q.id,
-                    kind=q.kind,
-                    value=q.value_of(option),
-                    option=option,
-                    probabilities=dict(zip(q.options, numbers, strict=True)),
-                )
+            answers = {
+                q.id: _answer_for(q, values.tolist())
+                for q, values in zip(questions, probabilities[at : at + len(questions)], strict=True)
+            }
             at += len(questions)
             results.append(
                 Result(
@@ -997,10 +1055,10 @@ class Prismyra:
         # tokens and does not hold at longer ones: at 24,327 tokens the same pass costs 238 ms at width 1 and 360 ms
         # at width 32, and its transient peak goes from 0.111 GiB to 4.970 GiB. Both of those are per-row work
         # proportional to the context, so a request with three questions should not pay for thirty-two rows of it.
-        largest_group = self.group
         plans = [plan(q, self.tokenizer) for q in questions]
         token_ids = [p.token_ids for p in plans]
         width = self._width_for(plans)
+        groups = self._packed_groups(plans, width)
 
         # Before the clock starts, and outside the lock's timed section: a prior is cached per question, so charging
         # the first request for every later one's correction would report a cost that is not there.
@@ -1012,24 +1070,22 @@ class Prismyra:
         with self._lock, torch.inference_mode():
             before = self._peak_baseline()
             try:
-                for lo in range(0, len(questions), largest_group):
-                    chunk = [p.text for p in plans[lo : lo + largest_group]]
+                by_index: dict[int, torch.Tensor] = {}
+                for n, (members, group_width) in enumerate(groups):
+                    chunk = [plans[i].text for i in members]
                     widest_chunk = max(widest_chunk, len(chunk))
                     # How many more groups of this exact shape this call will run, which is what decides whether
-                    # recording the pass can pay for itself. Only full groups share the shape: the last chunk is
-                    # narrower unless the questions divide evenly.
-                    full_left = (len(questions) - lo - largest_group) // largest_group
-                    hidden = self._branch(
-                        prefill, chunk, len(chunk), width, remaining=full_left if len(chunk) == largest_group else 0
+                    # recording the pass can pay for itself.
+                    same_shape_left = sum(1 for m, w in groups[n + 1 :] if len(m) == len(members) and w == group_width)
+                    hidden = self._branch(prefill, chunk, len(chunk), group_width, remaining=same_shape_left)
+                    scored = score(
+                        hidden,
+                        self.unembedding,
+                        [token_ids[i] for i in members],
+                        [priors[i] for i in members] if priors else None,
                     )
-                    probabilities.extend(
-                        score(
-                            hidden,
-                            self.unembedding,
-                            token_ids[lo : lo + largest_group],
-                            priors[lo : lo + largest_group] if priors else None,
-                        )
-                    )
+                    by_index.update(zip(members, scored, strict=True))
+                probabilities = [by_index[i] for i in range(len(questions))]
             except torch.OutOfMemoryError as e:
                 # The allocator is the authoritative answer to "does this fit", and admission is only a pre-filter:
                 # it budgets from what has been observed, and the first pass on an engine has nothing to observe.
@@ -1042,18 +1098,7 @@ class Prismyra:
             self._observe_peak(before, tokens, widest_chunk)
         readout_ms = _since(start, self.torch_device)
 
-        answers = {}
-        for q, p in zip(questions, probabilities, strict=True):
-            values = p.tolist()
-            best = max(range(len(values)), key=lambda i: values[i])
-            option = q.options[best]
-            answers[q.id] = Answer(
-                id=q.id,
-                kind=q.kind,
-                value=q.value_of(option),
-                option=option,
-                probabilities=dict(zip(q.options, values, strict=True)),
-            )
+        answers = {q.id: _answer_for(q, p.tolist()) for q, p in zip(questions, probabilities, strict=True)}
         return Result(
             answers=answers,
             model=self.model_name,
@@ -1127,11 +1172,40 @@ class Prismyra:
         One place, because the calibration measures its priors through the same passes an answer comes through, and a
         prior taken at a different width would correct for a different arrangement of the batch.
         """
-        widest = max(len(self.tokenizer("\n" + p.text, add_special_tokens=False)["input_ids"]) for p in plans)
+        widest = max(len(branch_ids(p.text, self.tokenizer)) for p in plans)
         try:
             return round_width(widest)
         except TooWide as e:
             raise PrismyraError(str(e)) from e
+
+    def _packed_groups(self, plans: list, width: int) -> list[tuple[list[int], int]]:
+        """Which questions share a branch pass, and how wide each pass is.
+
+        A pass is as wide as its longest question, and every shorter row pays for the difference in padding that each
+        layer computes and discards. With one width for the whole request -- the widest question, rounded to a bucket --
+        questions of mixed length spend much of a branch pass on padding (docs/PERFORMANCE.md measures 53%). Sorting by
+        length before grouping and sizing each group to its own longest row (to a multiple of `PACK_ALIGN`) leaves the
+        questions in every group of similar length. Which rows travel together changes the reduction order, so a
+        near-tie can move by as much as batching already allows; see `COMPANION_MOVEMENT` in the device tests.
+
+        Only when nothing depends on the width being shared: the calibration measures its priors at the request's width,
+        so `calibrate` keeps it. Recordings do not need it -- each group's (rows, width) is its own shape, and a caller
+        asking the same questions again produces the same groups, so each shape recurs and is recorded on its own.
+        """
+        n = len(plans)
+        if self.calibration is not None:
+            return [(list(range(lo, min(n, lo + self.group))), width) for lo in range(0, n, self.group)]
+        lengths = [len(branch_ids(p.text, self.tokenizer)) for p in plans]
+        order = sorted(range(n), key=lambda i: lengths[i])
+        groups = []
+        for lo in range(0, n, self.group):
+            members = order[lo : lo + self.group]
+            longest = max(lengths[i] for i in members)
+            # The same rule whether recording is on or not. A recording must answer exactly as the eager pass it was
+            # taken from, and a different width is a different reduction: rounding to the pinned buckets only under
+            # `graphs` moved a probability by 3e-4 between the two.
+            groups.append((members, min(width, -(-longest // PACK_ALIGN) * PACK_ALIGN)))
+        return groups
 
     def _branch(self, prefill: Prefill, texts: list[str], rows: int, width: int, remaining: int = 0) -> torch.Tensor:
         # The snapshot is taken on the first branch, when the cache holds exactly the context, so restoring it also
@@ -1318,7 +1392,7 @@ class Prismyra:
                 self.replay_cost[key] = (round(eager_ms, 1), round(replay_ms, 1))
                 slow = keeping_pays(eager_ms, replay_ms, expected)
                 if slow is not None:
-                    del store["taken"][key]
+                    # Nothing to remove: the recording is only stored below, once it has been judged worth keeping.
                     self.declined_recordings[key] = slow
                 elif moved > REPLAY_TOLERANCE:
                     self.declined_recordings[key] = (
@@ -1330,6 +1404,19 @@ class Prismyra:
                 # left it -- not where the eager pass above left it. They are the same state by construction, and
                 # `hidden` was read before any of it, so the answer this call returns is the eager one.
         return hidden
+
+
+def _answer_for(question: Question, values: list[float]) -> Answer:
+    """One question's answer from its probabilities, in its declared option order. Shared by every path that answers."""
+    best = max(range(len(values)), key=lambda i: values[i])
+    option = question.options[best]
+    return Answer(
+        id=question.id,
+        kind=question.kind,
+        value=question.value_of(option),
+        option=option,
+        probabilities=dict(zip(question.options, values, strict=True)),
+    )
 
 
 def row_constant(seen: int | None, per_row: int, at_tokens: int, per_token: int) -> int:

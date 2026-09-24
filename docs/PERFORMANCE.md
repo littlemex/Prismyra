@@ -20,6 +20,54 @@ At about 5,000 context tokens. Two constants, and they answer different question
 Both constants grow with the context length. The per-question figure people usually want, 2.85 ms, exists only at a full
 group; at one question per group it is 91.6 ms.
 
+## Three changes measured on an L40S
+
+Measured on one NVIDIA L40S (44 GiB) with the supported checkpoint, a fresh document on every request (a unique first
+line, so nothing is reused between requests), p50 of five timed requests after two warm-ups. The document is RACE
+articles concatenated to 5,335 tokens; the questions are that document's RACE questions, 42 to 98 tokens each.
+
+| | 1 question | 16 questions | 64 questions |
+|---|---|---|---|
+| before (group 16, one width per request) | 431 ms | 458 ms | 956 ms |
+| length-packed groups, group 32 | 435 ms | 455 ms | 792 ms |
+| + fused gated normalisation | 380 ms | 398 ms | 712 ms |
+| + one question in one pass | 274 ms | 405 ms | 731 ms |
+
+The last row is the steady state of forty requests rather than five, which is why its 64-question figure is not below
+the row above it: the one-pass path changes nothing for more than one question.
+
+**Length-packed groups.** A branch pass is as wide as its longest question, and every shorter row computes padding that
+is thrown away. Which rows travel together changes the reduction order, so a near-tie can move by as much as batching
+already allows -- one yes/no question at 0.44 against 0.56 moved by 0.078 in the device test -- and a decision clear of
+that bound does not change. With one width for the whole request -- the widest question rounded to a bucket -- those 64 questions
+were padded to 128 tokens: 8,192 positions computed for 3,846 real ones, 53% of every branch pass spent on padding.
+Sorting by length before grouping and sizing each group to its own longest row, to a multiple of eight, leaves 28% at
+group 32. Group 32 then beats group 16 because a pass reads every routed expert's weights whatever it carries (805 MB
+a layer), so fewer passes is cheaper; at group 64 the single pass is padded to the longest of all 64 and is slower
+again (930 ms). A calibrated engine keeps the shared width, because its priors are measured at that width.
+
+**Fused gated normalisation.** The gated delta net's output normalisation was eight elementwise kernels in thirty
+layers of every pass -- about 50 ms of kernel time at 64 questions, and 80 ms of the request once the launches are
+counted. `FusedGatedRMSNorm` does the same
+arithmetic, in the same order and with the same two intermediate roundings, in one kernel, and is verified against the
+module it replaces before it is installed.
+
+**One question in one pass.** With one question there is nothing for the fork to share, and the branch pass it would
+run cost about 107 ms. `ask` now reads the context and the question as one sequence and reads the answer at its last
+position -- the same tokens at the same positions as the forked path. On a 1,245-token document one question went from
+214 ms to 111 ms over HTTP. Media and calibration keep the forked path.
+
+Tried and not kept, each measured:
+
+* **Tuned MoE kernel configurations** for this card and these shapes (a grid of 432 configurations per batch size):
+  about 4% on the kernel alone and nothing measurable end to end.
+* **The paged storage** at the same group: 973 ms against 956 at 64 questions.
+* **Recording branch passes for a stream of new documents.** A recording holds the addresses of the cache it was
+  taken on, so it needs a cache that outlives the document. With the joined storage a recording is also bound to the
+  context length, and a document five tokens longer declines it; with the paged storage, capture failed on a host to
+  device copy inside the pass. Where it would pay is small groups -- a four-row pass replayed in 41.9 ms against
+  102.9 eagerly -- and at sixteen rows or more a replay saves nothing (101.9 against 102.5).
+
 ## Memory
 
 The other half of the cost, and the one the cost model does not mention. Every branch holds its own copy of the
