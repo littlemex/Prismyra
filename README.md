@@ -80,13 +80,19 @@ help and one figure this project published and then withdrew.
 
 ## Install
 
+**There is no release on PyPI**, so it installs from the repository:
+
 ```bash
-pip install prismyra              # runs, and leaves every borrowed kernel on its fallback
-pip install "prismyra[fast]"      # the kernels: needs vLLM and Triton
+git clone https://github.com/littlemex/Prismyra
+cd Prismyra
+pip install -e .                  # runs, and leaves every borrowed kernel on its fallback
+pip install -e ".[fast]"          # the kernels: needs vLLM and Triton, so Linux and CUDA
 ```
 
 Without the `fast` extra the model still answers, and `engine.stats()["kernels"]` says what was skipped. See
-[docs/KERNELS.md](docs/KERNELS.md) for what each kernel is worth.
+[docs/KERNELS.md](docs/KERNELS.md) for what each kernel is worth. The `fast` extra has no wheels for macOS or Windows and
+is left to fail loudly there rather than hidden behind a platform marker, which would install nothing and leave the engine
+quietly on its fallbacks.
 
 ## Asking more than once
 
@@ -206,7 +212,7 @@ between requests -- different contexts share no state.
 There is a server with that already wired:
 
 ```bash
-pip install "prismyra[server,fast]"
+pip install -e ".[server,fast]"
 prismyra-serve --require-kernels
 ```
 
@@ -284,11 +290,15 @@ that depends on how the work was arranged, so `0.99974` and `0.999417` are the s
 differs from one below, that is worth reporting.
 
 ```bash
-pip install "prismyra[server,fast]"
+git clone https://github.com/littlemex/Prismyra
+cd Prismyra
+pip install -e ".[server,fast]"
 prismyra-serve --host 127.0.0.1 --port 8000
 ```
 
-`python3 -m prismyra.server` is the same thing if the script is not on your path.
+`python3 -m prismyra.server` is the same thing if the script is not on your path. The `fast` extra needs Linux and CUDA;
+without it the server runs and answers at about a quarter of the speed, which `prismyra-serve --require-kernels` refuses
+to do silently.
 
 The first request waits for the weights to load. `curl -s localhost:8000/health` returns `{"ok":true,"depth":0}` when it
 is ready.
