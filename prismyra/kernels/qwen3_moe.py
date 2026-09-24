@@ -159,6 +159,94 @@ class FastRMSNorm(nn.Module):
         return out
 
 
+class FusedGatedRMSNorm(nn.Module):
+    """The gated delta net's output normalisation, `rms_norm(x) * weight * silu(gate)`, as one kernel.
+
+    The framework's version is eight separate elementwise kernels over the full activation -- a cast, a square, a mean,
+    an rsqrt, two multiplies, a silu and a cast back -- and every pass runs it in thirty layers (docs/KERNELS.md has
+    what it cost). One pass over the row does the same arithmetic in the same order: float32 accumulation, the round to
+    the input dtype before the weight, the weight product rounded again, then the gate in float32 and one final round.
+    That order assumes a bfloat16 weight, so a module with any other weight dtype is not replaced. Verified against the
+    module it replaces before it is installed.
+    """
+
+    def __init__(self, inner: nn.Module):
+        super().__init__()
+        self.inner = inner
+        self.weight = inner.weight
+        self.eps = float(getattr(inner, "variance_epsilon", 1e-6))
+
+    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
+        if gate is None or hidden_states.dtype != torch.bfloat16 or hidden_states.numel() == 0:
+            return self.inner(hidden_states, gate)
+        width = hidden_states.shape[-1]
+        x = hidden_states.reshape(-1, width).contiguous()
+        g = gate.reshape(-1, width).contiguous()
+        out = torch.empty_like(x)
+        w = self.weight if self.weight.is_contiguous() else self.weight.contiguous()  # the kernel indexes it flat
+        block = triton.next_power_of_2(width)
+        # One warp covers a row of this model's 128; wider rows get more warps rather than spilling registers.
+        _gated_rms_norm[(x.shape[0],)](
+            x, g, w, out, width, self.eps, BLOCK=block, num_warps=max(1, min(8, block // 256))
+        )
+        return out.view(hidden_states.shape)
+
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _gated_rms_norm(X, G, W, Y, N, eps, BLOCK: tl.constexpr):
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < N
+        x = tl.load(X + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+        variance = tl.sum(x * x, axis=0) / N
+        normed = (x * tl.rsqrt(variance + eps)).to(tl.bfloat16).to(tl.float32)
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+        scaled = (w * normed).to(tl.bfloat16).to(tl.float32)
+        g = tl.load(G + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+        y = scaled * (g * tl.sigmoid(g))
+        tl.store(Y + row * N + cols, y.to(tl.bfloat16), mask=mask)
+except ImportError:  # pragma: no cover - the adapter checks for triton before installing this
+    _gated_rms_norm = None
+
+
+def _swap_gated_norm(applied, root: nn.Module) -> None:
+    """Replace every gated normalisation, after checking one against the module it replaces on two inputs."""
+    targets = _find_children(root, lambda m: type(m).__name__ == "Qwen3_5MoeRMSNormGated")
+    if not targets:
+        applied.skipped.append("gated_norm: nothing matched")
+        return
+    if _gated_rms_norm is None:
+        applied.skipped.append("gated_norm: triton is not available")
+        return
+    _, _, original = targets[0]
+    p = original.weight
+    if p.dtype != torch.bfloat16:
+        applied.skipped.append(f"gated_norm: the weight is {p.dtype}, and the kernel's rounding order assumes bfloat16")
+        return
+    x = torch.randn(64, 32, p.shape[0], device=p.device, dtype=torch.bfloat16)
+    g = torch.randn(64, 32, p.shape[0], device=p.device, dtype=torch.bfloat16)
+    try:
+        with torch.inference_mode():
+            want = original(x, g)
+            got = FusedGatedRMSNorm(original)(x, g)
+        moved = ((want.float() - got.float()).abs().max() / want.float().abs().max().clamp(min=1e-6)).item()
+    except Exception as e:  # noqa: BLE001 - a replacement that cannot run here is not installed
+        applied.skipped.append(f"gated_norm left alone: {type(e).__name__}: {e}")
+        return
+    if moved > 2 * BF16_ULP:
+        applied.skipped.append(f"gated_norm left alone, disagreed by {moved:.3e} relative")
+        return
+    for parent, attribute, child in targets:
+        setattr(parent, attribute, FusedGatedRMSNorm(child))
+    applied.swaps.append(
+        Swap("gated_norm", len(targets), None, verified=f"{len(targets)} modules, agreed to {moved:.3e}")
+    )
+
+
 # --------------------------------------------------------------------------- attention
 class FlashAttention(nn.Module):
     """Attention on a variable-length kernel, in both the context pass and the branch pass.
@@ -630,6 +718,9 @@ class Qwen3MoeAdapter:
             _swap_and_verify(applied, text, "dense_matmul", None, [("fp8", Fp8Linear)], tolerance=5e-2)
         else:
             applied.skipped.append("vllm is not installed: the borrowed kernels are unavailable")
+        # Triton rather than vLLM, so it is not gated on the borrowed kernels.
+        if "gated_norm" not in _withheld():
+            _swap_gated_norm(applied, text)
 
         dropped, declined = _drop_head_duplication(text)
         if declined is None:
