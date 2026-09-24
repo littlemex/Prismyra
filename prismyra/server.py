@@ -280,3 +280,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
+
+
+if __name__ == "__main__":
+    # So that `python -m prismyra.server` works as well as the `prismyra-serve` script. Without it the module imports,
+    # defines `main`, and exits silently with a zero status -- which reads as a server that started and stopped.
+    raise SystemExit(main())
