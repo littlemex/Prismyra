@@ -98,20 +98,32 @@ def load_unembedding(model_name: str, hidden_size: int, device: str, dtype: torc
                 return min(hits, key=len)  # `lm_head.weight` over `something.lm_head.weight`
         return None
 
+    local = Path(model_name).is_dir()
+
+    def fetch(filename: str) -> str:
+        # A local checkpoint directory is read in place; the body loads from one (AutoModel accepts a path), and the
+        # read-out has to read the same files or it would score a different model's output matrix.
+        if local:
+            path = Path(model_name) / filename
+            if not path.exists():
+                raise EntryNotFoundError(f"{filename} is not in {model_name}")
+            return str(path)
+        return hf_hub_download(model_name, filename)
+
     try:
-        index_path = hf_hub_download(model_name, "model.safetensors.index.json")
+        index_path = fetch("model.safetensors.index.json")
         weight_map = json.loads(Path(index_path).read_text())["weight_map"]
     except EntryNotFoundError:
         # A checkpoint small enough to fit in one file has no index, so every key is in that one file.
         weight_map = None
 
     if weight_map is None:
-        path = hf_hub_download(model_name, "model.safetensors")
+        path = fetch("model.safetensors")
     else:
         key = pick(weight_map)
         if key is None:
             raise RuntimeError(f"{model_name} has no lm_head or embed_tokens in its index")
-        path = hf_hub_download(model_name, weight_map[key])
+        path = fetch(weight_map[key])
 
     # Opened rather than loaded: reading the file whole would materialise every tensor in the shard on the host to
     # keep one of them, which on a large mixture-of-experts is tens of gigabytes for a single matrix.
