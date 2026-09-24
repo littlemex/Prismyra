@@ -58,6 +58,14 @@ the fast kernel cannot take one, and attention drops to a memory-efficient kerne
 over ten layers against 10.9 ms. No mask is needed, because every branch's queries are the last positions of its own
 sequence.
 
+**Gated normalisation.** The gated delta net's output normalisation, `rms_norm(x) * weight * silu(gate)`, runs in thirty
+layers of every pass and was eight elementwise kernels in the framework. Profiled at 64 questions about a 5,335-token document on an
+L40S, those kernels were about 50 ms of kernel time. `FusedGatedRMSNorm` is one Triton kernel doing the same arithmetic in
+the same order -- float32 accumulation, a round to bfloat16 before the weight, another after it, the gate in float32, one
+final round -- and it agreed with the module it replaces to **0.0** on the verification input. The request went from
+792 ms to 712 ms and one question from 435 ms to 380 ms (docs/PERFORMANCE.md): more than the kernel time, because the
+launches went with them.
+
 **Dense projections.** Still behind. vLLM reaches a CUTLASS path that wants a scale layout this checkpoint does not store.
 Both kernels sit the same distance from a float32 reference (2.58e-02 against 2.64e-02), and that distance is dominated by
 quantising the activations, not by either kernel -- so the swap is not a loss of accuracy, it is a different rounding.
