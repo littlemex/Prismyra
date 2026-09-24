@@ -172,3 +172,32 @@ def test_a_question_neither_rendering_can_score_is_refused_with_both_reasons():
     table = {" alpha": [5, 6], "alpha": [5, 7], " beta": [5, 9], "beta": [5, 8]}
     with pytest.raises(QuestionError, match="cannot be scored"):
         plan(Choice(id="c", prompt="Which?", choices=["alpha", "beta"]), StubTokenizer(table))
+
+
+def test_the_unembedding_is_read_from_a_local_checkpoint_directory(tmp_path):
+    """A merged checkpoint lives in a directory, and the read-out must read that directory's matrix, not the hub's."""
+    import json
+
+    import torch
+    from safetensors.torch import save_file
+
+    from prismyra.readout import load_unembedding
+
+    head = torch.arange(12, dtype=torch.float32).view(3, 4)
+    save_file({"lm_head.weight": head, "model.embed_tokens.weight": -head}, str(tmp_path / "shard-1.safetensors"))
+    shard = "shard-1.safetensors"
+    index = {"weight_map": {"lm_head.weight": shard, "model.embed_tokens.weight": shard}}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+    got = load_unembedding(str(tmp_path), 4, "cpu", torch.float32)
+    assert torch.equal(got, head)
+
+
+def test_a_single_file_local_checkpoint_needs_no_index(tmp_path):
+    import torch
+    from safetensors.torch import save_file
+
+    from prismyra.readout import load_unembedding
+
+    head = torch.ones(2, 4)
+    save_file({"lm_head.weight": head}, str(tmp_path / "model.safetensors"))
+    assert torch.equal(load_unembedding(str(tmp_path), 4, "cpu", torch.float32), head)
