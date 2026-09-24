@@ -274,6 +274,161 @@ prismyra-bench compare --against benchmarks/results/qwen3_6_35b_a3b_fp8__rtx_pro
 | [docs/ACCURACY.md](docs/ACCURACY.md) | Whether the answers are right, on public labels, and where they are not |
 | [examples/tetris/](examples/tetris/) | A decision loop, where the representation was worth more than anything in the engine |
 
+## Try it with curl
+
+Three requests, one for each kind of context. Every response below is the real one, from the server started as below on
+one L40S -- nothing but `curl` and `base64`, and no `jq`.
+
+The last digits of a probability move between runs and the decisions do not: the reductions in a batch happen in an order
+that depends on how the work was arranged, so `0.99974` and `0.999417` are the same answer measured twice. If a **decision**
+differs from one below, that is worth reporting.
+
+```bash
+pip install "prismyra[server,fast]"
+prismyra-serve --host 127.0.0.1 --port 8000
+```
+
+`python3 -m prismyra.server` is the same thing if the script is not on your path.
+
+The first request waits for the weights to load. `curl -s localhost:8000/health` returns `{"ok":true,"depth":0}` when it
+is ready.
+
+### Text
+
+```bash
+curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
+  "context": "Returns are accepted within thirty days of delivery. Unopened items are refunded in full. Opened items are exchanged rather than refunded, unless a manufacturing fault is confirmed. Return shipping is paid by the seller when the item is faulty and by the buyer otherwise.",
+  "questions": [
+    {"id": "faulty", "prompt": "Does the seller pay return shipping on a faulty item?"},
+    {"id": "unopened", "prompt": "Are unopened items refunded in full?"},
+    {"id": "who_pays", "kind": "choice", "prompt": "Who pays return shipping when the item is not faulty?", "choices": ["seller", "buyer"]},
+    {"id": "clarity", "kind": "scale", "prompt": "How clearly is the refund policy stated?", "low": 1, "high": 5}
+  ]
+}'
+```
+
+```json
+{"answers":{
+  "faulty":   {"kind":"boolean","value":true,  "option":"yes",  "probabilities":{"no":0.046571,"yes":0.953429}},
+  "unopened": {"kind":"boolean","value":true,  "option":"yes",  "probabilities":{"no":0.073507,"yes":0.926493}},
+  "who_pays": {"kind":"choice", "value":"buyer","option":"buyer","probabilities":{"seller":0.008728,"buyer":0.991272}},
+  "clarity":  {"kind":"scale",  "value":1,     "option":"1",    "probabilities":{"1":0.315672,"2":0.246187,"3":0.175793,"4":0.11972,"5":0.142629}}},
+ "timing":{"queue_ms":0.0,"context_ms":228.6,"readout_ms":163.7,"total_ms":392.3},
+ "model":"Qwen/Qwen3.6-35B-A3B-FP8","scoring_version":1,"context_tokens":51}
+```
+
+Four questions of three kinds, one reading of the context. `context_ms` is that reading and `readout_ms` is all four
+answers together.
+
+The `clarity` answer is worth looking at rather than skipping: 0.316 on 1 against 0.246 on 2 is a preference, not a
+judgement, and this is what an uncalibrated scale looks like when the question does not really have an answer in the
+context. See [what a probability means](#what-a-probability-means).
+
+### An image
+
+The bytes go in base64, because a path would name a file on the server and a URL would make the server fetch whatever it
+is pointed at. Make a picture to try it with, or use one of your own:
+
+```bash
+python3 -c "
+import cv2, numpy as np
+image = np.full((224, 224, 3), 255, np.uint8)
+cv2.circle(image, (112, 112), 60, (60, 60, 200), -1)
+cv2.imwrite('sample.png', image)
+"
+```
+
+```bash
+IMAGE=$(base64 < sample.png | tr -d '\n')
+curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
+  "context": "The picture above is a product photograph.",
+  "images": ["'"$IMAGE"'"],
+  "questions": [
+    {"id": "round", "prompt": "Is the shape in the picture a circle?"},
+    {"id": "colour", "kind": "choice", "prompt": "What colour is the shape?", "choices": ["red", "blue", "green"]},
+    {"id": "count", "kind": "scale", "prompt": "How many shapes are in the picture?", "low": 1, "high": 5}
+  ]
+}'
+```
+
+```json
+{"answers":{
+  "round":  {"kind":"boolean","value":true, "option":"yes","probabilities":{"no":0.00866,"yes":0.99134}},
+  "colour": {"kind":"choice", "value":"red","option":"red","probabilities":{"red":0.99974,"blue":0.000155,"green":0.000104}},
+  "count":  {"kind":"scale",  "value":1,    "option":"1",  "probabilities":{"1":0.999712,"2":0.000258,"3":0.000023,"4":4e-6,"5":3e-6}}},
+ "timing":{"queue_ms":0.0,"context_ms":296.8,"readout_ms":113.5,"total_ms":410.3},
+ "model":"Qwen/Qwen3.6-35B-A3B-FP8","scoring_version":1,"context_tokens":74}
+```
+
+A red circle, one of them. `base64 < file | tr -d '\n'` rather than `base64 -w0`, because the flag that turns off
+wrapping is not the same on macOS as on Linux and the pipe is.
+
+### A video
+
+```bash
+python3 -c "
+import cv2, numpy as np
+writer = cv2.VideoWriter('sample.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 30, (224, 224))
+for i in range(90):
+    frame = np.full((224, 224, 3), 255, np.uint8)
+    x = int(i / 90 * 174)
+    colour = (60, 60, 200) if i < 60 else (200, 60, 60)
+    cv2.rectangle(frame, (x, 90), (x + 45, 135), colour, -1)
+    writer.write(frame)
+writer.release()
+"
+```
+
+Three seconds: a block crossing left to right, red for the first two thirds and blue for the last third.
+
+```bash
+CLIP=$(base64 < sample.mp4 | tr -d '\n')
+curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
+  "context": "The clip above shows a block moving across the frame.",
+  "videos": ["'"$CLIP"'"],
+  "questions": [
+    {"id": "direction", "kind": "choice", "prompt": "Which way does the block move?", "choices": ["left", "right"]},
+    {"id": "changes", "prompt": "Does the block change colour during the clip?"},
+    {"id": "ends", "kind": "choice", "prompt": "What colour is the block at the end?", "choices": ["red", "blue"]},
+    {"id": "seconds", "kind": "scale", "prompt": "How many seconds long is the clip?", "low": 1, "high": 9}
+  ]
+}'
+```
+
+```json
+{"answers":{
+  "direction":{"kind":"choice", "value":"right","option":"right","probabilities":{"left":0.012163,"right":0.987837}},
+  "changes":  {"kind":"boolean","value":true,   "option":"yes",  "probabilities":{"no":0.002985,"yes":0.997015}},
+  "ends":     {"kind":"choice", "value":"blue", "option":"blue", "probabilities":{"red":0.000752,"blue":0.999248}},
+  "seconds":  {"kind":"scale",  "value":3,      "option":"3",    "probabilities":{"1":0.03795,"2":0.122779,"3":0.692129,"4":0.113594,"5":0.019843,"6":0.009949,"7":0.002126,"8":0.000938,"9":0.000692}}},
+ "timing":{"queue_ms":0.0,"context_ms":140.5,"readout_ms":112.0,"total_ms":252.5},
+ "model":"Qwen/Qwen3.6-35B-A3B-FP8","scoring_version":1,"context_tokens":184}
+```
+
+Right, yes, blue, three seconds -- and the clip is three seconds. **The duration is the one to check**, because it is the
+question that fails when a clip is handed over as a pile of frames with its timing dropped: the model then answers about
+how many frames survived rather than how long the clip was. See [images and video](#images-and-video).
+
+### Limits, and the error you will hit first
+
+Refused before the device is touched, so a request that is too large costs the queue nothing:
+
+| | |
+|---|---|
+| `422` | no context, image or video; a question of an unknown kind; two questions with the same id; an option that is more than one token |
+| `413` | the context is longer than `--max-context-tokens`, or the media is more than the encoded-bytes limit |
+| `504` | the request waited longer than `--request-timeout` for the device |
+
+The one most people meet is `422` on an option, and the message says exactly what is wrong:
+
+```json
+{"detail":"question 'm' cannot be scored: question 'm': option 'twelve months' is 2 tokens as ' twelve months'.
+ This read-out scores a single token, so use a shorter name."}
+```
+
+The read-out scores **one token per option**, so `"twenty-four months"` is refused and on this tokenizer `"12"` is too.
+Use option names the tokenizer holds whole, and phrase the question so that short names are enough.
+
 ## Licence
 
 Apache 2.0.
