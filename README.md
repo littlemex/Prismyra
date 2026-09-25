@@ -44,6 +44,11 @@ That shape has a hard edge, and here it is as a number. On the machine in
 earns it back by amortising over questions; a single question pays the whole thing for one answer. Above four, the gap
 widens quickly, because a traversal costs the same whether it carries one question or thirty-two.
 
+The one-question row predates reading a single question together with its context in one pass, which removes the
+branch pass it used to pay for: on an L40S over HTTP, one question about a 1,245-token document went from 214 ms to
+111 ms, and about a 5,335-token document from 378 ms to 272 ms. The comparison with vLLM has not been re-measured since,
+so the crossing above is where it was measured, not where it now is.
+
 Use it for: classifying, routing, scoring or extracting many fields from the same document, transcript, ticket or page.
 Do not use it for: generating text, chat, one-off questions, or anything where the context differs per question.
 
@@ -60,8 +65,24 @@ separates them. [docs/ACCURACY.md](docs/ACCURACY.md) has the three lengths and w
 why.
 
 **The crossover is real and it is measurable on those same tasks.** RACE asks 3.9 questions per article and the read-out
-is 2.2x faster there; BoolQ asks one per passage and the read-out is **0.7x -- slower**. One question and this is the
-wrong tool, exactly as the table above says.
+is 2.2x faster there; BoolQ asks one per passage and the read-out was **0.7x -- slower**, measured before one question
+was read in one pass.
+
+**A trained read-out closes the long-context gap.** [`recipes/decision-lora`](recipes/decision-lora/) trains a LoRA on
+exactly the quantity the read-out reads and folds it into the FP8 checkpoint before serving, so the request path and its
+kernels are unchanged. The adapter it produced is published as
+[`littlemex/prismyra-decision-lora-qwen3.6-35b-a3b`](https://huggingface.co/littlemex/prismyra-decision-lora-qwen3.6-35b-a3b).
+Measured on one L40S, against the base checkpoint read the same way:
+
+| | base | with the adapter |
+|---|---|---|
+| RACE, short passages (579 questions) | 95.16 | 95.85 |
+| BoolQ (400) | 89.50 | 90.25 |
+| RACE buried in ~10k tokens (157) | 83.44 | **94.27** |
+| Kev transfer-v4 test (764) | 81.28 | 85.34 |
+
+The buried row moved by 10.8 points with an interval of [+5.1, +17.2]; the short rows are within noise. The adapter's
+card lists the training data, what was held out, and the terms of its sources.
 
 **Where it does not work is sharper than where it does.** On a task whose interesting class is rare -- LexGLUE's unfair
 terms-of-service clauses, where 1.5% of the answers are yes -- the read-out reaches 60% recall at 6% precision. It says
@@ -246,7 +267,8 @@ the context is read -- early enough to cost no device time, but not as early as 
 
 ## Supported models
 
-One, for now: `Qwen/Qwen3.6-35B-A3B-FP8`. The faster kernels are applied through a per-model adapter that checks it
+One, for now: `Qwen/Qwen3.6-35B-A3B-FP8`, with or without the decision adapter folded in -- a merged checkpoint has the
+same shapes and gets the same kernels. The faster kernels are applied through a per-model adapter that checks it
 found the number of modules it was measured against, and fails rather than quietly leaving the slow path in place.
 Another checkpoint will load and answer; it will not get the kernels until an adapter is written and measured for it.
 
@@ -259,7 +281,9 @@ total ~= 138 ms  +  92 ms x ceil(questions / 32)
 ```
 
 One question is the exception: it is read together with the context in one pass, so it costs the context pass alone.
-Both constants grow with the context length. Numbers come from
+A group's traversal is as wide as its longest question, and questions are grouped by length, so a request whose
+questions vary in length pays for less padding than one width for all of them would cost. Both constants grow with
+the context length. Numbers come from
 [`benchmarks/results/`](benchmarks/results/) and are refreshed by hand on the machine each file names --
 CI has no GPU and **cannot catch a performance regression**. On such a machine:
 
@@ -279,6 +303,7 @@ prismyra-bench compare --against benchmarks/results/qwen3_6_35b_a3b_fp8__rtx_pro
 | [docs/KERNELS.md](docs/KERNELS.md) | Each replacement, what it is worth, and what was rejected |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | How the numbers were measured and how to reproduce them |
 | [docs/ACCURACY.md](docs/ACCURACY.md) | Whether the answers are right, on public labels, and where they are not |
+| [recipes/decision-lora/](recipes/decision-lora/) | Training the read-out itself, and folding the adapter into the checkpoint before serving |
 | [examples/tetris/](examples/tetris/) | A decision loop, where the representation was worth more than anything in the engine |
 
 ## Try it with curl
@@ -287,7 +312,7 @@ Three requests, one for each kind of context. Every response below is the real o
 one L40S -- nothing but `curl` and `base64`, and no `jq`.
 
 The last digits of a probability move between runs and the decisions do not: the reductions in a batch happen in an order
-that depends on how the work was arranged, so `0.99974` and `0.999417` are the same answer measured twice. If a **decision**
+that depends on how the work was arranged, so `0.999492` and `0.99974` are the same answer measured twice. If a **decision**
 differs from one below, that is worth reporting.
 
 ```bash
@@ -324,12 +349,13 @@ curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
   "unopened": {"kind":"boolean","value":true,  "option":"yes",  "probabilities":{"no":0.073507,"yes":0.926493}},
   "who_pays": {"kind":"choice", "value":"buyer","option":"buyer","probabilities":{"seller":0.008728,"buyer":0.991272}},
   "clarity":  {"kind":"scale",  "value":1,     "option":"1",    "probabilities":{"1":0.315672,"2":0.246187,"3":0.175793,"4":0.11972,"5":0.142629}}},
- "timing":{"queue_ms":0.0,"context_ms":228.6,"readout_ms":163.7,"total_ms":392.3},
+ "timing":{"queue_ms":0.0,"context_ms":120.4,"readout_ms":148.4,"total_ms":268.8},
  "model":"Qwen/Qwen3.6-35B-A3B-FP8","scoring_version":1,"context_tokens":51}
 ```
 
 Four questions of three kinds, one reading of the context. `context_ms` is that reading and `readout_ms` is all four
-answers together.
+answers together. Ask one question instead and the response carries `"readout_ms":0.0`: a single question is read with
+the context in one pass, so the whole request is `context_ms` (111.1 ms for this context).
 
 The `clarity` answer is worth looking at rather than skipping: 0.316 on 1 against 0.246 on 2 is a preference, not a
 judgement, and this is what an uncalibrated scale looks like when the question does not really have an answer in the
@@ -364,10 +390,10 @@ curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
 
 ```json
 {"answers":{
-  "round":  {"kind":"boolean","value":true, "option":"yes","probabilities":{"no":0.00866,"yes":0.99134}},
-  "colour": {"kind":"choice", "value":"red","option":"red","probabilities":{"red":0.99974,"blue":0.000155,"green":0.000104}},
-  "count":  {"kind":"scale",  "value":1,    "option":"1",  "probabilities":{"1":0.999712,"2":0.000258,"3":0.000023,"4":4e-6,"5":3e-6}}},
- "timing":{"queue_ms":0.0,"context_ms":296.8,"readout_ms":113.5,"total_ms":410.3},
+  "round":  {"kind":"boolean","value":true, "option":"yes","probabilities":{"no":0.010961,"yes":0.98904}},
+  "colour": {"kind":"choice", "value":"red","option":"red","probabilities":{"red":0.999492,"blue":0.000314,"green":0.000194}},
+  "count":  {"kind":"scale",  "value":1,    "option":"1",  "probabilities":{"1":0.99934,"2":0.000614,"3":0.000036,"4":7e-6,"5":4e-6}}},
+ "timing":{"queue_ms":0.0,"context_ms":357.9,"readout_ms":111.1,"total_ms":469.0},
  "model":"Qwen/Qwen3.6-35B-A3B-FP8","scoring_version":1,"context_tokens":74}
 ```
 
@@ -412,7 +438,7 @@ curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
   "changes":  {"kind":"boolean","value":true,   "option":"yes",  "probabilities":{"no":0.002985,"yes":0.997015}},
   "ends":     {"kind":"choice", "value":"blue", "option":"blue", "probabilities":{"red":0.000752,"blue":0.999248}},
   "seconds":  {"kind":"scale",  "value":3,      "option":"3",    "probabilities":{"1":0.03795,"2":0.122779,"3":0.692129,"4":0.113594,"5":0.019843,"6":0.009949,"7":0.002126,"8":0.000938,"9":0.000692}}},
- "timing":{"queue_ms":0.0,"context_ms":140.5,"readout_ms":112.0,"total_ms":252.5},
+ "timing":{"queue_ms":0.1,"context_ms":139.4,"readout_ms":109.8,"total_ms":249.3},
  "model":"Qwen/Qwen3.6-35B-A3B-FP8","scoring_version":1,"context_tokens":184}
 ```
 
@@ -434,8 +460,12 @@ The one most people meet is `422` on an option, and the message says exactly wha
 
 ```json
 {"detail":"question 'm' cannot be scored: question 'm': option 'twelve months' is 2 tokens as ' twelve months'.
- This read-out scores a single token, so use a shorter name."}
+ This read-out scores a single token, so use a shorter name.; question 'm': option 'twelve months' is 3 tokens as
+ 'twelve months'. This read-out scores a single token, so use a shorter name."}
 ```
+
+Both renderings are named because both are tried: the prompt ending `Answer:` with the option scored after a space, and
+the prompt ending `Answer: ` with the bare option. A question is refused only when neither gives every option one token.
 
 The read-out scores **one token per option**, so `"twenty-four months"` is refused and on this tokenizer `"12"` is too.
 Use option names the tokenizer holds whole, and phrase the question so that short names are enough.
