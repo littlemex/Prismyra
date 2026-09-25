@@ -58,6 +58,8 @@ class Prefill:
     room: int | None = None
     position_from: int = 0
     snapshot: dict | None = field(default=None, repr=False)
+    #: Probe values from the context pass. See `prismyra.signals`.
+    signals: dict = field(default_factory=dict)
 
 
 def snapshot(cache) -> dict:

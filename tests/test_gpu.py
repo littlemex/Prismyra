@@ -759,3 +759,38 @@ def test_one_pass_refuses_a_question_wider_than_a_branch_as_the_fork_does(engine
         engine.ask(CONTEXT, [wide])
     with pytest.raises(PrismyraError), engine.open_context(CONTEXT) as opened:
         opened.ask([wide])
+
+
+def test_a_probe_reads_the_context_pass_and_changes_no_answer(engine, tmp_path):
+    """A probe loaded beside the read-out returns a value for every context and leaves every probability untouched."""
+    import json as _json
+
+    from prismyra.signals import Probe, SignalReader
+
+    decoder = getattr(engine.config, "text_config", engine.config)
+    text = getattr(engine.backbone, "language_model", engine.backbone)
+    weight = torch.linspace(-1, 1, decoder.hidden_size).tolist()
+    shape = {"hidden_size": decoder.hidden_size, "layers": len(text.layers)}
+    body = {"name": "demo", "layer": 20, "weight": weight, "bias": 0.0, "model": shape}
+    (tmp_path / "p.json").write_text(_json.dumps(body))
+    probe = Probe.load(tmp_path / "p.json")
+    probe.check(decoder.hidden_size, len(text.layers))
+    asked = questions(3)
+    with engine.open_context(CONTEXT) as opened:
+        plain = opened.ask(asked)
+    plain_one = engine.ask(CONTEXT, asked[:1])
+    was = engine.signals
+    reader = SignalReader([probe], text.layers, engine.torch_device)
+    engine.signals = reader
+    try:
+        with engine.open_context(CONTEXT) as opened:
+            probed = opened.ask(asked)
+        one = engine.ask(CONTEXT, asked[:1])
+    finally:
+        engine.signals = was
+        reader.close()
+    assert set(probed.signals) == {"demo"} and 0.0 < probed.signals["demo"] < 1.0
+    assert set(one.signals) == {"demo"}
+    for q in asked:
+        assert probed[q.id].probabilities == plain[q.id].probabilities
+    assert one[asked[0].id].probabilities == plain_one[asked[0].id].probabilities
