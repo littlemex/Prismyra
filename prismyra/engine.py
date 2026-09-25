@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -43,6 +44,7 @@ from .schema import (
     Result,
     Timing,
 )
+from .signals import Probe, SignalReader
 
 #: The widest group of questions one traversal may carry. A group of questions is answered in one pass and a request
 #: with more than this is answered in several; a request with fewer uses only as many rows as it has questions, which
@@ -320,6 +322,7 @@ class Prismyra:
         calibrate: bool = False,
         graphs: bool = False,
         paged: bool = False,
+        probes: list[str] | None = None,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -428,6 +431,16 @@ class Prismyra:
             if fast_kernels and on_cuda
             else kernels.Applied(adapter="none", skipped=[f"not applied on {self.device}"])
         )
+        #: Linear probes read from the context pass (`prismyra.signals`). None loaded means no hook is installed and the
+        #: request path is exactly what it was.
+        self.signals: SignalReader | None = None
+        if probes:
+            decoder = getattr(self.config, "text_config", self.config)
+            text = getattr(self.backbone, "language_model", self.backbone)
+            loaded = [Probe.load(path) for path in probes]
+            for probe in loaded:
+                probe.check(decoder.hidden_size, len(text.layers))
+            self.signals = SignalReader(loaded, text.layers, self.torch_device)
         #: Whether the borrowed attention kernel is in use, which decides whether the join is read in the layout it is
         #: stored in or handed to the framework's own attention as a strided view. That changes what a branch pass
         #: transiently allocates, so it changes what admission budgets.
@@ -642,7 +655,9 @@ class Prismyra:
                     cache = build_cache(
                         self.config, self.room_for(tokens) + WIDTHS[-1], 1, self.dtype, self.device, WIDTHS[-1]
                     )
-                    out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
+                    # The context's last token, the position a forked read's probe reads -- not the question's.
+                    with self._signals_at(encoded.input_ids.shape[1] - 1) as signals:
+                        out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
                     hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
                     (probabilities,) = score(hidden, self.unembedding, [planned.token_ids], None)
                     values = probabilities.tolist()
@@ -661,6 +676,7 @@ class Prismyra:
             model=self.model_name,
             context_tokens=encoded.tokens,
             scoring="raw",
+            signals=signals,
             # The question is read inside the context pass, so the whole request is `context_ms`.
             timing=Timing(context_ms=elapsed, readout_ms=0.0),
         )
@@ -771,9 +787,14 @@ class Prismyra:
                 f"{total / 1024**3:.1f} GiB is available. The context is held once, so {knobs}."
             )
 
+    def _signals_at(self, position: int):
+        """Probe values from the next forward pass at `position`, or nothing when no probe is loaded."""
+        return self.signals.capture(position) if self.signals is not None else nullcontext({})
+
     def _read(self, encoded) -> Prefill:
         cache, room = self._claim_cache(encoded.tokens)
-        self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
+        with self._signals_at(encoded.input_ids.shape[1] - 1) as signals:
+            self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
         # Read after the forward, not before: the offset is something the model works out while reading the context.
         position_from = position_offset(self.backbone, encoded.tokens) if encoded.has_media else encoded.tokens
         # The fork's state buffers are allocated here rather than on the first branch pass, and the reason is the budget
@@ -791,6 +812,7 @@ class Prismyra:
             tokens=encoded.tokens,
             last_position=torch.tensor([encoded.tokens - 1], device=self.device),
             position_from=position_from,
+            signals=signals,
         )
 
     @property
@@ -1105,6 +1127,7 @@ class Prismyra:
             context_tokens=tokens,
             scoring=self.calibration.mode if self.calibration else "raw",
             timing=Timing(context_ms=context_ms, readout_ms=readout_ms),
+            signals=dict(prefill.signals),
         )
 
     def _paged_reads(self) -> int:

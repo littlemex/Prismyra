@@ -8,7 +8,7 @@ probability of an option" -- a first-token logit, a sequence likelihood, a renor
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 #: Bumped whenever the meaning of a probability changes. Callers that store answers should store this beside them.
@@ -212,6 +212,11 @@ class Result(Mapping[str, Answer]):
     #: content-free prior subtracted first, which changes what a probability means and so travels with it.
     scoring: str = "raw"
     context_tokens: int = 0
+    #: Probe values read from the context pass (`Prismyra(probes=...)`), by probe name. Empty when none are loaded.
+    #: A property of the context rather than of any question: every result from one open context carries the same
+    #: values. A one-question `ask` reads the context inside a longer sequence, and its values differ from the forked
+    #: path's by rounding the probe amplifies (see `prismyra.signals`).
+    signals: Mapping[str, float] = field(default_factory=dict)
 
     def __getitem__(self, question_id: str) -> Answer:
         return self.answers[question_id]

@@ -86,6 +86,7 @@ def as_json(result: Result) -> dict:
         "model": result.model,
         "scoring_version": result.scoring_version,
         "context_tokens": result.context_tokens,
+        **({"signals": {k: round(v, 6) for k, v in result.signals.items()}} if result.signals else {}),
     }
 
 
