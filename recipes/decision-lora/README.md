@@ -35,6 +35,9 @@ python merge.py /path/to/Qwen3.6-35B-A3B-FP8 lora.pt /path/to/merged
 
 Then serve the merged directory like any checkpoint: `Prismyra("/path/to/merged")`.
 
+A trained adapter is published with `python export.py lora.pt <dir>` (safetensors plus a config), and `merge.py` accepts
+that directory in place of the `.pt`.
+
 ## Data
 
 Every row is rendered the way the evaluation renders it: a context, then one lettered choice or a yes/no question.

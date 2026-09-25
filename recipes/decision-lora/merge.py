@@ -2,7 +2,10 @@
 
 Usage:
 
-    python merge.py <base checkpoint dir> lora.pt <output dir>
+    python merge.py <base checkpoint dir> <adapter> <output dir>
+
+`<adapter>` is either the `.pt` that `train.py` writes, or a directory holding `adapter.safetensors` and
+`adapter_config.json` (the published form, which `export.py` writes from the `.pt`).
 
 Then serve the output directory as any other checkpoint: `Prismyra("<output dir>")`.
 
@@ -24,8 +27,12 @@ src, lora_path, dst = sys.argv[1], sys.argv[2], sys.argv[3]
 BLOCK = 128
 FP8 = torch.float8_e4m3fn
 FMAX = torch.finfo(FP8).max
-ck = torch.load(lora_path, map_location="cpu")
-lora = ck["lora"]
+if os.path.isdir(lora_path):
+    lora = load_file(os.path.join(lora_path, "adapter.safetensors"))
+    ck = json.load(open(os.path.join(lora_path, "adapter_config.json")))
+else:
+    ck = torch.load(lora_path, map_location="cpu")
+    lora = ck["lora"]
 scale = ck["alpha"] / ck["rank"]
 mods = sorted({k.rsplit(".", 1)[0] for k in lora})  # e.g. layers.3.self_attn.q_proj
 idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
