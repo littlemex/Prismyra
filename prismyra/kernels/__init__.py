@@ -120,7 +120,14 @@ def apply(model: nn.Module, config, required: bool = False) -> Applied:
     if required and applied.skipped:
         # A skip is not a failure to find modules, so `ok` stays true; it is a kernel that will not be used. Required
         # means required, and a server that asked for the kernels would rather not start than serve without them.
-        raise AdapterError(f"{adapter.name} could not apply every kernel: " + "; ".join(applied.skipped))
+        # Each skip below names which kernel and why; this line adds only the two ways out, since neither is one of
+        # them: run without the requirement, or fix what a skip says is missing and try again.
+        raise AdapterError(
+            f"{adapter.name} could not apply every kernel: "
+            + "; ".join(applied.skipped)
+            + " -- pass required=False (or drop --require-kernels) to serve without it, or install what the message"
+            " above says is missing and retry"
+        )
     return applied
 
 

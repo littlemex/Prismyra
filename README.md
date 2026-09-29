@@ -104,14 +104,14 @@ help and one figure this project published and then withdrew.
 **There is no release on PyPI**, so it installs from the repository, pinned to a tag:
 
 ```bash
-pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.2.1"                  # runs, and leaves every borrowed kernel on its fallback
-pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.2.1"             # the kernels: needs vLLM and Triton, so Linux and CUDA
+pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.2.2"                  # runs, and leaves every borrowed kernel on its fallback
+pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.2.2"             # the kernels: needs vLLM and Triton, so Linux and CUDA
 ```
 
 A clone works the same way, checked out at the same tag:
 
 ```bash
-git clone --branch v0.2.1 https://github.com/littlemex/Prismyra
+git clone --branch v0.2.2 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e .                  # runs, and leaves every borrowed kernel on its fallback
 pip install -e ".[fast]"          # the kernels: needs vLLM and Triton, so Linux and CUDA
@@ -252,7 +252,16 @@ curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
 ```
 
 `GET /stats` reports queue depth and latency, with waiting separated from working -- their fixes differ, and one latency
-figure hides which one is binding. `--require-kernels` refuses to start rather than serve at a quarter of the speed.
+figure hides which one is binding.
+
+**`--require-kernels` means every fused kernel this checkpoint's shape matches, applied.** Not "some": on the
+supported architecture, it fails the whole startup rather than serve any one of them missing, because a server that
+silently drops to a slower kernel for one replacement and not another makes `docs/KERNELS.md`'s per-kernel numbers
+describe a request that never happens. If one cannot apply -- most commonly the recurrence kernel, which needs a
+`vllm` build with its flash-linear-attention ops, and everything downstream of it -- startup fails with which kernel,
+why, and how to fix it in the message: install what is missing and retry, or drop the flag to serve at whatever speed
+is available and see it in `GET /stats`. Without the flag, a checkpoint this adapter recognises always answers, at
+the fastest set of kernels it could apply on this machine.
 
 Inside a process, put a `prismyra.queue.Worker` in front of the engine directly. One worker owns the device
 and callers queue. Requests entering the model together are correct but slow in a particular way: they share one stream,
@@ -341,7 +350,7 @@ that depends on how the work was arranged, so `0.999492` and `0.99974` are the s
 differs from one below, that is worth reporting.
 
 ```bash
-git clone --branch v0.2.1 https://github.com/littlemex/Prismyra
+git clone --branch v0.2.2 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e ".[server,fast]"
 prismyra-serve --host 127.0.0.1 --port 8000

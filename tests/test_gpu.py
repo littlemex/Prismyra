@@ -813,3 +813,19 @@ def test_one_pass_refuses_a_question_wider_than_a_branch_as_the_fork_does(engine
         engine.ask(CONTEXT, [wide])
     with pytest.raises(PrismyraError), engine.open_context(CONTEXT) as opened:
         opened.ask([wide])
+
+
+def test_require_kernels_starts_with_nothing_skipped():
+    """What `prismyra-serve --require-kernels` checks before it will answer a single request.
+
+    A separate construction from `engine` above, deliberately: `require_kernels` is a constructor argument, and
+    the thing this guards against -- a kernel that is skipped on this environment without anyone asking for that --
+    is exactly what a shared, already-built engine could not show. Loads the checkpoint a second time, on the same
+    device, at the cost this test accepts for testing what the flag is actually for.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    engine = Prismyra(MODEL, require_kernels=True)
+    applied = engine.stats()["kernels"]
+    assert applied["complete"] is True, applied
+    assert applied["skipped"] == [], applied

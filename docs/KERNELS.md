@@ -14,6 +14,25 @@ it is exact at any depth. A different total than expected means the swap matched
 missed something it should have caught, and it fails rather than leaving the slow path silently in place -- a swap
 that matches nothing looks exactly like a swap that worked.
 
+## Verifying every kernel applies, end to end
+
+`tests/test_gpu.py::test_require_kernels_starts_with_nothing_skipped` builds the engine with `require_kernels=True`
+against a real checkpoint on a real device and asserts nothing was skipped -- the regression test for this, run on
+the machine that measures. It does not install the package the way a user does, though, so the check that matters
+for a release is the same thing from a clean install:
+
+```bash
+python3 -m venv .verify && source .verify/bin/activate
+pip install "prismyra[server,fast] @ git+https://github.com/littlemex/Prismyra@<tag>"
+prismyra-serve --model <a checkpoint this adapter recognises> --require-kernels &
+curl -s localhost:8000/health   # {"ok":true,"depth":0} once the weights are loaded
+curl -s localhost:8000/stats | python3 -c 'import json,sys; print(json.load(sys.stdin)["engine"]["kernels"])'
+```
+
+`kernels.complete` should be `true` and `kernels.skipped` empty. If it is not, the message `--require-kernels` refused
+to start with says which kernel and why, and the two sections below -- particularly the note on head duplication --
+are where that reason is explained.
+
 ## What each replacement is worth
 
 Measured on one context of about 5,000 tokens. Each row is its own paired run -- the same process with and without that
@@ -45,10 +64,13 @@ through the routing index instead, so the copy never exists. This was the larges
 kernel doing the same work; it is less work.
 
 **Head duplication.** The linear-attention layer duplicates query and key from 16 heads to 32 because the value side has
-32. The recurrence handles the mismatch itself and returns a **bit-identical** result, so the duplication is work whose
-output is discarded. It is disabled by setting an attribute the layer reads only to make that decision, which is a flag
-set through a name that no longer describes its value -- so the adapter runs one layer both ways and requires the outputs
-to match exactly before applying it anywhere.
+32. The framework's own chunked-matmul fallback cannot take the two head counts as given -- it needs the duplication --
+but the borrowed recurrence kernel below can, and returns a **bit-identical** result once it is installed, so the
+duplication is then work whose output is discarded. It is disabled by setting an attribute the layer reads only to make
+that decision, which is a flag set through a name that no longer describes its value -- so the adapter installs the
+recurrence kernel first and only then runs one layer both ways, against whichever implementation will actually be
+called, and requires the outputs to match exactly before applying it anywhere. Probing before that kernel is installed
+checks the wrong implementation and fails on every measured framework version, not only a newer one.
 
 **Convolution.** Five routes were measured before the sixth worked. The framework falls back to a general
 two-dimensional convolution; `F.conv1d` with per-channel groups is 0.80x that, a token-major variant 0.43x, four scaled

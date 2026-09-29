@@ -411,10 +411,12 @@ def _borrowed_delta(where: str, what: str):
     try:
         module = importlib.import_module(f"vllm.third_party.flash_linear_attention.ops.{where}")
     except ImportError as e:
-        return None, f"vllm's flash-linear-attention is not importable: {e}"
+        fix = 'install the "fast" extra for a vllm build that includes it: pip install "prismyra[fast]"'
+        return None, f"vllm's flash-linear-attention is not importable ({e}); {fix}"
     kernel = getattr(module, what, None)
     if kernel is None:
-        return None, f"{what} is not in vllm's flash-linear-attention build"
+        fix = 'upgrade vllm: pip install -U "prismyra[fast]"'
+        return None, f"{what} is not in this vllm build's flash-linear-attention; {fix}"
     return kernel, None
 
 
@@ -725,11 +727,11 @@ class Qwen3MoeAdapter:
         if "gated_norm" not in _withheld():
             _swap_gated_norm(applied, text)
 
-        dropped, declined = _drop_head_duplication(text)
-        if declined is None:
-            applied.swaps.append(Swap("head_duplication", dropped, expected["head_duplication"]))
-        else:
-            applied.skipped.append(f"head duplication left in place: {declined}")
+        # Installed first, so the probe below tests the recurrence that will actually run rather than whatever the
+        # framework's own hub-or-fallback decorator happened to resolve to before this patched it. The borrowed
+        # kernel is a flash-linear-attention implementation and, unlike the framework's chunked-matmul fallback,
+        # accepts a query and key with fewer heads than the value they are paired with -- so probing against it is
+        # what makes head duplication provably droppable rather than merely untested against the path in use.
         withheld = _withheld()
         paths, declined = (
             (0, "withheld by PRISMYRA_WITHOUT")
@@ -744,6 +746,13 @@ class Qwen3MoeAdapter:
             )
         else:
             applied.skipped.append(f"the recurrence keeps the framework's path: {declined}")
+        dropped, declined = (
+            (0, "withheld by PRISMYRA_WITHOUT") if "head_duplication" in withheld else _drop_head_duplication(text)
+        )
+        if declined is None:
+            applied.swaps.append(Swap("head_duplication", dropped, expected["head_duplication"]))
+        else:
+            applied.skipped.append(f"head duplication left in place: {declined}")
         if not _install_conv():
             applied.skipped.append("triton is not available: the convolution keeps the framework's path")
         else:
@@ -864,16 +873,26 @@ def _swap_children(model: nn.Module, class_name: str, make) -> int:
 def _drop_head_duplication(model: nn.Module, verify: bool = True) -> tuple[int, str | None]:
     """Stop the linear-attention layers duplicating query and key, where the recurrence handles it itself.
 
-    This one is a flag set through an attribute whose name stops describing its value. On the framework version it was
-    measured against, `num_k_heads` was read in the forward pass only to decide whether to duplicate, so setting it
-    equal to `num_v_heads` disabled the duplication and changed nothing else. That is not a property of the model but
-    of one revision of somebody else's forward pass, so it is checked every time rather than assumed: one layer is run
-    both ways and the outputs must match exactly.
+    This one is a flag set through an attribute whose name stops describing its value: `num_k_heads` is read in the
+    forward pass only to decide whether to duplicate, so setting it equal to `num_v_heads` disables the duplication
+    and is meant to change nothing else. But that skips the duplication for *every* caller of the module-level
+    `chunk_gated_delta_rule`/`torch_recurrent_gated_delta_rule` names, and the framework's own chunked-matmul
+    fallback genuinely needs query and key pre-expanded to the value head count -- it multiplies them together with a
+    head dimension standing in for a batch dimension, so an un-duplicated 16-head query against a 32-head value
+    raises a plain shape error there, on every transformers version this has been measured against, not only a later
+    one. The borrowed kernel `_install_gated_delta_rule` installs in its place is a flash-linear-attention
+    implementation and, unlike that fallback, accepts the two head counts as given. So the caller matters: probed
+    after that kernel is installed, dropping the duplication is provably safe; probed before -- while the fallback is
+    still what forward() would call -- it is not, on any version, whether or not this returns a difference or an
+    outright error. Checked every time regardless, since what forward() will actually call is a fact about the
+    process rather than about the model: one layer is run both ways and the outputs must match exactly.
 
-    Returns the number of layers changed and, if none were, why. **Declining is not an error.** A later framework
-    version uses the attribute for more than that -- on transformers 5.15 the probe raises a shape mismatch rather
-    than returning a different answer -- and the right response is to leave the duplication in place and say so. It is
-    worth 8.5 ms of a 138 ms pass; refusing to run at all over it would be a poor trade.
+    Returns the number of layers changed and, if none were, why. **Declining is not an error.** Without the borrowed
+    kernel installed -- no `vllm`, or `vllm` missing its flash-linear-attention build -- forward() falls back to the
+    framework's own chunked-matmul path, which cannot take the un-duplicated shapes, and the probe raises exactly the
+    error described above. The right response is to leave the duplication in place and say so: it is worth roughly
+    6-9 ms of a 130-140 ms pass (measured both ways, one L40S), and refusing to run at all over it would be a poor
+    trade.
     """
     layers = [
         m
@@ -902,7 +921,12 @@ def _probe_head_duplication(probe: nn.Module) -> str | None:
             probe.num_k_heads = probe.num_v_heads
             after = probe(x, cache_params=None)
     except Exception as e:  # noqa: BLE001 - any failure here means the attribute now does more than gate duplication
-        return f"the head-duplication probe raised {type(e).__name__}: {e}"
+        return (
+            f"the head-duplication probe raised {type(e).__name__}: {e} -- this is the framework's own fallback "
+            f"rejecting an un-duplicated query and key, which means the borrowed recurrence kernel that can take "
+            f'them was not installed first; install the "fast" extra with a vllm build that has it '
+            f'(pip install "prismyra[fast]") for this to apply'
+        )
     finally:
         probe.num_k_heads = original
 
