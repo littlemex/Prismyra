@@ -7,7 +7,9 @@ These are the properties the whole design rests on, and each one was a real bug 
   mode is an answer that is plausible and wrong;
 * the convolution must not read across a sequence boundary;
 * skipping the head duplication must be bit-identical, since it is a flag set through an attribute whose name no longer
-  describes its value.
+  describes its value;
+* a document seen for the first time must cost what the same document costs the second time, once both have paid for
+  their shape once -- the failure mode is a benchmark that reads a width mismatch as a first-seen penalty.
 
 Run with:
 
@@ -17,7 +19,10 @@ Run with:
 
 from __future__ import annotations
 
+import itertools
 import os
+import statistics
+import time
 
 import numpy as np
 import pytest
@@ -181,6 +186,55 @@ def test_an_open_context_answers_as_a_fresh_one(engine):
     reused = engine.open_context(CONTEXT)
     assert reused.ask(asked)["thirty"].option == engine.ask(CONTEXT, asked)["thirty"].option
     assert reused.ask(asked)["thirty"].option == reused.ask(asked)["thirty"].option
+
+
+def test_a_first_seen_context_costs_no_more_than_a_repeated_one(engine):
+    """A document read for the first time must not cost more than the same document read again, once both have paid
+    for their shape once.
+
+    This is the comparison a benchmark got wrong: one script measured a document repeated and another measured a
+    document made fresh on every call, and the two scripts also defaulted to different request widths (`group`) --
+    32 against 8. Read together as "first-seen against repeated", the difference between 8 branch passes and 2 for
+    the same 64 questions looked exactly like a 1.64x penalty for novelty, and it was the width, not the freshness:
+    at a matched width, on this engine's own fixed code, a first-seen document measured 646.8-647.3 ms against
+    646.8-658.9 ms for the same one repeated -- no slower, within the run-to-run noise both directions.
+
+    A one-off nonce, not `uuid` -- this file already imports nothing that needs it, and the property under test
+    survives any content change that leaves the token count roughly where it was, so a counter serves as well as a
+    real nonce would.
+
+    Two warm-up calls before either timed run, matching what a caller who cares about latency does and what
+    `docs/PERFORMANCE.md` already says a harness must do: **"The first traversal of a shape pays for allocation and
+    kernel selection, which a served request does not."** That cost is paid once per shape, not once per document, so
+    both the repeated document and the fresh one pay it during warm-up and neither should pay it again during the
+    timed calls that follow.
+    """
+    long_context = CONTEXT * 40  # thousands of tokens, past the smallest bucket, where the benchmark ran
+    asked = questions(16)
+
+    def median_ms(build_context) -> float:
+        engine.ask(build_context(), asked)
+        engine.ask(build_context(), asked)
+        times = []
+        for _ in range(5):
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            engine.ask(build_context(), asked)
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - started) * 1000)
+        return statistics.median(times)
+
+    repeated_ms = median_ms(lambda: long_context)
+    counter = itertools.count()
+    fresh_ms = median_ms(lambda: f"[{next(counter)}]\n{long_context}")
+
+    # Half again above what the matched-width measurement above showed, for the same reason `COMPANION_MOVEMENT` sits
+    # above its own measured maximum: room for this machine's own noise without hiding a real regression.
+    assert fresh_ms <= repeated_ms * 1.15, (
+        f"a first-seen document ({fresh_ms:.1f} ms) cost more than a repeated one ({repeated_ms:.1f} ms) by more than "
+        f"15% at a matched group -- that is a real first-seen penalty, not the width mismatch this test exists to "
+        f"tell it apart from"
+    )
 
 
 def test_a_question_wider_than_the_widest_branch_is_refused_before_the_device(engine):
@@ -759,3 +813,19 @@ def test_one_pass_refuses_a_question_wider_than_a_branch_as_the_fork_does(engine
         engine.ask(CONTEXT, [wide])
     with pytest.raises(PrismyraError), engine.open_context(CONTEXT) as opened:
         opened.ask([wide])
+
+
+def test_require_kernels_starts_with_nothing_skipped():
+    """What `prismyra-serve --require-kernels` checks before it will answer a single request.
+
+    A separate construction from `engine` above, deliberately: `require_kernels` is a constructor argument, and
+    the thing this guards against -- a kernel that is skipped on this environment without anyone asking for that --
+    is exactly what a shared, already-built engine could not show. Loads the checkpoint a second time, on the same
+    device, at the cost this test accepts for testing what the flag is actually for.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    engine = Prismyra(MODEL, require_kernels=True)
+    applied = engine.stats()["kernels"]
+    assert applied["complete"] is True, applied
+    assert applied["skipped"] == [], applied

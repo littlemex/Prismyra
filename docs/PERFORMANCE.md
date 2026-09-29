@@ -1043,3 +1043,13 @@ served request does not, which is why the early samples go.
 
 It does not measure the baseline engine, the per-kernel profiles, or anything about a second GPU. Those are separate
 runs, recorded by hand, and the file says which is which.
+
+## A document seen for the first time costs no more than a repeated one
+
+A shape's first traversal pays a cost -- allocation and kernel selection -- exactly once, and that cost is paid per
+shape, the token count and the request width (`group`), not per document. So a benchmark that reads a document seen
+for the first time as slower than the same document repeated, without holding `group` fixed across both runs, is
+comparing two different request widths and calling the difference novelty rather than width.
+`tests/test_gpu.py::test_a_first_seen_context_costs_no_more_than_a_repeated_one` pins the invariant this way rather
+than as an equality: it asserts a first-seen document costs no more than a repeated one at a matched width, with
+room for ordinary run-to-run noise, not that the two are identical to the millisecond.

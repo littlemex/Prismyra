@@ -101,10 +101,17 @@ help and one figure this project published and then withdrew.
 
 ## Install
 
-**There is no release on PyPI**, so it installs from the repository:
+**There is no release on PyPI**, so it installs from the repository, pinned to a tag:
 
 ```bash
-git clone https://github.com/littlemex/Prismyra
+pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.2.2"                  # runs, and leaves every borrowed kernel on its fallback
+pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.2.2"             # the kernels: needs vLLM and Triton, so Linux and CUDA
+```
+
+A clone works the same way, checked out at the same tag:
+
+```bash
+git clone --branch v0.2.2 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e .                  # runs, and leaves every borrowed kernel on its fallback
 pip install -e ".[fast]"          # the kernels: needs vLLM and Triton, so Linux and CUDA
@@ -245,7 +252,16 @@ curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
 ```
 
 `GET /stats` reports queue depth and latency, with waiting separated from working -- their fixes differ, and one latency
-figure hides which one is binding. `--require-kernels` refuses to start rather than serve at a quarter of the speed.
+figure hides which one is binding.
+
+**`--require-kernels` means every fused kernel this checkpoint's shape matches, applied.** Not "some": on the
+supported architecture, it fails the whole startup rather than serve any one of them missing, because a server that
+silently drops to a slower kernel for one replacement and not another makes `docs/KERNELS.md`'s per-kernel numbers
+describe a request that never happens. If one cannot apply -- most commonly the recurrence kernel, which needs a
+`vllm` build with its flash-linear-attention ops, and everything downstream of it -- startup fails with which kernel,
+why, and how to fix it in the message: install what is missing and retry, or drop the flag to serve at whatever speed
+is available and see it in `GET /stats`. Without the flag, a checkpoint this adapter recognises always answers, at
+the fastest set of kernels it could apply on this machine.
 
 Inside a process, put a `prismyra.queue.Worker` in front of the engine directly. One worker owns the device
 and callers queue. Requests entering the model together are correct but slow in a particular way: they share one stream,
@@ -267,10 +283,28 @@ the context is read -- early enough to cost no device time, but not as early as 
 
 ## Supported models
 
-One, for now: `Qwen/Qwen3.6-35B-A3B-FP8`, with or without the decision adapter folded in -- a merged checkpoint has the
-same shapes and gets the same kernels. The faster kernels are applied through a per-model adapter that checks it
-found the number of modules it was measured against, and fails rather than quietly leaving the slow path in place.
-Another checkpoint will load and answer; it will not get the kernels until an adapter is written and measured for it.
+One family, for now: `Qwen/Qwen3.6-35B-A3B-FP8`, with or without the decision adapter folded in -- a merged checkpoint
+has the same shapes and gets the same kernels. The faster kernels are applied through a per-model adapter that checks
+it found the modules it was measured against, and fails rather than quietly leaving the slow path in place. What it
+checks is per-layer shape, not layer count, so a checkpoint cut down to fewer layers -- or grown to more -- still gets
+every kernel; see [docs/KERNELS.md](docs/KERNELS.md). A different architecture will load and answer; it will not get
+the kernels until an adapter is written and measured for it.
+
+Three checkpoints in this family are published with the decision adapter already folded in, at 40, 36 and 32 of the
+base model's 40 layers:
+
+| checkpoint | layers | Hugging Face |
+|---|---|---|
+| `prismyra-decision-qwen3.6-35b-a3b-fp8-40l` | 40 | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-40l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-40l) |
+| `prismyra-decision-qwen3.6-35b-a3b-fp8-36l` | 36 | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l) |
+| `prismyra-decision-qwen3.6-35b-a3b-fp8-32l` | 32 | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-32l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-32l) |
+
+The 36-layer checkpoint is the one to start with: on the five sets it is measured against it ties or clears every
+bar the 40-layer checkpoint does, while running faster. The 32-layer checkpoint is faster still, and beats both
+longer checkpoints on the two long-context sets, but is the one of the three that misses a bar (BoolQ, by a single
+question). See [recipes/decision-lora/](recipes/decision-lora/) for the per-set numbers, what each margin is worth
+against run-to-run noise, and the comparisons against other decision models and against general-purpose LLMs on the
+same questions.
 
 ## Performance
 
@@ -316,7 +350,7 @@ that depends on how the work was arranged, so `0.999492` and `0.99974` are the s
 differs from one below, that is worth reporting.
 
 ```bash
-git clone https://github.com/littlemex/Prismyra
+git clone --branch v0.2.2 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e ".[server,fast]"
 prismyra-serve --host 127.0.0.1 --port 8000

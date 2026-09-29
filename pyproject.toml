@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prismyra"
-version = "0.1.0"
+version = "0.2.2"
 description = "Read one context once, then answer many typed questions about it."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,14 +22,17 @@ classifiers = [
 
 # torch is a dependency but not pinned to a build: the wheel a user needs depends on their CUDA, and pinning one here
 # would fight their own index.
-# No upper bound on transformers, deliberately. The adapter does reach into the framework's cache classes and one model
-# module, so a release can break it -- but the measurements were taken on transformers 5.15, so a `<5` bound would
-# exclude the only version this has ever run against. The adapter fails closed instead, which is the check that matters.
+# Bounded to the range this has actually been run against: 5.15 is what every measurement in this project's history
+# -- training, evaluation, the numbers in the README and recipes -- has used, and 5.17 is the newest release `pip
+# install` resolves to today, checked directly rather than assumed. "No upper bound, the adapter fails closed instead"
+# used to be the reasoning here, and it hid a real bug for a release: failing closed on a kernel that could have been
+# made to apply is not the same as failing closed on one that genuinely cannot, and the difference is exactly what an
+# untested range cannot tell apart. The adapter still fails closed on whatever this range does not anticipate.
 # `accelerate` is what loads a model onto a named device; omitting it makes the documented CUDA path fail on a clean
 # install.
 dependencies = [
   "torch>=2.4",
-  "transformers>=4.57",
+  "transformers>=5.15,<5.18",
   "accelerate>=0.26",
   "safetensors>=0.4",
   "numpy>=1.24",

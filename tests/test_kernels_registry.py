@@ -55,18 +55,37 @@ def test_a_wrong_count_fails_closed():
 
 
 def test_the_qwen_adapter_claims_only_the_configuration_it_was_measured_on():
-    """The family name is not enough. Another checkpoint in the same family has different counts, and an adapter that
-    claimed it would mutate the model and only then refuse it, leaving a half-replaced model behind."""
+    """The family name is not enough. Another checkpoint in the same family has different per-layer shapes, and an
+    adapter that claimed it would mutate the model and only then refuse it, leaving a half-replaced model behind."""
     from prismyra.kernels.qwen3_moe import MEASURED_CONFIG
 
-    measured = FakeConfig(architectures=["Qwen3_5MoeForConditionalGeneration"], **MEASURED_CONFIG)
+    measured = FakeConfig(architectures=["Qwen3_5MoeForConditionalGeneration"], num_hidden_layers=40, **MEASURED_CONFIG)
     adapter = kernels.find(measured)
     assert adapter is not None and adapter.name == "qwen3-moe"
 
-    assert kernels.find(FakeConfig(architectures=["LlamaForCausalLM"], **MEASURED_CONFIG)) is None
+    assert kernels.find(FakeConfig(architectures=["LlamaForCausalLM"], num_hidden_layers=40, **MEASURED_CONFIG)) is None
 
-    bigger = dict(MEASURED_CONFIG, num_hidden_layers=48)
-    assert kernels.find(FakeConfig(architectures=["Qwen3_5MoeForConditionalGeneration"], **bigger)) is None
+    wrong_shape = dict(MEASURED_CONFIG, num_attention_heads=32)
+    assert (
+        kernels.find(
+            FakeConfig(architectures=["Qwen3_5MoeForConditionalGeneration"], num_hidden_layers=40, **wrong_shape)
+        )
+        is None
+    )
+
+
+def test_a_truncated_or_extended_checkpoint_still_matches():
+    """Depth is how many layers there are, not what one layer looks like. A checkpoint cut down to fewer layers, or
+    grown to more, still gets the fused kernels as long as every per-layer shape matches what was measured -- this
+    is what makes a truncated checkpoint serve at full speed with no override."""
+    from prismyra.kernels.qwen3_moe import MEASURED_CONFIG
+
+    for depth in (32, 36, 40, 48):
+        truncated = FakeConfig(
+            architectures=["Qwen3_5MoeForConditionalGeneration"], num_hidden_layers=depth, **MEASURED_CONFIG
+        )
+        adapter = kernels.find(truncated)
+        assert adapter is not None and adapter.name == "qwen3-moe"
 
 
 def test_applied_reports_what_it_did_without_carrying_timings():
