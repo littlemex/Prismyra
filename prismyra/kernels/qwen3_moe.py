@@ -28,10 +28,13 @@ REQUIRED_VLLM = (
 )
 
 #: The configuration these replacements were measured against, read from the checkpoint. Checked before anything is
-#: touched, because it is what makes the module counts below correct. Note the two key-value heads: this family's
-#: linear-attention layers carry 32 value heads and there are 16 attention heads, and neither is this number.
+#: touched, because it is what makes the module counts below correct. Depth is deliberately absent from this dict:
+#: every entry here is a per-layer shape, and cutting or growing the stack changes how many layers there are, not
+#: what any one of them looks like. `expected_counts` already reads the decoder's own `num_hidden_layers` for the
+#: former, so a checkpoint with fewer or more layers than this one still gets the fused kernels. Note the two
+#: key-value heads: this family's linear-attention layers carry 32 value heads and there are 16 attention heads, and
+#: neither is this number.
 MEASURED_CONFIG = {
-    "num_hidden_layers": 40,
     "num_experts": 256,
     "num_experts_per_tok": 8,
     "num_attention_heads": 16,
