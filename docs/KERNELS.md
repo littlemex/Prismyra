@@ -4,9 +4,15 @@ Prismyra does not own the model's forward pass. The framework's implementation s
 replaced inside it. That is deliberate: it keeps the original available as the reference every replacement was verified
 against, so a change does not remove its own oracle.
 
-An adapter declares which architectures it handles and how many modules of each kind it expects. A different number means
-a different model, and it fails rather than leaving the slow path silently in place -- a swap that matches nothing looks
-exactly like a swap that worked.
+An adapter declares which architectures it handles, and two separate things are checked before it touches anything.
+First, whether this checkpoint's *shape* is the one the adapter was measured against -- expert count, attention heads,
+key-value heads, and nothing that depends on how many layers there are. A checkpoint cut down to fewer layers, or
+grown to more, still has the same per-layer shape, so it still matches: depth is deliberately absent from this check.
+Second, once a swap runs, how many modules it actually replaced -- and that total *is* layer-count-dependent (one
+routed-expert block per layer, for instance), computed from the checkpoint's own layer count rather than assumed, so
+it is exact at any depth. A different total than expected means the swap matched something it should not have, or
+missed something it should have caught, and it fails rather than leaving the slow path silently in place -- a swap
+that matches nothing looks exactly like a swap that worked.
 
 ## What each replacement is worth
 
