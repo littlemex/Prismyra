@@ -18,6 +18,9 @@ Prefill only: nothing here generates text. The scope, and the point below which 
 are stated in the README.
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _installed_version
+
 from .engine import Batch, Context, Prismyra, Shelf
 from .schedule import Batcher
 from .schema import (
@@ -37,7 +40,13 @@ from .schema import (
 from .temperature import Temperature
 from .thresholds import Thresholds
 
-__version__ = "0.1.0"
+try:
+    __version__ = _installed_version("prismyra")
+except PackageNotFoundError:
+    # Running from a source checkout with no distribution installed, editable or otherwise -- there is no metadata
+    # to read. pyproject.toml is the one place a version number is written; inventing a second one here that could
+    # fall out of step with it is the failure this replaced.
+    __version__ = "0+unknown"
 
 __all__ = [
     "SCORING",

@@ -131,6 +131,39 @@ def test_the_endpoint_accepts_a_request_body_over_real_http():
         prismyra.Prismyra = real
 
 
+def test_the_served_version_is_the_package_version():
+    """`create_app` passes `__version__` to FastAPI once, at construction, so a caller reading the OpenAPI document
+    -- or anything built against it -- sees the same number `import prismyra` does, not a copy that can drift from
+    it."""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    import prismyra
+    from prismyra.server import create_app
+
+    class StubEngine:
+        model_name = "stub"
+        group = 32
+        tokenizer = None
+
+        def cache_bytes(self, tokens):
+            return tokens * 1024
+
+        def stats(self):
+            return {"model": "stub"}
+
+    real = prismyra.Prismyra
+    prismyra.Prismyra = lambda *a, **k: StubEngine()
+    try:
+        app = create_app("stub/model")
+        assert app.version == prismyra.__version__ == "0.2.1"
+        client = TestClient(app)
+        assert client.get("/openapi.json").json()["info"]["version"] == prismyra.__version__
+    finally:
+        prismyra.Prismyra = real
+
+
 def test_an_image_arrives_as_bytes_and_reaches_the_engine():
     """Base64 rather than a path or a URL: a path names a file on the server, and a URL sends the server fetching.
 
