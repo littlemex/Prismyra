@@ -795,8 +795,13 @@ catch, which is that the clip's timing reached the model at all. `tests/test_gpu
 The same diagnosis still applies, one layer down. What remains is launch count, and the routes to it are ordered by what
 they cost to build:
 
-* **the convolution kernel covers only the context pass.** A branch pass arrives as many rows and keeps the framework's
-  path, which is recorded where it is installed and is the next cheap thing to look at.
+* **the convolution kernel covers the branch pass too.** A branch pass arrives as one row per question, and the
+  framework's general convolution was 16.4 ms of a 64-question request (36 layers, a 5,304-token first-seen document,
+  one L40S). The rows are now laid end to end and each token is told where its row began, so no row reads another's
+  state. On this path the kernel rounds as the framework does -- the sum stored in bfloat16, then the activation -- and
+  the result is **bit-identical**: race150's 579 answers through the fork agreed to 0.0 on every probability. 64
+  questions went from 627.0 / 627.5 ms to 615.9 / 614.4 (two runs each, alternated), 16 from 350 to 347, and one
+  question is unchanged because it never forks.
 * **CUDA graphs are shipped, behind `Prismyra(graphs=True)`.** The earlier note said a recording faulted on replay and
   the reason was never found. The reason was what was being recorded: capturing `ask` fails immediately --
   `cudaErrorStreamCaptureInvalidated` -- because the read-out converts probabilities to host values and the suffix ids

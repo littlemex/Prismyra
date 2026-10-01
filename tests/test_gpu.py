@@ -829,3 +829,26 @@ def test_require_kernels_starts_with_nothing_skipped():
     applied = engine.stats()["kernels"]
     assert applied["complete"] is True, applied
     assert applied["skipped"] == [], applied
+
+
+def test_the_branch_convolution_is_bit_identical_to_the_framework():
+    """The branch pass's convolution runs on the Triton kernel, one row per question laid end to end, and rounds as the
+    framework does (the sum stored in bfloat16, then the activation). Bit-identical, not close: race150 answered with it
+    and without it agreed to 0.0 on every probability, and this pins the operator that made that true."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    import torch.nn.functional as F
+
+    from prismyra.kernels.conv import available, causal_depthwise_conv1d
+
+    if not available():
+        pytest.skip("triton is not available")
+    torch.manual_seed(0)
+    for rows, length in ((32, 103), (16, 67), (1, 500)):
+        x = (torch.randn(rows, 8192, length, device="cuda") * 2).to(torch.bfloat16)
+        w = (torch.randn(8192, 4, device="cuda") * 0.5).to(torch.bfloat16)
+        expected = F.silu(F.conv1d(x, w.unsqueeze(1), None, padding=3, groups=8192)[:, :, :length])
+        flat = x.transpose(1, 2).reshape(rows * length, 8192)
+        starts = (torch.arange(rows * length, device="cuda", dtype=torch.int32) // length) * length
+        got = causal_depthwise_conv1d(flat, w, seq_starts=starts, activation="silu", round_first=True)
+        assert torch.equal(got.view(rows, length, 8192).transpose(1, 2), expected), (rows, length)

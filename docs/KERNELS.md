@@ -111,6 +111,11 @@ Recorded because they are cheap to re-propose:
   11 ms before subtracting the cost of reconstructing scales.
 - **Dequantising to bfloat16.** Worth 21 ms on the dense projections and **-38 ms on the experts**, so a net loss. The
   part with enough arithmetic per byte wants narrow weights; the part without pays for the conversion.
+- **Reading the branch's attention without the join.** A branch's queries against the shared context and against
+  its own tokens, as two kernel calls merged by their softmax normalisers, removes the per-row copy of the context
+  (29 ms of a 64-question request on an L40S) and was worth a further 17 ms. It is not bit-identical -- each half
+  rounds its output before the merge -- and on race150 it moved two of 579 answers, one probability by 0.44, which
+  is outside what the device tests allow a companion question to move. Not shipped.
 - **CUDA graphs.** One recording works (83.9 ms to 51.7); a second in the same process faults on replay and the reason was
   never found. Not shipped.
 

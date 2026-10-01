@@ -39,6 +39,7 @@ if triton is not None:
         so_c,
         HAS_STARTS: tl.constexpr,
         SILU: tl.constexpr,
+        ROUND_FIRST: tl.constexpr,
         BLOCK_T: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
@@ -66,6 +67,11 @@ if triton is not None:
             wj = tl.load(w_ptr + offs_c * sw_c + j * sw_j, mask=mask_c, other=0.0).to(tl.float32)
             acc += x * wj[None, :]
 
+        if ROUND_FIRST:
+            # The framework's order: the convolution's sum is stored in the input dtype, and the activation is
+            # applied to that stored value and stored again. Two roundings rather than one, kept on request so a
+            # replacement can answer exactly as the path it replaces.
+            acc = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
         if SILU:
             acc = acc * tl.sigmoid(acc)
         tl.store(
@@ -87,6 +93,7 @@ def causal_depthwise_conv1d(
     activation: str | None = "silu",
     block_t: int = 64,
     block_c: int = 128,
+    round_first: bool = False,
 ) -> torch.Tensor:
     """`x` is (tokens, channels), `weight` is (channels, width). Returns (tokens, channels).
 
@@ -119,6 +126,7 @@ def causal_depthwise_conv1d(
         out.stride(1),
         HAS_STARTS=seq_starts is not None,
         SILU=activation in ("silu", "swish", True),
+        ROUND_FIRST=round_first,
         BLOCK_T=block_t,
         BLOCK_C=block_c,
     )

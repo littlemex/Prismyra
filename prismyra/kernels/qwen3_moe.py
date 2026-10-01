@@ -595,6 +595,20 @@ def _tag_conv_weights(model: nn.Module) -> int:
     return tagged
 
 
+_ROW_STARTS: dict[tuple[int, int, str], torch.Tensor] = {}
+
+
+def _row_starts(rows: int, length: int, device) -> torch.Tensor:
+    """For rows of equal length laid end to end, the position each token's own row began at. Cached per shape, since
+    a branch pass asks for the same one in every recurrent layer."""
+    key = (rows, length, str(device))
+    starts = _ROW_STARTS.get(key)
+    if starts is None:
+        starts = (torch.arange(rows * length, device=device, dtype=torch.int32) // length) * length
+        _ROW_STARTS[key] = starts
+    return starts
+
+
 def _install_conv() -> bool:
     """Route the layer's convolution through the Triton kernel, by replacing a name in the framework's own module.
 
@@ -621,8 +635,26 @@ def _install_conv() -> bool:
         # the original, which is the implementation those cases were written for.
         if not _measured_conv(weight):
             return original(x, weight, bias, activation=activation, **kwargs)
-        if bias is not None or x.dim() != 3 or x.shape[0] != 1 or not x.is_cuda:
+        if bias is not None or x.dim() != 3 or not x.is_cuda:
             return original(x, weight, bias, activation=activation, **kwargs)
+        if x.shape[0] != 1:
+            # A branch pass: one row per question, each row its own sequence -- the `kernel - 1` tokens of state the
+            # framework prepended, then that branch's own tokens. The rows are laid end to end and each token is told
+            # where its row began, so no row reads another's tail. Before this the framework's general convolution
+            # ran here, 16 ms of a 64-question request on an L40S (docs/PERFORMANCE.md).
+            if varlen.current() is not None or kwargs.get("cu_seq_lens_q") is not None:
+                return original(x, weight, bias, activation=activation, **kwargs)
+            rows, channels, length = x.shape
+            flat = x.transpose(1, 2).reshape(rows * length, channels)
+            starts = _row_starts(rows, length, x.device)
+            out = causal_depthwise_conv1d(
+                flat,
+                weight,
+                seq_starts=starts,
+                activation=activation if activation is not None else "silu",
+                round_first=True,
+            )
+            return out.view(rows, length, channels).transpose(1, 2)
         tokens_major = x.squeeze(0).t()
         if not tokens_major.is_contiguous():
             tokens_major = tokens_major.contiguous()
@@ -758,8 +790,8 @@ class Qwen3MoeAdapter:
         else:
             applied.swaps.append(Swap("convolution", _tag_conv_weights(text), expected["convolution"]))
             applied.notes.append(
-                "the convolution kernel covers the context pass; a branch pass arrives as many rows and keeps the "
-                "framework's path"
+                "the convolution kernel covers the context pass and the branch pass; on a branch pass it rounds as "
+                "the framework's convolution does, so a branch answers bit-identically to the path it replaced"
             )
         return applied
 
