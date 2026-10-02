@@ -261,6 +261,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="refuse to start without the faster kernels rather than serving at a quarter of the speed",
     )
+    parser.add_argument(
+        "--no-short-graphs",
+        action="store_true",
+        help="read every single-question request eagerly instead of replaying the startup recordings; frees the "
+        "device memory they hold (about 1.7 GiB on the supported model) and starts faster",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -277,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         max_questions=args.max_questions,
         max_video_frames=args.max_video_frames,
         require_kernels=args.require_kernels,
+        **({"short_graphs": False} if args.no_short_graphs else {}),
     )
     uvicorn.run(app, host=args.host, port=args.port)
     return 0

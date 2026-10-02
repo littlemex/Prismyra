@@ -315,7 +315,10 @@ total ~= 138 ms  +  92 ms x ceil(questions / 32)
 ```
 
 One question is the exception: it is read together with the context in one pass, so it costs the context pass alone.
-A group's traversal is as wide as its longest question, and questions are grouped by length, so a request whose
+Up to 2,048 tokens of context and question, that pass is replayed from a recording taken at start-up, with the same
+probabilities to the bit as reading it eagerly: on an L40S, twenty single-question routing prompts went from 98 ms to
+45 ms each over HTTP, for 1.7 GiB of device memory (`short_graphs=False` or `prismyra-serve --no-short-graphs` turns
+it off; see [docs/PERFORMANCE.md](docs/PERFORMANCE.md#one-short-question-recorded)). A group's traversal is as wide as its longest question, and questions are grouped by length, so a request whose
 questions vary in length pays for less padding than one width for all of them would cost. Both constants grow with
 the context length. Numbers come from
 [`benchmarks/results/`](benchmarks/results/) and are refreshed by hand on the machine each file names --

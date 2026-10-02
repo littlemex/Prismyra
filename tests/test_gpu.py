@@ -815,6 +815,39 @@ def test_one_pass_refuses_a_question_wider_than_a_branch_as_the_fork_does(engine
         opened.ask([wide])
 
 
+def test_a_short_question_replays_exactly_as_it_reads_eagerly(engine):
+    """The one-pass recordings must change nothing but the time: the same probabilities, to the bit, as the eager read.
+
+    Not a tolerance. A replay pads the request to a bucket, and the only reason that can be exact is that every
+    projection whose algorithm depends on the row count runs as an island at the real row count -- which is the thing
+    this test exists to catch going wrong. A near-tie at 0.44 against 0.54 changed its answer when the router's
+    projection alone was recorded at the padded length, so equality is the bar. Several lengths, so that more than one
+    bucket and more than one amount of padding are exercised.
+    """
+    graphs = engine.stats()["short_graphs"]
+    if not graphs:
+        pytest.skip("the one-pass recordings are not taken on this engine")
+    assert graphs["buckets"] and not graphs["declined"], graphs
+    assert all(moved == 0.0 for moved in graphs["proved"].values()), graphs["proved"]
+    q = Choice(
+        id="opened",
+        prompt="What happens to an opened item?\nA. Refunded\nB. Exchanged\nC. Kept",
+        choices=["A", "B", "C"],
+    )
+    held = engine._one_pass
+    for copies in (1, 2, 5, 9):
+        context = " ".join([CONTEXT] * copies)
+        before = sum(engine.stats()["short_graphs"]["replays"].values())
+        replayed = engine.ask(context, [q])
+        assert sum(engine.stats()["short_graphs"]["replays"].values()) == before + 1, "the request did not replay"
+        engine._one_pass = None
+        try:
+            eager = engine.ask(context, [q])
+        finally:
+            engine._one_pass = held
+        assert replayed[q.id].probabilities == eager[q.id].probabilities, copies
+
+
 def test_require_kernels_starts_with_nothing_skipped():
     """What `prismyra-serve --require-kernels` checks before it will answer a single request.
 
