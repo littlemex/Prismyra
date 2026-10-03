@@ -15,6 +15,7 @@ import sys
 
 import pytest
 import torch
+from gpu_room import no_room_reason
 
 pytestmark = pytest.mark.gpu
 
@@ -47,6 +48,9 @@ def test_cold_starts_with_an_empty_triton_cache_answer_bit_identically(tmp_path)
 
     gc.collect()
     torch.cuda.empty_cache()
+    reason = no_room_reason(MODEL, __file__)
+    if reason:
+        pytest.skip(reason)
     runs = []
     for start in range(STARTS):
         env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path / f"triton-{start}"))

@@ -11,6 +11,7 @@ import os
 
 import pytest
 import torch
+from gpu_room import no_room_reason
 
 from prismyra import Prismyra
 
@@ -29,12 +30,10 @@ def test_require_kernels_starts_with_nothing_skipped():
     """
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device")
-    try:
-        engine = Prismyra(MODEL, require_kernels=True)
-    except torch.OutOfMemoryError:
-        # Only when another engine in this process still holds the weights (this file run in the same session as one
-        # that keeps an engine alive). Run alone, it has the card to itself.
-        pytest.skip("another engine in this process holds the weights; run this file on its own")
+    reason = no_room_reason(MODEL, __file__)
+    if reason:
+        pytest.skip(reason)
+    engine = Prismyra(MODEL, require_kernels=True)
     applied = engine.stats()["kernels"]
     assert applied["complete"] is True, applied
     assert applied["skipped"] == [], applied
