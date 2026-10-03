@@ -923,6 +923,80 @@ model with a term missing or a term assumed constant, and none was a kernel beha
   serve every context length** rather than one per open context -- which is the difference between a session workload
   getting 3.7x and every workload getting it.
 
+## One short question, recorded
+
+A single question about a short text is the one-pass read, and on the supported model that read is **host-bound**.
+Profiled on an L40S with the 36-layer checkpoint at 232 tokens of context plus question: 92 ms of wall clock, 39.9 ms
+of kernel time, 2,564 kernel launches. At 781 tokens the kernel time is 62.1 ms and the wall clock is still about the
+same, which is why a single question cost about 97 ms whatever its length. The kernels themselves were not the
+problem -- the routed experts are 28.4 of the 39.9 ms and read every expert's weights once -- so the read is now
+recorded per length bucket at start-up and replayed (`prismyra/onepass.py`, on by default where the one-pass path
+runs; `short_graphs=False` or `prismyra-serve --no-short-graphs` turns it off).
+
+Measured on one L40S, the 36-layer checkpoint, two warm-ups and five repetitions of every request:
+
+| | before | after |
+|---|---|---|
+| 20 routing prompts (18 to 567 context tokens), in Python, median | 97.7 ms | **43.4 ms** |
+| the same, p90 | 98.2 ms | 51.5 ms |
+| the same over HTTP through `prismyra-serve`, median | 98.1 ms | **44.7 ms** |
+| the same over HTTP, p90 | 99.1 ms | 53.1 ms |
+| RACE, 579 questions each asked alone, median | 96.3 ms | **45.9 ms** |
+| decisions changed, of 579 + 20 + 100 over HTTP | | **0** |
+| largest probability movement | | **0.0** |
+
+**Zero, not within a tolerance.** Every probability is the same float as before, which is the bar this was held to
+from the start and is also the only bar that is honest here: one of the twenty routing prompts sits at 0.44 against
+0.54, and anything short of identical arithmetic moves it.
+
+What it costs: 1.7 GiB of device memory for 24 buckets from 64 to 2,048 tokens (admission subtracts it from what it
+counts as available), and about 15 s of start-up to record and prove them. A request longer than 2,048 tokens reads
+eagerly, as before.
+
+### Padding is causal and the libraries are not
+
+A recording has one shape, so a request is right-padded to its bucket and read at its last real token. Every layer is
+causal, so a padded token cannot reach a real one through the model. That argument is correct and **it was not
+enough**: the first version padded and recorded the whole pass, its proof on a random probe passed with a
+disagreement of exactly zero for all thirteen buckets, and on the routing prompts it changed four answers.
+
+The cause was the router. Its projection is a bf16 `F.linear`, and the library chooses the algorithm by the number of
+rows: the same 581 rows multiplied as the head of 640 come back with different bits in some logits, one rounding step,
+which moves a token's experts and, on the 0.44 against 0.54 prompt, the answer. The probe missed it because a
+reduction in a different order almost always rounds to the same bfloat16, so equal outputs on random rows are weak
+evidence of an equal algorithm. A scan of every projection on random rows at every length up to 2,048 confirmed that:
+it reported buckets as matching where real activations then disagreed in two rows of 65.
+
+The fix is to not record those projections at all. A **piecewise** recording ends a capture at each projection whose
+algorithm depends on the row count -- the bf16 `nn.Linear` calls, which on this model are the router, the shared
+expert's gate and the recurrence's two small input projections, 126 calls a pass -- runs it eagerly on exactly the
+request's real rows, which is the call the eager path makes, and copies the result into the buffer the next recorded
+piece reads. Everything between them is block-quantised Triton, attention, the recurrence and elementwise work, which
+compute each row the same way however many rows there are, and that is proved rather than assumed: each bucket is
+replayed at the shortest and the longest length it serves and compared bit for bit with the eager read, and a bucket
+that differs in one bit is not kept. None did.
+
+A pass is 127 recorded pieces and 126 islands, so a replay still runs about five milliseconds of Python. That is under
+the kernel time of the pieces between islands, so the host stays ahead of the device and the replay costs what its
+kernels cost: 41.3 ms at 232 tokens against 39.9 ms of kernel time.
+
+Two things did not survive measurement on the way:
+
+* **a stream per bucket.** The caching allocator keeps what a stream frees for that stream, so each recording's warm-up
+  pass left its activations reserved on a stream nothing would use again: 24 buckets held 8.9 GiB. One stream for all
+  of them: 1.7 GiB.
+* **island inputs held per bucket.** A graph keeps nothing alive, so the first piecewise version held every island's
+  input for every bucket, 126 tensors at each length. All buckets now share one staging buffer for island inputs and
+  one output buffer per island, because buckets never replay at once.
+
+The router change also removes work from the eager path: `FusedExperts` used to call the framework's router module,
+which computes a softmax, a top-k and a renormalisation that `fused_topk` then computes again. It now takes the
+router's projection directly -- the first line of the same forward, so the same bits -- and the duplicate is gone.
+
+What is left is the kernels. At 232 tokens the routed experts are 71% of the pass and read every expert's weights,
+which is a bandwidth floor rather than a launch cost; the remaining lever on short requests is a smaller checkpoint,
+not a faster runtime.
+
 ## What a recording can and cannot outlive
 
 A recording is worth 32.5 ms against 114, so the question of how long one lasts is the question of how often that

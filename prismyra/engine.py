@@ -17,7 +17,7 @@ import torch
 if TYPE_CHECKING:  # pragma: no cover - the framework's cache type, for the annotation only
     from transformers.cache_utils import Cache
 
-from . import kernels, varlen
+from . import kernels, onepass, varlen
 from .cache import build_cache, cache_bytes, join_bytes_per_token
 from .calibration import Calibration
 from .fork import (
@@ -320,6 +320,7 @@ class Prismyra:
         calibrate: bool = False,
         graphs: bool = False,
         paged: bool = False,
+        short_graphs: bool | None = None,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -436,6 +437,18 @@ class Prismyra:
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
         # measured question rather than an obvious one -- `evals/run.py` compares the two.
         self.calibration = Calibration() if calibrate else None
+        #: The one-pass read of a short request, recorded per length bucket. On by default wherever the one-pass path
+        #: is the path a single question takes -- CUDA with the borrowed kernels, no calibration, no paged storage --
+        #: because that read is host-bound at short lengths and a replay removes the wait (docs/PERFORMANCE.md). The
+        #: memory it holds is measured when it is taken and admission counts it, which is what keeping the branch
+        #: recordings off by default was protecting.
+        self._one_pass = None
+        wanted = short_graphs if short_graphs is not None else (on_cuda and self._borrowed_kernel)
+        if wanted:
+            if not on_cuda:
+                raise PrismyraError(f"short_graphs records CUDA graphs and this engine is on {self.device}")
+            if not (calibrate or paged):
+                self._one_pass = onepass.record_all(self, self._pad_id(), self._read_one_pass)
 
     # ------------------------------------------------------------------ public
     def validate(self, questions: list[Question]) -> None:
@@ -631,30 +644,29 @@ class Prismyra:
         with self._lock:
             encoded = encode(context, None, None, self.processor, self.tokenizer, self.device)
             tokens = encoded.tokens + len(suffix)
-            self._check_fits(tokens)
+            bucket = self._one_pass.bucket_for(tokens) if self._one_pass is not None else None
+            if bucket is None:
+                # A replay needs no admission: everything it touches was allocated when it was recorded.
+                self._check_fits(tokens)
             start = _now(self.torch_device)
-            before = self._peak_baseline()
+            before = None if bucket is not None else self._peak_baseline()
             try:
                 with torch.inference_mode():
                     ids = torch.cat([encoded.input_ids, torch.tensor([suffix], device=self.device)], dim=1)
-                    # One row. The branch room is kept at its usual size rather than zero, because the attention layer
-                    # sizes its context room as the total minus the branch room; at one row it is a few megabytes.
-                    cache = build_cache(
-                        self.config, self.room_for(tokens) + WIDTHS[-1], 1, self.dtype, self.device, WIDTHS[-1]
-                    )
-                    out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
-                    hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
+                    if bucket is not None:
+                        hidden = onepass.replay(bucket, ids, self._pad_id())
+                    else:
+                        hidden = self._read_one_pass(ids)
                     (probabilities,) = score(hidden, self.unembedding, [planned.token_ids], None)
                     values = probabilities.tolist()
-                    # Released here, inside the lock: the output holds the cache, and the next request must not find
-                    # this one's memory still allocated when it is admitted.
-                    del out, cache, hidden, ids
+                    del hidden, ids
             except torch.OutOfMemoryError as e:
                 raise PrismyraError(
                     f"ran out of memory reading a context of {encoded.tokens} tokens with its question; a shorter "
                     f"context is the only knob"
                 ) from e
-            self._observe_reading(before, tokens)
+            if before is not None:
+                self._observe_reading(before, tokens)
             elapsed = _since(start, self.torch_device)
         return Result(
             answers={question.id: _answer_for(question, values)},
@@ -664,6 +676,33 @@ class Prismyra:
             # The question is read inside the context pass, so the whole request is `context_ms`.
             timing=Timing(context_ms=elapsed, readout_ms=0.0),
         )
+
+    def _read_one_pass(self, ids: torch.Tensor) -> torch.Tensor:
+        """The eager one-pass read: one row of context and question, the hidden state at its last token.
+
+        Its own method because two things must run exactly this: a request no recording holds, and the proof each
+        recording is held to (`onepass.prove`), which compares a replay against it.
+        """
+        tokens = ids.shape[1]
+        # One row. The branch room is kept at its usual size rather than zero, because the attention layer sizes its
+        # context room as the total minus the branch room; at one row it is a few megabytes.
+        cache = build_cache(self.config, self.room_for(tokens) + WIDTHS[-1], 1, self.dtype, self.device, WIDTHS[-1])
+        with torch.inference_mode():
+            out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
+            hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
+        # Released before returning, inside the caller's lock: the output holds the cache, and the next request must
+        # not find this one's memory still allocated when it is admitted.
+        del out, cache
+        return hidden
+
+    def _pad_id(self) -> int:
+        """What a recorded one-pass read is padded with. Any token will do -- nothing after the last real token reaches
+        it, and each bucket is proved on that -- so the tokenizer's own pad token, or the end of text without one."""
+        for name in ("pad_token_id", "eos_token_id"):
+            value = getattr(self.tokenizer, name, None)
+            if isinstance(value, int):
+                return value
+        return 0
 
     def ask_many(self, requests: list[Request]) -> list[Result | PrismyraError]:
         """Answer several independent requests. One request failing does not fail the others.
@@ -702,6 +741,9 @@ class Prismyra:
             "graphs_verified": dict(self.verified_recordings),
             "graphs_replays": dict(self.replays),
             "graphs_cost": dict(self.replay_cost),
+            # The one-pass recordings: which buckets serve, how often each has, what proving each measured and what
+            # they hold. Empty when the one-pass read runs eagerly.
+            "short_graphs": self._one_pass.stats() if self._one_pass is not None else {},
             "caches_allocated": self._made_caches,
             # Measured on this engine rather than derived, and zero until a question has been answered. Reported
             # because it is the number that decides how many contexts can be answered at once, and it is several times
@@ -740,6 +782,11 @@ class Prismyra:
         # device and can hand out without asking again, and loading these weights leaves that pool large -- so asking
         # the device alone refused an 18,000-token context that had 9 GiB waiting for it inside the process.
         spare = torch.cuda.memory_reserved(self.torch_device) - torch.cuda.memory_allocated(self.torch_device)
+        # Less what the one-pass recordings hold: their private pool is reserved and mostly unallocated between
+        # replays, and none of it can be handed to a read. The figure is the whole growth of the reservation while they
+        # were taken, so it also counts tensors already outside `spare`; refusing a little early is the safe direction.
+        if self._one_pass is not None:
+            spare -= self._one_pass.held_bytes
         free += max(0, spare)
         if wanted >= free:
             phase = "reading it" if reading >= answering else f"answering at group={self.group}"

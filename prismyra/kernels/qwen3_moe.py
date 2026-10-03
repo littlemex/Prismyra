@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from .. import varlen
+from ..onepass import rows_exact
 from . import Applied, Swap, register
 from .conv import available as triton_available
 from .conv import causal_depthwise_conv1d, starts_from_boundaries
@@ -96,12 +97,19 @@ class FusedExperts(nn.Module):
             w2_scale=experts.down_proj_scale_inv.to(torch.float32),
         )
 
+    def _route(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x, self.gate.weight)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
 
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
-        logits, _, _ = self.gate(x)  # the original router, so the same experts are chosen
+        # The original router's projection, so the same experts are chosen: `F.linear` on its weight is the first
+        # line of its forward, and the rest of that forward -- a softmax, a top-k and a renormalisation -- is what
+        # `fused_topk` does here again, so calling the module computed it twice and threw one away. Through
+        # `rows_exact` because this projection picks its algorithm by row count (see `prismyra.onepass`).
+        logits = rows_exact(self._route, x)
         weights, ids = fused_topk(x, logits, self.top_k, renormalize=True)[:2]
         routed = fused_experts(x, self.w1, self.w2, weights, ids, quant_config=self.quant)
         shared = torch.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
