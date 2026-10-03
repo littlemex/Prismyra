@@ -160,6 +160,9 @@ class Answer:
     value: object
     option: str
     probabilities: Mapping[str, float]
+    #: The registered head that produced `probabilities` (see `prismyra.heads`), or None when the model's own output
+    #: embedding did, as `SCORING` describes. A head's probabilities are its own softmax, not that definition.
+    read_by: str | None = None
 
 
 @dataclass(frozen=True)

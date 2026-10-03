@@ -26,6 +26,10 @@ So a probability here is a **relative preference among the options you offered**
 Nothing is trained. The read-out is the model's own output embedding used as a reader instead of a writer, so answers are
 zero-shot: there is no head to fit and nothing to fine-tune.
 
+The one exception is opt-in and named in every answer it touches: an option-set head (docs/HEADS.md) answers the
+questions that declare its set of options with its own fitted softmax, and such an answer has `read_by` set to the
+head's name. An answer with `read_by` of `None` is read exactly as defined here.
+
 ## Two things refused rather than answered wrongly
 
 Both raise at construction, never at inference:

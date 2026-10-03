@@ -33,6 +33,7 @@ from .fork import (
     snapshot,
 )
 from .graphs import keeping_pays, pays_from, record
+from .heads import Heads
 from .media import Encoded, encode, position_offset
 from .readout import load_unembedding, plan, score
 from .schema import (
@@ -320,6 +321,7 @@ class Prismyra:
         calibrate: bool = False,
         graphs: bool = False,
         paged: bool = False,
+        heads: str | list | None = None,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -436,6 +438,9 @@ class Prismyra:
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
         # measured question rather than an obvious one -- `evals/run.py` compares the two.
         self.calibration = Calibration() if calibrate else None
+        #: Learned read-outs registered by option list (see `prismyra.heads`). A question whose options match none of
+        #: them is read from the output embedding exactly as without heads.
+        self.heads = Heads(heads, self.hidden_size, self.device)
 
     # ------------------------------------------------------------------ public
     def validate(self, questions: list[Question]) -> None:
@@ -644,7 +649,9 @@ class Prismyra:
                     )
                     out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
                     hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
-                    (probabilities,) = score(hidden, self.unembedding, [planned.token_ids], None)
+                    (probabilities,) = self.heads.apply(
+                        hidden, [question.options], score(hidden, self.unembedding, [planned.token_ids], None)
+                    )
                     values = probabilities.tolist()
                     # Released here, inside the lock: the output holds the cache, and the next request must not find
                     # this one's memory still allocated when it is admitted.
@@ -657,7 +664,7 @@ class Prismyra:
             self._observe_reading(before, tokens)
             elapsed = _since(start, self.torch_device)
         return Result(
-            answers={question.id: _answer_for(question, values)},
+            answers={question.id: _answer_for(question, values, self.heads.name_for(question.options))},
             model=self.model_name,
             context_tokens=encoded.tokens,
             scoring="raw",
@@ -997,7 +1004,8 @@ class Prismyra:
         with self._lock, torch.inference_mode():
             try:
                 hidden = self._branch_across(prefills, counts, rows_for, [p.text for p in plans], width)
-                probabilities = score(hidden, self.unembedding, [p.token_ids for p in plans], None)
+                read = score(hidden, self.unembedding, [p.token_ids for p in plans], None)
+                probabilities = self.heads.apply(hidden, [q.options for q in flat], read)
             finally:
                 # Whether it answered or raised, no row is set up to read anything now, so a document nobody is
                 # reading can be dropped. In a `finally`: a failed pass must not leave a shelf unable to drop anything.
@@ -1010,7 +1018,7 @@ class Prismyra:
         results, at = [], 0
         for handle, questions in enumerate(asked):
             answers = {
-                q.id: _answer_for(q, values.tolist())
+                q.id: _answer_for(q, values.tolist(), self.heads.name_for(q.options))
                 for q, values in zip(questions, probabilities[at : at + len(questions)], strict=True)
             }
             at += len(questions)
@@ -1078,11 +1086,15 @@ class Prismyra:
                     # recording the pass can pay for itself.
                     same_shape_left = sum(1 for m, w in groups[n + 1 :] if len(m) == len(members) and w == group_width)
                     hidden = self._branch(prefill, chunk, len(chunk), group_width, remaining=same_shape_left)
-                    scored = score(
+                    scored = self.heads.apply(
                         hidden,
-                        self.unembedding,
-                        [token_ids[i] for i in members],
-                        [priors[i] for i in members] if priors else None,
+                        [questions[i].options for i in members],
+                        score(
+                            hidden,
+                            self.unembedding,
+                            [token_ids[i] for i in members],
+                            [priors[i] for i in members] if priors else None,
+                        ),
                     )
                     by_index.update(zip(members, scored, strict=True))
                 probabilities = [by_index[i] for i in range(len(questions))]
@@ -1098,7 +1110,10 @@ class Prismyra:
             self._observe_peak(before, tokens, widest_chunk)
         readout_ms = _since(start, self.torch_device)
 
-        answers = {q.id: _answer_for(q, p.tolist()) for q, p in zip(questions, probabilities, strict=True)}
+        answers = {
+            q.id: _answer_for(q, p.tolist(), self.heads.name_for(q.options))
+            for q, p in zip(questions, probabilities, strict=True)
+        }
         return Result(
             answers=answers,
             model=self.model_name,
@@ -1406,8 +1421,10 @@ class Prismyra:
         return hidden
 
 
-def _answer_for(question: Question, values: list[float]) -> Answer:
-    """One question's answer from its probabilities, in its declared option order. Shared by every path that answers."""
+def _answer_for(question: Question, values: list[float], read_by: str | None = None) -> Answer:
+    """One question's answer from its probabilities, in its declared option order. Shared by every path that answers.
+
+    `read_by` names the head that produced the probabilities, or is None when the output embedding did."""
     best = max(range(len(values)), key=lambda i: values[i])
     option = question.options[best]
     return Answer(
@@ -1416,6 +1433,7 @@ def _answer_for(question: Question, values: list[float]) -> Answer:
         value=question.value_of(option),
         option=option,
         probabilities=dict(zip(question.options, values, strict=True)),
+        read_by=read_by,
     )
 
 
