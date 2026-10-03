@@ -862,3 +862,94 @@ def test_require_kernels_starts_with_nothing_skipped():
     applied = engine.stats()["kernels"]
     assert applied["complete"] is True, applied
     assert applied["skipped"] == [], applied
+
+
+
+HEAD_OPTIONS = ["seller", "buyer"]
+HEAD_BIAS = [2.0, -1.0]
+NOT_HEADED = [
+    Boolean(id="returnable", prompt="Can an opened item be returned for a refund?"),
+    Choice(id="three", prompt="Who pays return shipping for a faulty item?", choices=["seller", "buyer", "courier"]),
+    Choice(id="other", prompt="Who pays return shipping for a faulty item?", choices=["seller", "courier"]),
+]
+HEADED = Choice(id="pays", prompt="Who pays return shipping for a faulty item?", choices=HEAD_OPTIONS)
+#: The same set declared in the other order: answered by the head, with its probabilities in this question's order.
+HEADED_SWAPPED = Choice(id="swapped", prompt="Who pays return shipping for a faulty item?", choices=HEAD_OPTIONS[::-1])
+
+
+def _heads_for(engine, tmp_path):
+    """A head that ignores the hidden state (zero weights, a fixed bias), so the probabilities it gives are known."""
+    import json
+
+    from safetensors.torch import save_file
+
+    from prismyra.heads import Heads
+
+    weights = {"W": torch.zeros(2, engine.hidden_size), "b": torch.tensor(HEAD_BIAS)}
+    save_file(weights, str(tmp_path / "pays.safetensors"))
+    (tmp_path / "heads.json").write_text(
+        json.dumps([{"name": "who-pays", "options": HEAD_OPTIONS, "form": "linear", "weights": "pays.safetensors"}])
+    )
+    return Heads(str(tmp_path / "heads.json"), engine.hidden_size, engine.device)
+
+
+def _with_heads(engine, heads, answer):
+    saved = engine.heads
+    try:
+        engine.heads = heads
+        return answer()
+    finally:
+        engine.heads = saved
+
+
+def _check_heads(before, after):
+    expected = torch.softmax(torch.tensor(HEAD_BIAS), dim=-1).tolist()
+    for q in NOT_HEADED:
+        assert after[q.id].probabilities == before[q.id].probabilities, q.id   # bit-identical, not merely close
+        assert after[q.id].read_by is None
+    for q in (HEADED, HEADED_SWAPPED):
+        got = after[q.id]
+        assert before[q.id].read_by is None and got.read_by == "who-pays"
+        assert [got.probabilities[o] for o in HEAD_OPTIONS] == pytest.approx(expected, abs=1e-6)
+        assert got.option == "seller"
+
+
+def test_a_head_answers_only_its_option_list_and_leaves_every_other_question_bit_identical(engine, tmp_path):
+    """Registering a head must not move any question whose options it does not name: one question in one pass, and
+    several questions in a fork."""
+    heads = _heads_for(engine, tmp_path)
+    for answer in (
+        lambda: {q.id: engine.ask(CONTEXT, [q])[q.id] for q in [*NOT_HEADED, HEADED, HEADED_SWAPPED]},
+        lambda: engine.ask(CONTEXT, [*NOT_HEADED, HEADED, HEADED_SWAPPED]),
+    ):
+        _check_heads(answer(), _with_heads(engine, heads, answer))
+
+
+def test_a_head_in_a_batch_across_documents_moves_nothing_else(engine_paged, tmp_path):
+    """The same, on the path that answers about several documents in one pass."""
+    heads = _heads_for(engine_paged, tmp_path)
+    cards = [Boolean(id="cash", prompt="Can a gift card be exchanged for cash?")]
+
+    def answer():
+        with engine_paged.open_batch([CONTEXT, SECOND_CONTEXT]) as batch:
+            return batch.ask([[*NOT_HEADED, HEADED, HEADED_SWAPPED], cards])
+
+    before, after = answer(), _with_heads(engine_paged, heads, answer)
+    _check_heads(before[0], after[0])
+    assert after[1]["cash"].probabilities == before[1]["cash"].probabilities
+
+
+def test_recorded_hidden_states_are_the_ones_the_read_out_scores(engine):
+    """`record_hidden` must hand a head the very state the output embedding reads: scoring a recorded row with the
+    option tokens' embedding rows has to give back the probabilities the engine answered with."""
+    from prismyra.heads import record_hidden
+    from prismyra.readout import plan
+
+    with record_hidden(engine, HEADED.options) as rec:
+        one = engine.ask(CONTEXT, [HEADED])[HEADED.id]
+        fork = engine.ask(CONTEXT, [*NOT_HEADED, HEADED])[HEADED.id]
+    assert len(rec.rows) == 2
+    ids = plan(HEADED, engine.tokenizer).token_ids
+    for h, answered in zip(rec.rows, (one, fork), strict=True):
+        p = torch.softmax(h @ engine.unembedding[ids].float().cpu().t(), dim=-1).tolist()
+        assert p == pytest.approx([answered.probabilities[o] for o in HEADED.options], abs=1e-6)

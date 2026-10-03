@@ -74,6 +74,7 @@ def as_json(result: Result) -> dict:
                 "value": a.value,
                 "option": a.option,
                 "probabilities": {k: round(v, 6) for k, v in a.probabilities.items()},
+                **({"read_by": a.read_by} if a.read_by is not None else {}),
             }
             for a in result.values()
         },
@@ -267,6 +268,11 @@ def main(argv: list[str] | None = None) -> int:
         help="read every single-question request eagerly instead of replaying the startup recordings; frees the "
         "device memory they hold (about 1.7 GiB on the supported model) and starts faster",
     )
+    parser.add_argument(
+        "--heads",
+        default=None,
+        help="a JSON spec of option-set heads (see prismyra.heads); questions whose options match none are unaffected",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -284,6 +290,7 @@ def main(argv: list[str] | None = None) -> int:
         max_video_frames=args.max_video_frames,
         require_kernels=args.require_kernels,
         **({"short_graphs": False} if args.no_short_graphs else {}),
+        heads=args.heads,
     )
     uvicorn.run(app, host=args.host, port=args.port)
     return 0

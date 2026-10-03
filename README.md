@@ -277,6 +277,11 @@ is not calibrated and it is not comparable across different option sets. There i
 `result.scoring_version` travels with the numbers; store it if you store answers. Full statement:
 [docs/READOUT.md](docs/READOUT.md).
 
+A question you ask on every request can instead be answered by an option-set head: a small learned read-out over the
+same hidden state, registered for one set of options and used only by questions that declare exactly that set. Every
+other question is read as above, bit for bit, and each answer's `read_by` says which read produced it. See
+[docs/HEADS.md](docs/HEADS.md).
+
 Two things are refused rather than answered wrongly: an option that is more than one token with a leading space, and two
 options whose first token is the same. Both need the model's tokenizer, so they are refused by `engine.validate` before
 the context is read -- early enough to cost no device time, but not as early as construction.
@@ -337,6 +342,7 @@ prismyra-bench compare --against benchmarks/results/qwen3_6_35b_a3b_fp8__rtx_pro
 |---|---|
 | [docs/FORK.md](docs/FORK.md) | How one context serves many questions, and the asymmetry it rests on |
 | [docs/READOUT.md](docs/READOUT.md) | What a probability is, exactly |
+| [docs/HEADS.md](docs/HEADS.md) | A learned read-out for one option set, used only by the questions that declare that set |
 | [docs/KERNELS.md](docs/KERNELS.md) | Each replacement, what it is worth, and what was rejected |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | How the numbers were measured and how to reproduce them |
 | [docs/ACCURACY.md](docs/ACCURACY.md) | Whether the answers are right, on public labels, and where they are not |
