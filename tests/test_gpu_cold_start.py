@@ -41,6 +41,12 @@ print(json.dumps({"answers": answers, "raced": raced, "autotune": engine.stats()
 def test_cold_starts_with_an_empty_triton_cache_answer_bit_identically(tmp_path):
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device")
+    # Each start is a separate process and needs the card's memory. In a session that ran test_gpu.py first, the
+    # engines there are gone but this process's allocator may still hold their blocks; hand them back to the device.
+    import gc
+
+    gc.collect()
+    torch.cuda.empty_cache()
     runs = []
     for start in range(STARTS):
         env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path / f"triton-{start}"))
