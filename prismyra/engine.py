@@ -33,6 +33,7 @@ from .fork import (
     snapshot,
 )
 from .graphs import keeping_pays, pays_from, record
+from .kernels.autotune import pin as pin_autotunes
 from .media import Encoded, encode, position_offset
 from .readout import load_unembedding, plan, score
 from .schema import (
@@ -320,6 +321,7 @@ class Prismyra:
         calibrate: bool = False,
         graphs: bool = False,
         paged: bool = False,
+        pin_autotune: bool = True,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -436,6 +438,10 @@ class Prismyra:
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
         # measured question rather than an obvious one -- `evals/run.py` compares the two.
         self.calibration = Calibration() if calibrate else None
+        #: Every timing-based Triton autotuner in the process held to one configuration (see `kernels.autotune`), so
+        #: that answers do not depend on which candidate happened to win the race at a process's first call. Last,
+        #: after every kernel this engine uses has been imported and verified.
+        self.autotune = pin_autotunes(self.torch_device, enabled=pin_autotune)
 
     # ------------------------------------------------------------------ public
     def validate(self, questions: list[Question]) -> None:
@@ -692,6 +698,7 @@ class Prismyra:
             "device": self.device,
             "group": self.group,
             "kernels": self.applied.as_dict(),
+            "autotune": self.autotune.as_dict(),
             "scoring": self.calibration.mode if self.calibration else "raw",
             "storage": "paged" if self.paged else "joined",
             # Counted by the layers themselves rather than taken from the flag. A previous version of the paged path
