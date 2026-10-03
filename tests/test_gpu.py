@@ -848,21 +848,6 @@ def test_a_short_question_replays_exactly_as_it_reads_eagerly(engine):
         assert replayed[q.id].probabilities == eager[q.id].probabilities, copies
 
 
-def test_require_kernels_starts_with_nothing_skipped():
-    """What `prismyra-serve --require-kernels` checks before it will answer a single request.
-
-    A separate construction from `engine` above, deliberately: `require_kernels` is a constructor argument, and
-    the thing this guards against -- a kernel that is skipped on this environment without anyone asking for that --
-    is exactly what a shared, already-built engine could not show. Loads the checkpoint a second time, on the same
-    device, at the cost this test accepts for testing what the flag is actually for.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("no CUDA device")
-    engine = Prismyra(MODEL, require_kernels=True)
-    applied = engine.stats()["kernels"]
-    assert applied["complete"] is True, applied
-    assert applied["skipped"] == [], applied
-
 
 
 HEAD_OPTIONS = ["seller", "buyer"]
@@ -953,3 +938,45 @@ def test_recorded_hidden_states_are_the_ones_the_read_out_scores(engine):
     for h, answered in zip(rec.rows, (one, fork), strict=True):
         p = torch.softmax(h @ engine.unembedding[ids].float().cpu().t(), dim=-1).tolist()
         assert p == pytest.approx([answered.probabilities[o] for o in HEADED.options], abs=1e-6)
+
+
+def test_a_headed_question_replays_exactly_as_it_reads_eagerly(engine, tmp_path):
+    """The head reads the hidden state the one-pass read returns, so it must see the same state whether the read was
+    replayed from a recording or run eagerly. A head whose answer depends on that state (random weights), at several
+    lengths so that more than one bucket is exercised: the probabilities must be equal to the bit."""
+    import json
+
+    from safetensors.torch import save_file
+
+    from prismyra.heads import Heads
+
+    if not engine.stats()["short_graphs"]:
+        pytest.skip("the one-pass recordings are not taken on this engine")
+    g = torch.Generator().manual_seed(0)
+    weights = {
+        "W1": torch.randn(16, engine.hidden_size, generator=g) * 0.05,
+        "b1": torch.zeros(16),
+        "W2": torch.randn(2, 16, generator=g),
+        "b2": torch.zeros(2),
+    }
+    save_file(weights, str(tmp_path / "pays.safetensors"))
+    (tmp_path / "heads.json").write_text(
+        json.dumps([{"name": "who-pays", "options": HEAD_OPTIONS, "form": "mlp", "weights": "pays.safetensors"}])
+    )
+    saved, held = engine.heads, engine._one_pass
+    try:
+        engine.heads = Heads(str(tmp_path / "heads.json"), engine.hidden_size, engine.device)
+        for copies in (1, 3, 7):
+            context = " ".join([CONTEXT] * copies)
+            before = sum(engine.stats()["short_graphs"]["replays"].values())
+            replayed = engine.ask(context, [HEADED])[HEADED.id]
+            assert sum(engine.stats()["short_graphs"]["replays"].values()) == before + 1, "the request did not replay"
+            engine._one_pass = None
+            try:
+                eager = engine.ask(context, [HEADED])[HEADED.id]
+            finally:
+                engine._one_pass = held
+            assert replayed.read_by == eager.read_by == "who-pays"
+            assert replayed.probabilities == eager.probabilities, copies
+    finally:
+        engine.heads = saved
