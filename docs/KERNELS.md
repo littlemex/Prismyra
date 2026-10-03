@@ -33,6 +33,35 @@ curl -s localhost:8000/stats | python3 -c 'import json,sys; print(json.load(sys.
 to start with says which kernel and why, and the two sections below -- particularly the note on head duplication --
 are where that reason is explained.
 
+## The same answer in every process: autotuned kernels are pinned
+
+Several kernels on the read path are Triton kernels with `triton.autotune`: the first call in a process times each
+candidate configuration and keeps the fastest. When candidates are close, the winner is decided by timing noise, and
+some candidates do not compute the same floating-point sums. On an L40S, the flash-linear-attention kernel that inverts
+the gated-delta layers' triangular blocks (`merge_16x16_to_64x64_inverse_kernel`) picks `num_warps=2` on about one cold
+start in five and `num_warps=4` otherwise, and the two give probabilities up to 0.59 apart on single questions --
+identical code, weights, driver and card, answering differently from one process to the next.
+
+So at start the engine holds every autotuner in the process to one configuration and clears any choice already made
+(`prismyra.kernels.autotune`). The configuration comes from a file per GPU generation shipped with the package,
+`prismyra/kernels/pinned/sm_<major><minor>.json`, which names each kernel's configuration and says how it was chosen.
+A generation with no file, or a kernel the file does not name, keeps its **first** declared candidate: still the same
+in every process, possibly not the fastest, and listed under `engine.stats()["autotune"]["fallback"]`. Pinning is on
+by default; `Prismyra(..., pin_autotune=False)` turns it off.
+
+The right configuration depends on the generation, which is why it is data. On an RTX PRO 4500 (sm_120) the same
+inverse kernel's timing picks `num_warps=2` every time, and there 2 and 4 give the same outputs; and the FP8 block
+linear's `num_stages=4`, the fastest at the branch's shape, needs more shared memory than that card has at longer
+shapes, so its table names `num_stages=2`. An entry must be valid for every shape the kernel sees -- the cold-start
+test (`tests/test_gpu_cold_start.py`) runs the read path and fails on a configuration the card cannot launch.
+
+On an L40S, pinned and unpinned answer at the same speed (median 94.8-95.0 ms against 96.0-96.6 ms over 400
+questions, two cold starts each), and the pinned engine no longer spends the first call timing candidates.
+
+To add a generation: run the read path once with pinning off and an empty `TRITON_CACHE_DIR`, take each kernel's
+fastest configuration from the cache's `*.autotune.json` records (summed over the keys it recorded), check it is valid
+at every shape, write the file, and run the cold-start test.
+
 ## What each replacement is worth
 
 Measured on one context of about 5,000 tokens. Each row is its own paired run -- the same process with and without that

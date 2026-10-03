@@ -1,0 +1,47 @@
+{
+ "measured_on": "NVIDIA RTX PRO 4500 Blackwell Server Edition (sm_120), driver 580.178.04, Triton 3.7.1, vLLM 0.27.1. Flash-linear-attention kernels: the fastest summed time over the keys a cold start of the chunked gated-delta kernel at the model's shapes recorded. w8a8_block_dynamic_fp8_matmul_kernel keeps no timing records; two cold starts chose num_stages=4 for the branch-sized key (M=16) and num_stages=2 for longer inputs; num_stages=4 needs 160 KiB of shared memory at the longer shapes, above this card's 99 KiB, so the entry is num_stages=2, valid for every shape.",
+ "kernels": {
+  "chunk_fwd_kernel_o": {
+   "kwargs": {
+    "BK": 64,
+    "BV": 32
+   },
+   "num_stages": 2,
+   "num_warps": 2
+  },
+  "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": {
+   "kwargs": {
+    "BV": 64
+   },
+   "num_stages": 3,
+   "num_warps": 4
+  },
+  "chunk_local_cumsum_scalar_kernel": {
+   "kwargs": {},
+   "num_stages": 3,
+   "num_warps": 1
+  },
+  "chunk_scaled_dot_kkt_fwd_kernel": {
+   "kwargs": {
+    "BK": 64
+   },
+   "num_stages": 4,
+   "num_warps": 8
+  },
+  "merge_16x16_to_64x64_inverse_kernel": {
+   "kwargs": {},
+   "num_stages": 2,
+   "num_warps": 2
+  },
+  "recompute_w_u_fwd_kernel": {
+   "kwargs": {},
+   "num_stages": 3,
+   "num_warps": 4
+  },
+  "w8a8_block_dynamic_fp8_matmul_kernel": {
+   "kwargs": {},
+   "num_stages": 2,
+   "num_warps": 8
+  }
+ }
+}
