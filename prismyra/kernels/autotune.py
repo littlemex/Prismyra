@@ -101,7 +101,11 @@ def autotuners() -> list:
         from triton.runtime.autotuner import Autotuner
     except ImportError:
         return []
-    return [o for o in gc.get_objects() if isinstance(o, Autotuner)]
+    # Asking every object in the process its type touches lazily deprecated attributes of other libraries (torch's
+    # `distributed.reduce_op` warns when it is so much as looked at); those warnings are about them, not about this.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return [o for o in gc.get_objects() if isinstance(o, Autotuner)]
 
 
 def pin_all(tuners, table: dict[str, dict]) -> tuple[dict[str, str], dict[str, str]]:
