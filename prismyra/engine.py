@@ -1874,60 +1874,86 @@ def _load_processor(model: str):
 
 
 def _enable_batch_invariance() -> None:
-    """Make the plain bf16 projections row-independent, process-wide, the way vLLM already ships for exactly this.
+    """Make the operations that actually move with a pass's row count row-independent -- no more of them.
 
     Found decisively (`diag_layer0_op_divergence.py`): a document read alongside two companions of identical
     length but entirely different content was bit-identical through every layer-0 operation except one -- the
     router's own `F.linear(x, self.gate.weight)` inside `kernels.qwen3_moe.FusedExperts._route`. That one op's
     result for a real row moved with the pass's total row count, the row-count-chosen-GEMM-algorithm effect
     `onepass.py`'s islands already defend against during a *recording* (`rows_exact`) but nothing defends against
-    during an ordinary read or branch pass.
+    during an ordinary read or branch pass. `kernels.qwen3_moe._ROUTER_LINEAR` calls vLLM's `linear_batch_invariant`
+    directly at `_route`'s one call site, and `fused_experts`' own kernel gets `VLLM_BATCH_INVARIANT=1` (set below)
+    so its tile-size choice stops keying on `M` too (`fused_moe.py`'s own guard, independent of any dispatcher
+    override). 2026-10-05's first attempt stopped here ("ルーターのみ") and found 2/80 real-document mismatches
+    left (largest move 0.189) -- not from attention or shared-expert projections as first suspected (that
+    diagnosis was from a single synthetic two-document companion pair, which `diag_full_inventory_op_divergence.py`
+    and `diag_all_layers_real_mismatch_padded.py` later showed does not generalise), but from the borrowed
+    chunked gated-delta-rule kernel (`vllm.third_party.flash_linear_attention`) itself: on the real mismatching
+    batch (RACE validation, batch 4 of the 80-document benchmark), layer 0's `linear_attn` block alone moved by
+    0.0039 between a solo read and the real 8-document batch with router+tiling already fixed -- before the
+    router, before any MoE op, inside the recurrence this engine depends on for its batching to be fast at all.
 
-    2026-10-05 tried narrowing this to just that one call site (THROUGHPUT.md's "ルーターのみの batch-invariant"):
-    `kernels.qwen3_moe._ROUTER_LINEAR` calls vLLM's `linear_batch_invariant` directly at `_route`'s one call site
-    (kept below, it is correct and free), and `fused_experts`' own kernel still gets `VLLM_BATCH_INVARIANT=1` so
-    its tile-size choice stops keying on `M` too (`fused_moe.py`'s own guard, independent of the dispatch-level
-    override). Measured against the full RACE validation set the same way the full fix was
-    (`diag_openbatch_vs_ask.py`, 80 documents, 11 batches): **2 mismatches, largest probability move 0.189** --
-    router and MoE-tiling invariance alone are not enough. The layer-0 diagnostic that found the router was the
-    only row-dependent op was run on one companion pair at one pair of lengths; `onepass._chooses_by_rows` already
-    says *why* this should generalise rather than surprise -- every plain bf16 `nn.Linear` in the decoder picks its
-    GEMM algorithm by row count, not just the router's, and the two documents that moved exercised attention or
-    shared-expert projections the narrower layer-0 check never companioned. Narrowing the fix does not survive
-    contact with the full benchmark, so the process-wide override stays. (The router's direct call stays too: it
-    costs nothing extra now that the override reaches the same op anyway, and it stops this one call site's
-    correctness from depending on some other engine in the process having been constructed `paged=True` first --
-    see `enable_batch_invariant_mode`'s global, idempotent, order-sensitive flag.)
+    Two candidates were measured head-to-head at full scale (`diag_isolate_invariance_lever_combined.py` for the
+    single-layer signal, `diag_openbatch_vs_ask_modes.py` for the decisive 80-document/11-batch count):
+    disabling TF32 and bf16/fp16 reduced-precision matmul reduction closed layer 0's gap (0.0039 -> 0.0) but
+    *reopened* it at layer 4 once checked across all 40 layers on the real batch -- a precision change shrinks the
+    chunk-boundary reduction-order effect enough to round to zero at shallow layers, not remove it, so it does not
+    survive the full benchmark (still 2/80 mismatches). Registering vLLM's fixed-tile Triton matmul on
+    `aten::mm`/`addmm`/`matmul`/`linear` (`enable_batch_invariant_mode`'s dispatcher step, SM80-family path) does
+    survive it: 0/80 mismatches, confirming the borrowed kernel's inter-chunk state carry runs through one of
+    those four ops. `enable_batch_invariant_mode()` does three more things this does not need: monkeypatching
+    `torch.bmm` (measured alone: still 0.0039, no effect on this kernel), the TF32/reduced-precision flags just
+    shown insufficient alone and unneeded once the dispatcher override is in, and preferring the `cublaslt` BLAS
+    backend. None of the three changed the measured 0/80 result when added or removed alongside the dispatcher
+    registration, so this function registers only the dispatcher override plus the MoE tiling env var, rather
+    than calling `enable_batch_invariant_mode()`/`init_batch_invariance()` wholesale.
 
-    Calling `enable_batch_invariant_mode()` alone was not enough on its own either: it replaces
-    `aten::linear`/`mm`/`addmm`/`matmul`/`bmm`/`softmax`/`mean` for the whole process with a fixed-tile Triton
-    implementation that does not choose its algorithm by row count, which closed the context-read mismatch
-    completely but left one open on the *branch* pass -- `fused_experts`' own Triton MoE kernel is called
-    directly, not through `aten::`, so the dispatcher-level override cannot reach it. vLLM's `fused_moe.py` has
-    its own guard for exactly this (`if envs.VLLM_BATCH_INVARIANT: ...` picks a fixed config instead of one keyed
-    by `M`), gated on the environment variable rather than the in-process flag `enable_batch_invariant_mode()`
-    sets. `envs.VLLM_BATCH_INVARIANT` reads `os.environ` fresh on every access (vLLM's own lazy `envs.py`
-    pattern), so setting it here before calling `init_batch_invariance()` (which checks that variable itself, and
-    also disables TF32 and pins the cuBLAS workspace config) reaches both the dispatcher-level override and this
-    second, separate guard. Found by a test this fix is shipped with
-    (`test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length`): without the environment
-    variable, a document asked two questions, batched with a one-question companion, had its own probabilities
-    move even with `enable_batch_invariant_mode()` already on -- `_round_rows` buckets a solo pass's two rows and
-    a batched pass's three rows to two different row counts (2 and 4), and the router being batch-invariant does
-    not help if `fused_experts`' *own* kernel still picks its tiling by which of those two it was called with.
+    Measured cost against the full five-lever version (`docs/PERFORMANCE.md`-style sweep, `diag_solo_document_cost.py`
+    and the `open_batch` documents=8/16/32, group=64 sweep): unchanged within measurement noise -- the dispatcher
+    registration this keeps was already the expensive part (every plain bf16/fp32 matmul in the decoder funnelled
+    through a slower fixed-tile Triton kernel instead of cuBLAS), and `torch.bmm`/TF32/`cublaslt` were measured to
+    cost nothing extra on this model (it has no plain `torch.bmm` call site and no FP32 tensors for TF32 to touch).
+    Dropping them is a correctness simplification -- fewer process-wide side effects for whatever future kernel
+    might actually use `torch.bmm` or care which BLAS backend is preferred -- not a speed win in this measurement.
 
-    Measured cost with both switches on: a solo `fork` read is unchanged (18.5 against 18.6 questions/s);
-    `open_batch` loses roughly 7-15% (72.4-76.9 against 77.7-90.2 questions/s across group=32..64), the fixed-tile
-    kernels being a slower trade for not choosing by shape. Kept only when the borrowed kernels this engine's
-    batching depends on are actually in use (`paged` on CUDA): a joined-storage engine never shares a pass across
-    documents, so it has nothing this buys.
+    Kept only when the borrowed kernels this engine's batching depends on are actually in use (`paged` on CUDA): a
+    joined-storage engine never shares a pass across documents, so it has nothing this buys.
     """
     import os
 
-    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
+    import torch
+    from vllm.model_executor.layers.batch_invariant import (
+        addmm_batch_invariant,
+        linear_batch_invariant,
+        matmul_batch_invariant,
+        mm_batch_invariant,
+    )
+    from vllm.platforms import current_platform
 
+    # fused_moe.py's own guard (`get_default_config`): picks a fixed MoE tiling config instead of one keyed by the
+    # pass's row count M, independent of anything registered on the dispatcher below.
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
-    init_batch_invariance()
+
+    if not current_platform.is_cuda() or not current_platform.is_device_capability_family(80):
+        # The SM80-family (Ampere/Ada/Hopper-adjacent) Triton persistent matmul is what this was measured against
+        # (L40S, SM89). A different family's registration (vLLM's own `enable_batch_invariant_mode` has an SM90/
+        # Blackwell branch that only pins the cuBLAS workspace config) was not measured here; fall back to the
+        # router+tiling fix alone rather than assume it carries over.
+        return
+
+    lib = torch.library.Library("aten", "IMPL")
+    key = current_platform.dispatch_key
+    lib.impl("aten::mm", mm_batch_invariant, key)
+    lib.impl("aten::addmm", addmm_batch_invariant, key)
+    lib.impl("aten::matmul", matmul_batch_invariant, key)
+    lib.impl("aten::linear", linear_batch_invariant, key)
+    # Kept alive for the process's lifetime (matching `enable_batch_invariant_mode`'s own module-level singleton):
+    # letting it be garbage-collected would un-register the dispatcher entries it just installed.
+    global _BATCH_INVARIANT_DISPATCH_LIB
+    _BATCH_INVARIANT_DISPATCH_LIB = lib
+
+
+_BATCH_INVARIANT_DISPATCH_LIB = None
 
 
 def _now(device: torch.device) -> float:
