@@ -1084,7 +1084,15 @@ class Prismyra:
 
         flat = [q for questions in asked for q in questions]
         plans = [plan(q, self.tokenizer) for q in flat]
-        width = self._width_for(plans)
+        # Tightened the same way `_packed_groups` tightens a single document's groups: a batch answering several
+        # documents in one pass is exactly one group of that function's own kind, every row in it. Using the
+        # untightened WIDTHS bucket here instead -- which is what this line did before -- pads every row wider than
+        # `ask()` would and is not a rounding difference: the extra padding columns reach the recurrent layers'
+        # kernels and move the hidden state at the real last token, not just the padding's own. Confirmed by
+        # bisecting shelf against `ask()` on the same document, same questions, same order: matching only this
+        # width made the two bit-exact; matching only the question order changed nothing. See
+        # tests/test_gpu.py::test_a_shelf_matches_ask_bit_for_bit.
+        width = _round_pack_align(max(len(branch_ids(p.text, self.tokenizer)) for p in plans), self._width_for(plans))
         # Which document each row answers about, named by the handle the **cache** knows it as. A batch admits its
         # documents in order so the handles are the positions; a shelf holds whatever was put on it, which is why this
         # is given rather than derived.
@@ -1330,7 +1338,7 @@ class Prismyra:
             # The same rule whether recording is on or not. A recording must answer exactly as the eager pass it was
             # taken from, and a different width is a different reduction: rounding to the pinned buckets only under
             # `graphs` moved a probability by 3e-4 between the two.
-            groups.append((members, min(width, -(-longest // PACK_ALIGN) * PACK_ALIGN)))
+            groups.append((members, _round_pack_align(longest, width)))
         return groups
 
     def _branch(self, prefill: Prefill, texts: list[str], rows: int, width: int, remaining: int = 0) -> torch.Tensor:
@@ -1614,6 +1622,21 @@ class Prismyra:
                 # left it -- not where the eager pass above left it. They are the same state by construction, and
                 # `hidden` was read before any of it, so the answer this call returns is the eager one.
         return hidden
+
+
+def _round_pack_align(longest: int, bucket: int) -> int:
+    """How wide a branch pass actually needs to be: the longest row it carries, rounded up to `PACK_ALIGN`, never
+    wider than `bucket` (a pinned `WIDTHS` entry, which is as wide as a recording may ever be asked to be).
+
+    One function, because `_packed_groups` (one document, several groups) and `_answer_batch` (several documents,
+    one group) are the same shape of decision -- a group of rows sharing one pass -- and having two copies of this
+    arithmetic is how they drifted: `_answer_batch` used to call `self._width_for(plans)` and stop, which is `bucket`
+    with no tightening. The two padding widths are not an equivalent rounding of each other; the padding columns
+    reach the recurrent layers' kernels and move the hidden state at a row's own last token, not just the padding's.
+    A document asked once through `ask()` and once through a shelf, with nothing else different, answered a
+    different option (0.339 against 0.512 on the deciding one) until both went through this.
+    """
+    return min(bucket, -(-longest // PACK_ALIGN) * PACK_ALIGN)
 
 
 def _answer_for(question: Question, values: list[float], read_by: str | None = None) -> Answer:

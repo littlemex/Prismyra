@@ -865,6 +865,86 @@ def test_a_document_on_a_shelf_answers_as_one_read_fresh(engine_paged):
                 assert abs(shelved[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
 
 
+def test_a_shelf_matches_ask_bit_for_bit(engine_paged):
+    """The bug an open-loop measurement found, with graphs off, so it has nothing to do with recordings: a document
+    put on a shelf and asked about alone -- never mixed with another document in the same pass -- still answered
+    differently from `ask()` on the identical document and questions. Real RACE data moved a decision outright
+    (0.339 against 0.512 on the deciding option) at 10 documents a second and again, differently, at 20.
+
+    The root cause, found by bisecting the two code paths against each other one difference at a time: `ask()`'s
+    `_packed_groups` tightens a branch pass's width to the longest question it carries, rounded only to
+    `PACK_ALIGN`; `_answer_batch` (which `Shelf.ask` and `open_batch` both go through) used the untightened `WIDTHS`
+    bucket and stopped there. The two paddings are not an equivalent rounding of each other -- the extra columns
+    reach the recurrent layers' kernels and move the hidden state at a row's own last token. Matching only this
+    width made the two paths bit-exact; matching only the question order (`ask()` sorts by length, a shelf answers
+    in the order it was given) changed nothing by itself. `_round_pack_align` is the fix, shared by both paths.
+
+    Documents stay on the shelf and are dropped before and after the one under test, because the bug this is written
+    against is specifically about a shelf that has already held other documents -- `prismyra.schedule.Batcher`'s own
+    name for it is putting several documents "on" one cache over time, not necessarily several in one pass.
+
+    This is bit-exact rather than within `COMPANION_MOVEMENT` because the document under test is answered alone, with
+    nothing else sharing its pass to blame a difference on -- the comparison this guards is `ask()` against itself,
+    through a different door.
+    """
+    asked = [
+        Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?"),
+        Boolean(id="unopened", prompt="Are unopened items refunded in full?"),
+        Choice(
+            id="opened",
+            prompt="What happens to an opened item?\nA. Refunded\nB. Exchanged\nC. Kept\nD. Discarded",
+            choices=["A", "B", "C", "D"],
+        ),
+        Choice(
+            id="shipping",
+            prompt=(
+                "Who pays return shipping when the item turns out to have a manufacturing fault, confirmed after "
+                "inspection by the seller's own technician working from the original receipt?\n"
+                "A. The buyer\nB. The seller\nC. Nobody, it is refunded\nD. It depends on the courier\nE. The maker"
+            ),
+            choices=["A", "B", "C", "D", "E"],
+        ),
+        Boolean(id="exchange", prompt="Is an opened item ever refunded rather than exchanged?"),
+    ]
+
+    # The gap this test exists to close only shows up when the longest question's rendered width does not already
+    # sit on a `WIDTHS` bucket -- otherwise `ask()`'s tightening and `_answer_batch`'s old untightened bucket are
+    # the same number and there is nothing to catch. Checked rather than assumed, so this fails loudly instead of
+    # silently passing if the question text above is ever edited down to a width that no longer exercises it.
+    from prismyra.engine import PACK_ALIGN
+    from prismyra.fork import branch_ids, round_width
+    from prismyra.readout import plan
+
+    plans = [plan(q, engine_paged.tokenizer) for q in asked]
+    longest = max(len(branch_ids(p.text, engine_paged.tokenizer)) for p in plans)
+    bucket = round_width(longest)
+    tightened = -(-longest // PACK_ALIGN) * PACK_ALIGN
+    assert tightened < bucket, (
+        f"this question set rounds to the same width both ways ({tightened} == {bucket}); it no longer exercises "
+        f"the gap this test exists to close -- lengthen one question's prompt"
+    )
+
+    want = engine_paged.ask(CONTEXT, asked)
+    with engine_paged.open_shelf() as shelf:
+        warm_up = shelf.put(SECOND_CONTEXT)
+        shelf.ask({warm_up: [Boolean(id="cash", prompt="Can a gift card be exchanged for cash?")]})
+        shelf.drop(warm_up)
+
+        handle = shelf.put(CONTEXT)
+        got = shelf.ask({handle: asked})[handle]
+        shelf.drop(handle)
+
+        after = shelf.put(SECOND_CONTEXT)
+        shelf.ask({after: [Boolean(id="replaced", prompt="Is a lost gift card replaced on proof of purchase?")]})
+        shelf.drop(after)
+
+    for q in asked:
+        assert got[q.id].option == want[q.id].option, f"{q.id} changed its answer on a shelf"
+        for option, p in want[q.id].probabilities.items():
+            assert got[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (q.id, option)
+
+
+
 def test_asking_twice_about_a_shelved_document_does_not_read_it_twice(engine_paged):
     """What the shelf is for. The second question pays a branch pass and no read."""
     asked = [Boolean(id="faulty", prompt="Does the seller pay on a faulty item?")]
