@@ -1155,21 +1155,37 @@ class Prismyra:
         exact context length, makes a recording survive the batch's documents changing between passes.
         """
         rows = sum(counts)
-        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, rows, width)
+        # Batch-invariant: see `_round_rows`. The row count is the only thing that otherwise differs between "two
+        # documents answered together" and "either one answered alone", once the width is matched (`_round_pack_align`)
+        # -- and that alone moved an answer by up to 0.29 and flipped decisions. Padding every pass sharing documents
+        # to the same row count a solo document would be padded to removes the difference entirely: `pad` extra rows
+        # repeat the first document, discarded at the end exactly as `build_suffixes` already discards padded columns.
+        padded_rows = _round_rows(rows, self.group)
+        pad = padded_rows - rows
+        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, padded_rows, width)
         starts = [
             prefills[at].position_from or prefills[at].tokens for at, count in enumerate(counts) for _ in range(count)
         ]
+        # Padding extends the *last* document's own block, never a new one at the tail: `rows_for`'s rows are laid
+        # out contiguously per document (`paged.PagedForkLayer.begin_branches` rebuilds its row assignment from each
+        # document's *total* count in `rows_for`, not from the row positions themselves, so it assumes every row
+        # naming one document is contiguous). Padding with the first document while a different one is last split
+        # that document's rows across the gap and answered every row from the wrong table -- found by this file's
+        # own open-loop comparison moving a probability by 0.93 instead of removing the smaller 0.29 it was meant to.
+        if pad:
+            starts += [starts[-1]] * pad
         offsets = torch.tensor(starts, device=self.device).unsqueeze(1)
         positions = offsets + torch.arange(ids.shape[1], device=self.device).unsqueeze(0)
         cache = prefills[0].cache
 
+        parts = [(prefills[at].snapshot, count) for at, count in enumerate(counts)]
+        rows_for_padded = rows_for
+        if pad:
+            parts = [*parts[:-1], (parts[-1][0], parts[-1][1] + pad)]
+            rows_for_padded = [*rows_for, *([rows_for[-1]] * pad)]
+
         def fork() -> None:
-            restore_and_fork_many(
-                cache,
-                [(prefills[at].snapshot, count) for at, count in enumerate(counts)],
-                width=self.group,
-                rows_for=rows_for,
-            )
+            restore_and_fork_many(cache, parts, width=self.group, rows_for=rows_for_padded)
 
         def run(suffix: torch.Tensor, suffix_positions: torch.Tensor) -> torch.Tensor:
             out = self.backbone(
@@ -1180,8 +1196,8 @@ class Prismyra:
         # One document's remainder is all a paged recording's bucket key carries (see `_run_recorded`), so a pass
         # naming more than one document is not a shape graphs may generalise over yet.
         homogeneous = len(set(rows_for)) <= 1
-        hidden = self._run_recorded(cache, fork, run, ids, positions, rows, width, homogeneous=homogeneous)
-        return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
+        hidden = self._run_recorded(cache, fork, run, ids, positions, padded_rows, width, homogeneous=homogeneous)
+        return hidden[torch.arange(padded_rows, device=self.device), read_at][: len(texts)]
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
         # Already validated: both public entry points call `validate` before the context is read, and repeating it
@@ -1213,8 +1229,13 @@ class Prismyra:
                     chunk = [plans[i].text for i in members]
                     widest_chunk = max(widest_chunk, len(chunk))
                     # How many more groups of this exact shape this call will run, which is what decides whether
-                    # recording the pass can pay for itself.
-                    same_shape_left = sum(1 for m, w in groups[n + 1 :] if len(m) == len(members) and w == group_width)
+                    # recording the pass can pay for itself. Compared on the padded row count `_branch` actually
+                    # runs at (`_round_rows`), not the raw member count: two groups of 5 and 7 real questions run
+                    # the identical padded-to-8 pass now, so they are the same shape for this count too.
+                    padded = _round_rows(len(members), self.group)
+                    same_shape_left = sum(
+                        1 for m, w in groups[n + 1 :] if _round_rows(len(m), self.group) == padded and w == group_width
+                    )
                     hidden = self._branch(prefill, chunk, len(chunk), group_width, remaining=same_shape_left)
                     scored = self.heads.apply(
                         hidden,
@@ -1359,10 +1380,14 @@ class Prismyra:
         if prefill.snapshot is None:
             prefill.snapshot = snapshot(prefill.cache)
 
-        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, rows, width)
+        # Batch-invariant: see `_round_rows`. Every row buffer downstream is already sized for `self.group`, so
+        # padding up to it costs nothing to allocate -- only the padded rows' own compute, which `remaining` below
+        # also now measures economics against at this padded shape rather than the raw one.
+        padded_rows = _round_rows(rows, self.group)
+        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, padded_rows, width)
         # From where the model thinks the context reached, which is past its token count when media widened it.
         start = prefill.position_from or prefill.tokens
-        positions = torch.arange(start, start + ids.shape[1], device=self.device).expand(rows, -1)
+        positions = torch.arange(start, start + ids.shape[1], device=self.device).expand(padded_rows, -1)
 
         def run(suffix: torch.Tensor, suffix_positions: torch.Tensor) -> torch.Tensor:
             """One branch pass, with the fork done by the caller.
@@ -1384,9 +1409,9 @@ class Prismyra:
             )
             return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
-        hidden = self._run_branch(prefill, run, ids, rows, width, positions, remaining)
+        hidden = self._run_branch(prefill, run, ids, padded_rows, width, positions, remaining)
         # Each row is read at its own last real token, which is why the padding cannot reach an answer.
-        return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
+        return hidden[torch.arange(padded_rows, device=self.device), read_at][: len(texts)]
 
     def _replay_disagreement_on(self, taken, cache, fork, ids, positions, reference) -> tuple[float, float]:
         """The worst a recording's replays are from the pass it was taken from, and what a replay costs -- both measured
@@ -1633,6 +1658,29 @@ class Prismyra:
                 # left it -- not where the eager pass above left it. They are the same state by construction, and
                 # `hidden` was read before any of it, so the answer this call returns is the eager one.
         return hidden
+
+
+def _round_rows(rows: int, cap: int) -> int:
+    """How many rows a branch pass actually runs at: the next power of two at or above `rows`, never past `cap`
+    (`self.group`, which every row buffer is already allocated for).
+
+    Found by bisection, not supposition: two documents sharing a pass moved a probability by up to 0.29 and
+    flipped decisions, with the question width matched and the question order ruled out, and the same move
+    reproduced on **one** document with two unrelated dummy questions appended -- no second document, no
+    varlen boundary, just a different row count. Comparing the row count against `ask()`'s own, with the
+    borrowed `gated_delta_rule` kernel disabled (`PRISMYRA_WITHOUT=gated_delta_rule`), the same change in row
+    count moved things by 0.084 instead of 0.19 and flipped nothing -- smaller, so some of this is ordinary
+    floating-point reduction order, but the larger share is that kernel's own row-count-dependent tiling.
+
+    A kernel chosen by shape cannot be told to ignore the shape, so this changes the shape instead: pads every
+    pass to one of a small fixed set of row counts, so two passes that would have run at 5 and 7 real rows both
+    run at 8, with the extra rows a harmless repeat of an existing row (discarded the same way `build_suffixes`
+    already discards padded columns). Two documents or one document asked twice then see the identical kernel
+    dispatch their row count would get alone, which is what makes answering together stop moving an answer.
+    """
+    if rows >= cap:
+        return cap
+    return min(cap, 1 << (max(rows, 1) - 1).bit_length())
 
 
 def _round_pack_align(longest: int, bucket: int) -> int:
