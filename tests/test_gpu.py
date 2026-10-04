@@ -487,6 +487,7 @@ def test_a_replayed_pass_answers_exactly_as_the_eager_one_did(engine, monkeypatc
     finally:
         engine.graphs = was
         engine.declined_recordings.clear()
+        engine._economics_needed.clear()
         engine.replays.clear()
 
     # Either a recording was used, in which case every group must match exactly, or it was refused -- and a refusal is a
@@ -505,6 +506,100 @@ def test_a_replayed_pass_answers_exactly_as_the_eager_one_did(engine, monkeypatc
             assert got[name][0] == want[name][0], f"group {n}, question {name} changed its answer"
             for option, p in want[name][1].items():
                 assert got[name][1][option] == pytest.approx(p, abs=1e-4), f"group {n}, {name}, option {option}"
+
+
+def _context_with_remainder(tokenizer, base: str, target_remainder: int) -> str:
+    """`base`, extended with filler sentences, at a token count that shares `target_remainder` modulo the page block
+    but is not `base`'s own count.
+
+    Built for one thing: a second document whose length differs from the first's but whose branch writes land at the
+    same offset inside a page, which is the only thing a paged recording's `usable` check accepts as the same shape
+    now that it is not pinned to one exact length. If the two happened to need the same text this test would prove
+    nothing, so the loop also refuses to return `base` unchanged.
+    """
+    from prismyra.paged import BLOCK
+
+    filler = " Additionally, the warranty card must be retained for the full coverage period."
+    text = base
+    for _ in range(64):
+        n = len(tokenizer(text)["input_ids"])
+        if n % BLOCK == target_remainder and text != base:
+            return text
+        text += filler
+    raise RuntimeError(f"could not reach remainder {target_remainder} by extending the context with filler sentences")
+
+
+def test_a_paged_recording_answers_a_later_document_of_a_different_length(engine_paged, monkeypatch):
+    """The point of bucketing a paged recording by remainder rather than by exact length: it has to answer about a
+    document it was never taken on.
+
+    `graphs.Recording.usable` used to refuse any context whose length did not match the one the recording was taken
+    at, which made a recording useless the moment the shelf moved on to a different document -- every real workload
+    does that on every request. The paged storage's branch write only depends on the context length modulo the page
+    block (`docs/PERFORMANCE.md`, "Recording the batched pass is not the next thing, and why"), so a recording taken
+    on one document is bucketed on that remainder and reused for any other document sharing it.
+
+    The shelf is what makes the cache -- and so the recording -- outlive one document: `put`, `ask`, `drop`, and the
+    cache the recording holds the addresses of is the one the next document is read into. Without the shelf a fresh
+    cache per document would never let a recording see a second one at all, which was the gap this test was written
+    to close.
+    """
+    asked = questions(4)
+    was = engine_paged.graphs
+    # The economics suspended, as in the test above: this tests whether a replayed answer is right, not whether taking
+    # one was worth it.
+    monkeypatch.setattr("prismyra.engine.keeping_pays", lambda *a, **k: None)
+    tokenizer = engine_paged.tokenizer
+
+    from prismyra.paged import BLOCK
+
+    base_tokens = len(tokenizer(CONTEXT)["input_ids"])
+    doc_b = _context_with_remainder(tokenizer, SECOND_CONTEXT, base_tokens % BLOCK)
+    tokens_b = len(tokenizer(doc_b)["input_ids"])
+    assert tokens_b != base_tokens and tokens_b % BLOCK == base_tokens % BLOCK
+
+    try:
+        engine_paged.graphs = False
+        with engine_paged.open_shelf() as shelf:
+            handle = shelf.put(CONTEXT)
+            eager_a = shelf.ask({handle: asked})[handle]
+            shelf.drop(handle)
+            handle = shelf.put(doc_b)
+            eager_b = shelf.ask({handle: asked})[handle]
+            shelf.drop(handle)
+
+        engine_paged.graphs = True
+        engine_paged.replays.clear()
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        with engine_paged.open_shelf() as shelf:
+            # Enough passes about the first document's shape for a recording to be worth taking (`graphs.pays_from`),
+            # then one pass about a document of a different length that shares its remainder.
+            for _ in range(GROUPS_FOR_A_REPLAY):
+                handle = shelf.put(CONTEXT)
+                replayed_a = shelf.ask({handle: asked})[handle]
+                shelf.drop(handle)
+            replays_before = sum(engine_paged.stats()["graphs_replays"].values())
+            handle = shelf.put(doc_b)
+            replayed_b = shelf.ask({handle: asked})[handle]
+            shelf.drop(handle)
+        replays_after = sum(engine_paged.stats()["graphs_replays"].values())
+        declined = dict(engine_paged.stats()["graphs_declined"])
+    finally:
+        engine_paged.graphs = was
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        engine_paged.replays.clear()
+
+    assert replays_before > 0, f"no recording ever answered about the first document: {declined}"
+    assert replays_after > replays_before, (
+        f"the second document did not replay the first document's recording: {declined}"
+    )
+    for q in asked:
+        assert replayed_a[q.id].option == eager_a[q.id].option, f"{q.id} changed its answer on the first document"
+        assert replayed_b[q.id].option == eager_b[q.id].option, f"{q.id} changed its answer on the second document"
+        for option, p in eager_b[q.id].probabilities.items():
+            assert replayed_b[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (q.id, option)
 
 
 def test_a_recording_judged_not_to_pay_is_declined_rather_than_raising(engine, monkeypatch):
@@ -529,6 +624,7 @@ def test_a_recording_judged_not_to_pay_is_declined_rather_than_raising(engine, m
     finally:
         engine.graphs = was
         engine.declined_recordings.clear()
+        engine._economics_needed.clear()
         engine.replays.clear()
         engine.replay_cost.clear()
 
@@ -538,6 +634,60 @@ def test_a_recording_judged_not_to_pay_is_declined_rather_than_raising(engine, m
     for want, got in zip(eager, answered, strict=True):
         for q in asked:
             assert got[q.id].option == want[q.id].option
+
+
+def test_a_declined_recording_is_retried_once_enough_more_passes_arrive(engine_paged):
+    """The fix for the gap `prismyra-branch-graphs-paged-remainder-bucket` found: a shape declined once used to stay
+    declined forever, which on 368 real documents meant a shape measured to pay 1.94x on its own replay was kept
+    exactly zero times.
+
+    The attempt gate (`expected >= pays_from()`, the generous short one-pass ratio) fires at a shape's eighth
+    sighting; the keep decision (`keeping_pays`, this shape's own measured ratio) usually needs a few more than
+    that. So the only attempt a shape without `_economics_needed` ever got arrived already below the bar, was
+    declined, and `key in self.declined_recordings` then blocked every later sighting from trying again -- not
+    because the shape could not pay, but because nothing was watching for the point where it would.
+
+    This runs enough groups on one shelved document for both halves to show: a decline near the gate's own
+    threshold, then a successful retry once `expected` clears the bar `_economics_needed` remembered.
+    """
+    asked = questions(4)
+    was = engine_paged.graphs
+    try:
+        engine_paged.graphs = False
+        with engine_paged.open_shelf() as shelf:
+            handle = shelf.put(CONTEXT)
+            eager = shelf.ask({handle: asked})[handle]
+            shelf.drop(handle)
+
+        engine_paged.graphs = True
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        engine_paged.replays.clear()
+        with engine_paged.open_shelf() as shelf:
+            # Comfortably past any realistic needed-passes count for this shape (measured elsewhere at 11-12), so a
+            # decline early in this loop gets the chance to be reopened and kept before the loop ends.
+            for _ in range(30):
+                handle = shelf.put(CONTEXT)
+                answered = shelf.ask({handle: asked})[handle]
+                shelf.drop(handle)
+        declined = dict(engine_paged.stats()["graphs_declined"])
+        retry_at = dict(engine_paged.stats()["graphs_retry_at"])
+        replays = sum(engine_paged.stats()["graphs_replays"].values())
+    finally:
+        engine_paged.graphs = was
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        engine_paged.replays.clear()
+        engine_paged.replay_cost.clear()
+
+    assert replays > 0, (
+        f"no recording was ever kept across 30 passes of one shape, so the retry never happened: "
+        f"declined={declined}, retry_at={retry_at}"
+    )
+    for q in asked:
+        assert answered[q.id].option == eager[q.id].option, f"{q.id} changed its answer"
+        for option, p in eager[q.id].probabilities.items():
+            assert answered[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (q.id, option)
 
 
 def test_the_engine_measures_what_a_replay_costs_before_it_trusts_one(engine):
@@ -563,6 +713,7 @@ def test_the_engine_measures_what_a_replay_costs_before_it_trusts_one(engine):
     finally:
         engine.graphs = was
         engine.declined_recordings.clear()
+        engine._economics_needed.clear()
         engine.replays.clear()
         engine.replay_cost.clear()
 
@@ -615,6 +766,52 @@ def test_one_pass_answers_about_two_documents_exactly_as_two_passes_did(engine_p
             assert mixed[q.id].option == alone[q.id].option, f"{q.id} changed its answer in a mixed batch"
             for option, p in alone[q.id].probabilities.items():
                 assert abs(mixed[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
+
+
+def test_graphs_never_corrupt_a_batch_naming_more_than_one_document(engine_paged):
+    """The bug an open-loop measurement found: a paged recording's bucket key carries one remainder (the longest
+    document's), but a mixed batch's other rows write their own branches at an offset from *their* remainder --
+    which the key never saw. Replaying a recording taken on one mix of documents onto a different mix sharing only
+    the longest one's remainder moved a probability by 0.277 and changed four decisions, over an open-loop run
+    against real documents.
+
+    `_run_recorded`'s `homogeneous` flag is the fix: a batch naming more than one document always runs eagerly. This
+    repeats the same two documents' mixed batch, with `graphs=True` and enough times to clear the attempt gate several
+    times over, and checks every repeat against the single-document baseline rather than trusting the first one --
+    the corruption above did not show up until documents had been mixed differently across many batches, not on the
+    first repeat of the same mix.
+    """
+    about_returns = [Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?")]
+    about_cards = [Boolean(id="cash", prompt="Can a gift card be exchanged for cash?")]
+    was = engine_paged.graphs
+    try:
+        engine_paged.graphs = False
+        with engine_paged.open_context(CONTEXT) as first:
+            alone_returns = first.ask(about_returns)
+        with engine_paged.open_context(SECOND_CONTEXT) as second:
+            alone_cards = second.ask(about_cards)
+
+        engine_paged.graphs = True
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        engine_paged.replays.clear()
+        for _ in range(GROUPS_FOR_A_REPLAY + 5):
+            with engine_paged.open_batch([CONTEXT, SECOND_CONTEXT]) as batch:
+                together = batch.ask([about_returns, about_cards])
+            for alone, mixed, asked in (
+                (alone_returns, together[0], about_returns),
+                (alone_cards, together[1], about_cards),
+            ):
+                for q in asked:
+                    assert mixed[q.id].option == alone[q.id].option, f"{q.id} changed its answer in a mixed batch"
+                    for option, p in alone[q.id].probabilities.items():
+                        assert abs(mixed[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
+    finally:
+        engine_paged.graphs = was
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        engine_paged.replays.clear()
+        engine_paged.replay_cost.clear()
 
 
 def test_a_mixed_batch_really_used_the_pages(engine_paged):

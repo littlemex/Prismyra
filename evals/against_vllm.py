@@ -262,6 +262,62 @@ def run_fork(items, model: str, engine=None, graphs: bool = False) -> dict:
     }
 
 
+def run_fork_shelf(items, model: str, engine=None, graphs: bool = True) -> dict:
+    """This package, one document at a time, through a shelf instead of a fresh context per item.
+
+    `run_fork` opens a new context per item and closes it before the next one, so every item gets a fresh cache
+    (`Prismyra._claim_cache` builds one; `Context.close` drops it) and a recording taken while answering about one
+    document is gone before the next arrives -- `graphs=True` on that arm records nothing a second request can reuse.
+
+    A shelf keeps the cache: `put` admits a document into pages the shelf already owns, `ask` answers it, `drop` gives
+    the pages back, and the next `put` reads into the *same* cache object. That is what lets a recorded branch pass
+    outlive one document, and it is also why this needs the paged storage -- `graphs.Recording` buckets a paged
+    recording by the context length's remainder modulo the page block rather than by its exact length, which is the
+    other half of making one recording answer about many documents (`docs/PERFORMANCE.md`, "Recording the batched
+    pass is not the next thing, and why"; `prismyra/graphs.py`).
+
+    This is the shape a server is in: one process, one shelf, documents arriving one at a time. `run_fork` measures
+    the shape `evals/against_vllm.py` was first run against -- a context opened and dropped per request -- and this
+    measures what changes when the cache is allowed to persist.
+    """
+    from prismyra import Prismyra
+
+    engine = engine or Prismyra(model, paged=True, graphs=graphs)
+    tokenizer = engine.tokenizer
+    rows, seconds, tokens = [], [], 0
+    with engine.open_shelf() as shelf:
+        for n, item in enumerate(items):
+            started = time.perf_counter()
+            handle = shelf.put(item.context)
+            result = shelf.ask({handle: item.questions})[handle]
+            shelf.drop(handle)
+            elapsed = time.perf_counter() - started
+            seconds.append(elapsed)
+            context_tokens = len(tokenizer(item.context)["input_ids"])
+            suffix = max(len(tokenizer("\n" + q.prompt)["input_ids"]) for q in item.questions)
+            tokens += context_tokens + suffix * len(item.questions)
+            for question in item.questions:
+                if question.id not in item.gold:
+                    continue
+                answer = result[question.id]
+                rows.append(
+                    {
+                        "item": n,
+                        "id": question.id,
+                        "got": answer.value,
+                        "want": item.gold[question.id],
+                    }
+                )
+    return {
+        "arm": "fork-shelf",
+        "rows": rows,
+        "seconds": seconds,
+        "tokens": tokens,
+        "model": model,
+        "asked": sum(len(item.questions) for item in items[1:]) or sum(len(item.questions) for item in items),
+    }
+
+
 def run_vllm(items, model: str, mode: str, max_len: int, utilisation: float, llm=None) -> dict:
     """vLLM, with prefix caching on. `separate` sends one request per question, `packed` one per item."""
     from vllm import LLM, SamplingParams
@@ -439,6 +495,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--documents", type=int, help="answer this many documents in one pass (fork arm only; needs the paged storage)"
     )
+    parser.add_argument(
+        "--shelf",
+        action="store_true",
+        help=(
+            "one document at a time through a persistent cache instead of a fresh one per item (fork arm only; "
+            "needs the paged storage; this is what lets --graphs reuse a recording across different documents)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Identical items in both processes, because both load the same task with the same seed. Passing the items through
@@ -481,11 +545,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.record:
-        run = (
-            run_batched(items, args.model, documents=args.documents)
-            if args.documents
-            else run_fork(items, args.model, graphs=args.graphs)
-        )
+        if args.documents:
+            run = run_batched(items, args.model, documents=args.documents)
+        elif args.shelf:
+            run = run_fork_shelf(items, args.model, graphs=args.graphs)
+        else:
+            run = run_fork(items, args.model, graphs=args.graphs)
         args.record.write_text(json.dumps(run, indent=2, default=str))
         print(json.dumps(summarise(run, questions), indent=2))
         print(f"\nwritten to {args.record}")

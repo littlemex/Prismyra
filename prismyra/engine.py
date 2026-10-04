@@ -69,6 +69,27 @@ REPLAY_TOLERANCE = 1e-3
 #: exactly the state the recording was taken in, and a recording that diverges does so from the second replay onwards.
 REPLAY_CHECKS = 2
 
+#: Free device memory a new recording's capture is refused below. 2 GiB, which is small next to the 44 GiB this was
+#: measured on -- it is a check that the ordinary eager pass every call still runs first has not already been
+#: starved, not a budget for the capture itself. Raising it to 8 GiB was tried and made every GPU test that takes a
+#: recording fail by refusing the capture outright: this model's weights alone leave about 10 GiB free on a 44 GiB
+#: card, and 8 GiB of margin is most of that before admission's own budget or an ordinary pass gets any of it. The
+#: number that needed changing was not this one -- see `MAX_KEPT_RECORDINGS`.
+GRAPH_MEMORY_MARGIN = 2 * 1024**3
+
+#: How many distinct shapes one cache may hold a kept recording for at once. A kept recording's pool is never freed,
+#: so unlike everything else admission budgets, this is not something a size-based margin can bound on its own: an
+#: open-loop run against real traffic, with the decline-retry above in place and only a memory margin to stop it,
+#: drove free device memory from several gigabytes to a few megabytes across a handful of distinct shapes each
+#: keeping one recording, and into a tight allocate-fail-retry loop that was not even inside a recording attempt --
+#: it was the ordinary eager pass every call still runs first. A margin only ever asks "is there room for one more";
+#: it does not know how expensive the attempts already granted turned out to be, so raising it cannot bound a count
+#: of unknown-sized things. A small fixed count can. Two, because the recordings measured so far during the paged
+#: branch pass's remainder-bucket work moved a probability by nothing and a replay cost half an eager pass -- worth
+#: having at all -- and this package has not yet measured what one recording actually costs in isolation, which it
+#: would need before this number could be raised with evidence instead of nerve.
+MAX_KEPT_RECORDINGS = 2
+
 #: Context lengths a cache is allocated for. A context of 900 tokens and one of 1,000 both get the 1,024 allocation, and
 #: that is the point: an allocation shared between contexts keeps its addresses, and addresses are what a recording
 #: holds. Without this every context built its own cache and freed it on close, so a recording could never outlive the
@@ -362,9 +383,23 @@ class Prismyra:
                     else f"paged storage needs the borrowed kernels on CUDA, and this is fast_kernels={fast_kernels} "
                     f"on {self.device}"
                 )
-        #: Shapes a recording was attempted on and refused, with the reason. Attempted once per shape, not once per
-        #: group, and reported through `stats()` rather than retried in silence.
+        #: Shapes a recording was attempted on and refused, with the reason. Reported through `stats()` rather than
+        #: retried in silence -- but retried, once there is reason to think the answer would be different. See
+        #: `_economics_needed` for which declines that applies to and why.
         self.declined_recordings: dict = {}
+        #: The passes-still-expected count an economics decline (`keeping_pays` returned a reason) would need to flip
+        #: to a keep, for shapes currently in `declined_recordings` for that reason. Nothing else is in here: a
+        #: decline from a stale cache (`Recording.usable` failing) or a capture failure (`graphs.record` returning
+        #: `None`) is not a question of *how many more passes*, so there is no number here that retrying it later
+        #: would change.
+        #:
+        #: Exists because the alternative -- declining once and never asking again -- was found to be the reason a
+        #: shape judged capable of a 1.94x replay was never once kept across 368 documents. The attempt gate below
+        #: fires at `expected == pays_from()` (a shape's eighth sighting, under the gate's own threshold), and the
+        #: shape's own measured ratio almost always needs a few more than that -- so the very first attempt, the only
+        #: one that was ever going to happen, arrived already below the bar that would keep it. Four more sightings
+        #: were often all that was missing, and nothing was watching for them.
+        self._economics_needed: dict = {}
         #: What each accepted recording's replays disagreed with their own pass by. Reported so that "it was accepted"
         #: and "it agreed" are separate statements: a check that silently measures the wrong thing reads as the second.
         self.verified_recordings: dict = {}
@@ -753,6 +788,9 @@ class Prismyra:
             "paged_reads_served": self._paged_reads(),
             "graphs": self.graphs,
             "graphs_declined": dict(self.declined_recordings),
+            # Only the economics declines still eligible for a second attempt -- the bar `expected` has to clear.
+            # Shrinks as shapes are reopened and either kept or declined again under a fresh measurement.
+            "graphs_retry_at": dict(self._economics_needed),
             "graphs_verified": dict(self.verified_recordings),
             "graphs_replays": dict(self.replays),
             "graphs_cost": dict(self.replay_cost),
@@ -1089,7 +1127,14 @@ class Prismyra:
         return results
 
     def _branch_across(self, prefills, counts: list[int], rows_for: list[int], texts: list[str], width: int):
-        """The pass itself. Every row's positions start at its own document's end, which is per row not per batch."""
+        """The pass itself. Every row's positions start at its own document's end, which is per row not per batch.
+
+        Goes through `_run_recorded`, the same decision `_run_branch` uses for a single document. It did not used to:
+        this called the backbone directly, so `graphs=True` recorded nothing here, which is the gap `docs/PERFORMANCE.md`
+        names under "Recording the batched pass is not the next thing, and why". Wiring it is what that section says it
+        would take -- a few lines -- once the other half, `graphs.Recording` accepting a remainder bucket instead of an
+        exact context length, makes a recording survive the batch's documents changing between passes.
+        """
         rows = sum(counts)
         ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, rows, width)
         starts = [
@@ -1097,15 +1142,26 @@ class Prismyra:
         ]
         offsets = torch.tensor(starts, device=self.device).unsqueeze(1)
         positions = offsets + torch.arange(ids.shape[1], device=self.device).unsqueeze(0)
+        cache = prefills[0].cache
 
-        restore_and_fork_many(
-            prefills[0].cache,
-            [(prefills[at].snapshot, count) for at, count in enumerate(counts)],
-            width=self.group,
-            rows_for=rows_for,
-        )
-        out = self.backbone(input_ids=ids, position_ids=positions, use_cache=True, past_key_values=prefills[0].cache)
-        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        def fork() -> None:
+            restore_and_fork_many(
+                cache,
+                [(prefills[at].snapshot, count) for at, count in enumerate(counts)],
+                width=self.group,
+                rows_for=rows_for,
+            )
+
+        def run(suffix: torch.Tensor, suffix_positions: torch.Tensor) -> torch.Tensor:
+            out = self.backbone(
+                input_ids=suffix, position_ids=suffix_positions, use_cache=True, past_key_values=cache
+            )
+            return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+
+        # One document's remainder is all a paged recording's bucket key carries (see `_run_recorded`), so a pass
+        # naming more than one document is not a shape graphs may generalise over yet.
+        homogeneous = len(set(rows_for)) <= 1
+        hidden = self._run_recorded(cache, fork, run, ids, positions, rows, width, homogeneous=homogeneous)
         return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
@@ -1289,7 +1345,7 @@ class Prismyra:
         start = prefill.position_from or prefill.tokens
         positions = torch.arange(start, start + ids.shape[1], device=self.device).expand(rows, -1)
 
-        def run(suffix: torch.Tensor) -> torch.Tensor:
+        def run(suffix: torch.Tensor, suffix_positions: torch.Tensor) -> torch.Tensor:
             """One branch pass, with the fork done by the caller.
 
             The fork is deliberately **not** in here, and that was found by measurement rather than reasoned out. With
@@ -1298,15 +1354,22 @@ class Prismyra:
             state to a new tensor on every pass, and a rebinding is Python: a recording keeps the tensor it saw and a
             replay cannot repeat the assignment. So the fork runs eagerly every time, at the cost of a few copies per
             layer, and the recording covers only what is pure device work.
+
+            `suffix_positions` is a parameter rather than the closed-over `positions`, and a recording's own static
+            buffer rather than a kept constant -- `graphs.record` says why: a different document starts its branch at
+            a different position, and a recording that answered every document at the position its first one needed
+            would be wrong rather than slow.
             """
-            out = self.backbone(input_ids=suffix, position_ids=positions, use_cache=True, past_key_values=prefill.cache)
+            out = self.backbone(
+                input_ids=suffix, position_ids=suffix_positions, use_cache=True, past_key_values=prefill.cache
+            )
             return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
         hidden = self._run_branch(prefill, run, ids, rows, width, positions, remaining)
         # Each row is read at its own last real token, which is why the padding cannot reach an answer.
         return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
 
-    def _replay_disagreement(self, taken, prefill, ids, rows: int, reference) -> tuple[float, float]:
+    def _replay_disagreement_on(self, taken, cache, fork, ids, positions, reference) -> tuple[float, float]:
         """The worst a recording's replays are from the pass it was taken from, and what a replay costs -- both measured
         here because both need a replay and these are the only replays that answer nothing.
 
@@ -1323,9 +1386,9 @@ class Prismyra:
         # measured is the cost of one replayed pass as a caller would experience it.
         started = _now(self.torch_device)
         for _ in range(REPLAY_CHECKS):
-            taken.before_fork(prefill.cache)
-            self.fork(prefill, rows)
-            replayed = taken.replay(prefill.cache, ids)
+            taken.before_fork(cache)
+            fork()
+            replayed = taken.replay(cache, ids, positions)
             worst = max(worst, float((replayed.float() - reference.float()).abs().amax()))
         return worst, _since(started, self.torch_device) / REPLAY_CHECKS
 
@@ -1391,7 +1454,41 @@ class Prismyra:
         restore_and_fork(prefill.cache, prefill.snapshot, rows, width=self.group)
 
     def _run_branch(self, prefill, run, ids, rows: int, width: int, positions, remaining: int = 0):
+        """The single-document branch pass, through the shared recording machinery. See `_run_recorded`."""
+        return self._run_recorded(
+            prefill.cache, lambda: self.fork(prefill, rows), run, ids, positions, rows, width, remaining
+        )
+
+    def _bucket_key(self, cache, rows: int, width: int) -> tuple:
+        """The shape a recording is kept under: `(rows, width)`, widened with a remainder bucket when the cache is
+        paged storage.
+
+        The joined storage's read is shaped `(rows, context + suffix, heads, dim)`, so two contexts of different
+        lengths are two different graphs and `(rows, width)` is already as coarse as it can be. The paged storage's
+        read is shaped by the pool, not by the context, so its only remaining dependence is the one `graphs.Recording`
+        checks: the branch write's offset, which is the context length modulo the page size. Bucketing the key by that
+        remainder, rather than by the exact length, is what lets one recording answer about every document that shares
+        it -- sixteen recordings instead of one per length ever seen.
+        """
+        if not self.paged:
+            return (rows, width)
+        from .paged import BLOCK as page_block
+
+        remainder = next(
+            (held % page_block for layer in cache.layers if (held := getattr(layer, "context_length", None)) is not None),
+            None,
+        )
+        return (rows, width) if remainder is None else (rows, width, remainder)
+
+    def _run_recorded(
+        self, cache, fork, run, ids, positions, rows: int, width: int, remaining: int = 0, homogeneous: bool = True
+    ):
         """The pass, replayed from a recording where there is one and recorded where a second one is worth taking.
+
+        Shared by the single-document branch pass (`_run_branch`) and the batched one (`_branch_across`): both fork a
+        cache into the shape a pass needs, run the backbone, and may record it, and the only thing that differs
+        between them is *how* the fork is done -- one document's snapshot widened, or several documents' snapshots
+        laid out by row. `cache` and `fork` carry that difference in; everything from here down is the same decision.
 
         The order is what makes this safe. A recording is not a result: under stream capture the kernels are written
         down rather than run, so the pass is executed eagerly for its answer *first* and recorded afterwards.
@@ -1403,33 +1500,43 @@ class Prismyra:
         once; and the count of times this shape has come back on this cache, which is evidence about a session asking
         group after group. A shape that has neither records nothing, so a caller asking one group about a document it
         will not revisit pays nothing for machinery it never uses.
+
+        `homogeneous` is false for a pass answering about more than one document, and that turns graphs off for this
+        call entirely -- found by an open-loop measurement answering wrong questions after this was shipped without
+        it. The paged storage's remainder bucket is sound for *one* document's remainder: a batch's `context_length`
+        is the *longest* document in it (`PagedForkLayer.begin_branches`), so two batches sharing that one number can
+        still disagree, row for row, on every other document's remainder -- which is exactly what decides where that
+        row's own branch write lands. A recording bakes that address in. Making the key or the check carry every
+        row's remainder would fix it properly; until that is built, a mixed batch is not a shape graphs generalises
+        over at all, and the honest thing is to say so rather than key it coarser and answer some rows wrong.
         """
-        if not self.graphs or self.torch_device.type != "cuda":
-            self.fork(prefill, rows)
-            return run(ids)
+        if not self.graphs or self.torch_device.type != "cuda" or not homogeneous:
+            fork()
+            return run(ids, positions)
 
         # Keyed on the cache rather than on the context, because the cache is what a recording holds the addresses of.
         # A context that closes returns its cache to the pool with its recordings attached, so the next context of the
-        # same size replays instead of recording again.
-        store = self._recordings_for(prefill.cache)
-        key = (rows, width)
+        # same size replays instead of recording again. `_bucket_key` widens the key with a remainder bucket for the
+        # paged storage, so a recording survives a change of document and not only a change of group.
+        store = self._recordings_for(cache)
+        key = self._bucket_key(cache, rows, width)
         recorded = store["taken"].get(key)
         if recorded is not None:
             # The bindings first, then the fork: the fork must write the context into the tensors the recording reads,
             # and after the last pass those are not the ones the layers point at.
-            recorded.before_fork(prefill.cache)
-            self.fork(prefill, rows)
-            wrong = recorded.usable(prefill.cache)
+            recorded.before_fork(cache)
+            fork()
+            wrong = recorded.usable(cache)
             if wrong is None:
                 self.replays[key] = self.replays.get(key, 0) + 1
-                return recorded.replay(prefill.cache, ids)
+                return recorded.replay(cache, ids, positions)
             # A recording that no longer describes the cache is discarded rather than replayed. The alternative is a
             # plausible answer, and this package treats that as the worst outcome available.
             del store["taken"][key]
             self.declined_recordings[key] = wrong
-            return run(ids)
+            return run(ids, positions)
 
-        self.fork(prefill, rows)
+        fork()
         # Copied, and this is not defensive housekeeping. A recording replays into buffers the allocator may have handed
         # out for this pass's own output, so a replay can overwrite the answer that was just computed -- which made the
         # first version of the check below compare a tensor against itself and pass every time, and would have returned
@@ -1438,15 +1545,43 @@ class Prismyra:
         # Timed, because whether a recording can pay is a question about this shape on this card and the answer is not a
         # constant. See `_worth_keeping`.
         started = _now(self.torch_device)
-        hidden = run(ids).clone()
+        hidden = run(ids, positions).clone()
         eager_ms = _since(started, self.torch_device)
         store["seen"][key] = store["seen"].get(key, 0) + 1
         expected = max(remaining, store["seen"][key] - 1)
-        if expected >= pays_from() and key not in self.declined_recordings:
-            taken, why = record(run, prefill.cache, ids, fork=lambda: self.fork(prefill, rows), keep=(positions,))
+        # An economics decline is reopened once enough more passes have arrived to clear the bar it was declined by
+        # -- `_economics_needed` holds that bar, set only for this one kind of decline. Everything else in
+        # `declined_recordings` (a stale cache, a capture failure) stays closed: those are not "not enough passes
+        # yet" and more passes would not change the answer.
+        if key in self._economics_needed and expected >= self._economics_needed[key]:
+            del self.declined_recordings[key]
+            del self._economics_needed[key]
+        # `pays_from()` here only gates whether a recording is *attempted* -- the decision whether to *keep* one, a
+        # few lines down, already measures this exact shape's own eager and replay cost and does not borrow a ratio
+        # from anywhere. See `graphs.PAGED_REPLAY_MS` for why swapping this gate's ratio was tried and reverted: the
+        # short one-pass ratio (0.268) makes an *attempt* easier to justify than the paged branch pass's own ratio
+        # (0.515) would, because a better ratio needs fewer future passes to pay back the same recording cost -- so
+        # using the paged ratio here would make attempts rarer, which is the opposite of what was wanted. The gate
+        # being generous is exactly why most attempts arrive one or two sightings short of the keep bar and need the
+        # reopening above to get a second chance rather than none.
+        # A kept recording holds a private allocator pool for the life of the engine -- nothing here ever frees one --
+        # and the retry above means a shape declined once can now be kept later, so the number of pools this engine
+        # ends up holding is not bounded by anything written down. Measured the hard way, twice: an open-loop run
+        # against real traffic, with the retry in place, drove free device memory from several gigabytes to a few
+        # megabytes and into a tight allocate-fail-retry loop that made no further progress -- and raising the
+        # memory margin alone did not stop it recurring, because the margin only ever asks "is there room for one
+        # more", never "how many are there already". `MAX_KEPT_RECORDINGS` asks the second question; the margin
+        # stays as a check the first still answers usefully once the count is bounded.
+        free, _ = (
+            torch.cuda.mem_get_info(self.torch_device) if self.torch_device.type == "cuda" else (1 << 62, 1 << 62)
+        )
+        room_to_record = free > GRAPH_MEMORY_MARGIN and len(store["taken"]) < MAX_KEPT_RECORDINGS
+        if expected >= pays_from() and key not in self.declined_recordings and room_to_record:
+            taken, why = record(run, cache, ids, positions, fork=fork)
             if taken is None:
                 # Remembered so it is attempted once per shape rather than once per group, and reported rather than
-                # retried in silence.
+                # retried in silence. Not an economics decline, so `_economics_needed` does not get an entry and this
+                # one stays closed: a capture failure is about this shape, not about how many more passes are coming.
                 self.declined_recordings[key] = why or "unknown"
             else:
                 # Replayed once and checked against the pass it was taken from, before it is allowed to answer anything.
@@ -1457,13 +1592,18 @@ class Prismyra:
                 # itself: if the first replay does not reproduce the answer already in hand, the recording is discarded.
                 # A wrong answer that looks right is the worst outcome available here, and this is what makes it
                 # impossible rather than unlikely.
-                moved, replay_ms = self._replay_disagreement(taken, prefill, ids, rows, hidden)
+                moved, replay_ms = self._replay_disagreement_on(taken, cache, fork, ids, positions, hidden)
                 self.verified_recordings[key] = moved
                 self.replay_cost[key] = (round(eager_ms, 1), round(replay_ms, 1))
                 slow = keeping_pays(eager_ms, replay_ms, expected)
                 if slow is not None:
                     # Nothing to remove: the recording is only stored below, once it has been judged worth keeping.
                     self.declined_recordings[key] = slow
+                    # The bar this shape needs to clear, in the same units as `expected` -- so the gate above can
+                    # reopen this exact decline once enough more sightings have arrived, instead of never asking
+                    # again. `pays_from` is the only thing `keeping_pays` computed `slow` from, so this is not a
+                    # second measurement, only the number the first one already produced.
+                    self._economics_needed[key] = pays_from(replay_ms, eager_ms)
                 elif moved > REPLAY_TOLERANCE:
                     self.declined_recordings[key] = (
                         f"a replay moved a hidden state by {moved:.3e}, above {REPLAY_TOLERANCE:.0e}"

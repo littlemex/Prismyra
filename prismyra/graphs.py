@@ -28,11 +28,24 @@ from dataclasses import dataclass, field
 import torch
 
 from .fork import LENGTH_ATTRS
+from .paged import BLOCK as PAGE_BLOCK
 
 #: What a pass costs eagerly and replayed, measured on the supported model at a short suffix. Only their **ratio** is
 #: used, because the absolute figures belong to one suffix width and the ratio is what survives a change of width.
+#:
+#: This pair is from `prismyra/onepass.py`'s single-question recording, not from a paged branch pass -- the two are
+#: different mechanisms (one pass of width one against a group of several), and borrowing one's ratio for the other's
+#: decision is a guess rather than a measurement. `PAGED_REPLAY_MS`/`PAGED_EAGER_MS` below is the measured pair for the
+#: paged branch pass, taken on the one shape that was ever actually recorded end to end
+#: (`(rows=4, width=96, remainder=7)`, `docs/PERFORMANCE.md`'s "paged remainder bucket" measurement). The caller picks
+#: which pair to use -- `engine._run_recorded` passes the paged pair when the cache is paged storage.
 REPLAY_MS = 28.9
 EAGER_MS = 107.7
+
+#: The paged branch pass's own measured ratio (0.515), against the short one-pass's 0.268. A paged recording is
+#: declined roughly twice as readily under the borrowed ratio as it should be under its own.
+PAGED_REPLAY_MS = 54.4
+PAGED_EAGER_MS = 105.6
 
 #: Replays spent proving a recording before it may answer. `engine.REPLAY_CHECKS` is the same number; it is a cost here.
 PROVING_REPLAYS = 2
@@ -194,19 +207,36 @@ class Recording:
     graph: torch.cuda.CUDAGraph
     #: Written before every replay. The recording baked in this tensor's address, so it is filled rather than replaced.
     ids: torch.Tensor
+    #: Written before every replay, the same way `ids` is. Kept as data rather than as a closure constant for the same
+    #: reason the paged storage's context length is: two documents of different lengths place a branch's own tokens
+    #: at different real positions, and a recording that closed over one document's position ids would answer every
+    #: later document as if it were still reading the first one -- a wrong answer that is bit-identical to a right one
+    #: for *some* document, which is what made this the slow bug to find: `test_a_paged_recording_answers_a_later_
+    #: document_of_a_different_length` passed the decision and failed only the probability, by exactly the gap between
+    #: the two documents' lengths.
+    positions: torch.Tensor
     #: Read after every replay, and overwritten by the next one. A caller that needs it to survive must copy it.
     hidden: torch.Tensor
     rows: int
     width: int
-    #: The context length the recording was taken at. A recording is valid for that length and no other, and this is
-    #: checked rather than hoped for.
+    #: The context length the recording was taken at. For the joined storage this must match exactly: the join's shape
+    #: is `(rows, context + suffix, heads, dim)`, so a different length is a different tensor and a different graph.
     #:
-    #: It is not enough that the *shapes* match. A branch's tokens are written at an offset measured from the end of the
-    #: context, and with pages that offset includes the context length modulo the page size -- so a context thirteen
-    #: tokens longer puts the branch in different slots, and the recorded writes go to the slots from before. Measured:
-    #: five documents of 251 to 302 tokens, answers wrong by up to 0.15, with the recording reporting agreement to zero
-    #: because the check had only ever compared replays taken on the context the recording came from.
+    #: For the paged storage it is not enough that the *shapes* match, but exact equality is also too strict. A
+    #: branch's tokens are written at an offset measured from the end of the context, and with pages that offset is the
+    #: context length modulo the page size -- so a context thirteen tokens longer puts the branch in different page
+    #: slots, and the recorded writes (made during capture, when the write loop ran as plain Python) go to the slots
+    #: from before. Measured: five documents of 251 to 302 tokens, answers wrong by up to 0.15, with the recording
+    #: reporting agreement to zero because the check had only ever compared replays taken on the context the recording
+    #: came from.
+    #:
+    #: What the write loop actually depends on is the *remainder* (`context length % BLOCK`), not the length itself:
+    #: the row's own private pages are at pool-constant addresses, and the only thing the remainder changes is how many
+    #: bytes land in the first private page before the write spills into the next one. Sixteen remainders exist, not
+    #: one per length, so `usable` checks the remainder when `paged` is set and the exact value otherwise.
     context_length: int = 0
+    #: Whether this recording was taken on paged storage, which decides how `usable` reads `context_length`.
+    paged: bool = False
     #: Everything else the recorded pass reads that Python allocated. Held for the recording's whole life, because a
     #: graph bakes in addresses and does not keep the tensors at them alive: the position ids were a local of the call
     #: that took the recording, so they were freed when it returned and the replay went on reading memory the allocator
@@ -237,7 +267,15 @@ class Recording:
         """
         for layer in cache.layers:
             held = getattr(layer, "context_length", None)
-            if held is not None and held != self.context_length:
+            if held is None:
+                continue
+            if self.paged:
+                if held % PAGE_BLOCK != self.context_length % PAGE_BLOCK:
+                    return (
+                        f"the context is {held} tokens (remainder {held % PAGE_BLOCK}) and this recording was taken "
+                        f"at a context whose remainder was {self.context_length % PAGE_BLOCK}"
+                    )
+            elif held != self.context_length:
                 return f"the context is {held} tokens and this recording was taken at {self.context_length}"
         for n, (layer, want) in enumerate(zip(cache.layers, self.reads, strict=True)):
             for attr, value in want.items():
@@ -254,30 +292,41 @@ class Recording:
                     return f"layer {n} rebound {attr} away from the tensor the recording reads"
         return None
 
-    def replay(self, cache, ids: torch.Tensor) -> torch.Tensor:
-        """Run the recorded pass on new suffix tokens, and leave the cache as that pass would have left it.
+    def replay(self, cache, ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Run the recorded pass on new suffix tokens at new positions, and leave the cache as that pass would have
+        left it.
 
         The caller forks first, after calling `before_fork`. Neither is inside the recording, and `record` says why.
         """
         if ids.shape != self.ids.shape:
             raise ValueError(f"this recording takes ids of {tuple(self.ids.shape)}, not {tuple(ids.shape)}")
+        if positions.shape != self.positions.shape:
+            raise ValueError(
+                f"this recording takes positions of {tuple(self.positions.shape)}, not {tuple(positions.shape)}"
+            )
         self.ids.copy_(ids)
+        self.positions.copy_(positions)
         self.graph.replay()
         _rebind(cache, self.writes)
         _restore_host_state(cache, self.after)
         return self.hidden
 
 
-def record(run, cache, ids: torch.Tensor, fork, keep: tuple = ()) -> tuple[Recording | None, str | None]:
+def record(
+    run, cache, ids: torch.Tensor, positions: torch.Tensor, fork, keep: tuple = ()
+) -> tuple[Recording | None, str | None]:
     """Warm up, record the pass, and return something replayable -- or None and the reason it could not be recorded.
 
-    `run` takes the static ids tensor and returns the pass's hidden states, and `fork` puts the cache back to the end of
-    the context. `run` is called `WARMUPS` times on a side stream and then once inside the recording, with `fork` before
-    each of them -- without that the warm-ups continue from one another and the recording is taken against a state no
-    real pass is ever in.
+    `run` takes the static ids and positions tensors and returns the pass's hidden states, and `fork` puts the cache
+    back to the end of the context. `run` is called `WARMUPS` times on a side stream and then once inside the
+    recording, with `fork` before each of them -- without that the warm-ups continue from one another and the
+    recording is taken against a state no real pass is ever in.
 
-    `keep` is every other tensor the pass reads that Python allocated -- the position ids, anything else a closure
-    captured. The recording holds them so they cannot be freed, because a graph stores addresses and nothing else.
+    Positions get the same static-buffer treatment as ids, and not the `keep` treatment the first version gave them.
+    Keeping a tensor alive is correct for something a replay never writes; it is wrong for something that has to be
+    *different* on a later replay, and position ids are the second kind -- a branch's own tokens sit at a position
+    measured from the end of whatever document is open, and that number is the point of a cross-document recording
+    changing. `keep` is left for anything else the pass reads that Python allocated and that is the same every replay.
 
     `fork` is outside the recording on purpose. With it inside, one replay disagreed with the eager pass and two replays
     disagreed with each other, because the layer rebinds its recurrent state to a new tensor on each pass and a
@@ -291,28 +340,30 @@ def record(run, cache, ids: torch.Tensor, fork, keep: tuple = ()) -> tuple[Recor
     a kernel that compiles on first use, an allocator that reaches past its pool -- and the eager path is always
     available, so an engine that cannot record should say so and carry on.
     """
-    static = ids.clone()
+    static_ids = ids.clone()
+    static_positions = positions.clone()
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     try:
         with torch.cuda.stream(side):
             for _ in range(WARMUPS):
                 fork()
-                run(static)
+                run(static_ids, static_positions)
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         fork()
         reads = _bindings(cache)
         with torch.cuda.graph(graph):
-            hidden = run(static)
+            hidden = run(static_ids, static_positions)
         torch.cuda.synchronize()
         writes = _bindings(cache)
     except Exception as e:  # noqa: BLE001 - any failure here means the eager path, which is what the caller has
         return None, f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
     return Recording(
         graph=graph,
-        ids=static,
+        ids=static_ids,
+        positions=static_positions,
         hidden=hidden,
         rows=ids.shape[0],
         width=ids.shape[1],
@@ -320,6 +371,9 @@ def record(run, cache, ids: torch.Tensor, fork, keep: tuple = ()) -> tuple[Recor
         context_length=next(
             (held for layer in cache.layers if (held := getattr(layer, "context_length", None)) is not None), 0
         ),
+        # Decided by the layer rather than taken from a flag the caller might pass inconsistently: a cache mixes
+        # layer types but not storage kinds, so any attention layer that says `paged` speaks for all of them.
+        paged=any(getattr(layer, "paged", False) for layer in cache.layers),
         after=_host_state(cache),
         reads=reads,
         writes=writes,
