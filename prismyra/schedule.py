@@ -356,6 +356,7 @@ class Batcher:
         shelf = self._on_shelf()
         wanted = sum(self._tokens(job) for job in fresh)
         incoming_snapshot = len(fresh) * self._slot_bytes
+        tried_reclaim = False
         while self._resident:
             held = sum(shelf.documents[handle].tokens for handle in shelf.documents)
             fits_tokens = held + wanted <= self.limits.tokens
@@ -363,6 +364,18 @@ class Batcher:
             if self.engine.torch_device.type == "cuda":
                 free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
                 fits_memory = free - incoming_snapshot > SHELF_MEMORY_MARGIN
+                # 2026-10-05 (THROUGHPUT.md item 2, same measurement and reasoning as
+                # `engine._run_recorded`'s GRAPH_MEMORY_MARGIN check): a `mem_get_info` free number below the
+                # margin is often PyTorch's caching allocator holding cached-but-unallocated blocks, not memory
+                # any resident document actually needs -- `empty_cache()` reclaimed 7.6 of a measured 7.9 GiB gap
+                # in one call. Tried once per `_make_room` call (not once per loop iteration: a resident document
+                # evicted a moment ago may have made room on its own, which this re-checks first) before this
+                # loop evicts a document that fits-memory alone would not have required dropping.
+                if not fits_memory and not tried_reclaim:
+                    tried_reclaim = True
+                    torch.cuda.empty_cache()
+                    free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
+                    fits_memory = free - incoming_snapshot > SHELF_MEMORY_MARGIN
             if fits_tokens and fits_memory:
                 return
             oldest = min(

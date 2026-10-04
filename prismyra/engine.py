@@ -1741,6 +1741,17 @@ class Prismyra:
         free, _ = (
             torch.cuda.mem_get_info(self.torch_device) if self.torch_device.type == "cuda" else (1 << 62, 1 << 62)
         )
+        # 2026-10-05 (THROUGHPUT.md item 2): measured the gap directly (`diag_memory_breakdown_single.py`) --
+        # after a rate=10 burst, `mem_get_info`'s free number was 2.16 GiB (below this margin) while PyTorch's own
+        # `reserved - allocated` gap was 7.6 GiB of cached-but-unallocated blocks the caching allocator was simply
+        # not returning to the driver, not memory any live tensor (recording, shelf snapshot, or anything else)
+        # actually needed. `empty_cache()` recovered essentially all of it (free: 2.16 -> 9.54 GiB) in one call. A
+        # margin check that only ever looks at the driver's free number declines on exactly this kind of transient
+        # fragmentation, so one reclaim attempt happens here before giving up -- cheap because it only runs on the
+        # already-below-margin path, not on every pass.
+        if self.torch_device.type == "cuda" and free <= GRAPH_MEMORY_MARGIN:
+            torch.cuda.empty_cache()
+            free, _ = torch.cuda.mem_get_info(self.torch_device)
         room_to_record = free > GRAPH_MEMORY_MARGIN and len(store["taken"]) < MAX_KEPT_RECORDINGS
         if expected >= pays_from() and key not in self.declined_recordings and room_to_record:
             taken, why = record(run, cache, ids, positions, fork=fork)
