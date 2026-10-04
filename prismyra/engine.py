@@ -502,6 +502,14 @@ class Prismyra:
         #: stored in or handed to the framework's own attention as a strided view. That changes what a branch pass
         #: transiently allocates, so it changes what admission budgets.
         self._borrowed_kernel = self.applied.ok and not self.applied.skipped
+        if paged and on_cuda:
+            try:
+                _enable_batch_invariance()
+            except ImportError as e:
+                self.applied.notes.append(
+                    f"batch-invariant mode not available ({e}); open_batch/Batcher may still move an answer by "
+                    "who else shares the pass -- see diag_layer0_op_divergence.py"
+                )
         self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
         # measured question rather than an obvious one -- `evals/run.py` compares the two.
@@ -1852,6 +1860,49 @@ def _load_processor(model: str):
         return AutoProcessor.from_pretrained(model)
     except Exception:  # noqa: BLE001 - a checkpoint without one simply cannot take images, which `encode` reports
         return None
+
+
+def _enable_batch_invariance() -> None:
+    """Make the plain bf16 projections row-independent, process-wide, the way vLLM already ships for exactly this.
+
+    Found decisively (`diag_layer0_op_divergence.py`): a document read alongside two companions of identical
+    length but entirely different content was bit-identical through every layer-0 operation except one -- the
+    router's own `F.linear(x, self.gate.weight)` inside `kernels.qwen3_moe.FusedExperts._route`. That one op's
+    result for a real row moved with the pass's total row count, which is the row-count-chosen-GEMM-algorithm
+    effect `onepass.py`'s islands already defend against during a *recording* (`rows_exact`) but nothing defends
+    against during an ordinary read or branch pass. Measured with it on: `open_batch` against `ask()` across the
+    full RACE validation set (80 documents, 11 batches) went from a residual mismatch to **zero**, every
+    probability bit-identical.
+
+    Calling `enable_batch_invariant_mode()` alone was not enough: it replaces `aten::linear`/`mm`/`addmm`/`matmul`/
+    `bmm`/`softmax`/`mean` for the whole process with a fixed-tile Triton implementation that does not choose its
+    algorithm by row count, which closed the context-read mismatch completely but left one open on the *branch*
+    pass -- `fused_experts`' own Triton MoE kernel is called directly, not through `aten::`, so the dispatcher-level
+    override cannot reach it. vLLM's `fused_moe.py` has its own guard for exactly this
+    (`if envs.VLLM_BATCH_INVARIANT: ...` picks a fixed config instead of one keyed by `M`), gated on the
+    environment variable rather than the in-process flag `enable_batch_invariant_mode()` sets. `envs.VLLM_BATCH_INVARIANT`
+    reads `os.environ` fresh on every access (vLLM's own lazy `envs.py` pattern), so setting it here before calling
+    `init_batch_invariance()` (which checks that variable itself, and also disables TF32 and pins the cuBLAS
+    workspace config) reaches both the dispatcher-level override and this second, separate guard. Found by a test
+    this fix is shipped with (`test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length`):
+    without the environment variable, a document asked two questions, batched with a one-question companion, had
+    its own probabilities move even with `enable_batch_invariant_mode()` already on -- `_round_rows` buckets a
+    solo pass's two rows and a batched pass's three rows to two different row counts (2 and 4), and the router
+    being batch-invariant does not help if `fused_experts`' *own* kernel still picks its tiling by which of those
+    two it was called with.
+
+    Measured cost with both switches on: a solo `fork` read is unchanged (18.5 against 18.6 questions/s);
+    `open_batch` loses roughly 7-15% (72.4-76.9 against 77.7-90.2 questions/s across group=32..64), the fixed-tile
+    kernels being a slower trade for not choosing by shape. Kept only when the borrowed kernels this engine's
+    batching depends on are actually in use (`paged` on CUDA): a joined-storage engine never shares a pass across
+    documents, so it has nothing this buys.
+    """
+    import os
+
+    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
+
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    init_batch_invariance()
 
 
 def _now(device: torch.device) -> float:

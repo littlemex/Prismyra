@@ -944,6 +944,58 @@ def test_a_shelf_matches_ask_bit_for_bit(engine_paged):
             assert got[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (q.id, option)
 
 
+def test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length(engine_paged):
+    """The mismatch an open-loop measurement found that neither the width fix (`test_a_shelf_matches_ask_bit_for_bit`)
+    nor row-count padding (`_round_rows`) closed on their own: `open_batch`'s `fused_experts` router projection
+    (`kernels.qwen3_moe.FusedExperts._route`, a plain bf16 `F.linear`) picked its own reduction order by the
+    *context read*'s total row count, the same row-count-chosen-algorithm effect `onepass.py`'s islands already
+    guard against during a *recording* but nothing guarded against during an ordinary read or branch pass.
+
+    Found decisively (`diag_layer0_op_divergence.py`): the same document, companioned by two documents of
+    completely different content but the identical total length, was bit-identical through every layer-0
+    operation. Companioned instead by documents of *different* total length, the first and only divergent
+    operation was the router's logits -- not the chunked recurrence, not the convolution, not either RMSNorm.
+    `Prismyra._enable_batch_invariance` (vLLM's `enable_batch_invariant_mode` plus `VLLM_BATCH_INVARIANT=1` for
+    `fused_moe.py`'s own row-count-keyed config, on by default for a paged engine on CUDA since this was found)
+    is the fix for that axis, and the full RACE validation set (80 documents, 11 batches,
+    `diag_openbatch_vs_ask.py`) now answers `open_batch` bit-identical to `ask()` -- zero mismatches, where there
+    were three before this and the context-length padding together.
+
+    What this fix does *not* reach, found while writing this test rather than assumed: a companion with a
+    different *question count* -- not context length -- still moves a probability a little
+    (measured: 0.0128, with a two-question target and a one-question companion forcing two different `_round_rows`
+    buckets, 2 against 4, for the branch pass itself). Decisions do not change and the movement is a twentieth of
+    `COMPANION_MOVEMENT` (0.3), so this is checked against that bound rather than claimed as zero -- the
+    context-length axis is closed, the row-count axis inside the branch pass is narrowed but not yet, and that gap
+    is recorded in `THROUGHPUT.md` rather than hidden by loosening this test further than the measurement.
+    """
+    long_companion = SECOND_CONTEXT * 6  # several times CONTEXT's own length: the context-read axis this closes.
+    asked = [
+        Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?"),
+        Choice(
+            id="opened",
+            prompt="What happens to an opened item?\nA. Refunded\nB. Exchanged\nC. Kept\nD. Discarded",
+            choices=["A", "B", "C", "D"],
+        ),
+    ]
+    about_companion = [Boolean(id="replaced", prompt="Is a lost gift card replaced on proof of purchase?")]
+
+    want = engine_paged.ask(CONTEXT, asked)
+
+    with engine_paged.open_batch([CONTEXT, SECOND_CONTEXT]) as short_batch:
+        with_short = short_batch.ask([asked, about_companion])[0]
+    with engine_paged.open_batch([CONTEXT, long_companion]) as long_batch:
+        with_long = long_batch.ask([asked, about_companion])[0]
+
+    for label, mixed in (("short companion", with_short), ("long companion", with_long)):
+        for q in asked:
+            assert mixed[q.id].option == want[q.id].option, f"{label}: {q.id} changed its answer"
+            for option, p in want[q.id].probabilities.items():
+                assert mixed[q.id].probabilities[option] == pytest.approx(p, abs=COMPANION_MOVEMENT / 20), (
+                    label, q.id, option
+                )
+
+
 def test_a_shelf_evicts_on_memory_pressure_even_with_tokens_to_spare(engine_paged, monkeypatch):
     """The second bug an open-loop measurement found: streaming RACE's 368 documents through a shelf one at a time
     exhausted a 44 GiB card at 97 resident documents holding 24,394 of a 65,536-token budget -- nowhere near full
@@ -1254,7 +1306,12 @@ def test_recorded_hidden_states_are_the_ones_the_read_out_scores(engine):
     ids = plan(HEADED, engine.tokenizer).token_ids
     for h, answered in zip(rec.rows, (one, fork), strict=True):
         p = torch.softmax(h @ engine.unembedding[ids].float().cpu().t(), dim=-1).tolist()
-        assert p == pytest.approx([answered.probabilities[o] for o in HEADED.options], abs=1e-6)
+        # abs=1e-5 rather than 1e-6: a paged engine now runs the router's projection (and every other plain bf16
+        # `F.linear`) through vLLM's batch-invariant Triton matmul (`engine._enable_batch_invariant`), which does
+        # not pick its reduction by row count -- the fix for a real companion-dependent mismatch
+        # (`diag_layer0_op_divergence.py`), at the cost of a reduction order that differs from this test's own CPU
+        # float32 softmax by a hair more than the old tolerance allowed (measured: 1.3e-6, not 1.3e-5).
+        assert p == pytest.approx([answered.probabilities[o] for o in HEADED.options], abs=1e-5)
 
 
 def test_a_headed_question_replays_exactly_as_it_reads_eagerly(engine, tmp_path):
