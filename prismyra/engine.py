@@ -170,12 +170,24 @@ class Shelf:
             # left. Zeroed rather than reset: reset would clear the pages, which is where the documents already on the
             # shelf live.
             _forget_recurrent_state(self._cache)
+            # Same reason `_read` pads a solo read: the borrowed chunked recurrent kernel picks its own
+            # configuration by this read's *total* length, not by what any one document in it is, so a document put
+            # on the shelf alongside different company at different times can otherwise end its read at a different,
+            # real-but-inconsistent state. See `Prismyra._pad_context_lengths`.
+            lengths = [one.tokens for one in encoded]
+            pad_ids, lengths = engine._pad_context_lengths(lengths, [one.input_ids for one in encoded])
+            # The padding needs a handle of its own, same as every real document (`_write_context`'s own check), one
+            # that nothing on this shelf is using. `self._next_handle` is reserved for the *next* `put_many` call and
+            # has not been handed out yet, which is exactly what makes it free to borrow for the length of this one.
+            pad_handle = self._next_handle + len(encoded)
+            has_pad = pad_ids.shape[1] > 0
+            begin_handles = [*handles, pad_handle] if has_pad else handles
             for layer in self._cache.layers:
                 begin = getattr(layer, "begin_documents", None)
                 if begin is not None:
-                    begin(handles)
-            ids = torch.cat([one.input_ids for one in encoded], dim=1)
-            with varlen.reading([one.tokens for one in encoded], engine.device) as boundaries:
+                    begin(begin_handles)
+            ids = torch.cat([*(one.input_ids for one in encoded), pad_ids], dim=1)
+            with varlen.reading(lengths, engine.device) as boundaries:
                 engine.backbone(
                     input_ids=ids,
                     position_ids=boundaries.positions(engine.device),
@@ -185,6 +197,13 @@ class Shelf:
                 _put_back_conv_states(self._cache, boundaries)
                 engine._check_batched_read(self._cache, boundaries)
             taken = snapshot(self._cache)
+            if has_pad:
+                # The padding answers nothing and keeps no row on this shelf, so its pages go back now rather than
+                # sitting here as a document nobody will ever ask about or drop.
+                for layer in self._cache.layers:
+                    release = getattr(layer, "release_document", None)
+                    if release is not None:
+                        release(pad_handle)
         engine._note_read(_since(started, engine.torch_device), len(encoded))
         for at, (handle, one) in enumerate(zip(handles, encoded, strict=True)):
             piece = pick(taken, at)
@@ -883,6 +902,24 @@ class Prismyra:
             )
 
     def _read(self, encoded) -> Prefill:
+        # A solo read and `open_batch`'s joint read of several documents go through the *same* borrowed chunked
+        # recurrent kernel, and that kernel's own configuration is chosen by the *total* length of the varlen run
+        # it is given -- not by any one document's content in it (measured decisively,
+        # `diag_total_length_hypothesis.py`: two companions of the identical length but different content left a
+        # target's extracted state bit-identical; the same target alone, at a different total length, did not).
+        # So a document read alone and the same document read alongside others can legitimately end up at two
+        # different total lengths, and therefore two different -- but each internally consistent -- recurrent
+        # states, which is exactly the open_batch/`ask()` mismatch this engine's device tests measure against.
+        # Padding every read, solo or batched, up to the same small set of total-length buckets (`_round_rows`,
+        # reused rather than duplicated: "round up to the next power of two, capped" is the identical decision for
+        # a row count and for a token count) removes the difference instead of chasing it. Only when the borrowed
+        # kernels this depends on are installed, the engine is paged (unpaged storage has no per-document state to
+        # keep separate in the first place) and there is no media (whose positions a flat multi-segment run has not
+        # been taught to carry, same restriction `open_batch` already states).
+        if self.paged and not encoded.has_media and not self._missing_batched_read_kernels():
+            pad_ids, lengths = self._pad_context_lengths([encoded.tokens], [encoded.input_ids])
+            if pad_ids.shape[1] > 0:
+                return self._read_padded(encoded, pad_ids, lengths)
         cache, room = self._claim_cache(encoded.tokens)
         self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
         # Read after the forward, not before: the offset is something the model works out while reading the context.
@@ -902,6 +939,70 @@ class Prismyra:
             tokens=encoded.tokens,
             last_position=torch.tensor([encoded.tokens - 1], device=self.device),
             position_from=position_from,
+        )
+
+    def _missing_batched_read_kernels(self) -> set[str]:
+        """Which of the two borrowed replacements a batched (multi-segment, `cu_seqlens`) read depends on are not
+        installed, empty when both are. Shared by `open_batch` and `_read`'s padding, which depend on the same
+        thing for the same reason: the framework's own gated-delta-rule and convolution have no argument for where
+        one document ends inside a flat run.
+        """
+        return {"convolution", "gated_delta_rule"} - {swap.name for swap in self.applied.swaps}
+
+    def _pad_context_lengths(self, lengths: list[int], ids: list[torch.Tensor]) -> tuple[torch.Tensor, list[int]]:
+        """Round a varlen read's total length up to the bucket `_round_rows` would pick, as one more segment appended
+        after the real documents, and the padding ids to fill it -- a harmless repeat of the last document's own
+        tokens, because the measurement behind this is that a chunked recurrent kernel's config is chosen by *total*
+        length and does not care what the padding is (`diag_total_length_hypothesis.py`).
+
+        Returns the padding ids (shape `(1, 0)`, not `(1, pad)` carrying nothing, when the total is already at a
+        bucket) and `lengths` with the pad segment appended only when there is one -- `varlen.reading` refuses a
+        zero-length document, and a run that is already at a bucket has nothing to add.
+        """
+        total = sum(lengths)
+        padded = _round_rows(total, self.longest_context)
+        pad = max(0, padded - total)
+        if pad == 0:
+            return ids[0].new_zeros((1, 0)), lengths
+        last = ids[-1]
+        reps = -(-pad // last.shape[1])
+        pad_ids = last.repeat(1, reps)[:, :pad]
+        return pad_ids, [*lengths, pad]
+
+    def _read_padded(self, encoded, pad_ids: torch.Tensor, lengths: list[int]) -> Prefill:
+        """`_read`'s single-document path, through the same joint-read machinery `open_batch` uses for several --
+        one real document and one padding segment, so the kernel sees the same total length a later `open_batch`
+        sharing this document would round it to. Only the real document's row of the result is kept; the padding's
+        is discarded exactly as a padded branch pass already discards its extra rows (`_round_rows`'s own note).
+        """
+        cache, room = self._claim_cache(sum(lengths))
+        ids = torch.cat([encoded.input_ids, pad_ids], dim=1)
+        with torch.inference_mode():
+            for layer in cache.layers:
+                begin = getattr(layer, "begin_documents", None)
+                if begin is not None:
+                    begin([0, 1])  # the real document, then its padding -- one handle each, or `_write_context` refuses
+            with varlen.reading(lengths, self.device) as boundaries:
+                self.backbone(input_ids=ids, position_ids=boundaries.positions(self.device), use_cache=True, past_key_values=cache)
+                _put_back_conv_states(cache, boundaries)
+                self._check_batched_read(cache, boundaries)
+            taken = pick(snapshot(cache), 0)
+            for layer in cache.layers:
+                release = getattr(layer, "release_document", None)
+                if release is not None:
+                    release(1)
+        # Not `restore_and_fork`: its `begin_branches()` defaults every row to "the last document written" (its own
+        # docstring), which was always correct when the only document ever written to a solo cache was the real one
+        # -- here the padding was written after it. `rows_for=[0] * self.group` says the same thing this cache's
+        # only remaining document already implies, explicitly rather than by relying on write order.
+        restore_and_fork_many(cache, [(taken, self.group)], width=self.group, rows_for=[0] * self.group)
+        return Prefill(
+            snapshot=taken,
+            cache=cache,
+            room=room,
+            tokens=encoded.tokens,
+            last_position=torch.tensor([encoded.tokens - 1], device=self.device),
+            position_from=encoded.tokens,
         )
 
     @property
@@ -991,9 +1092,7 @@ class Prismyra:
         # The two replacements a batched read depends on, named rather than "all of them". The first version of this
         # check asked whether anything had been skipped at all, and a skipped head duplication -- nothing to do with
         # document boundaries -- refused every batch.
-        needed = {"convolution", "gated_delta_rule"}
-        installed = {swap.name for swap in self.applied.swaps}
-        if missing := needed - installed:
+        if missing := self._missing_batched_read_kernels():
             raise PrismyraError(
                 f"a batch of documents needs the borrowed {' and '.join(sorted(missing))}: the framework's own has no "
                 "argument for where one document ends, so a batched read would scan across the boundary and answer "
@@ -1008,18 +1107,26 @@ class Prismyra:
             )
         lengths = [one.tokens for one in encoded]
         total = sum(lengths)
-        cache, room = self._claim_cache(total)
+        pad_ids, lengths = self._pad_context_lengths(lengths, [one.input_ids for one in encoded])
+        cache, room = self._claim_cache(total + pad_ids.shape[1])
         started = _now(self.torch_device)
         with torch.inference_mode():
             # One pass over all of them. Reading is 110 ms of fixed cost plus 11 ms per thousand tokens on this
             # model, so what this removes is that fixed cost paid per document rather than per batch.
             # Named even though a batch's handles are its positions, so the layer's "already held" check runs rather
             # than being skipped on the one path that could get away with skipping it.
+            # The padding is one more document to the pages, same as to the recurrence: `begin_documents` wants one
+            # handle per entry in `lengths`, pages and all, or the paged attention layer refuses the read outright
+            # (`_write_context`'s own check). `len(encoded)` is free because nothing is held in a batch's fresh cache
+            # yet.
+            pad_handle = len(encoded)
+            has_pad = pad_ids.shape[1] > 0
+            handles = list(range(len(encoded))) + ([pad_handle] if has_pad else [])
             for layer in cache.layers:
                 begin = getattr(layer, "begin_documents", None)
                 if begin is not None:
-                    begin(list(range(len(encoded))))
-            ids = torch.cat([one.input_ids for one in encoded], dim=1)
+                    begin(handles)
+            ids = torch.cat([*(one.input_ids for one in encoded), pad_ids], dim=1)
             with varlen.reading(lengths, self.device) as boundaries:
                 self.backbone(
                     input_ids=ids,
@@ -1032,6 +1139,13 @@ class Prismyra:
             # One snapshot with a row per document, because the recurrence returns a state per document when it is told
             # the boundaries. `fork.pick` is how a document takes its own row of it.
             taken = snapshot(cache)
+            if has_pad:
+                # The padding answers nothing and keeps no row, so its pages go back now rather than sitting in this
+                # batch's cache until it closes.
+                for layer in cache.layers:
+                    release = getattr(layer, "release_document", None)
+                    if release is not None:
+                        release(pad_handle)
         prefills = [
             Prefill(
                 snapshot=pick(taken, handle),
