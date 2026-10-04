@@ -21,6 +21,22 @@ from .conv import causal_depthwise_conv1d, starts_from_boundaries
 
 BLOCK = (128, 128)
 
+#: The router's own matmul, made row-count invariant at its one call site, rather than through the process-wide
+#: `aten::linear` override `engine._enable_batch_invariance` used to be the only way to reach it. vLLM's own fixed-tile
+#: Triton kernel (not the dispatch-level registration -- a plain function, callable directly) picks its tile sizes from
+#: the operands' shapes alone, never from how many other rows happened to share the call, which is exactly what this one
+#: call site needs and the rest of the model's `F.linear` calls do not: THROUGHPUT.md's "ルーターのみの
+#: batch-invariant" measurement found the router is the only plain bf16 projection whose reduction order moved with a
+#: pass's total row count (`diag_layer0_op_divergence.py` -- every other layer-0 operation, including the shared
+#: expert's own `F.linear`, was already bit-identical). `None` when the installed vLLM is too old to have it: `_route`
+#: then falls back to the ordinary row-dependent `F.linear`, exactly as it did before this existed.
+try:
+    from vllm.model_executor.layers.batch_invariant import (
+        linear_batch_invariant as _ROUTER_LINEAR,
+    )
+except ImportError:
+    _ROUTER_LINEAR = None
+
 #: Submodules the replacements import inside their forward pass. Each is checked before anything is replaced.
 REQUIRED_VLLM = (
     "vllm.vllm_flash_attn",
@@ -98,7 +114,8 @@ class FusedExperts(nn.Module):
         )
 
     def _route(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x, self.gate.weight)
+        linear = _ROUTER_LINEAR or torch.nn.functional.linear
+        return linear(x, self.gate.weight)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
@@ -107,8 +124,10 @@ class FusedExperts(nn.Module):
         x = hidden_states.reshape(-1, shape[-1])
         # The original router's projection, so the same experts are chosen: `F.linear` on its weight is the first
         # line of its forward, and the rest of that forward -- a softmax, a top-k and a renormalisation -- is what
-        # `fused_topk` does here again, so calling the module computed it twice and threw one away. Through
-        # `rows_exact` because this projection picks its algorithm by row count (see `prismyra.onepass`).
+        # `fused_topk` does here again, so calling the module computed it twice and threw one away. `_route` itself
+        # is now row-count invariant (`_ROUTER_LINEAR`, above) rather than relying on `rows_exact` to recover
+        # invariance only during a recording -- but the wrapper stays: a recording still needs its own row count run
+        # as an island (`prismyra.onepass`) for reasons unrelated to this op's reduction order.
         logits = rows_exact(self._route, x)
         weights, ids = fused_topk(x, logits, self.top_k, renormalize=True)[:2]
         routed = fused_experts(x, self.w1, self.w2, weights, ids, quant_config=self.quant)

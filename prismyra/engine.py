@@ -1868,28 +1868,42 @@ def _enable_batch_invariance() -> None:
     Found decisively (`diag_layer0_op_divergence.py`): a document read alongside two companions of identical
     length but entirely different content was bit-identical through every layer-0 operation except one -- the
     router's own `F.linear(x, self.gate.weight)` inside `kernels.qwen3_moe.FusedExperts._route`. That one op's
-    result for a real row moved with the pass's total row count, which is the row-count-chosen-GEMM-algorithm
-    effect `onepass.py`'s islands already defend against during a *recording* (`rows_exact`) but nothing defends
-    against during an ordinary read or branch pass. Measured with it on: `open_batch` against `ask()` across the
-    full RACE validation set (80 documents, 11 batches) went from a residual mismatch to **zero**, every
-    probability bit-identical.
+    result for a real row moved with the pass's total row count, the row-count-chosen-GEMM-algorithm effect
+    `onepass.py`'s islands already defend against during a *recording* (`rows_exact`) but nothing defends against
+    during an ordinary read or branch pass.
 
-    Calling `enable_batch_invariant_mode()` alone was not enough: it replaces `aten::linear`/`mm`/`addmm`/`matmul`/
-    `bmm`/`softmax`/`mean` for the whole process with a fixed-tile Triton implementation that does not choose its
-    algorithm by row count, which closed the context-read mismatch completely but left one open on the *branch*
-    pass -- `fused_experts`' own Triton MoE kernel is called directly, not through `aten::`, so the dispatcher-level
-    override cannot reach it. vLLM's `fused_moe.py` has its own guard for exactly this
-    (`if envs.VLLM_BATCH_INVARIANT: ...` picks a fixed config instead of one keyed by `M`), gated on the
-    environment variable rather than the in-process flag `enable_batch_invariant_mode()` sets. `envs.VLLM_BATCH_INVARIANT`
-    reads `os.environ` fresh on every access (vLLM's own lazy `envs.py` pattern), so setting it here before calling
-    `init_batch_invariance()` (which checks that variable itself, and also disables TF32 and pins the cuBLAS
-    workspace config) reaches both the dispatcher-level override and this second, separate guard. Found by a test
-    this fix is shipped with (`test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length`):
-    without the environment variable, a document asked two questions, batched with a one-question companion, had
-    its own probabilities move even with `enable_batch_invariant_mode()` already on -- `_round_rows` buckets a
-    solo pass's two rows and a batched pass's three rows to two different row counts (2 and 4), and the router
-    being batch-invariant does not help if `fused_experts`' *own* kernel still picks its tiling by which of those
-    two it was called with.
+    2026-10-05 tried narrowing this to just that one call site (THROUGHPUT.md's "ルーターのみの batch-invariant"):
+    `kernels.qwen3_moe._ROUTER_LINEAR` calls vLLM's `linear_batch_invariant` directly at `_route`'s one call site
+    (kept below, it is correct and free), and `fused_experts`' own kernel still gets `VLLM_BATCH_INVARIANT=1` so
+    its tile-size choice stops keying on `M` too (`fused_moe.py`'s own guard, independent of the dispatch-level
+    override). Measured against the full RACE validation set the same way the full fix was
+    (`diag_openbatch_vs_ask.py`, 80 documents, 11 batches): **2 mismatches, largest probability move 0.189** --
+    router and MoE-tiling invariance alone are not enough. The layer-0 diagnostic that found the router was the
+    only row-dependent op was run on one companion pair at one pair of lengths; `onepass._chooses_by_rows` already
+    says *why* this should generalise rather than surprise -- every plain bf16 `nn.Linear` in the decoder picks its
+    GEMM algorithm by row count, not just the router's, and the two documents that moved exercised attention or
+    shared-expert projections the narrower layer-0 check never companioned. Narrowing the fix does not survive
+    contact with the full benchmark, so the process-wide override stays. (The router's direct call stays too: it
+    costs nothing extra now that the override reaches the same op anyway, and it stops this one call site's
+    correctness from depending on some other engine in the process having been constructed `paged=True` first --
+    see `enable_batch_invariant_mode`'s global, idempotent, order-sensitive flag.)
+
+    Calling `enable_batch_invariant_mode()` alone was not enough on its own either: it replaces
+    `aten::linear`/`mm`/`addmm`/`matmul`/`bmm`/`softmax`/`mean` for the whole process with a fixed-tile Triton
+    implementation that does not choose its algorithm by row count, which closed the context-read mismatch
+    completely but left one open on the *branch* pass -- `fused_experts`' own Triton MoE kernel is called
+    directly, not through `aten::`, so the dispatcher-level override cannot reach it. vLLM's `fused_moe.py` has
+    its own guard for exactly this (`if envs.VLLM_BATCH_INVARIANT: ...` picks a fixed config instead of one keyed
+    by `M`), gated on the environment variable rather than the in-process flag `enable_batch_invariant_mode()`
+    sets. `envs.VLLM_BATCH_INVARIANT` reads `os.environ` fresh on every access (vLLM's own lazy `envs.py`
+    pattern), so setting it here before calling `init_batch_invariance()` (which checks that variable itself, and
+    also disables TF32 and pins the cuBLAS workspace config) reaches both the dispatcher-level override and this
+    second, separate guard. Found by a test this fix is shipped with
+    (`test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length`): without the environment
+    variable, a document asked two questions, batched with a one-question companion, had its own probabilities
+    move even with `enable_batch_invariant_mode()` already on -- `_round_rows` buckets a solo pass's two rows and
+    a batched pass's three rows to two different row counts (2 and 4), and the router being batch-invariant does
+    not help if `fused_experts`' *own* kernel still picks its tiling by which of those two it was called with.
 
     Measured cost with both switches on: a solo `fork` read is unchanged (18.5 against 18.6 questions/s);
     `open_batch` loses roughly 7-15% (72.4-76.9 against 77.7-90.2 questions/s across group=32..64), the fixed-tile
