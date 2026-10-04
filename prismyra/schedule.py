@@ -234,13 +234,28 @@ class Batcher:
         Waits up to `Limits.linger_ms` for another request, and stops the moment the pass is full. The module
         docstring says why there is a wait at all and what bounds it: the first version of this method did not wait, and
         paid a whole pass's fixed cost to answer one request that seven others were microseconds behind.
+
+        That bound is a ceiling, not a bet, and the bet is what `backlogged` adds. `first` was already taken off the
+        queue before this runs, so `self._worker.depth` here is the number of *other* jobs already waiting at this
+        instant -- not a guess, a fact observed one line ago. Zero of them is not weak evidence that a companion is
+        imminent; over an open-loop run against real documents (`THROUGHPUT.md`, "到着率10の負けの切り分け"), lingering
+        on that non-evidence raised the median end-to-end latency at a sparse arrival rate (10 documents/s) from
+        386.8ms to 436.9ms and dropped the deadline-hit rate from 0.875 to 0.713 -- waiting for a companion that
+        usually was not coming, at everyone's expense once in a while when the wait ran long. One or more already
+        waiting is real evidence, and at a busier rate (20 documents/s) skipping the wait entirely made the median
+        latency worse (496.8ms to 625.7ms) and the hit rate worse (0.506 to 0.206): there, a companion usually was
+        coming, and the amortised read paid for the wait. `backlogged` is what tells the two cases apart without being
+        told the arrival rate -- it reads the queue the caller already has, rather than a configured guess at how busy
+        things are.
         """
         formed = Formed(jobs=[first])
         tokens = self._tokens(first)
+        backlogged = self._worker.depth > 0
         # Bounded by what the engine has measured as well as by the setting. A linger longer than a pass's fixed cost
-        # cannot pay, and before anything has been read there is no evidence for any wait at all.
-        quiet = min(self.limits.linger_ms, self.limits.worth_waiting_ms(self.engine)) / 1e3
-        ceiling = time.perf_counter() + self.limits.worth_waiting_ms(self.engine) / 1e3
+        # cannot pay, and before anything has been read there is no evidence for any wait at all -- the same reason
+        # `backlogged` being false means there is no evidence either, this time about whether anyone else is coming.
+        quiet = min(self.limits.linger_ms if backlogged else 0.0, self.limits.worth_waiting_ms(self.engine)) / 1e3
+        ceiling = time.perf_counter() + (self.limits.worth_waiting_ms(self.engine) if backlogged else 0.0) / 1e3
         deadline = time.perf_counter() + quiet
         while True:
             if formed.documents >= self.limits.documents:
@@ -253,7 +268,10 @@ class Batcher:
                     # Nothing waiting yet, and there is still time for a straggler from the same burst.
                     time.sleep(0.0002)
                     continue
-                formed.reason = "the ceiling was reached" if now >= ceiling else "nothing else was waiting"
+                if not backlogged:
+                    formed.reason = "nothing was already waiting, so no wait was worth betting on"
+                else:
+                    formed.reason = "the ceiling was reached" if now >= ceiling else "nothing else was waiting"
                 return formed
             questions = len(nxt.payload.questions)
             more = self._tokens(nxt)
