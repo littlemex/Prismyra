@@ -944,6 +944,46 @@ def test_a_shelf_matches_ask_bit_for_bit(engine_paged):
             assert got[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (q.id, option)
 
 
+def test_a_shelf_evicts_on_memory_pressure_even_with_tokens_to_spare(engine_paged, monkeypatch):
+    """The second bug an open-loop measurement found: streaming RACE's 368 documents through a shelf one at a time
+    exhausted a 44 GiB card at 97 resident documents holding 24,394 of a 65,536-token budget -- nowhere near full
+    by the only thing `Batcher._make_room` checked. Each resident document also keeps a clone of the recurrent
+    state it ended on (`Shelved.snapshot_bytes`), outside the page pool and roughly the same size whatever the
+    document's length, and nothing bounded how many of those a shelf could hold at once.
+
+    Reproduced here without filling a real card: `torch.cuda.mem_get_info` is monkeypatched to report free memory
+    just under `schedule.SHELF_MEMORY_MARGIN` once one small document is already resident -- a state the token
+    budget alone would never ask for an eviction over.
+    """
+    from prismyra import schedule as schedule_module
+    from prismyra.schedule import Batcher
+
+    batcher = Batcher(engine_paged, linger_ms=0.0).start()
+    try:
+        first = batcher.submit(CONTEXT, [Boolean(id="q1", prompt="Is there a return policy?")])
+        assert first.done.wait(timeout=30), "the first document never answered"
+        assert first.error is None, first.error
+        assert len(batcher._resident) == 1
+        assert batcher._slot_bytes > 0, (
+            "nothing was measured for the first document, so this test would pass without the fix doing anything"
+        )
+
+        monkeypatch.setattr(
+            torch.cuda, "mem_get_info", lambda *_a, **_k: (schedule_module.SHELF_MEMORY_MARGIN // 2, 1 << 40)
+        )
+        second = batcher.submit(SECOND_CONTEXT, [Boolean(id="q2", prompt="Can a gift card be exchanged for cash?")])
+        assert second.done.wait(timeout=30), "the second document never answered"
+        assert second.error is None, second.error
+
+        assert len(batcher._resident) <= 1, (
+            "a second document was admitted while free memory was reported below the margin, and the first "
+            "resident was not evicted for it -- the token budget alone decided, which is the bug"
+        )
+    finally:
+        batcher.stop()
+
+
+
 
 def test_asking_twice_about_a_shelved_document_does_not_read_it_twice(engine_paged):
     """What the shelf is for. The second question pays a branch pass and no read."""

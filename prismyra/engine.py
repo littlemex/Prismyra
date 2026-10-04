@@ -31,6 +31,7 @@ from .fork import (
     restore_and_fork_many,
     round_width,
     snapshot,
+    snapshot_bytes,
 )
 from .graphs import keeping_pays, pays_from, record
 from .heads import Heads
@@ -109,6 +110,11 @@ class Shelved:
     tokens: int
     snapshot: dict = field(repr=False)
     position_from: int = 0
+    #: Bytes `snapshot` actually holds -- the recurrent state's clone, not the pages. Measured at `put_many` time,
+    #: because it does not depend on `tokens` at all: a recurrent layer's state is the same size whatever the
+    #: document was, so a shelf's non-page cost grows with how many documents it holds, not with how long they are.
+    #: See `schedule.Batcher._make_room`, which is what this field exists for.
+    snapshot_bytes: int = 0
 
 
 @dataclass
@@ -181,8 +187,13 @@ class Shelf:
             taken = snapshot(self._cache)
         engine._note_read(_since(started, engine.torch_device), len(encoded))
         for at, (handle, one) in enumerate(zip(handles, encoded, strict=True)):
+            piece = pick(taken, at)
             self.documents[handle] = Shelved(
-                handle=handle, tokens=one.tokens, snapshot=pick(taken, at), position_from=one.tokens
+                handle=handle,
+                tokens=one.tokens,
+                snapshot=piece,
+                position_from=one.tokens,
+                snapshot_bytes=snapshot_bytes(piece),
             )
         return handles
 

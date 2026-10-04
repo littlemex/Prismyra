@@ -163,6 +163,30 @@ def _owned(layer, attr: str, key, like: torch.Tensor, width: int, rows: int) -> 
     return view
 
 
+def snapshot_bytes(snap: dict) -> int:
+    """How many bytes one document's slice of a snapshot holds. Measured, not estimated: the tensors are already in
+    hand -- the same slice `pick` hands to a `Shelved` -- and a budget that counts what it was actually given is
+    sounder than one that predicts it from the context length, which this does not depend on at all: a recurrent
+    layer's state is the same size whatever the document was.
+
+    What this does not count is pages: those are `Pool`'s own accounting, already bounded by `Pool.admit` refusing
+    by name. This is the other half, which nothing was counting -- a document kept on a shelf also keeps a clone of
+    the recurrent state it ended on, and a shelf holding many short documents can run out of memory on that count
+    alone while the page pool still has tokens to spare. See `schedule.Batcher._make_room`.
+    """
+    total = 0
+    for entry in snap.values():
+        for attr in ("recurrent_states", "conv_states"):
+            for v in entry.get(attr, {}).values():
+                if torch.is_tensor(v):
+                    total += v.numel() * v.element_size()
+        for attr in ("keys", "values"):
+            v = entry.get(attr)
+            if torch.is_tensor(v):
+                total += v.numel() * v.element_size()
+    return total
+
+
 def pick(snap: dict, row: int) -> dict:
     """One document's slice of a snapshot taken over a batched read.
 

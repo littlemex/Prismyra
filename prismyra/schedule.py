@@ -51,8 +51,17 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import torch
+
 from .queue import Job, QueueFull, Worker, WorkerStopped
 from .schema import PrismyraError, Question, Result
+
+#: Free device memory `_make_room` keeps clear of shelf residents, for the same reason `engine.GRAPH_MEMORY_MARGIN`
+#: keeps it clear of a new recording: so the ordinary pass every call still runs is not the thing that starves.
+#: `_make_room` turns this into a count by comparing it against `Batcher._slot_bytes` -- the margin alone only
+#: answers "is there room for one more", and a shelf's non-page cost is not bounded by anything that asks "how many
+#: are there already" without it. See `_make_room`.
+SHELF_MEMORY_MARGIN = 2 * 1024**3
 
 
 @dataclass
@@ -165,6 +174,12 @@ class Batcher:
         #: matters and a counter cannot go backwards.
         self._used: dict[int, int] = {}
         self._clock = 0
+        #: The largest recurrent-state snapshot a document on this shelf has actually cost, in bytes. Zero until one
+        #: has been read, which is honest: nothing has been measured yet, the same reason `fastest_read_ms` starts at
+        #: `None` rather than a guess. Updated from what `Shelf.put_many` actually allocated for each new resident,
+        #: not estimated from the document's length -- a recurrent layer's state does not depend on it. See
+        #: `_make_room`.
+        self._slot_bytes = 0
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> Batcher:
@@ -281,6 +296,9 @@ class Batcher:
             for job, handle in zip(jobs, handles, strict=True):
                 self._resident[job.payload.digest] = handle
                 self._digest_of[handle] = job.payload.digest
+                # Measured, not assumed: the largest snapshot actually seen so far, which `_make_room` uses to
+                # decide how much free memory the *next* admission needs before it starts.
+                self._slot_bytes = max(self._slot_bytes, shelf.documents[handle].snapshot_bytes)
         asked: dict[int, list[Question]] = {}
         for job in formed.jobs:
             handle = self._resident[job.payload.digest]
@@ -302,15 +320,32 @@ class Batcher:
     def _make_room(self, fresh: list[Job], keep: set[str]) -> None:
         """Drop the least recently used documents until the new ones have somewhere to go.
 
-        Least recently used, and never one in the pass being formed. What decides "enough room" is the pool, so this
-        drops until the tokens fit the shelf's room rather than guessing at pages: the shelf refuses by name if the
-        estimate is still wrong, and a refusal is recoverable where a wrong page is not.
+        Least recently used, and never one in the pass being formed. The pool decides whether the **pages** fit, so
+        this drops until the tokens fit the shelf's room rather than guessing at pages: the shelf refuses by name if
+        the estimate is still wrong, and a refusal is recoverable where a wrong page is not.
+
+        That bound alone is not enough, and the gap is not pages. Every resident document also keeps a clone of the
+        recurrent state it ended on (`Shelved.snapshot`), outside the pool, and that clone costs roughly the same
+        whatever the document's length -- a shelf holding many *short* documents can exhaust device memory on that
+        count alone while the token budget above still has room to spare. Measured: 97 documents averaging 251
+        tokens each (24,394 total, far under a 65,536-token budget) exhausted a 44 GiB card one snapshot at a time,
+        because nothing was ever evicted on their account. `self._slot_bytes` is what one of them actually cost,
+        and this is `_make_room` asking, before admitting more, whether the device has that much to spare -- the
+        same question `engine.GRAPH_MEMORY_MARGIN` asks before a recording, for the same reason: the margin alone
+        only answers "is there room for one more", and pairing it with a per-document figure is what makes it also
+        answer "how many are there already", which an unbounded resident count needs answered.
         """
         shelf = self._on_shelf()
         wanted = sum(self._tokens(job) for job in fresh)
+        incoming_snapshot = len(fresh) * self._slot_bytes
         while self._resident:
             held = sum(shelf.documents[handle].tokens for handle in shelf.documents)
-            if held + wanted <= self.limits.tokens:
+            fits_tokens = held + wanted <= self.limits.tokens
+            fits_memory = True
+            if self.engine.torch_device.type == "cuda":
+                free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
+                fits_memory = free - incoming_snapshot > SHELF_MEMORY_MARGIN
+            if fits_tokens and fits_memory:
                 return
             oldest = min(
                 (handle for handle in shelf.documents if self._digest_of.get(handle) not in keep),

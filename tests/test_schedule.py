@@ -30,6 +30,14 @@ class FakeEncoded:
     tokens: int
 
 
+class FakeDevice:
+    """Enough of a `torch.device` for `_make_room` to see this is not CUDA and skip the memory check it would
+    otherwise run -- this file tests the forming rule's arithmetic, not a device's free memory, which is why
+    `FakeEngine` has no real one."""
+
+    type = "cpu"
+
+
 class FakeEngine:
     """A stand-in that records the batches it was handed, and answers instantly.
 
@@ -48,6 +56,7 @@ class FakeEngine:
     ):
         self.group = group
         self.longest_context = longest_context
+        self.torch_device = FakeDevice()
         # None means "nothing has been read yet", and the scheduler must not make anybody wait on no evidence. A figure
         # here is what a warmed engine looks like, and is what exercises the linger.
         self.fastest_read_ms = fastest_read_ms
@@ -92,6 +101,9 @@ class FakeEngine:
 @dataclass
 class FakeShelved:
     tokens: int
+    #: Mirrors `engine.Shelved.snapshot_bytes`, which `Batcher._slot_bytes` reads off every resident document. Zero
+    #: here, by the same reasoning `FakeDevice` is not CUDA: this file tests the forming rule, not device memory.
+    snapshot_bytes: int = 0
 
 
 class FakeShelf:
