@@ -133,4 +133,4 @@ def test_the_adapter_runs_the_routed_experts_in_nvfp4_and_still_answers():
         "The sky is blue. Grass is green.",
         [Boolean(id="sky", prompt="Is the sky blue?")],
     )
-    assert answer["sky"].option is True
+    assert answer["sky"].value is True
