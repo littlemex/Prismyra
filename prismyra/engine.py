@@ -7,6 +7,7 @@ the thing it exists to provide.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -535,7 +536,24 @@ class Prismyra:
         # need one.
         self.processor = _load_processor(model)
         # No language-model head: it projects to the whole vocabulary and nothing here generates a token.
-        self.backbone = AutoModel.from_pretrained(model, dtype=self.dtype, device_map=self.device if on_cuda else None)
+        #
+        # Experimental: routed experts in NVFP4, selected with PRISMYRA_EXPERTS=nvfp4 (prismyra/kernels/nvfp4.py).
+        # `model` must then be a checkpoint directory whose index leaves the routed-expert weights out (the FP8
+        # experts are never loaded; `tiny_experts` makes the framework's loader accept the missing keys). Converted
+        # here, before `kernels.apply` below, so the adapter below finds `FusedExpertsFp4` already in place and
+        # only has to recognise it rather than build it.
+        use_nvfp4_experts = os.environ.get("PRISMYRA_EXPERTS") == "nvfp4" and on_cuda and fast_kernels
+        if use_nvfp4_experts:
+            from .kernels import nvfp4 as _nvfp4
+
+            with _nvfp4.tiny_experts():
+                self.backbone = AutoModel.from_pretrained(model, dtype=self.dtype, device_map=self.device)
+            decoder_cfg = getattr(self.config, "text_config", self.config)
+            _nvfp4.convert(self.backbone, decoder_cfg.num_experts_per_tok, self.torch_device)
+        else:
+            self.backbone = AutoModel.from_pretrained(
+                model, dtype=self.dtype, device_map=self.device if on_cuda else None
+            )
         self.backbone.eval()
         if not on_cuda:
             self.backbone.to(self.torch_device)

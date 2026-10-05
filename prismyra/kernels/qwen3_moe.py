@@ -718,15 +718,23 @@ class Qwen3MoeAdapter:
             applied.skipped.append("vllm is installed but missing " + ", ".join(missing))
 
         if have_vllm:
+            # `engine.py` converts the routed experts to NVFP4 (prismyra/kernels/nvfp4.py, PRISMYRA_EXPERTS=nvfp4)
+            # before this adapter runs, so that path's modules are `FusedExpertsFp4` already. Counting them here
+            # rather than swapping again keeps this adapter the one place that reports whether the routed-expert
+            # replacement happened, whichever format it ran in.
+            already_nvfp4 = sum(1 for m in text.modules() if type(m).__name__ == "FusedExpertsFp4")
             applied.swaps.append(
                 Swap(
                     "routed_experts",
-                    _swap_children(
+                    already_nvfp4
+                    or _swap_children(
                         text, "Qwen3_5MoeSparseMoeBlock", lambda m: FusedExperts(m, decoder.num_experts_per_tok)
                     ),
                     expected["routed_experts"],
                 )
             )
+            if already_nvfp4:
+                applied.notes.append("the routed experts are NVFP4 (experimental, PRISMYRA_EXPERTS=nvfp4)")
             applied.swaps.append(
                 Swap(
                     "attention",
