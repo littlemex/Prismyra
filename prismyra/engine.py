@@ -483,6 +483,14 @@ class Prismyra:
         #: rather than from a constant, because the ratio between them runs from 0.684 at a suffix of sixteen tokens to
         #: 0.997 at 128 -- see `_worth_keeping`.
         self.replay_cost: dict = {}
+        #: 2026-10-05 (座長 "パスそのものを短くする"): why an attempt at a homogeneous shape never got as far as
+        #: `graphs.record` -- the attempt gate (`expected < pays_from()`), a standing decline already in
+        #: `declined_recordings`, or `room_to_record` failing for one of its own two reasons (the memory margin,
+        #: or `MAX_KEPT_RECORDINGS` already full). `room_to_record` failing was previously invisible: the gate's
+        #: `and` short-circuits before `declined_recordings` is ever written to for that reason, so a card that
+        #: never has two free recording slots at once would show zero declines and zero replays with no record of
+        #: why. Reported through `stats()`.
+        self._skip_reasons: dict[str, int] = {}
         #: The fastest read this engine has served, in milliseconds. An estimate of a pass's fixed cost, which is what
         #: it is for: reading is that fixed cost plus a slope in the tokens, so the shortest document seen is the
         #: closest
@@ -873,6 +881,7 @@ class Prismyra:
             "graphs_verified": dict(self.verified_recordings),
             "graphs_replays": dict(self.replays),
             "graphs_cost": dict(self.replay_cost),
+            "graphs_skip_reasons": dict(self._skip_reasons),
             # The one-pass recordings: which buckets serve, how often each has, what proving each measured and what
             # they hold. Empty when the one-pass read runs eagerly.
             "short_graphs": self._one_pass.stats() if self._one_pass is not None else {},
@@ -1854,7 +1863,17 @@ class Prismyra:
                 free, _ = torch.cuda.mem_get_info(self.torch_device)
                 if free <= GRAPH_MEMORY_MARGIN:
                     self._reclaim_cooldown_until = now + RECLAIM_COOLDOWN_S
-        room_to_record = free > GRAPH_MEMORY_MARGIN and len(store["taken"]) < MAX_KEPT_RECORDINGS
+        fits_memory_margin = free > GRAPH_MEMORY_MARGIN
+        fits_kept_count = len(store["taken"]) < MAX_KEPT_RECORDINGS
+        room_to_record = fits_memory_margin and fits_kept_count
+        if expected < pays_from():
+            self._skip_reasons["economics_gate"] = self._skip_reasons.get("economics_gate", 0) + 1
+        elif key in self.declined_recordings:
+            self._skip_reasons["already_declined"] = self._skip_reasons.get("already_declined", 0) + 1
+        elif not fits_memory_margin:
+            self._skip_reasons["memory_margin"] = self._skip_reasons.get("memory_margin", 0) + 1
+        elif not fits_kept_count:
+            self._skip_reasons["max_kept_recordings"] = self._skip_reasons.get("max_kept_recordings", 0) + 1
         if expected >= pays_from() and key not in self.declined_recordings and room_to_record:
             taken, why = record(run, cache, ids, positions, fork=fork)
             if taken is None:
