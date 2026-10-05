@@ -49,29 +49,40 @@ def test_dequant_fp8_restores_the_source_within_one_fp8_step():
     assert (back - full).abs().max() < 0.05 * full.abs().max()
 
 
+def _decode(packed: torch.Tensor, scale: torch.Tensor, g: torch.Tensor, device) -> torch.Tensor:
+    """The inverse of `quantize`/`quantize_search`'s packing, independent of either: a packed byte's low nibble is
+    original column `2j` and its high nibble is `2j + 1` (`quantize` builds it as
+    `code[:, 0::2] | (code[:, 1::2] << 4)`), so unpacking and interleaving them back -- rather than assuming they
+    line up with the sixteen-wide scale groups, which they do not until the scale is itself repeated out to one
+    value per original column -- is what a decoder has to do, not an extra step for a test to skip."""
+    lo, hi = (packed & 0x0F).long(), ((packed >> 4) & 0x0F).long()
+    table = _e2m1(device)
+    sign = lambda c: torch.where((c & 0x8).bool(), -1.0, 1.0)
+    lo_val, hi_val = table[lo & 0x7] * sign(lo), table[hi & 0x7] * sign(hi)
+    code_vals = torch.stack([lo_val, hi_val], dim=-1).flatten(-2)  # (rows, cols), columns back in original order
+    eff = (scale.float() / g).repeat_interleave(16, dim=-1)  # one group's scale broadcast to its sixteen columns
+    return code_vals * eff
+
+
 def test_quantize_round_trips_within_the_e2m1_grid():
-    """Sixteen-wide groups, packed two values per byte: decoding the packed code must land on exactly the table of
-    representable magnitudes (`_e2m1`), and the whole tensor's error must be bounded by that grid's own spacing."""
+    """Sixteen-wide groups, packed two values per byte: decoding the packed code (`_decode`, the inverse this test
+    does not get to assume is correct either) must land within the representable grid's own spacing of the source,
+    the way `prepare_layer`'s own `quantize` -> served-weight round trip has to."""
     torch.manual_seed(1)
     w = (torch.rand(32, 64) - 0.5) * 4.0
-    g = torch.tensor(448.0 * 6.0 / w.abs().amax())
+    g = 448.0 * 6.0 / w.abs().amax()
     packed, scale = quantize(w, g)
     assert packed.dtype == torch.uint8
     assert packed.shape == (32, 32)  # two 4-bit codes per byte
     assert scale.shape == (32, 4)  # one scale per group of sixteen
     assert scale.dtype == FP8
 
-    lo = packed & 0x0F
-    hi = (packed >> 4) & 0x0F
-    table = _e2m1(w.device)
-    magnitude = torch.cat([table[lo & 0x7], table[hi & 0x7]], dim=0)
-    assert torch.isin(magnitude, table).all()
-
+    decoded = _decode(packed, scale, g, w.device)
+    assert decoded.shape == w.shape
+    # Per group, the largest step on the grid (4.0 to 6.0, the grid's own coarsest gap) scaled back into this
+    # group's units -- no row's worst value may miss by more than that, or the code disagrees with its own scale.
     eff = (scale.float() / g).repeat_interleave(16, dim=-1)
-    rescaled = w / eff.clamp(min=1e-12)
-    worst_group_max = rescaled.view(32, 4, 16).abs().amax(-1).clamp(max=6.0)
-    # A group's own values cannot round further off than the grid's largest gap (6.0 to 4.0).
-    assert (worst_group_max.view(-1) - 4.0 <= 2.0 + 1e-4).all()
+    assert ((decoded - w).abs() <= 2.0 * eff + 1e-4).all()
 
 
 def test_quantize_search_does_not_lose_to_the_scale_it_is_offered_as_an_improvement_over():
@@ -81,7 +92,7 @@ def test_quantize_search_does_not_lose_to_the_scale_it_is_offered_as_an_improvem
     make the search actually move off 1.0."""
     torch.manual_seed(2)
     w = (torch.rand(16, 32) - 0.5) * 4.0
-    g = torch.tensor(448.0 * 6.0 / w.abs().amax())
+    g = 448.0 * 6.0 / w.abs().amax()
     importance = torch.ones(1, 32)
     importance[:, 0] = 1000.0  # one column that must be protected far more than the rest
 
@@ -89,12 +100,8 @@ def test_quantize_search_does_not_lose_to_the_scale_it_is_offered_as_an_improvem
     search_packed, search_scale = quantize_search(w, g, importance)
 
     def _error(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        eff = (scale.float() / g).unsqueeze(-1)
-        lo, hi = packed & 0x0F, (packed >> 4) & 0x0F
-        table = _e2m1(w.device)
-        sign = lambda c: torch.where((c & 0x8).bool(), -1.0, 1.0)
-        decoded = torch.stack([table[lo & 0x7] * sign(lo), table[hi & 0x7] * sign(hi)], dim=-1).flatten(-2) * eff.squeeze(-1).unsqueeze(-1)
-        return ((decoded.view(w.shape) - w) ** 2 * importance).sum()
+        decoded = _decode(packed, scale, g, w.device)
+        return ((decoded - w) ** 2 * importance).sum()
 
     assert _error(search_packed, search_scale) <= _error(plain_packed, plain_scale) + 1e-6
 
