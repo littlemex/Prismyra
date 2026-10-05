@@ -234,14 +234,27 @@ def convert(model: nn.Module, top_k: int, device) -> int:
     return len(names)
 
 
+#: Kept alive for the engine's whole lifetime once `autotune_tactics` has run, never exited: FlashInfer's
+#: `autotune()` context manager is what makes `map_to_tuning_buckets` round a runtime size to a profiled bucket
+#: instead of falling back to an untuned tactic, and it only has that effect while the context is entered. The
+#: profiling loop below closes its own `with` block before this module's caller ever serves a real request, so
+#: without this second, permanently-open context, the profiling was real but every later call ran outside it --
+#: measured as `falling back to runner=MoERunner tactic=-1` in FlashInfer's own log for every token count that
+#: was not one of the exact profiled buckets, i.e. nearly every real request. One per process, since the tactics
+#: are themselves process-global (see the first paragraph below).
+_INFERENCE_AUTOTUNE_CTX = None
+
+
 def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
     """Pick the fused MoE kernel's tactic (tile shape and schedule) per token-count bucket by timing them on this card.
 
     Without this FlashInfer runs one default tactic for every size. Every MoE layer has the same shapes, so one layer's
     choices serve all of them; FlashInfer keeps the choices for the rest of the process. Inputs are random: the timing
     depends on the shapes and the routing spread, not on the values. Buckets are the powers of two; a size between two
-    runs the lower one's choice. Adding the points half way between them was measured and not kept: 1 question
-    259.3 against 260, 64 questions 655 against 650 ms.
+    is meant to run the lower one's choice (`round_up=False`, FlashInfer's own historical default) -- adding the points
+    half way between them was measured and not kept: 1 question 259.3 against 260, 64 questions 655 against 650 ms.
+    That rounding needs an `autotune()` context active at the moment a real request runs, which the profiling loop's
+    own `with` block does not provide once it exits; `_INFERENCE_AUTOTUNE_CTX` below is what keeps one open.
 
     The choice is made by timing, so two processes can pick differently between near-equal tactics, and a different
     tactic adds in a different order. `PRISMYRA_NVFP4_TACTICS` names a JSON file: loaded if it exists, written if not,
@@ -249,18 +262,27 @@ def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
     """
     from flashinfer.autotuner import autotune
 
+    global _INFERENCE_AUTOTUNE_CTX
     buckets, m = [], 1
     while m <= max_tokens:
         buckets.append(m)
         m *= 2
     buckets = tuple(sorted(set(buckets)))
-    with torch.inference_mode(), autotune(True, cache=os.environ.get("PRISMYRA_NVFP4_TACTICS"), tuning_buckets=buckets):
+    cache = os.environ.get("PRISMYRA_NVFP4_TACTICS")
+    with torch.inference_mode(), autotune(True, cache=cache, tuning_buckets=buckets):
         for m in buckets:
             x = torch.randn(m, layer.k, device=layer.w1.device, dtype=torch.bfloat16)
             ids = torch.rand(m, layer.e, device=x.device).argsort(1)[:, : layer.top_k].int().contiguous()
             w = torch.full((m, layer.top_k), 1.0 / layer.top_k, device=x.device)
             layer.routed(x, w, ids)
     torch.cuda.synchronize()
+    # Opened and never exited: every call to `routed()` for the rest of this process now runs inside it, with
+    # tune_mode=False (look up the cached tactic rather than re-profile) and round_up=False (the historical,
+    # already-measured choice above) so a runtime size between two buckets gets the lower bucket's tactic instead
+    # of falling back to an untuned one.
+    ctx = autotune(False, cache=cache, tuning_buckets=buckets, round_up=False)
+    ctx.__enter__()
+    _INFERENCE_AUTOTUNE_CTX = ctx
 
 
 class tiny_experts:
