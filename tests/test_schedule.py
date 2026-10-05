@@ -93,7 +93,7 @@ class FakeEngine:
             time.sleep(self.per_call)
         return FakeBatch(list(contexts))
 
-    def open_shelf(self, room: int | None = None) -> FakeShelf:
+    def open_shelf(self, room: int | None = None, lane: int = 0) -> FakeShelf:
         self.shelves += 1
         return FakeShelf(self)
 
@@ -127,7 +127,7 @@ class FakeShelf:
             time.sleep(self.engine.per_call)
         return handles
 
-    def ask(self, asked: dict) -> dict:
+    def ask(self, asked: dict, lane: int = 0) -> dict:
         self.engine.passes.append(sorted(asked))
         return {handle: FakeResult({q.id: handle for q in questions}) for handle, questions in asked.items()}
 
@@ -280,7 +280,7 @@ def test_a_failing_pass_fails_every_request_in_it():
     worker handed over were completed."""
 
     class Broken(FakeEngine):
-        def open_shelf(self, room: int | None = None):
+        def open_shelf(self, room: int | None = None, lane: int = 0):
             raise RuntimeError("the pass failed")
 
     engine = Broken(group=8)

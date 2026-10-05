@@ -78,6 +78,11 @@ SHELF_MEMORY_MARGIN = 2 * 1024**3
 #: natural ceiling of 8, so it does not bind the ordinary case and only catches the transient this was added for.
 SHELF_MAX_RESIDENTS = 16
 
+#: Same constant and same reasoning as `engine.RECLAIM_COOLDOWN_S` -- see there. Kept separate (not imported) so
+#: `schedule.py` does not need `engine.py` for a number that is really "how long a cheap, repeated CUDA sync is
+#: worth skipping", not a fact about the engine.
+RECLAIM_COOLDOWN_S = 1.0
+
 
 @dataclass
 class Request:
@@ -161,12 +166,55 @@ class Batcher:
     Requires the paged storage, because that is what lets rows of one pass belong to different documents.
     """
 
-    def __init__(self, engine, max_queue: int = 512, linger_ms: float | None = None):
+    def __init__(
+        self,
+        engine,
+        max_queue: int = 512,
+        linger_ms: float | None = None,
+        lanes: int = 1,
+        lane_room: int | None = None,
+        _lane_id: int = 0,
+    ):
+        """`lanes>1` (THROUGHPUT.md 2026-10-05, "本当に効く経路"): the single-worker-thread bottleneck a rate=10
+        open-loop run exposed is not a tuning question, it is that one `Worker` thread runs one pass fully before
+        starting the next. `lanes` builds that many fully independent (`Shelf`/`Pool`/`Worker`) stacks under one
+        router, so two passes can be in flight on the device at once -- each lane is otherwise identical to the
+        `lanes=1` object this already was, which is what keeps this safe to add: a lane's `Shelf` is never shared
+        with another lane's, so the only new sharing between lanes is the model's weights (read-only) and, for the
+        engine's own forking machinery, a lane-tagged `fork.OWNED` buffer (`Prismyra._owned`'s `lane` argument) --
+        see `prismyra.engine.Prismyra.open_shelf`'s docstring for why a lane's `Shelf` is its own `Pool`/cache and
+        not a bigger one shared out.
+
+        `lane_room` is the token budget each lane's own shelf is opened with (default's reasoning: `open_shelf`'s
+        own default, sized for being the *only* shelf, double-costs when there are two -- measured infeasible for
+        the full-size default, see `diag_two_shelves_memory.py`). A document is routed to a lane by a hash of its
+        digest, so repeat questions about the same document always land on the same lane and keep the shelf-hit
+        benefit `Batcher` exists for.
+
+        A document arriving at a lane that is momentarily busy still queues *for that lane only* -- `lanes` buys
+        two lanes each as fast as one lane was, not one lane twice as fast, which is the whole reason to measure
+        it against a single-lane baseline rather than assume it from the design.
+        """
+        self._lane_id = _lane_id
+        if lanes > 1:
+            if _lane_id != 0:
+                raise PrismyraError("lanes>1 only builds the outer router; a lane does not build further lanes")
+            self._children: list[Batcher] | None = [
+                Batcher(engine, max_queue=max_queue, linger_ms=linger_ms, lanes=1, lane_room=lane_room, _lane_id=i)
+                for i in range(lanes)
+            ]
+            self.engine = engine
+            return
+        self._children = None
         if not getattr(engine, "paged", False):
             raise PrismyraError(
                 "a batching scheduler needs the paged storage, because the joined storage keeps a document in one row "
                 "that every row reads. Build the engine with Prismyra(..., paged=True)."
             )
+        #: Token budget this lane's own shelf is opened with when it first opens one (`_on_shelf`). `None` keeps
+        #: `open_shelf`'s own default (the largest bucket admission accepts) -- unchanged from before `lanes`
+        #: existed, for a lane-less (`lanes=1`, the default) `Batcher`.
+        self._lane_room = lane_room
         self.engine = engine
         self.limits = Limits.of(engine) if linger_ms is None else Limits.of(engine, linger_ms=linger_ms)
         self._worker = Worker(drive=self._drive, max_queue=max_queue)
@@ -195,13 +243,24 @@ class Batcher:
         #: not estimated from the document's length -- a recurrent layer's state does not depend on it. See
         #: `_make_room`.
         self._slot_bytes = 0
+        #: Monotonic deadline before `_make_room` tries `empty_cache()` again, once an attempt has already left
+        #: free memory at or below `SHELF_MEMORY_MARGIN`. See `RECLAIM_COOLDOWN_S`.
+        self._reclaim_cooldown_until = 0.0
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> Batcher:
+        if self._children is not None:
+            for child in self._children:
+                child.start()
+            return self
         self._worker.start()
         return self
 
     def stop(self, timeout: float = 30.0) -> None:
+        if self._children is not None:
+            for child in self._children:
+                child.stop(timeout=timeout)
+            return
         self._worker.stop(timeout=timeout)
         if self._shelf is not None:
             self._shelf.close()
@@ -222,7 +281,14 @@ class Batcher:
 
         Refused here rather than at the front of the queue when it cannot fit any batch at all, because a caller who is
         going to be refused should not wait first.
+
+        `lanes>1`: routed to one lane by a hash of the document's digest, before any of the per-lane checks below
+        run (a lane's own `submit` repeats them, so nothing here is skipped, just decided which lane does it) --
+        stable so the same document always lands on the same lane and keeps its shelf-hit benefit across requests.
         """
+        if self._children is not None:
+            lane = int(_digest(context)[:8], 16) % len(self._children)
+            return self._children[lane].submit(context, questions)
         if not questions:
             raise PrismyraError("a request needs at least one question")
         if len(questions) > self.limits.questions:
@@ -340,14 +406,14 @@ class Batcher:
             # Two callers asking about the same document in one pass would collide here, and one of them would get the
             # other's questions. They are merged instead -- one document, both callers' questions, one set of rows.
             asked.setdefault(handle, []).extend(job.payload.questions)
-        answers = shelf.ask(asked)
+        answers = shelf.ask(asked, lane=self._lane_id)
         self.reads.append(len(fresh))
         return [answers[self._resident[job.payload.digest]] for job in formed.jobs]
 
     def _on_shelf(self):
         """The shelf, opened on the first pass rather than at construction, because opening it allocates."""
         if self._shelf is None:
-            self._shelf = self.engine.open_shelf()
+            self._shelf = self.engine.open_shelf(room=self._lane_room, lane=self._lane_id)
         return self._shelf
 
     def _make_room(self, fresh: list[Job], keep: set[str]) -> None:
@@ -395,11 +461,19 @@ class Batcher:
                 # in one call. Tried once per `_make_room` call (not once per loop iteration: a resident document
                 # evicted a moment ago may have made room on its own, which this re-checks first) before this
                 # loop evicts a document that fits-memory alone would not have required dropping.
-                if not fits_memory and not tried_reclaim:
+                # 2026-10-05 (coordinator's item 2 follow-up): across *calls*, not just within one -- the reclaim
+                # itself costs 2-4% of questions/second under load (THROUGHPUT.md, isolated from the dispatcher-
+                # narrowing change by comparing both independently). `RECLAIM_COOLDOWN_S` skips the call while a
+                # previous attempt from a recent pass is still within its cooldown; `fits_memory` stays `False` on
+                # the stale number either way, so skipping the call never admits past a margin that is still tight.
+                now = time.perf_counter()
+                if not fits_memory and not tried_reclaim and now >= self._reclaim_cooldown_until:
                     tried_reclaim = True
                     torch.cuda.empty_cache()
                     free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
                     fits_memory = free - incoming_snapshot > SHELF_MEMORY_MARGIN
+                    if not fits_memory:
+                        self._reclaim_cooldown_until = now + RECLAIM_COOLDOWN_S
             if fits_tokens and fits_memory and fits_count:
                 return
             oldest = min(
@@ -450,6 +524,8 @@ class Batcher:
 
     # ------------------------------------------------------------------ reporting
     def stats(self) -> dict:
+        if self._children is not None:
+            return {"lanes": [child.stats() for child in self._children]}
         with self._lock:
             widths = list(self.widths)
             reasons = list(self.reasons)

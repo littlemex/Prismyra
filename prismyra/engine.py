@@ -91,6 +91,17 @@ GRAPH_MEMORY_MARGIN = 2 * 1024**3
 #: would need before this number could be raised with evidence instead of nerve.
 MAX_KEPT_RECORDINGS = 2
 
+#: How long `empty_cache()` is skipped after it was tried and *still* left free memory at or below the margin --
+#: on this card, meaning the margin is genuinely tight right now, not just fragmented. Measured (THROUGHPUT.md
+#: 2026-10-05, item 2 of the coordinator's instructions): comparing this reclaim call present/absent at arrival
+#: rates 40/60 found it costs 2-4% of questions/second (60.3-61.4 q/s with it vs 63.0-63.5 without, the dispatcher
+#: narrowing in `_enable_batch_invariance` measured as unrelated noise by the same comparison) -- a real cost from
+#: a real CUDA synchronisation, paid every time admission runs while the margin stays tight, which an open-loop
+#: run under load does repeatedly. 1 second, long enough that a tight stretch is not retried every single pass
+#: (the thing costing the 2-4%) and short enough that genuine headroom returning (a resident dropped, a recording
+#: declined) is noticed within a couple of passes rather than held stale for the life of the engine.
+RECLAIM_COOLDOWN_S = 1.0
+
 #: Context lengths a cache is allocated for. A context of 900 tokens and one of 1,000 both get the 1,024 allocation, and
 #: that is the point: an allocation shared between contexts keeps its addresses, and addresses are what a recording
 #: holds. Without this every context built its own cache and freed it on close, so a recording could never outlive the
@@ -136,6 +147,11 @@ class Shelf:
     _engine: Prismyra
     _cache: Cache | None
     room: int
+    #: Which engine lane this shelf's passes run under (lock, stream, `fork.OWNED` buffer) -- see `Prismyra.ask`'s
+    #: lane plumbing and `prismyra.schedule.Batcher(lanes=2)`, the only caller that opens a shelf with anything but
+    #: the default. Each lane owns its own `Shelf`/`Pool`/cache (never shared between lanes), so this is "which
+    #: lock does *this* shelf's own pass take", not a routing decision made per document.
+    lane: int = 0
     #: Documents on the shelf, by the handle `put` returned.
     documents: dict[int, Shelved] = field(default_factory=dict)
     _next_handle: int = 0
@@ -222,9 +238,11 @@ class Shelf:
             raise PrismyraError("this shelf has been closed")
         if handle not in self.documents:
             raise PrismyraError(f"this shelf does not hold document {handle}")
-        # The engine's lock, because a pass running on another thread has rows naming this document's pages and the run
-        # would be handed to the next one underneath it.
-        with self._engine._lock:
+        # This shelf's own lane's lock, because a pass running on another thread *of this lane* has rows naming
+        # this document's pages and the run would be handed to the next one underneath it. A different lane's
+        # pass never names this shelf's pages at all -- each lane owns its own `Shelf`/`Pool` -- so it does not
+        # need to wait for this.
+        with self._engine._lock_for(self.lane):
             for layer in self._cache.layers:
                 release = getattr(layer, "release_document", None)
                 if release is not None:
@@ -232,8 +250,15 @@ class Shelf:
             del self.documents[handle]
 
     # ---------------------------------------------------------------- answering
-    def ask(self, asked: dict[int, list[Question]]) -> dict[int, Result]:
-        """Answer questions about documents already on the shelf, in one pass. No reading happens here."""
+    def ask(self, asked: dict[int, list[Question]], lane: int | None = None) -> dict[int, Result]:
+        """Answer questions about documents already on the shelf, in one pass. No reading happens here.
+
+        `lane` names which of the engine's locks/streams/`fork.OWNED` buffers this pass uses, defaulting to this
+        shelf's own `self.lane` -- see `prismyra.schedule.Batcher(lanes=2)`, the only caller that sets `self.lane`
+        to anything but 0.
+        """
+        if lane is None:
+            lane = self.lane
         if self._cache is None:
             raise PrismyraError("this shelf has been closed")
         if not asked:
@@ -255,7 +280,7 @@ class Shelf:
             for handle in handles
         ]
         results = engine._answer_batch(
-            prefills, [asked[handle] for handle in handles], context_ms=0.0, rows_for=handles
+            prefills, [asked[handle] for handle in handles], context_ms=0.0, rows_for=handles, lane=lane
         )
         return dict(zip(handles, results, strict=True))
 
@@ -393,6 +418,22 @@ class Prismyra:
         # The caches are held by the engine and mutated in place, so two threads asking at once would interleave one
         # another's branches. The lock makes that safe; `prismyra.queue.Worker` is still what makes it fast.
         self._lock = threading.RLock()
+        # Lane=2 (THROUGHPUT.md 2026-10-05, "本当に効く経路"): a second lane needs its own lock, because the point
+        # is for two passes to actually run at once rather than queue behind one `RLock`. Lane 0 keeps `self._lock`
+        # itself (identity, not a copy) so every existing single-lane caller is unaffected; a lane's own cache/Pool
+        # (a separate `Shelf`, built by `prismyra.schedule.Batcher(lanes=2)`) is what makes the lock sufficient --
+        # two lanes never touch the same Pool, only the same model weights (read-only) and lane-tagged `fork.OWNED`
+        # scratch (see `_owned`'s `lane` argument).
+        self._locks: dict[int, threading.RLock] = {0: self._lock}
+        #: One CUDA stream per lane beyond the first, so a lane's kernels can actually run concurrently with
+        #: another lane's rather than just being launched from a different Python thread onto the one stream every
+        #: `Prismyra` has used until now (lane 0 keeps that stream -- `None` here means "the current/default
+        #: stream", not "no stream"). Built lazily, once per lane, because building one costs nothing worth paying
+        #: for an engine that is never asked for a second lane.
+        self._streams: dict[int, "torch.cuda.Stream | None"] = {0: None}
+        #: Monotonic deadline before `empty_cache()` is tried again, once it has been tried and still left free
+        #: memory at or below `GRAPH_MEMORY_MARGIN`. See `RECLAIM_COOLDOWN_S`.
+        self._reclaim_cooldown_until = 0.0
         #: Whether to record a branch pass and replay it. Off by default, and the reason is memory rather than doubt: a
         #: recording holds a private allocator pool, and this engine refuses a context by name from a budget it
         #: measures, so a feature that quietly takes device memory behind that budget would make the refusal wrong.
@@ -1033,7 +1074,7 @@ class Prismyra:
         """
         return encode(context, None, None, self.processor, self.tokenizer, self.device)
 
-    def open_shelf(self, room: int | None = None) -> Shelf:
+    def open_shelf(self, room: int | None = None, lane: int = 0) -> Shelf:
         """One cache held open, with documents put on it and taken off as callers come and go.
 
         A `Batch` reads its documents, answers them and drops the cache, so asking twice about one document reads it
@@ -1043,6 +1084,14 @@ class Prismyra:
 
         `room` is how many context tokens the shelf holds altogether, rounded up to a bucket. Default is the largest
         bucket that admission will accept, because a shelf that holds two documents is barely a shelf.
+
+        `lane` is which engine lane this shelf's own passes run under (see `Shelf.lane`). Each call builds a brand
+        new cache (`_claim_cache` has no pool to reuse from yet), so two shelves -- one per lane -- never share a
+        `Pool`/page table; the only thing two lanes still share is the model weights (read-only) and, if `lane`
+        differs, nothing else at all. Measured (THROUGHPUT.md 2026-10-05, `diag_two_shelves_memory.py`): a second
+        shelf is not free -- opening one at `room=4096` plus 5 documents on each cost about 2.1 GiB total from a
+        freshly loaded model's 8.6 GiB of free device memory -- so a second lane's `room` should be set with that
+        in mind rather than left at the default (which is sized for *one* shelf being the only one).
         """
         if not self.paged:
             raise PrismyraError(
@@ -1052,7 +1101,7 @@ class Prismyra:
         wanted = room if room is not None else self._largest_shelf()
         self._check_fits(wanted)
         cache, held = self._claim_cache(wanted)
-        return Shelf(_engine=self, _cache=cache, room=held)
+        return Shelf(_engine=self, _cache=cache, room=held, lane=lane)
 
     def _largest_shelf(self) -> int:
         """The biggest bucket this engine can hold a shelf of, from its own admission figures.
@@ -1198,6 +1247,7 @@ class Prismyra:
         asked: list[list[Question]],
         context_ms: float,
         rows_for: list[int] | None = None,
+        lane: int = 0,
     ) -> list[Result]:
         """One forward pass carrying questions about several documents, one row per question.
 
@@ -1235,9 +1285,9 @@ class Prismyra:
         rows_for = [names[at] for at, count in enumerate(counts) for _ in range(count)]
 
         start = _now(self.torch_device)
-        with self._lock, torch.inference_mode():
+        with self._lock_for(lane), self._stream_for(lane), torch.inference_mode():
             try:
-                hidden = self._branch_across(prefills, counts, rows_for, [p.text for p in plans], width)
+                hidden = self._branch_across(prefills, counts, rows_for, [p.text for p in plans], width, lane=lane)
                 read = score(hidden, self.unembedding, [p.token_ids for p in plans], None)
                 probabilities = self.heads.apply(hidden, [q.options for q in flat], read)
             finally:
@@ -1267,7 +1317,9 @@ class Prismyra:
             )
         return results
 
-    def _branch_across(self, prefills, counts: list[int], rows_for: list[int], texts: list[str], width: int):
+    def _branch_across(
+        self, prefills, counts: list[int], rows_for: list[int], texts: list[str], width: int, lane: int = 0
+    ):
         """The pass itself. Every row's positions start at its own document's end, which is per row not per batch.
 
         Goes through `_run_recorded`, the same decision `_run_branch` uses for a single document. It did not used to:
@@ -1307,7 +1359,7 @@ class Prismyra:
             rows_for_padded = [*rows_for, *([rows_for[-1]] * pad)]
 
         def fork() -> None:
-            restore_and_fork_many(cache, parts, width=self.group, rows_for=rows_for_padded)
+            restore_and_fork_many(cache, parts, width=self.group, rows_for=rows_for_padded, lane=lane)
 
         def run(suffix: torch.Tensor, suffix_positions: torch.Tensor) -> torch.Tensor:
             out = self.backbone(
@@ -1318,7 +1370,9 @@ class Prismyra:
         # One document's remainder is all a paged recording's bucket key carries (see `_run_recorded`), so a pass
         # naming more than one document is not a shape graphs may generalise over yet.
         homogeneous = len(set(rows_for)) <= 1
-        hidden = self._run_recorded(cache, fork, run, ids, positions, padded_rows, width, homogeneous=homogeneous)
+        hidden = self._run_recorded(
+            cache, fork, run, ids, positions, padded_rows, width, homogeneous=homogeneous, lane=lane
+        )
         return hidden[torch.arange(padded_rows, device=self.device), read_at][: len(texts)]
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
@@ -1558,6 +1612,30 @@ class Prismyra:
             worst = max(worst, float((replayed.float() - reference.float()).abs().amax()))
         return worst, _since(started, self.torch_device) / REPLAY_CHECKS
 
+    def _lock_for(self, lane: int) -> threading.RLock:
+        """The lock a lane's whole pass is serialised under. Lane 0 is `self._lock` itself; a further lane gets its
+        own, built once and kept -- see `self._locks`."""
+        lock = self._locks.get(lane)
+        if lock is None:
+            lock = threading.RLock()
+            self._locks[lane] = lock
+        return lock
+
+    def _stream_for(self, lane: int):
+        """The CUDA stream a lane's pass runs on, as a context manager -- `contextlib.nullcontext()` for lane 0,
+        which keeps using whatever stream was already current (today's single-lane behaviour, unchanged); a real
+        `torch.cuda.stream(...)` for any further lane, built once. CPU, or no CUDA stream support needed, falls
+        back to the same `nullcontext()` lane 0 uses."""
+        import contextlib
+
+        if lane == 0 or self.torch_device.type != "cuda":
+            return contextlib.nullcontext()
+        stream = self._streams.get(lane)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.torch_device)
+            self._streams[lane] = stream
+        return torch.cuda.stream(stream)
+
     def _recordings_for(self, cache) -> dict:
         """The recordings taken on this cache, and how many times each shape has been seen on it.
 
@@ -1647,7 +1725,17 @@ class Prismyra:
         return (rows, width) if remainder is None else (rows, width, remainder)
 
     def _run_recorded(
-        self, cache, fork, run, ids, positions, rows: int, width: int, remaining: int = 0, homogeneous: bool = True
+        self,
+        cache,
+        fork,
+        run,
+        ids,
+        positions,
+        rows: int,
+        width: int,
+        remaining: int = 0,
+        homogeneous: bool = True,
+        lane: int = 0,
     ):
         """The pass, replayed from a recording where there is one and recorded where a second one is worth taking.
 
@@ -1676,7 +1764,13 @@ class Prismyra:
         row's remainder would fix it properly; until that is built, a mixed batch is not a shape graphs generalises
         over at all, and the honest thing is to say so rather than key it coarser and answer some rows wrong.
         """
-        if not self.graphs or self.torch_device.type != "cuda" or not homogeneous:
+        # Lane=2 (THROUGHPUT.md 2026-10-05): CUDA graph capture is a stream-scoped operation, and recording's own
+        # claim to "a private allocator pool for the life of the engine" has never been checked against a second
+        # lane capturing on a second stream at the same time. Rather than find out by trusting it, a non-zero lane
+        # always takes the eager path -- the concurrency this lane exists for is between lanes' eager passes, which
+        # does not need graphs at all; the cost given up is lane 0's already-measured graphs economics (THROUGHPUT.md
+        # 2026-10-04, "採算が合わないと判断されて使われなかった" -- rarely paid for even on lane 0 in practice).
+        if not self.graphs or self.torch_device.type != "cuda" or not homogeneous or lane != 0:
             fork()
             return run(ids, positions)
 
@@ -1749,9 +1843,17 @@ class Prismyra:
         # margin check that only ever looks at the driver's free number declines on exactly this kind of transient
         # fragmentation, so one reclaim attempt happens here before giving up -- cheap because it only runs on the
         # already-below-margin path, not on every pass.
+        # 2026-10-05 (coordinator's item 2 follow-up): the reclaim call itself, not just reaching it, costs 2-4% of
+        # questions/second under load (THROUGHPUT.md, measured by isolating it from the dispatcher-narrowing
+        # change). `RECLAIM_COOLDOWN_S` skips the call (not the margin check -- `room_to_record` below still comes
+        # out `False` on the stale, still-tight `free`) while a previous attempt is still within its cooldown.
         if self.torch_device.type == "cuda" and free <= GRAPH_MEMORY_MARGIN:
-            torch.cuda.empty_cache()
-            free, _ = torch.cuda.mem_get_info(self.torch_device)
+            now = time.monotonic()
+            if now >= self._reclaim_cooldown_until:
+                torch.cuda.empty_cache()
+                free, _ = torch.cuda.mem_get_info(self.torch_device)
+                if free <= GRAPH_MEMORY_MARGIN:
+                    self._reclaim_cooldown_until = now + RECLAIM_COOLDOWN_S
         room_to_record = free > GRAPH_MEMORY_MARGIN and len(store["taken"]) < MAX_KEPT_RECORDINGS
         if expected >= pays_from() and key not in self.declined_recordings and room_to_record:
             taken, why = record(run, cache, ids, positions, fork=fork)

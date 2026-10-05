@@ -1062,6 +1062,91 @@ def test_shelf_resident_count_stays_at_the_cap_with_room_to_spare(engine_paged):
         batcher.stop()
 
 
+def test_lanes_two_answers_match_ask_bit_for_bit_when_isolated(engine_paged):
+    """`Batcher(lanes=2)` (THROUGHPUT.md 2026-10-05, "本当に効く経路"): two lanes, each its own `Shelf`/`Pool`,
+    sharing only the model's weights (read-only) and a lane-tagged `fork.OWNED` scratch buffer (`fork._owned`'s
+    `lane` argument) and a thread-local `varlen._current` (fixed in this same session -- a plain module global
+    there raised "a batched read is already in progress" the first time two lanes' reads genuinely overlapped,
+    which is the correct failure for ambient state shared by two threads, not a bug to tolerate).
+
+    One document at a time, waited for before the next is submitted, so no pass ever carries more than this one
+    document (`Batcher.form`'s own "backlogged" check never sees another job queued) -- the comparison against
+    `engine.ask()` is bit-exact (`abs=1e-6`) because nothing else could move a probability to blame a difference
+    on if one appears. Twenty distinct documents, alternating across both lanes by construction (`submit`'s
+    digest-hash routing), each repeated once more straight after (the shelf-hit path, a second question about a
+    document already resident on its lane -- not a second read).
+    """
+    from prismyra.schedule import Batcher
+
+    docs = [
+        (
+            f"Document {i}: a short, self-contained policy note with its own number and nothing shared with its "
+            f"neighbours, so a lane crossing wires with another lane's buffer would show up as this document "
+            f"answering a question about a different one.",
+            Boolean(id="q", prompt=f"Does this note mention the number {i}?"),
+        )
+        for i in range(20)
+    ]
+    truth = {i: engine_paged.ask(context, [question]) for i, (context, question) in enumerate(docs)}
+
+    batcher = Batcher(engine_paged, lanes=2, lane_room=2048, linger_ms=0.0).start()
+    try:
+        for i, (context, question) in enumerate(docs):
+            for round_ in ("first", "repeat"):
+                job = batcher.submit(context, [question])
+                assert job.done.wait(timeout=30), f"document {i} ({round_}) never answered"
+                assert job.error is None, (i, round_, job.error)
+                want = truth[i]["q"]
+                got = job.result["q"]
+                assert got.option == want.option, (
+                    f"document {i} ({round_}) changed its answer under lanes=2 ({got} vs {want})"
+                )
+                for option, p in want.probabilities.items():
+                    assert got.probabilities[option] == pytest.approx(p, abs=1e-6), (i, round_, option)
+    finally:
+        batcher.stop()
+
+
+def test_lanes_two_decisions_under_a_burst_do_not_move(engine_paged):
+    """The same claim as `test_lanes_two_answers_match_ask_bit_for_bit_when_isolated`, but under a real burst: all
+    twenty documents submitted without waiting for each one, so jobs are genuinely in flight on both lanes at
+    once and `Batcher.form`'s own "backlogged" check lets same-lane jobs share a pass exactly as it would for a
+    single lane.
+
+    `test_an_answer_does_not_depend_on_its_companions` already states this file's standard for a companion
+    effect: "the decision is asserted exactly and the distribution behind it within a measured tolerance ...
+    only [the decision] is a promise". The first version of this test used synthetic, near-50/50 documents and
+    found decisions moving under *both* `lanes=1` and `lanes=2` on the same burst (`diag_lanes_control.py`:
+    identical flips, matching probabilities to the sixth decimal place, so not a lanes=2 regression) -- a
+    pre-existing sensitivity of borderline questions to which companions share a pass, consistent with how
+    `NEARLY_SIX` elsewhere in this file documents the same thing happening to a *single* document's result when
+    the recurrence kernel changed. That is real but orthogonal to what lane=2 adds, and testing it with
+    borderline documents conflates the two. This test uses the decisive, already-established `CONTEXT` and
+    `faulty` question instead (confidently "yes" -- `test_an_answer_does_not_depend_on_its_companions` already
+    relies on this), with twenty distinguishing suffixes only so each document's digest routes differently and
+    the full 368-document open-loop benchmark (THROUGHPUT.md 2026-10-05) measured zero decisions changed across
+    every arrival rate with the production (`lanes=1`) `Batcher`, which is the bar lanes=2 is held to here.
+    """
+    from prismyra.schedule import Batcher
+
+    question = Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?")
+    docs = [f"{CONTEXT} (document {i} of this run, otherwise identical to its neighbours.)" for i in range(20)]
+    truth = engine_paged.ask(CONTEXT, [question])["faulty"]
+
+    batcher = Batcher(engine_paged, lanes=2, lane_room=2048, linger_ms=0.0).start()
+    try:
+        jobs = [batcher.submit(context, [question]) for context in docs]
+        for i, job in enumerate(jobs):
+            assert job.done.wait(timeout=30), f"document {i} never answered"
+            assert job.error is None, (i, job.error)
+            got = job.result["faulty"]
+            assert got.option == truth.option, f"document {i} changed its decision under lanes=2 ({got} vs {truth})"
+            for option, p in truth.probabilities.items():
+                assert abs(got.probabilities[option] - p) < COMPANION_MOVEMENT, (i, option)
+    finally:
+        batcher.stop()
+
+
 def test_asking_twice_about_a_shelved_document_does_not_read_it_twice(engine_paged):
     """What the shelf is for. The second question pays a branch pass and no read."""
     asked = [Boolean(id="faulty", prompt="Does the seller pay on a faulty item?")]
