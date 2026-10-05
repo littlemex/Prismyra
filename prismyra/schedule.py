@@ -63,6 +63,21 @@ from .schema import PrismyraError, Question, Result
 #: are there already" without it. See `_make_room`.
 SHELF_MEMORY_MARGIN = 2 * 1024**3
 
+#: The same question `MAX_KEPT_RECORDINGS` asks for recordings, asked here for shelf residents: the margin above
+#: only ever fires when *admitting a new document* finds the device short, which never happens while the token
+#: budget and the memory margin both still have room to spare -- a shelf can and does sit on dozens of short
+#: residents without ever being asked to drop one. Measured (THROUGHPUT.md 2026-10-05, the lane=2 go/no-go
+#: harness's own rate=10/n=80 burst, `mem_breakdown_candidates.py`/`diag_shelf_resident_cap.py`): with no cap,
+#: resident count came out at 33-37 across repeated runs of the identical scenario (seeded, but real wall-clock
+#: Poisson arrivals make the exact eviction moment timing-sensitive) and *dominated* the free-memory variance --
+#: capping residents at 24/16/8 measured free-after-`empty_cache()` of 3.132/3.966/5.079 GiB against the no-cap
+#: run's 3.288 GiB, with no measured questions/second cost (34.7-35.3 q/s across all four, inside noise). The full
+#: multi-rate open-loop benchmark's own natural steady state (THROUGHPUT.md "常駐文書数は到着率ごとに1〜8") never
+#: approaches this cap, so it only ever fires on the kind of short, bursty accumulation the margin alone missed --
+#: the same shape of gap `MAX_KEPT_RECORDINGS` closed for recordings. 16, a 2x safety factor over that observed
+#: natural ceiling of 8, so it does not bind the ordinary case and only catches the transient this was added for.
+SHELF_MAX_RESIDENTS = 16
+
 
 @dataclass
 class Request:
@@ -352,6 +367,14 @@ class Batcher:
         same question `engine.GRAPH_MEMORY_MARGIN` asks before a recording, for the same reason: the margin alone
         only answers "is there room for one more", and pairing it with a per-document figure is what makes it also
         answer "how many are there already", which an unbounded resident count needs answered.
+
+        That is still a margin, asking "is there room for one more" every time admission runs -- which only fires
+        when the device is already short, not when residents have simply piled up while there was still room to
+        spare. `SHELF_MAX_RESIDENTS` is the count version of the same gap `MAX_KEPT_RECORDINGS` closed for
+        recordings (its own docstring explains why a margin alone cannot bound a count): evicting toward it is
+        folded into this same loop rather than a separate pass, so a resident kept past the cap because the pass
+        being formed needed it (`keep`) is still protected the same way `fits_tokens`/`fits_memory` already protect
+        it.
         """
         shelf = self._on_shelf()
         wanted = sum(self._tokens(job) for job in fresh)
@@ -360,6 +383,7 @@ class Batcher:
         while self._resident:
             held = sum(shelf.documents[handle].tokens for handle in shelf.documents)
             fits_tokens = held + wanted <= self.limits.tokens
+            fits_count = len(self._resident) + len(fresh) <= SHELF_MAX_RESIDENTS
             fits_memory = True
             if self.engine.torch_device.type == "cuda":
                 free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
@@ -376,7 +400,7 @@ class Batcher:
                     torch.cuda.empty_cache()
                     free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
                     fits_memory = free - incoming_snapshot > SHELF_MEMORY_MARGIN
-            if fits_tokens and fits_memory:
+            if fits_tokens and fits_memory and fits_count:
                 return
             oldest = min(
                 (handle for handle in shelf.documents if self._digest_of.get(handle) not in keep),

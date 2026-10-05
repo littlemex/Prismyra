@@ -1035,6 +1035,31 @@ def test_a_shelf_evicts_on_memory_pressure_even_with_tokens_to_spare(engine_page
         batcher.stop()
 
 
+def test_shelf_resident_count_stays_at_the_cap_with_room_to_spare(engine_paged):
+    """`SHELF_MAX_RESIDENTS` (THROUGHPUT.md 2026-10-05, task item 1): the margin check above only ever fires when
+    the device is already short, which never happens while many *short* documents are each well under the token
+    budget -- measured, the lane=2 go/no-go harness's own rate=10 burst piled up 33-37 residents with gigabytes of
+    free memory still unspent. Reproduced here with plenty of real free memory (no monkeypatch): more than the cap
+    worth of distinct, short documents are shelved one at a time, and resident count must never exceed the cap even
+    though neither the token budget nor the memory margin would ever have asked for an eviction on their own.
+    """
+    from prismyra import schedule as schedule_module
+    from prismyra.schedule import Batcher
+
+    cap = schedule_module.SHELF_MAX_RESIDENTS
+    batcher = Batcher(engine_paged, linger_ms=0.0).start()
+    try:
+        for i in range(cap + 4):
+            context = f"Document number {i}: a short policy note with nothing in common with its neighbours."
+            job = batcher.submit(context, [Boolean(id="q", prompt="Is this a policy note?")])
+            assert job.done.wait(timeout=30), f"document {i} never answered"
+            assert job.error is None, job.error
+            assert len(batcher._resident) <= cap, (
+                f"after document {i}, {len(batcher._resident)} documents are resident, above the cap of {cap} -- "
+                f"neither the token budget nor the memory margin would have evicted for this short a document"
+            )
+    finally:
+        batcher.stop()
 
 
 def test_asking_twice_about_a_shelved_document_does_not_read_it_twice(engine_paged):
