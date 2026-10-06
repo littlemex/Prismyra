@@ -7,6 +7,7 @@ the thing it exists to provide.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -17,7 +18,7 @@ import torch
 if TYPE_CHECKING:  # pragma: no cover - the framework's cache type, for the annotation only
     from transformers.cache_utils import Cache
 
-from . import kernels, varlen
+from . import kernels, onepass, varlen
 from .cache import build_cache, cache_bytes, join_bytes_per_token
 from .calibration import Calibration
 from .fork import (
@@ -31,8 +32,11 @@ from .fork import (
     restore_and_fork_many,
     round_width,
     snapshot,
+    snapshot_bytes,
 )
 from .graphs import keeping_pays, pays_from, record
+from .heads import Heads
+from .kernels.autotune import pin as pin_autotunes
 from .media import Encoded, encode, position_offset
 from .readout import load_unembedding, plan, score
 from .schema import (
@@ -67,6 +71,38 @@ REPLAY_TOLERANCE = 1e-3
 #: exactly the state the recording was taken in, and a recording that diverges does so from the second replay onwards.
 REPLAY_CHECKS = 2
 
+#: Free device memory a new recording's capture is refused below. 2 GiB, which is small next to the 44 GiB this was
+#: measured on -- it is a check that the ordinary eager pass every call still runs first has not already been
+#: starved, not a budget for the capture itself. Raising it to 8 GiB was tried and made every GPU test that takes a
+#: recording fail by refusing the capture outright: this model's weights alone leave about 10 GiB free on a 44 GiB
+#: card, and 8 GiB of margin is most of that before admission's own budget or an ordinary pass gets any of it. The
+#: number that needed changing was not this one -- see `MAX_KEPT_RECORDINGS`.
+GRAPH_MEMORY_MARGIN = 2 * 1024**3
+
+#: How many distinct shapes one cache may hold a kept recording for at once. A kept recording's pool is never freed,
+#: so unlike everything else admission budgets, this is not something a size-based margin can bound on its own: an
+#: open-loop run against real traffic, with the decline-retry above in place and only a memory margin to stop it,
+#: drove free device memory from several gigabytes to a few megabytes across a handful of distinct shapes each
+#: keeping one recording, and into a tight allocate-fail-retry loop that was not even inside a recording attempt --
+#: it was the ordinary eager pass every call still runs first. A margin only ever asks "is there room for one more";
+#: it does not know how expensive the attempts already granted turned out to be, so raising it cannot bound a count
+#: of unknown-sized things. A small fixed count can. Two, because the recordings measured so far during the paged
+#: branch pass's remainder-bucket work moved a probability by nothing and a replay cost half an eager pass -- worth
+#: having at all -- and this package has not yet measured what one recording actually costs in isolation, which it
+#: would need before this number could be raised with evidence instead of nerve.
+MAX_KEPT_RECORDINGS = 2
+
+#: How long `empty_cache()` is skipped after it was tried and *still* left free memory at or below the margin --
+#: on this card, meaning the margin is genuinely tight right now, not just fragmented. Measured (THROUGHPUT.md
+#: 2026-10-05, item 2 of the coordinator's instructions): comparing this reclaim call present/absent at arrival
+#: rates 40/60 found it costs 2-4% of questions/second (60.3-61.4 q/s with it vs 63.0-63.5 without, the dispatcher
+#: narrowing in `_enable_batch_invariance` measured as unrelated noise by the same comparison) -- a real cost from
+#: a real CUDA synchronisation, paid every time admission runs while the margin stays tight, which an open-loop
+#: run under load does repeatedly. 1 second, long enough that a tight stretch is not retried every single pass
+#: (the thing costing the 2-4%) and short enough that genuine headroom returning (a resident dropped, a recording
+#: declined) is noticed within a couple of passes rather than held stale for the life of the engine.
+RECLAIM_COOLDOWN_S = 1.0
+
 #: Context lengths a cache is allocated for. A context of 900 tokens and one of 1,000 both get the 1,024 allocation, and
 #: that is the point: an allocation shared between contexts keeps its addresses, and addresses are what a recording
 #: holds. Without this every context built its own cache and freed it on close, so a recording could never outlive the
@@ -86,6 +122,11 @@ class Shelved:
     tokens: int
     snapshot: dict = field(repr=False)
     position_from: int = 0
+    #: Bytes `snapshot` actually holds -- the recurrent state's clone, not the pages. Measured at `put_many` time,
+    #: because it does not depend on `tokens` at all: a recurrent layer's state is the same size whatever the
+    #: document was, so a shelf's non-page cost grows with how many documents it holds, not with how long they are.
+    #: See `schedule.Batcher._make_room`, which is what this field exists for.
+    snapshot_bytes: int = 0
 
 
 @dataclass
@@ -107,6 +148,11 @@ class Shelf:
     _engine: Prismyra
     _cache: Cache | None
     room: int
+    #: Which engine lane this shelf's passes run under (lock, stream, `fork.OWNED` buffer) -- see `Prismyra.ask`'s
+    #: lane plumbing and `prismyra.schedule.Batcher(lanes=2)`, the only caller that opens a shelf with anything but
+    #: the default. Each lane owns its own `Shelf`/`Pool`/cache (never shared between lanes), so this is "which
+    #: lock does *this* shelf's own pass take", not a routing decision made per document.
+    lane: int = 0
     #: Documents on the shelf, by the handle `put` returned.
     documents: dict[int, Shelved] = field(default_factory=dict)
     _next_handle: int = 0
@@ -141,12 +187,24 @@ class Shelf:
             # left. Zeroed rather than reset: reset would clear the pages, which is where the documents already on the
             # shelf live.
             _forget_recurrent_state(self._cache)
+            # Same reason `_read` pads a solo read: the borrowed chunked recurrent kernel picks its own
+            # configuration by this read's *total* length, not by what any one document in it is, so a document put
+            # on the shelf alongside different company at different times can otherwise end its read at a different,
+            # real-but-inconsistent state. See `Prismyra._pad_context_lengths`.
+            lengths = [one.tokens for one in encoded]
+            pad_ids, lengths = engine._pad_context_lengths(lengths, [one.input_ids for one in encoded])
+            # The padding needs a handle of its own, same as every real document (`_write_context`'s own check), one
+            # that nothing on this shelf is using. `self._next_handle` is reserved for the *next* `put_many` call and
+            # has not been handed out yet, which is exactly what makes it free to borrow for the length of this one.
+            pad_handle = self._next_handle + len(encoded)
+            has_pad = pad_ids.shape[1] > 0
+            begin_handles = [*handles, pad_handle] if has_pad else handles
             for layer in self._cache.layers:
                 begin = getattr(layer, "begin_documents", None)
                 if begin is not None:
-                    begin(handles)
-            ids = torch.cat([one.input_ids for one in encoded], dim=1)
-            with varlen.reading([one.tokens for one in encoded], engine.device) as boundaries:
+                    begin(begin_handles)
+            ids = torch.cat([*(one.input_ids for one in encoded), pad_ids], dim=1)
+            with varlen.reading(lengths, engine.device) as boundaries:
                 engine.backbone(
                     input_ids=ids,
                     position_ids=boundaries.positions(engine.device),
@@ -156,10 +214,22 @@ class Shelf:
                 _put_back_conv_states(self._cache, boundaries)
                 engine._check_batched_read(self._cache, boundaries)
             taken = snapshot(self._cache)
+            if has_pad:
+                # The padding answers nothing and keeps no row on this shelf, so its pages go back now rather than
+                # sitting here as a document nobody will ever ask about or drop.
+                for layer in self._cache.layers:
+                    release = getattr(layer, "release_document", None)
+                    if release is not None:
+                        release(pad_handle)
         engine._note_read(_since(started, engine.torch_device), len(encoded))
         for at, (handle, one) in enumerate(zip(handles, encoded, strict=True)):
+            piece = pick(taken, at)
             self.documents[handle] = Shelved(
-                handle=handle, tokens=one.tokens, snapshot=pick(taken, at), position_from=one.tokens
+                handle=handle,
+                tokens=one.tokens,
+                snapshot=piece,
+                position_from=one.tokens,
+                snapshot_bytes=snapshot_bytes(piece),
             )
         return handles
 
@@ -169,9 +239,11 @@ class Shelf:
             raise PrismyraError("this shelf has been closed")
         if handle not in self.documents:
             raise PrismyraError(f"this shelf does not hold document {handle}")
-        # The engine's lock, because a pass running on another thread has rows naming this document's pages and the run
-        # would be handed to the next one underneath it.
-        with self._engine._lock:
+        # This shelf's own lane's lock, because a pass running on another thread *of this lane* has rows naming
+        # this document's pages and the run would be handed to the next one underneath it. A different lane's
+        # pass never names this shelf's pages at all -- each lane owns its own `Shelf`/`Pool` -- so it does not
+        # need to wait for this.
+        with self._engine._lock_for(self.lane):
             for layer in self._cache.layers:
                 release = getattr(layer, "release_document", None)
                 if release is not None:
@@ -179,8 +251,15 @@ class Shelf:
             del self.documents[handle]
 
     # ---------------------------------------------------------------- answering
-    def ask(self, asked: dict[int, list[Question]]) -> dict[int, Result]:
-        """Answer questions about documents already on the shelf, in one pass. No reading happens here."""
+    def ask(self, asked: dict[int, list[Question]], lane: int | None = None) -> dict[int, Result]:
+        """Answer questions about documents already on the shelf, in one pass. No reading happens here.
+
+        `lane` names which of the engine's locks/streams/`fork.OWNED` buffers this pass uses, defaulting to this
+        shelf's own `self.lane` -- see `prismyra.schedule.Batcher(lanes=2)`, the only caller that sets `self.lane`
+        to anything but 0.
+        """
+        if lane is None:
+            lane = self.lane
         if self._cache is None:
             raise PrismyraError("this shelf has been closed")
         if not asked:
@@ -202,7 +281,7 @@ class Shelf:
             for handle in handles
         ]
         results = engine._answer_batch(
-            prefills, [asked[handle] for handle in handles], context_ms=0.0, rows_for=handles
+            prefills, [asked[handle] for handle in handles], context_ms=0.0, rows_for=handles, lane=lane
         )
         return dict(zip(handles, results, strict=True))
 
@@ -320,6 +399,9 @@ class Prismyra:
         calibrate: bool = False,
         graphs: bool = False,
         paged: bool = False,
+        short_graphs: bool | None = None,
+        heads: str | list | None = None,
+        pin_autotune: bool = True,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -337,6 +419,22 @@ class Prismyra:
         # The caches are held by the engine and mutated in place, so two threads asking at once would interleave one
         # another's branches. The lock makes that safe; `prismyra.queue.Worker` is still what makes it fast.
         self._lock = threading.RLock()
+        # Lane=2 (THROUGHPUT.md 2026-10-05, "本当に効く経路"): a second lane needs its own lock, because the point
+        # is for two passes to actually run at once rather than queue behind one `RLock`. Lane 0 keeps `self._lock`
+        # itself (identity, not a copy) so every existing single-lane caller is unaffected; a lane's own cache/Pool
+        # (a separate `Shelf`, built by `prismyra.schedule.Batcher(lanes=2)`) is what makes the lock sufficient --
+        # two lanes never touch the same Pool, only the same model weights (read-only) and lane-tagged `fork.OWNED`
+        # scratch (see `_owned`'s `lane` argument).
+        self._locks: dict[int, threading.RLock] = {0: self._lock}
+        #: One CUDA stream per lane beyond the first, so a lane's kernels can actually run concurrently with
+        #: another lane's rather than just being launched from a different Python thread onto the one stream every
+        #: `Prismyra` has used until now (lane 0 keeps that stream -- `None` here means "the current/default
+        #: stream", not "no stream"). Built lazily, once per lane, because building one costs nothing worth paying
+        #: for an engine that is never asked for a second lane.
+        self._streams: dict[int, "torch.cuda.Stream | None"] = {0: None}
+        #: Monotonic deadline before `empty_cache()` is tried again, once it has been tried and still left free
+        #: memory at or below `GRAPH_MEMORY_MARGIN`. See `RECLAIM_COOLDOWN_S`.
+        self._reclaim_cooldown_until = 0.0
         #: Whether to record a branch pass and replay it. Off by default, and the reason is memory rather than doubt: a
         #: recording holds a private allocator pool, and this engine refuses a context by name from a budget it
         #: measures, so a feature that quietly takes device memory behind that budget would make the refusal wrong.
@@ -357,9 +455,23 @@ class Prismyra:
                     else f"paged storage needs the borrowed kernels on CUDA, and this is fast_kernels={fast_kernels} "
                     f"on {self.device}"
                 )
-        #: Shapes a recording was attempted on and refused, with the reason. Attempted once per shape, not once per
-        #: group, and reported through `stats()` rather than retried in silence.
+        #: Shapes a recording was attempted on and refused, with the reason. Reported through `stats()` rather than
+        #: retried in silence -- but retried, once there is reason to think the answer would be different. See
+        #: `_economics_needed` for which declines that applies to and why.
         self.declined_recordings: dict = {}
+        #: The passes-still-expected count an economics decline (`keeping_pays` returned a reason) would need to flip
+        #: to a keep, for shapes currently in `declined_recordings` for that reason. Nothing else is in here: a
+        #: decline from a stale cache (`Recording.usable` failing) or a capture failure (`graphs.record` returning
+        #: `None`) is not a question of *how many more passes*, so there is no number here that retrying it later
+        #: would change.
+        #:
+        #: Exists because the alternative -- declining once and never asking again -- was found to be the reason a
+        #: shape judged capable of a 1.94x replay was never once kept across 368 documents. The attempt gate below
+        #: fires at `expected == pays_from()` (a shape's eighth sighting, under the gate's own threshold), and the
+        #: shape's own measured ratio almost always needs a few more than that -- so the very first attempt, the only
+        #: one that was ever going to happen, arrived already below the bar that would keep it. Four more sightings
+        #: were often all that was missing, and nothing was watching for them.
+        self._economics_needed: dict = {}
         #: What each accepted recording's replays disagreed with their own pass by. Reported so that "it was accepted"
         #: and "it agreed" are separate statements: a check that silently measures the wrong thing reads as the second.
         self.verified_recordings: dict = {}
@@ -372,6 +484,14 @@ class Prismyra:
         #: rather than from a constant, because the ratio between them runs from 0.684 at a suffix of sixteen tokens to
         #: 0.997 at 128 -- see `_worth_keeping`.
         self.replay_cost: dict = {}
+        #: 2026-10-05 (座長 "パスそのものを短くする"): why an attempt at a homogeneous shape never got as far as
+        #: `graphs.record` -- the attempt gate (`expected < pays_from()`), a standing decline already in
+        #: `declined_recordings`, or `room_to_record` failing for one of its own two reasons (the memory margin,
+        #: or `MAX_KEPT_RECORDINGS` already full). `room_to_record` failing was previously invisible: the gate's
+        #: `and` short-circuits before `declined_recordings` is ever written to for that reason, so a card that
+        #: never has two free recording slots at once would show zero declines and zero replays with no record of
+        #: why. Reported through `stats()`.
+        self._skip_reasons: dict[str, int] = {}
         #: The fastest read this engine has served, in milliseconds. An estimate of a pass's fixed cost, which is what
         #: it is for: reading is that fixed cost plus a slope in the tokens, so the shortest document seen is the
         #: closest
@@ -416,7 +536,24 @@ class Prismyra:
         # need one.
         self.processor = _load_processor(model)
         # No language-model head: it projects to the whole vocabulary and nothing here generates a token.
-        self.backbone = AutoModel.from_pretrained(model, dtype=self.dtype, device_map=self.device if on_cuda else None)
+        #
+        # Experimental: routed experts in NVFP4, selected with PRISMYRA_EXPERTS=nvfp4 (prismyra/kernels/nvfp4.py).
+        # `model` must then be a checkpoint directory whose index leaves the routed-expert weights out (the FP8
+        # experts are never loaded; `tiny_experts` makes the framework's loader accept the missing keys). Converted
+        # here, before `kernels.apply` below, so the adapter below finds `FusedExpertsFp4` already in place and
+        # only has to recognise it rather than build it.
+        use_nvfp4_experts = os.environ.get("PRISMYRA_EXPERTS") == "nvfp4" and on_cuda and fast_kernels
+        if use_nvfp4_experts:
+            from .kernels import nvfp4 as _nvfp4
+
+            with _nvfp4.tiny_experts():
+                self.backbone = AutoModel.from_pretrained(model, dtype=self.dtype, device_map=self.device)
+            decoder_cfg = getattr(self.config, "text_config", self.config)
+            _nvfp4.convert(self.backbone, decoder_cfg.num_experts_per_tok, self.torch_device)
+        else:
+            self.backbone = AutoModel.from_pretrained(
+                model, dtype=self.dtype, device_map=self.device if on_cuda else None
+            )
         self.backbone.eval()
         if not on_cuda:
             self.backbone.to(self.torch_device)
@@ -432,10 +569,38 @@ class Prismyra:
         #: stored in or handed to the framework's own attention as a strided view. That changes what a branch pass
         #: transiently allocates, so it changes what admission budgets.
         self._borrowed_kernel = self.applied.ok and not self.applied.skipped
+        if paged and on_cuda:
+            try:
+                _enable_batch_invariance()
+            except ImportError as e:
+                self.applied.notes.append(
+                    f"batch-invariant mode not available ({e}); open_batch/Batcher may still move an answer by "
+                    "who else shares the pass -- see diag_layer0_op_divergence.py"
+                )
         self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
         # measured question rather than an obvious one -- `evals/run.py` compares the two.
         self.calibration = Calibration() if calibrate else None
+        #: Every timing-based Triton autotuner in the process held to one configuration (see `kernels.autotune`), so
+        #: that answers do not depend on which candidate happened to win the race at a process's first call. Before the
+        #: one-pass recordings are taken: a recording keeps the configuration it captured, so one picked by timing
+        #: would be replayed for the life of the engine.
+        self.autotune = pin_autotunes(self.torch_device, enabled=pin_autotune)
+        #: Learned read-outs registered by option list (see `prismyra.heads`). A question whose options match none of
+        #: them is read from the output embedding exactly as without heads.
+        self.heads = Heads(heads, self.hidden_size, self.device)
+        #: The one-pass read of a short request, recorded per length bucket. On by default wherever the one-pass path
+        #: is the path a single question takes -- CUDA with the borrowed kernels, no calibration, no paged storage --
+        #: because that read is host-bound at short lengths and a replay removes the wait (docs/PERFORMANCE.md). The
+        #: memory it holds is measured when it is taken and admission counts it, which is what keeping the branch
+        #: recordings off by default was protecting.
+        self._one_pass = None
+        wanted = short_graphs if short_graphs is not None else (on_cuda and self._borrowed_kernel)
+        if wanted:
+            if not on_cuda:
+                raise PrismyraError(f"short_graphs records CUDA graphs and this engine is on {self.device}")
+            if not (calibrate or paged):
+                self._one_pass = onepass.record_all(self, self._pad_id(), self._read_one_pass)
 
     # ------------------------------------------------------------------ public
     def validate(self, questions: list[Question]) -> None:
@@ -631,39 +796,67 @@ class Prismyra:
         with self._lock:
             encoded = encode(context, None, None, self.processor, self.tokenizer, self.device)
             tokens = encoded.tokens + len(suffix)
-            self._check_fits(tokens)
+            bucket = self._one_pass.bucket_for(tokens) if self._one_pass is not None else None
+            if bucket is None:
+                # A replay needs no admission: everything it touches was allocated when it was recorded.
+                self._check_fits(tokens)
             start = _now(self.torch_device)
-            before = self._peak_baseline()
+            before = None if bucket is not None else self._peak_baseline()
             try:
                 with torch.inference_mode():
                     ids = torch.cat([encoded.input_ids, torch.tensor([suffix], device=self.device)], dim=1)
-                    # One row. The branch room is kept at its usual size rather than zero, because the attention layer
-                    # sizes its context room as the total minus the branch room; at one row it is a few megabytes.
-                    cache = build_cache(
-                        self.config, self.room_for(tokens) + WIDTHS[-1], 1, self.dtype, self.device, WIDTHS[-1]
+                    if bucket is not None:
+                        hidden = onepass.replay(bucket, ids, self._pad_id())
+                    else:
+                        hidden = self._read_one_pass(ids)
+                    (probabilities,) = self.heads.apply(
+                        hidden, [question.options], score(hidden, self.unembedding, [planned.token_ids], None)
                     )
-                    out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
-                    hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
-                    (probabilities,) = score(hidden, self.unembedding, [planned.token_ids], None)
                     values = probabilities.tolist()
-                    # Released here, inside the lock: the output holds the cache, and the next request must not find
-                    # this one's memory still allocated when it is admitted.
-                    del out, cache, hidden, ids
+                    del hidden, ids
             except torch.OutOfMemoryError as e:
                 raise PrismyraError(
                     f"ran out of memory reading a context of {encoded.tokens} tokens with its question; a shorter "
                     f"context is the only knob"
                 ) from e
-            self._observe_reading(before, tokens)
+            if before is not None:
+                self._observe_reading(before, tokens)
             elapsed = _since(start, self.torch_device)
         return Result(
-            answers={question.id: _answer_for(question, values)},
+            answers={question.id: _answer_for(question, values, self.heads.name_for(question.options))},
             model=self.model_name,
             context_tokens=encoded.tokens,
             scoring="raw",
             # The question is read inside the context pass, so the whole request is `context_ms`.
             timing=Timing(context_ms=elapsed, readout_ms=0.0),
         )
+
+    def _read_one_pass(self, ids: torch.Tensor) -> torch.Tensor:
+        """The eager one-pass read: one row of context and question, the hidden state at its last token.
+
+        Its own method because two things must run exactly this: a request no recording holds, and the proof each
+        recording is held to (`onepass.prove`), which compares a replay against it.
+        """
+        tokens = ids.shape[1]
+        # One row. The branch room is kept at its usual size rather than zero, because the attention layer sizes its
+        # context room as the total minus the branch room; at one row it is a few megabytes.
+        cache = build_cache(self.config, self.room_for(tokens) + WIDTHS[-1], 1, self.dtype, self.device, WIDTHS[-1])
+        with torch.inference_mode():
+            out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
+            hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
+        # Released before returning, inside the caller's lock: the output holds the cache, and the next request must
+        # not find this one's memory still allocated when it is admitted.
+        del out, cache
+        return hidden
+
+    def _pad_id(self) -> int:
+        """What a recorded one-pass read is padded with. Any token will do -- nothing after the last real token reaches
+        it, and each bucket is proved on that -- so the tokenizer's own pad token, or the end of text without one."""
+        for name in ("pad_token_id", "eos_token_id"):
+            value = getattr(self.tokenizer, name, None)
+            if isinstance(value, int):
+                return value
+        return 0
 
     def ask_many(self, requests: list[Request]) -> list[Result | PrismyraError]:
         """Answer several independent requests. One request failing does not fail the others.
@@ -692,6 +885,7 @@ class Prismyra:
             "device": self.device,
             "group": self.group,
             "kernels": self.applied.as_dict(),
+            "autotune": self.autotune.as_dict(),
             "scoring": self.calibration.mode if self.calibration else "raw",
             "storage": "paged" if self.paged else "joined",
             # Counted by the layers themselves rather than taken from the flag. A previous version of the paged path
@@ -699,9 +893,16 @@ class Prismyra:
             "paged_reads_served": self._paged_reads(),
             "graphs": self.graphs,
             "graphs_declined": dict(self.declined_recordings),
+            # Only the economics declines still eligible for a second attempt -- the bar `expected` has to clear.
+            # Shrinks as shapes are reopened and either kept or declined again under a fresh measurement.
+            "graphs_retry_at": dict(self._economics_needed),
             "graphs_verified": dict(self.verified_recordings),
             "graphs_replays": dict(self.replays),
             "graphs_cost": dict(self.replay_cost),
+            "graphs_skip_reasons": dict(self._skip_reasons),
+            # The one-pass recordings: which buckets serve, how often each has, what proving each measured and what
+            # they hold. Empty when the one-pass read runs eagerly.
+            "short_graphs": self._one_pass.stats() if self._one_pass is not None else {},
             "caches_allocated": self._made_caches,
             # Measured on this engine rather than derived, and zero until a question has been answered. Reported
             # because it is the number that decides how many contexts can be answered at once, and it is several times
@@ -740,6 +941,11 @@ class Prismyra:
         # device and can hand out without asking again, and loading these weights leaves that pool large -- so asking
         # the device alone refused an 18,000-token context that had 9 GiB waiting for it inside the process.
         spare = torch.cuda.memory_reserved(self.torch_device) - torch.cuda.memory_allocated(self.torch_device)
+        # Less what the one-pass recordings hold: their private pool is reserved and mostly unallocated between
+        # replays, and none of it can be handed to a read. The figure is the whole growth of the reservation while they
+        # were taken, so it also counts tensors already outside `spare`; refusing a little early is the safe direction.
+        if self._one_pass is not None:
+            spare -= self._one_pass.held_bytes
         free += max(0, spare)
         if wanted >= free:
             phase = "reading it" if reading >= answering else f"answering at group={self.group}"
@@ -772,6 +978,24 @@ class Prismyra:
             )
 
     def _read(self, encoded) -> Prefill:
+        # A solo read and `open_batch`'s joint read of several documents go through the *same* borrowed chunked
+        # recurrent kernel, and that kernel's own configuration is chosen by the *total* length of the varlen run
+        # it is given -- not by any one document's content in it (measured decisively,
+        # `diag_total_length_hypothesis.py`: two companions of the identical length but different content left a
+        # target's extracted state bit-identical; the same target alone, at a different total length, did not).
+        # So a document read alone and the same document read alongside others can legitimately end up at two
+        # different total lengths, and therefore two different -- but each internally consistent -- recurrent
+        # states, which is exactly the open_batch/`ask()` mismatch this engine's device tests measure against.
+        # Padding every read, solo or batched, up to the same small set of total-length buckets (`_round_rows`,
+        # reused rather than duplicated: "round up to the next power of two, capped" is the identical decision for
+        # a row count and for a token count) removes the difference instead of chasing it. Only when the borrowed
+        # kernels this depends on are installed, the engine is paged (unpaged storage has no per-document state to
+        # keep separate in the first place) and there is no media (whose positions a flat multi-segment run has not
+        # been taught to carry, same restriction `open_batch` already states).
+        if self.paged and not encoded.has_media and not self._missing_batched_read_kernels():
+            pad_ids, lengths = self._pad_context_lengths([encoded.tokens], [encoded.input_ids])
+            if pad_ids.shape[1] > 0:
+                return self._read_padded(encoded, pad_ids, lengths)
         cache, room = self._claim_cache(encoded.tokens)
         self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
         # Read after the forward, not before: the offset is something the model works out while reading the context.
@@ -791,6 +1015,70 @@ class Prismyra:
             tokens=encoded.tokens,
             last_position=torch.tensor([encoded.tokens - 1], device=self.device),
             position_from=position_from,
+        )
+
+    def _missing_batched_read_kernels(self) -> set[str]:
+        """Which of the two borrowed replacements a batched (multi-segment, `cu_seqlens`) read depends on are not
+        installed, empty when both are. Shared by `open_batch` and `_read`'s padding, which depend on the same
+        thing for the same reason: the framework's own gated-delta-rule and convolution have no argument for where
+        one document ends inside a flat run.
+        """
+        return {"convolution", "gated_delta_rule"} - {swap.name for swap in self.applied.swaps}
+
+    def _pad_context_lengths(self, lengths: list[int], ids: list[torch.Tensor]) -> tuple[torch.Tensor, list[int]]:
+        """Round a varlen read's total length up to the bucket `_round_rows` would pick, as one more segment appended
+        after the real documents, and the padding ids to fill it -- a harmless repeat of the last document's own
+        tokens, because the measurement behind this is that a chunked recurrent kernel's config is chosen by *total*
+        length and does not care what the padding is (`diag_total_length_hypothesis.py`).
+
+        Returns the padding ids (shape `(1, 0)`, not `(1, pad)` carrying nothing, when the total is already at a
+        bucket) and `lengths` with the pad segment appended only when there is one -- `varlen.reading` refuses a
+        zero-length document, and a run that is already at a bucket has nothing to add.
+        """
+        total = sum(lengths)
+        padded = _round_rows(total, self.longest_context)
+        pad = max(0, padded - total)
+        if pad == 0:
+            return ids[0].new_zeros((1, 0)), lengths
+        last = ids[-1]
+        reps = -(-pad // last.shape[1])
+        pad_ids = last.repeat(1, reps)[:, :pad]
+        return pad_ids, [*lengths, pad]
+
+    def _read_padded(self, encoded, pad_ids: torch.Tensor, lengths: list[int]) -> Prefill:
+        """`_read`'s single-document path, through the same joint-read machinery `open_batch` uses for several --
+        one real document and one padding segment, so the kernel sees the same total length a later `open_batch`
+        sharing this document would round it to. Only the real document's row of the result is kept; the padding's
+        is discarded exactly as a padded branch pass already discards its extra rows (`_round_rows`'s own note).
+        """
+        cache, room = self._claim_cache(sum(lengths))
+        ids = torch.cat([encoded.input_ids, pad_ids], dim=1)
+        with torch.inference_mode():
+            for layer in cache.layers:
+                begin = getattr(layer, "begin_documents", None)
+                if begin is not None:
+                    begin([0, 1])  # the real document, then its padding -- one handle each, or `_write_context` refuses
+            with varlen.reading(lengths, self.device) as boundaries:
+                self.backbone(input_ids=ids, position_ids=boundaries.positions(self.device), use_cache=True, past_key_values=cache)
+                _put_back_conv_states(cache, boundaries)
+                self._check_batched_read(cache, boundaries)
+            taken = pick(snapshot(cache), 0)
+            for layer in cache.layers:
+                release = getattr(layer, "release_document", None)
+                if release is not None:
+                    release(1)
+        # Not `restore_and_fork`: its `begin_branches()` defaults every row to "the last document written" (its own
+        # docstring), which was always correct when the only document ever written to a solo cache was the real one
+        # -- here the padding was written after it. `rows_for=[0] * self.group` says the same thing this cache's
+        # only remaining document already implies, explicitly rather than by relying on write order.
+        restore_and_fork_many(cache, [(taken, self.group)], width=self.group, rows_for=[0] * self.group)
+        return Prefill(
+            snapshot=taken,
+            cache=cache,
+            room=room,
+            tokens=encoded.tokens,
+            last_position=torch.tensor([encoded.tokens - 1], device=self.device),
+            position_from=encoded.tokens,
         )
 
     @property
@@ -813,7 +1101,7 @@ class Prismyra:
         """
         return encode(context, None, None, self.processor, self.tokenizer, self.device)
 
-    def open_shelf(self, room: int | None = None) -> Shelf:
+    def open_shelf(self, room: int | None = None, lane: int = 0) -> Shelf:
         """One cache held open, with documents put on it and taken off as callers come and go.
 
         A `Batch` reads its documents, answers them and drops the cache, so asking twice about one document reads it
@@ -823,6 +1111,14 @@ class Prismyra:
 
         `room` is how many context tokens the shelf holds altogether, rounded up to a bucket. Default is the largest
         bucket that admission will accept, because a shelf that holds two documents is barely a shelf.
+
+        `lane` is which engine lane this shelf's own passes run under (see `Shelf.lane`). Each call builds a brand
+        new cache (`_claim_cache` has no pool to reuse from yet), so two shelves -- one per lane -- never share a
+        `Pool`/page table; the only thing two lanes still share is the model weights (read-only) and, if `lane`
+        differs, nothing else at all. Measured (THROUGHPUT.md 2026-10-05, `diag_two_shelves_memory.py`): a second
+        shelf is not free -- opening one at `room=4096` plus 5 documents on each cost about 2.1 GiB total from a
+        freshly loaded model's 8.6 GiB of free device memory -- so a second lane's `room` should be set with that
+        in mind rather than left at the default (which is sized for *one* shelf being the only one).
         """
         if not self.paged:
             raise PrismyraError(
@@ -832,7 +1128,7 @@ class Prismyra:
         wanted = room if room is not None else self._largest_shelf()
         self._check_fits(wanted)
         cache, held = self._claim_cache(wanted)
-        return Shelf(_engine=self, _cache=cache, room=held)
+        return Shelf(_engine=self, _cache=cache, room=held, lane=lane)
 
     def _largest_shelf(self) -> int:
         """The biggest bucket this engine can hold a shelf of, from its own admission figures.
@@ -880,9 +1176,7 @@ class Prismyra:
         # The two replacements a batched read depends on, named rather than "all of them". The first version of this
         # check asked whether anything had been skipped at all, and a skipped head duplication -- nothing to do with
         # document boundaries -- refused every batch.
-        needed = {"convolution", "gated_delta_rule"}
-        installed = {swap.name for swap in self.applied.swaps}
-        if missing := needed - installed:
+        if missing := self._missing_batched_read_kernels():
             raise PrismyraError(
                 f"a batch of documents needs the borrowed {' and '.join(sorted(missing))}: the framework's own has no "
                 "argument for where one document ends, so a batched read would scan across the boundary and answer "
@@ -897,18 +1191,26 @@ class Prismyra:
             )
         lengths = [one.tokens for one in encoded]
         total = sum(lengths)
-        cache, room = self._claim_cache(total)
+        pad_ids, lengths = self._pad_context_lengths(lengths, [one.input_ids for one in encoded])
+        cache, room = self._claim_cache(total + pad_ids.shape[1])
         started = _now(self.torch_device)
         with torch.inference_mode():
             # One pass over all of them. Reading is 110 ms of fixed cost plus 11 ms per thousand tokens on this
             # model, so what this removes is that fixed cost paid per document rather than per batch.
             # Named even though a batch's handles are its positions, so the layer's "already held" check runs rather
             # than being skipped on the one path that could get away with skipping it.
+            # The padding is one more document to the pages, same as to the recurrence: `begin_documents` wants one
+            # handle per entry in `lengths`, pages and all, or the paged attention layer refuses the read outright
+            # (`_write_context`'s own check). `len(encoded)` is free because nothing is held in a batch's fresh cache
+            # yet.
+            pad_handle = len(encoded)
+            has_pad = pad_ids.shape[1] > 0
+            handles = list(range(len(encoded))) + ([pad_handle] if has_pad else [])
             for layer in cache.layers:
                 begin = getattr(layer, "begin_documents", None)
                 if begin is not None:
-                    begin(list(range(len(encoded))))
-            ids = torch.cat([one.input_ids for one in encoded], dim=1)
+                    begin(handles)
+            ids = torch.cat([*(one.input_ids for one in encoded), pad_ids], dim=1)
             with varlen.reading(lengths, self.device) as boundaries:
                 self.backbone(
                     input_ids=ids,
@@ -921,6 +1223,13 @@ class Prismyra:
             # One snapshot with a row per document, because the recurrence returns a state per document when it is told
             # the boundaries. `fork.pick` is how a document takes its own row of it.
             taken = snapshot(cache)
+            if has_pad:
+                # The padding answers nothing and keeps no row, so its pages go back now rather than sitting in this
+                # batch's cache until it closes.
+                for layer in cache.layers:
+                    release = getattr(layer, "release_document", None)
+                    if release is not None:
+                        release(pad_handle)
         prefills = [
             Prefill(
                 snapshot=pick(taken, handle),
@@ -965,6 +1274,7 @@ class Prismyra:
         asked: list[list[Question]],
         context_ms: float,
         rows_for: list[int] | None = None,
+        lane: int = 0,
     ) -> list[Result]:
         """One forward pass carrying questions about several documents, one row per question.
 
@@ -984,7 +1294,15 @@ class Prismyra:
 
         flat = [q for questions in asked for q in questions]
         plans = [plan(q, self.tokenizer) for q in flat]
-        width = self._width_for(plans)
+        # Tightened the same way `_packed_groups` tightens a single document's groups: a batch answering several
+        # documents in one pass is exactly one group of that function's own kind, every row in it. Using the
+        # untightened WIDTHS bucket here instead -- which is what this line did before -- pads every row wider than
+        # `ask()` would and is not a rounding difference: the extra padding columns reach the recurrent layers'
+        # kernels and move the hidden state at the real last token, not just the padding's own. Confirmed by
+        # bisecting shelf against `ask()` on the same document, same questions, same order: matching only this
+        # width made the two bit-exact; matching only the question order changed nothing. See
+        # tests/test_gpu.py::test_a_shelf_matches_ask_bit_for_bit.
+        width = _round_pack_align(max(len(branch_ids(p.text, self.tokenizer)) for p in plans), self._width_for(plans))
         # Which document each row answers about, named by the handle the **cache** knows it as. A batch admits its
         # documents in order so the handles are the positions; a shelf holds whatever was put on it, which is why this
         # is given rather than derived.
@@ -994,10 +1312,11 @@ class Prismyra:
         rows_for = [names[at] for at, count in enumerate(counts) for _ in range(count)]
 
         start = _now(self.torch_device)
-        with self._lock, torch.inference_mode():
+        with self._lock_for(lane), self._stream_for(lane), torch.inference_mode():
             try:
-                hidden = self._branch_across(prefills, counts, rows_for, [p.text for p in plans], width)
-                probabilities = score(hidden, self.unembedding, [p.token_ids for p in plans], None)
+                hidden = self._branch_across(prefills, counts, rows_for, [p.text for p in plans], width, lane=lane)
+                read = score(hidden, self.unembedding, [p.token_ids for p in plans], None)
+                probabilities = self.heads.apply(hidden, [q.options for q in flat], read)
             finally:
                 # Whether it answered or raised, no row is set up to read anything now, so a document nobody is
                 # reading can be dropped. In a `finally`: a failed pass must not leave a shelf unable to drop anything.
@@ -1010,7 +1329,7 @@ class Prismyra:
         results, at = [], 0
         for handle, questions in enumerate(asked):
             answers = {
-                q.id: _answer_for(q, values.tolist())
+                q.id: _answer_for(q, values.tolist(), self.heads.name_for(q.options))
                 for q, values in zip(questions, probabilities[at : at + len(questions)], strict=True)
             }
             at += len(questions)
@@ -1025,25 +1344,63 @@ class Prismyra:
             )
         return results
 
-    def _branch_across(self, prefills, counts: list[int], rows_for: list[int], texts: list[str], width: int):
-        """The pass itself. Every row's positions start at its own document's end, which is per row not per batch."""
+    def _branch_across(
+        self, prefills, counts: list[int], rows_for: list[int], texts: list[str], width: int, lane: int = 0
+    ):
+        """The pass itself. Every row's positions start at its own document's end, which is per row not per batch.
+
+        Goes through `_run_recorded`, the same decision `_run_branch` uses for a single document. It did not used to:
+        this called the backbone directly, so `graphs=True` recorded nothing here, which is the gap `docs/PERFORMANCE.md`
+        names under "Recording the batched pass is not the next thing, and why". Wiring it is what that section says it
+        would take -- a few lines -- once the other half, `graphs.Recording` accepting a remainder bucket instead of an
+        exact context length, makes a recording survive the batch's documents changing between passes.
+        """
         rows = sum(counts)
-        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, rows, width)
+        # Batch-invariant: see `_round_rows`. The row count is the only thing that otherwise differs between "two
+        # documents answered together" and "either one answered alone", once the width is matched (`_round_pack_align`)
+        # -- and that alone moved an answer by up to 0.29 and flipped decisions. Padding every pass sharing documents
+        # to the same row count a solo document would be padded to removes the difference entirely: `pad` extra rows
+        # repeat the first document, discarded at the end exactly as `build_suffixes` already discards padded columns.
+        padded_rows = _round_rows(rows, self.group)
+        pad = padded_rows - rows
+        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, padded_rows, width)
         starts = [
             prefills[at].position_from or prefills[at].tokens for at, count in enumerate(counts) for _ in range(count)
         ]
+        # Padding extends the *last* document's own block, never a new one at the tail: `rows_for`'s rows are laid
+        # out contiguously per document (`paged.PagedForkLayer.begin_branches` rebuilds its row assignment from each
+        # document's *total* count in `rows_for`, not from the row positions themselves, so it assumes every row
+        # naming one document is contiguous). Padding with the first document while a different one is last split
+        # that document's rows across the gap and answered every row from the wrong table -- found by this file's
+        # own open-loop comparison moving a probability by 0.93 instead of removing the smaller 0.29 it was meant to.
+        if pad:
+            starts += [starts[-1]] * pad
         offsets = torch.tensor(starts, device=self.device).unsqueeze(1)
         positions = offsets + torch.arange(ids.shape[1], device=self.device).unsqueeze(0)
+        cache = prefills[0].cache
 
-        restore_and_fork_many(
-            prefills[0].cache,
-            [(prefills[at].snapshot, count) for at, count in enumerate(counts)],
-            width=self.group,
-            rows_for=rows_for,
+        parts = [(prefills[at].snapshot, count) for at, count in enumerate(counts)]
+        rows_for_padded = rows_for
+        if pad:
+            parts = [*parts[:-1], (parts[-1][0], parts[-1][1] + pad)]
+            rows_for_padded = [*rows_for, *([rows_for[-1]] * pad)]
+
+        def fork() -> None:
+            restore_and_fork_many(cache, parts, width=self.group, rows_for=rows_for_padded, lane=lane)
+
+        def run(suffix: torch.Tensor, suffix_positions: torch.Tensor) -> torch.Tensor:
+            out = self.backbone(
+                input_ids=suffix, position_ids=suffix_positions, use_cache=True, past_key_values=cache
+            )
+            return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+
+        # One document's remainder is all a paged recording's bucket key carries (see `_run_recorded`), so a pass
+        # naming more than one document is not a shape graphs may generalise over yet.
+        homogeneous = len(set(rows_for)) <= 1
+        hidden = self._run_recorded(
+            cache, fork, run, ids, positions, padded_rows, width, homogeneous=homogeneous, lane=lane
         )
-        out = self.backbone(input_ids=ids, position_ids=positions, use_cache=True, past_key_values=prefills[0].cache)
-        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
-        return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
+        return hidden[torch.arange(padded_rows, device=self.device), read_at][: len(texts)]
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
         # Already validated: both public entry points call `validate` before the context is read, and repeating it
@@ -1075,14 +1432,23 @@ class Prismyra:
                     chunk = [plans[i].text for i in members]
                     widest_chunk = max(widest_chunk, len(chunk))
                     # How many more groups of this exact shape this call will run, which is what decides whether
-                    # recording the pass can pay for itself.
-                    same_shape_left = sum(1 for m, w in groups[n + 1 :] if len(m) == len(members) and w == group_width)
+                    # recording the pass can pay for itself. Compared on the padded row count `_branch` actually
+                    # runs at (`_round_rows`), not the raw member count: two groups of 5 and 7 real questions run
+                    # the identical padded-to-8 pass now, so they are the same shape for this count too.
+                    padded = _round_rows(len(members), self.group)
+                    same_shape_left = sum(
+                        1 for m, w in groups[n + 1 :] if _round_rows(len(m), self.group) == padded and w == group_width
+                    )
                     hidden = self._branch(prefill, chunk, len(chunk), group_width, remaining=same_shape_left)
-                    scored = score(
+                    scored = self.heads.apply(
                         hidden,
-                        self.unembedding,
-                        [token_ids[i] for i in members],
-                        [priors[i] for i in members] if priors else None,
+                        [questions[i].options for i in members],
+                        score(
+                            hidden,
+                            self.unembedding,
+                            [token_ids[i] for i in members],
+                            [priors[i] for i in members] if priors else None,
+                        ),
                     )
                     by_index.update(zip(members, scored, strict=True))
                 probabilities = [by_index[i] for i in range(len(questions))]
@@ -1098,7 +1464,10 @@ class Prismyra:
             self._observe_peak(before, tokens, widest_chunk)
         readout_ms = _since(start, self.torch_device)
 
-        answers = {q.id: _answer_for(q, p.tolist()) for q, p in zip(questions, probabilities, strict=True)}
+        answers = {
+            q.id: _answer_for(q, p.tolist(), self.heads.name_for(q.options))
+            for q, p in zip(questions, probabilities, strict=True)
+        }
         return Result(
             answers=answers,
             model=self.model_name,
@@ -1204,7 +1573,7 @@ class Prismyra:
             # The same rule whether recording is on or not. A recording must answer exactly as the eager pass it was
             # taken from, and a different width is a different reduction: rounding to the pinned buckets only under
             # `graphs` moved a probability by 3e-4 between the two.
-            groups.append((members, min(width, -(-longest // PACK_ALIGN) * PACK_ALIGN)))
+            groups.append((members, _round_pack_align(longest, width)))
         return groups
 
     def _branch(self, prefill: Prefill, texts: list[str], rows: int, width: int, remaining: int = 0) -> torch.Tensor:
@@ -1214,12 +1583,16 @@ class Prismyra:
         if prefill.snapshot is None:
             prefill.snapshot = snapshot(prefill.cache)
 
-        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, rows, width)
+        # Batch-invariant: see `_round_rows`. Every row buffer downstream is already sized for `self.group`, so
+        # padding up to it costs nothing to allocate -- only the padded rows' own compute, which `remaining` below
+        # also now measures economics against at this padded shape rather than the raw one.
+        padded_rows = _round_rows(rows, self.group)
+        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, padded_rows, width)
         # From where the model thinks the context reached, which is past its token count when media widened it.
         start = prefill.position_from or prefill.tokens
-        positions = torch.arange(start, start + ids.shape[1], device=self.device).expand(rows, -1)
+        positions = torch.arange(start, start + ids.shape[1], device=self.device).expand(padded_rows, -1)
 
-        def run(suffix: torch.Tensor) -> torch.Tensor:
+        def run(suffix: torch.Tensor, suffix_positions: torch.Tensor) -> torch.Tensor:
             """One branch pass, with the fork done by the caller.
 
             The fork is deliberately **not** in here, and that was found by measurement rather than reasoned out. With
@@ -1228,15 +1601,22 @@ class Prismyra:
             state to a new tensor on every pass, and a rebinding is Python: a recording keeps the tensor it saw and a
             replay cannot repeat the assignment. So the fork runs eagerly every time, at the cost of a few copies per
             layer, and the recording covers only what is pure device work.
+
+            `suffix_positions` is a parameter rather than the closed-over `positions`, and a recording's own static
+            buffer rather than a kept constant -- `graphs.record` says why: a different document starts its branch at
+            a different position, and a recording that answered every document at the position its first one needed
+            would be wrong rather than slow.
             """
-            out = self.backbone(input_ids=suffix, position_ids=positions, use_cache=True, past_key_values=prefill.cache)
+            out = self.backbone(
+                input_ids=suffix, position_ids=suffix_positions, use_cache=True, past_key_values=prefill.cache
+            )
             return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
-        hidden = self._run_branch(prefill, run, ids, rows, width, positions, remaining)
+        hidden = self._run_branch(prefill, run, ids, padded_rows, width, positions, remaining)
         # Each row is read at its own last real token, which is why the padding cannot reach an answer.
-        return hidden[torch.arange(rows, device=self.device), read_at][: len(texts)]
+        return hidden[torch.arange(padded_rows, device=self.device), read_at][: len(texts)]
 
-    def _replay_disagreement(self, taken, prefill, ids, rows: int, reference) -> tuple[float, float]:
+    def _replay_disagreement_on(self, taken, cache, fork, ids, positions, reference) -> tuple[float, float]:
         """The worst a recording's replays are from the pass it was taken from, and what a replay costs -- both measured
         here because both need a replay and these are the only replays that answer nothing.
 
@@ -1253,11 +1633,35 @@ class Prismyra:
         # measured is the cost of one replayed pass as a caller would experience it.
         started = _now(self.torch_device)
         for _ in range(REPLAY_CHECKS):
-            taken.before_fork(prefill.cache)
-            self.fork(prefill, rows)
-            replayed = taken.replay(prefill.cache, ids)
+            taken.before_fork(cache)
+            fork()
+            replayed = taken.replay(cache, ids, positions)
             worst = max(worst, float((replayed.float() - reference.float()).abs().amax()))
         return worst, _since(started, self.torch_device) / REPLAY_CHECKS
+
+    def _lock_for(self, lane: int) -> threading.RLock:
+        """The lock a lane's whole pass is serialised under. Lane 0 is `self._lock` itself; a further lane gets its
+        own, built once and kept -- see `self._locks`."""
+        lock = self._locks.get(lane)
+        if lock is None:
+            lock = threading.RLock()
+            self._locks[lane] = lock
+        return lock
+
+    def _stream_for(self, lane: int):
+        """The CUDA stream a lane's pass runs on, as a context manager -- `contextlib.nullcontext()` for lane 0,
+        which keeps using whatever stream was already current (today's single-lane behaviour, unchanged); a real
+        `torch.cuda.stream(...)` for any further lane, built once. CPU, or no CUDA stream support needed, falls
+        back to the same `nullcontext()` lane 0 uses."""
+        import contextlib
+
+        if lane == 0 or self.torch_device.type != "cuda":
+            return contextlib.nullcontext()
+        stream = self._streams.get(lane)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.torch_device)
+            self._streams[lane] = stream
+        return torch.cuda.stream(stream)
 
     def _recordings_for(self, cache) -> dict:
         """The recordings taken on this cache, and how many times each shape has been seen on it.
@@ -1321,7 +1725,51 @@ class Prismyra:
         restore_and_fork(prefill.cache, prefill.snapshot, rows, width=self.group)
 
     def _run_branch(self, prefill, run, ids, rows: int, width: int, positions, remaining: int = 0):
+        """The single-document branch pass, through the shared recording machinery. See `_run_recorded`."""
+        return self._run_recorded(
+            prefill.cache, lambda: self.fork(prefill, rows), run, ids, positions, rows, width, remaining
+        )
+
+    def _bucket_key(self, cache, rows: int, width: int) -> tuple:
+        """The shape a recording is kept under: `(rows, width)`, widened with a remainder bucket when the cache is
+        paged storage.
+
+        The joined storage's read is shaped `(rows, context + suffix, heads, dim)`, so two contexts of different
+        lengths are two different graphs and `(rows, width)` is already as coarse as it can be. The paged storage's
+        read is shaped by the pool, not by the context, so its only remaining dependence is the one `graphs.Recording`
+        checks: the branch write's offset, which is the context length modulo the page size. Bucketing the key by that
+        remainder, rather than by the exact length, is what lets one recording answer about every document that shares
+        it -- sixteen recordings instead of one per length ever seen.
+        """
+        if not self.paged:
+            return (rows, width)
+        from .paged import BLOCK as page_block
+
+        remainder = next(
+            (held % page_block for layer in cache.layers if (held := getattr(layer, "context_length", None)) is not None),
+            None,
+        )
+        return (rows, width) if remainder is None else (rows, width, remainder)
+
+    def _run_recorded(
+        self,
+        cache,
+        fork,
+        run,
+        ids,
+        positions,
+        rows: int,
+        width: int,
+        remaining: int = 0,
+        homogeneous: bool = True,
+        lane: int = 0,
+    ):
         """The pass, replayed from a recording where there is one and recorded where a second one is worth taking.
+
+        Shared by the single-document branch pass (`_run_branch`) and the batched one (`_branch_across`): both fork a
+        cache into the shape a pass needs, run the backbone, and may record it, and the only thing that differs
+        between them is *how* the fork is done -- one document's snapshot widened, or several documents' snapshots
+        laid out by row. `cache` and `fork` carry that difference in; everything from here down is the same decision.
 
         The order is what makes this safe. A recording is not a result: under stream capture the kernels are written
         down rather than run, so the pass is executed eagerly for its answer *first* and recorded afterwards.
@@ -1333,33 +1781,49 @@ class Prismyra:
         once; and the count of times this shape has come back on this cache, which is evidence about a session asking
         group after group. A shape that has neither records nothing, so a caller asking one group about a document it
         will not revisit pays nothing for machinery it never uses.
+
+        `homogeneous` is false for a pass answering about more than one document, and that turns graphs off for this
+        call entirely -- found by an open-loop measurement answering wrong questions after this was shipped without
+        it. The paged storage's remainder bucket is sound for *one* document's remainder: a batch's `context_length`
+        is the *longest* document in it (`PagedForkLayer.begin_branches`), so two batches sharing that one number can
+        still disagree, row for row, on every other document's remainder -- which is exactly what decides where that
+        row's own branch write lands. A recording bakes that address in. Making the key or the check carry every
+        row's remainder would fix it properly; until that is built, a mixed batch is not a shape graphs generalises
+        over at all, and the honest thing is to say so rather than key it coarser and answer some rows wrong.
         """
-        if not self.graphs or self.torch_device.type != "cuda":
-            self.fork(prefill, rows)
-            return run(ids)
+        # Lane=2 (THROUGHPUT.md 2026-10-05): CUDA graph capture is a stream-scoped operation, and recording's own
+        # claim to "a private allocator pool for the life of the engine" has never been checked against a second
+        # lane capturing on a second stream at the same time. Rather than find out by trusting it, a non-zero lane
+        # always takes the eager path -- the concurrency this lane exists for is between lanes' eager passes, which
+        # does not need graphs at all; the cost given up is lane 0's already-measured graphs economics (THROUGHPUT.md
+        # 2026-10-04, "採算が合わないと判断されて使われなかった" -- rarely paid for even on lane 0 in practice).
+        if not self.graphs or self.torch_device.type != "cuda" or not homogeneous or lane != 0:
+            fork()
+            return run(ids, positions)
 
         # Keyed on the cache rather than on the context, because the cache is what a recording holds the addresses of.
         # A context that closes returns its cache to the pool with its recordings attached, so the next context of the
-        # same size replays instead of recording again.
-        store = self._recordings_for(prefill.cache)
-        key = (rows, width)
+        # same size replays instead of recording again. `_bucket_key` widens the key with a remainder bucket for the
+        # paged storage, so a recording survives a change of document and not only a change of group.
+        store = self._recordings_for(cache)
+        key = self._bucket_key(cache, rows, width)
         recorded = store["taken"].get(key)
         if recorded is not None:
             # The bindings first, then the fork: the fork must write the context into the tensors the recording reads,
             # and after the last pass those are not the ones the layers point at.
-            recorded.before_fork(prefill.cache)
-            self.fork(prefill, rows)
-            wrong = recorded.usable(prefill.cache)
+            recorded.before_fork(cache)
+            fork()
+            wrong = recorded.usable(cache)
             if wrong is None:
                 self.replays[key] = self.replays.get(key, 0) + 1
-                return recorded.replay(prefill.cache, ids)
+                return recorded.replay(cache, ids, positions)
             # A recording that no longer describes the cache is discarded rather than replayed. The alternative is a
             # plausible answer, and this package treats that as the worst outcome available.
             del store["taken"][key]
             self.declined_recordings[key] = wrong
-            return run(ids)
+            return run(ids, positions)
 
-        self.fork(prefill, rows)
+        fork()
         # Copied, and this is not defensive housekeeping. A recording replays into buffers the allocator may have handed
         # out for this pass's own output, so a replay can overwrite the answer that was just computed -- which made the
         # first version of the check below compare a tensor against itself and pass every time, and would have returned
@@ -1368,15 +1832,72 @@ class Prismyra:
         # Timed, because whether a recording can pay is a question about this shape on this card and the answer is not a
         # constant. See `_worth_keeping`.
         started = _now(self.torch_device)
-        hidden = run(ids).clone()
+        hidden = run(ids, positions).clone()
         eager_ms = _since(started, self.torch_device)
         store["seen"][key] = store["seen"].get(key, 0) + 1
         expected = max(remaining, store["seen"][key] - 1)
-        if expected >= pays_from() and key not in self.declined_recordings:
-            taken, why = record(run, prefill.cache, ids, fork=lambda: self.fork(prefill, rows), keep=(positions,))
+        # An economics decline is reopened once enough more passes have arrived to clear the bar it was declined by
+        # -- `_economics_needed` holds that bar, set only for this one kind of decline. Everything else in
+        # `declined_recordings` (a stale cache, a capture failure) stays closed: those are not "not enough passes
+        # yet" and more passes would not change the answer.
+        if key in self._economics_needed and expected >= self._economics_needed[key]:
+            del self.declined_recordings[key]
+            del self._economics_needed[key]
+        # `pays_from()` here only gates whether a recording is *attempted* -- the decision whether to *keep* one, a
+        # few lines down, already measures this exact shape's own eager and replay cost and does not borrow a ratio
+        # from anywhere. See `graphs.PAGED_REPLAY_MS` for why swapping this gate's ratio was tried and reverted: the
+        # short one-pass ratio (0.268) makes an *attempt* easier to justify than the paged branch pass's own ratio
+        # (0.515) would, because a better ratio needs fewer future passes to pay back the same recording cost -- so
+        # using the paged ratio here would make attempts rarer, which is the opposite of what was wanted. The gate
+        # being generous is exactly why most attempts arrive one or two sightings short of the keep bar and need the
+        # reopening above to get a second chance rather than none.
+        # A kept recording holds a private allocator pool for the life of the engine -- nothing here ever frees one --
+        # and the retry above means a shape declined once can now be kept later, so the number of pools this engine
+        # ends up holding is not bounded by anything written down. Measured the hard way, twice: an open-loop run
+        # against real traffic, with the retry in place, drove free device memory from several gigabytes to a few
+        # megabytes and into a tight allocate-fail-retry loop that made no further progress -- and raising the
+        # memory margin alone did not stop it recurring, because the margin only ever asks "is there room for one
+        # more", never "how many are there already". `MAX_KEPT_RECORDINGS` asks the second question; the margin
+        # stays as a check the first still answers usefully once the count is bounded.
+        free, _ = (
+            torch.cuda.mem_get_info(self.torch_device) if self.torch_device.type == "cuda" else (1 << 62, 1 << 62)
+        )
+        # 2026-10-05 (THROUGHPUT.md item 2): measured the gap directly (`diag_memory_breakdown_single.py`) --
+        # after a rate=10 burst, `mem_get_info`'s free number was 2.16 GiB (below this margin) while PyTorch's own
+        # `reserved - allocated` gap was 7.6 GiB of cached-but-unallocated blocks the caching allocator was simply
+        # not returning to the driver, not memory any live tensor (recording, shelf snapshot, or anything else)
+        # actually needed. `empty_cache()` recovered essentially all of it (free: 2.16 -> 9.54 GiB) in one call. A
+        # margin check that only ever looks at the driver's free number declines on exactly this kind of transient
+        # fragmentation, so one reclaim attempt happens here before giving up -- cheap because it only runs on the
+        # already-below-margin path, not on every pass.
+        # 2026-10-05 (coordinator's item 2 follow-up): the reclaim call itself, not just reaching it, costs 2-4% of
+        # questions/second under load (THROUGHPUT.md, measured by isolating it from the dispatcher-narrowing
+        # change). `RECLAIM_COOLDOWN_S` skips the call (not the margin check -- `room_to_record` below still comes
+        # out `False` on the stale, still-tight `free`) while a previous attempt is still within its cooldown.
+        if self.torch_device.type == "cuda" and free <= GRAPH_MEMORY_MARGIN:
+            now = time.monotonic()
+            if now >= self._reclaim_cooldown_until:
+                torch.cuda.empty_cache()
+                free, _ = torch.cuda.mem_get_info(self.torch_device)
+                if free <= GRAPH_MEMORY_MARGIN:
+                    self._reclaim_cooldown_until = now + RECLAIM_COOLDOWN_S
+        fits_memory_margin = free > GRAPH_MEMORY_MARGIN
+        fits_kept_count = len(store["taken"]) < MAX_KEPT_RECORDINGS
+        room_to_record = fits_memory_margin and fits_kept_count
+        if expected < pays_from():
+            self._skip_reasons["economics_gate"] = self._skip_reasons.get("economics_gate", 0) + 1
+        elif key in self.declined_recordings:
+            self._skip_reasons["already_declined"] = self._skip_reasons.get("already_declined", 0) + 1
+        elif not fits_memory_margin:
+            self._skip_reasons["memory_margin"] = self._skip_reasons.get("memory_margin", 0) + 1
+        elif not fits_kept_count:
+            self._skip_reasons["max_kept_recordings"] = self._skip_reasons.get("max_kept_recordings", 0) + 1
+        if expected >= pays_from() and key not in self.declined_recordings and room_to_record:
+            taken, why = record(run, cache, ids, positions, fork=fork)
             if taken is None:
                 # Remembered so it is attempted once per shape rather than once per group, and reported rather than
-                # retried in silence.
+                # retried in silence. Not an economics decline, so `_economics_needed` does not get an entry and this
+                # one stays closed: a capture failure is about this shape, not about how many more passes are coming.
                 self.declined_recordings[key] = why or "unknown"
             else:
                 # Replayed once and checked against the pass it was taken from, before it is allowed to answer anything.
@@ -1387,13 +1908,18 @@ class Prismyra:
                 # itself: if the first replay does not reproduce the answer already in hand, the recording is discarded.
                 # A wrong answer that looks right is the worst outcome available here, and this is what makes it
                 # impossible rather than unlikely.
-                moved, replay_ms = self._replay_disagreement(taken, prefill, ids, rows, hidden)
+                moved, replay_ms = self._replay_disagreement_on(taken, cache, fork, ids, positions, hidden)
                 self.verified_recordings[key] = moved
                 self.replay_cost[key] = (round(eager_ms, 1), round(replay_ms, 1))
                 slow = keeping_pays(eager_ms, replay_ms, expected)
                 if slow is not None:
                     # Nothing to remove: the recording is only stored below, once it has been judged worth keeping.
                     self.declined_recordings[key] = slow
+                    # The bar this shape needs to clear, in the same units as `expected` -- so the gate above can
+                    # reopen this exact decline once enough more sightings have arrived, instead of never asking
+                    # again. `pays_from` is the only thing `keeping_pays` computed `slow` from, so this is not a
+                    # second measurement, only the number the first one already produced.
+                    self._economics_needed[key] = pays_from(replay_ms, eager_ms)
                 elif moved > REPLAY_TOLERANCE:
                     self.declined_recordings[key] = (
                         f"a replay moved a hidden state by {moved:.3e}, above {REPLAY_TOLERANCE:.0e}"
@@ -1406,8 +1932,48 @@ class Prismyra:
         return hidden
 
 
-def _answer_for(question: Question, values: list[float]) -> Answer:
-    """One question's answer from its probabilities, in its declared option order. Shared by every path that answers."""
+def _round_rows(rows: int, cap: int) -> int:
+    """How many rows a branch pass actually runs at: the next power of two at or above `rows`, never past `cap`
+    (`self.group`, which every row buffer is already allocated for).
+
+    Found by bisection, not supposition: two documents sharing a pass moved a probability by up to 0.29 and
+    flipped decisions, with the question width matched and the question order ruled out, and the same move
+    reproduced on **one** document with two unrelated dummy questions appended -- no second document, no
+    varlen boundary, just a different row count. Comparing the row count against `ask()`'s own, with the
+    borrowed `gated_delta_rule` kernel disabled (`PRISMYRA_WITHOUT=gated_delta_rule`), the same change in row
+    count moved things by 0.084 instead of 0.19 and flipped nothing -- smaller, so some of this is ordinary
+    floating-point reduction order, but the larger share is that kernel's own row-count-dependent tiling.
+
+    A kernel chosen by shape cannot be told to ignore the shape, so this changes the shape instead: pads every
+    pass to one of a small fixed set of row counts, so two passes that would have run at 5 and 7 real rows both
+    run at 8, with the extra rows a harmless repeat of an existing row (discarded the same way `build_suffixes`
+    already discards padded columns). Two documents or one document asked twice then see the identical kernel
+    dispatch their row count would get alone, which is what makes answering together stop moving an answer.
+    """
+    if rows >= cap:
+        return cap
+    return min(cap, 1 << (max(rows, 1) - 1).bit_length())
+
+
+def _round_pack_align(longest: int, bucket: int) -> int:
+    """How wide a branch pass actually needs to be: the longest row it carries, rounded up to `PACK_ALIGN`, never
+    wider than `bucket` (a pinned `WIDTHS` entry, which is as wide as a recording may ever be asked to be).
+
+    One function, because `_packed_groups` (one document, several groups) and `_answer_batch` (several documents,
+    one group) are the same shape of decision -- a group of rows sharing one pass -- and having two copies of this
+    arithmetic is how they drifted: `_answer_batch` used to call `self._width_for(plans)` and stop, which is `bucket`
+    with no tightening. The two padding widths are not an equivalent rounding of each other; the padding columns
+    reach the recurrent layers' kernels and move the hidden state at a row's own last token, not just the padding's.
+    A document asked once through `ask()` and once through a shelf, with nothing else different, answered a
+    different option (0.339 against 0.512 on the deciding one) until both went through this.
+    """
+    return min(bucket, -(-longest // PACK_ALIGN) * PACK_ALIGN)
+
+
+def _answer_for(question: Question, values: list[float], read_by: str | None = None) -> Answer:
+    """One question's answer from its probabilities, in its declared option order. Shared by every path that answers.
+
+    `read_by` names the head that produced the probabilities, or is None when the output embedding did."""
     best = max(range(len(values)), key=lambda i: values[i])
     option = question.options[best]
     return Answer(
@@ -1416,6 +1982,7 @@ def _answer_for(question: Question, values: list[float]) -> Answer:
         value=question.value_of(option),
         option=option,
         probabilities=dict(zip(question.options, values, strict=True)),
+        read_by=read_by,
     )
 
 
@@ -1443,6 +2010,89 @@ def _load_processor(model: str):
         return AutoProcessor.from_pretrained(model)
     except Exception:  # noqa: BLE001 - a checkpoint without one simply cannot take images, which `encode` reports
         return None
+
+
+def _enable_batch_invariance() -> None:
+    """Make the operations that actually move with a pass's row count row-independent -- no more of them.
+
+    Found decisively (`diag_layer0_op_divergence.py`): a document read alongside two companions of identical
+    length but entirely different content was bit-identical through every layer-0 operation except one -- the
+    router's own `F.linear(x, self.gate.weight)` inside `kernels.qwen3_moe.FusedExperts._route`. That one op's
+    result for a real row moved with the pass's total row count, the row-count-chosen-GEMM-algorithm effect
+    `onepass.py`'s islands already defend against during a *recording* (`rows_exact`) but nothing defends against
+    during an ordinary read or branch pass. `kernels.qwen3_moe._ROUTER_LINEAR` calls vLLM's `linear_batch_invariant`
+    directly at `_route`'s one call site, and `fused_experts`' own kernel gets `VLLM_BATCH_INVARIANT=1` (set below)
+    so its tile-size choice stops keying on `M` too (`fused_moe.py`'s own guard, independent of any dispatcher
+    override). 2026-10-05's first attempt stopped here ("ルーターのみ") and found 2/80 real-document mismatches
+    left (largest move 0.189) -- not from attention or shared-expert projections as first suspected (that
+    diagnosis was from a single synthetic two-document companion pair, which `diag_full_inventory_op_divergence.py`
+    and `diag_all_layers_real_mismatch_padded.py` later showed does not generalise), but from the borrowed
+    chunked gated-delta-rule kernel (`vllm.third_party.flash_linear_attention`) itself: on the real mismatching
+    batch (RACE validation, batch 4 of the 80-document benchmark), layer 0's `linear_attn` block alone moved by
+    0.0039 between a solo read and the real 8-document batch with router+tiling already fixed -- before the
+    router, before any MoE op, inside the recurrence this engine depends on for its batching to be fast at all.
+
+    Two candidates were measured head-to-head at full scale (`diag_isolate_invariance_lever_combined.py` for the
+    single-layer signal, `diag_openbatch_vs_ask_modes.py` for the decisive 80-document/11-batch count):
+    disabling TF32 and bf16/fp16 reduced-precision matmul reduction closed layer 0's gap (0.0039 -> 0.0) but
+    *reopened* it at layer 4 once checked across all 40 layers on the real batch -- a precision change shrinks the
+    chunk-boundary reduction-order effect enough to round to zero at shallow layers, not remove it, so it does not
+    survive the full benchmark (still 2/80 mismatches). Registering vLLM's fixed-tile Triton matmul on
+    `aten::mm`/`addmm`/`matmul`/`linear` (`enable_batch_invariant_mode`'s dispatcher step, SM80-family path) does
+    survive it: 0/80 mismatches, confirming the borrowed kernel's inter-chunk state carry runs through one of
+    those four ops. `enable_batch_invariant_mode()` does three more things this does not need: monkeypatching
+    `torch.bmm` (measured alone: still 0.0039, no effect on this kernel), the TF32/reduced-precision flags just
+    shown insufficient alone and unneeded once the dispatcher override is in, and preferring the `cublaslt` BLAS
+    backend. None of the three changed the measured 0/80 result when added or removed alongside the dispatcher
+    registration, so this function registers only the dispatcher override plus the MoE tiling env var, rather
+    than calling `enable_batch_invariant_mode()`/`init_batch_invariance()` wholesale.
+
+    Measured cost against the full five-lever version (`docs/PERFORMANCE.md`-style sweep, `diag_solo_document_cost.py`
+    and the `open_batch` documents=8/16/32, group=64 sweep): unchanged within measurement noise -- the dispatcher
+    registration this keeps was already the expensive part (every plain bf16/fp32 matmul in the decoder funnelled
+    through a slower fixed-tile Triton kernel instead of cuBLAS), and `torch.bmm`/TF32/`cublaslt` were measured to
+    cost nothing extra on this model (it has no plain `torch.bmm` call site and no FP32 tensors for TF32 to touch).
+    Dropping them is a correctness simplification -- fewer process-wide side effects for whatever future kernel
+    might actually use `torch.bmm` or care which BLAS backend is preferred -- not a speed win in this measurement.
+
+    Kept only when the borrowed kernels this engine's batching depends on are actually in use (`paged` on CUDA): a
+    joined-storage engine never shares a pass across documents, so it has nothing this buys.
+    """
+    import os
+
+    import torch
+    from vllm.model_executor.layers.batch_invariant import (
+        addmm_batch_invariant,
+        linear_batch_invariant,
+        matmul_batch_invariant,
+        mm_batch_invariant,
+    )
+    from vllm.platforms import current_platform
+
+    # fused_moe.py's own guard (`get_default_config`): picks a fixed MoE tiling config instead of one keyed by the
+    # pass's row count M, independent of anything registered on the dispatcher below.
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+
+    if not current_platform.is_cuda() or not current_platform.is_device_capability_family(80):
+        # The SM80-family (Ampere/Ada/Hopper-adjacent) Triton persistent matmul is what this was measured against
+        # (L40S, SM89). A different family's registration (vLLM's own `enable_batch_invariant_mode` has an SM90/
+        # Blackwell branch that only pins the cuBLAS workspace config) was not measured here; fall back to the
+        # router+tiling fix alone rather than assume it carries over.
+        return
+
+    lib = torch.library.Library("aten", "IMPL")
+    key = current_platform.dispatch_key
+    lib.impl("aten::mm", mm_batch_invariant, key)
+    lib.impl("aten::addmm", addmm_batch_invariant, key)
+    lib.impl("aten::matmul", matmul_batch_invariant, key)
+    lib.impl("aten::linear", linear_batch_invariant, key)
+    # Kept alive for the process's lifetime (matching `enable_batch_invariant_mode`'s own module-level singleton):
+    # letting it be garbage-collected would un-register the dispatcher entries it just installed.
+    global _BATCH_INVARIANT_DISPATCH_LIB
+    _BATCH_INVARIANT_DISPATCH_LIB = lib
+
+
+_BATCH_INVARIANT_DISPATCH_LIB = None
 
 
 def _now(device: torch.device) -> float:

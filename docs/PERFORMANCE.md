@@ -432,6 +432,138 @@ change -- and four things have to be cleared together for that:
 With all four cleared the layer is in exactly the state a cache that has never held anything is in. That also means the
 convolution takes its prefill branch, which pads rather than concatenating, so a read carries no prefix from the last one.
 
+### A shelf answers like ask()
+
+A document asked once through `ask()` and once through `open_batch` (the batched pass behind a shelf), same context,
+same questions, same order, is bit-identical on the measurement this is checked against -- the full RACE validation
+benchmark, 80 documents in 11 batches, 0 mismatches -- across three closed axes, bounded on two more that are not
+closed:
+
+* **Width, closed.** `ask()` tightens a branch pass to the longest question in its own group; `open_batch` stopped at a
+  wider bucket instead. The extra columns reach the recurrent layers' kernels and move the hidden state at a row's own
+  last token, not just the padding's -- measured at 0.339 against 0.512 on the deciding option, over real RACE data at
+  an arrival rate of 10 and 20 documents/s. One rounding function, shared by both paths, removes the second bucket:
+  0 mismatches over 80 RACE documents, where the two buckets had produced 2 and 6.
+* **Row count, closed.** Two documents sharing a pass could still move a probability by up to 0.29 and flip a decision,
+  with width already matched, because the borrowed recurrence kernel chooses its own tiling by how many rows the pass
+  carries. Padding every pass to the next power of two at or above its real row count, capped at the engine's own
+  group, gives a kernel the same row count for 5 real rows as for 7. This reduced a separate, `open_batch`-only
+  comparison (RACE, 80 documents) from 4 mismatches to 3 -- most of what remained was the router axis below.
+* **The MoE router's own kernel choice, closed for row count.** The router's `F.linear` and the fused MoE kernel's own
+  tile-size choice are both selected by row count too, independently of the fix above, and were the largest remaining
+  contributor measured. Registering vLLM's fixed-tile batch-invariant kernel on `aten::mm`/`addmm`/`matmul`/`linear`,
+  and setting `fused_moe`'s own `VLLM_BATCH_INVARIANT` guard, took the same 80-document, 11-batch benchmark from 3
+  mismatches to the 0 cited above.
+* **Context length and companion question count: two axes still open, each bounded rather than closed.** A context
+  read, solo or joint, is padded to the same length bucket a solo read already rounds to, which is why the 0-mismatch
+  benchmark above holds; but a solo document and an eight-document batch round to different buckets by construction,
+  and pairings that land in different buckets still disagree. Closing that needs every read, solo included, padded to
+  one shared length, which would cost a short solo read padding throughput it does not need, so the shared length stays
+  a workload-dependent setting rather than a fixed one. Separately, a companion carrying a different *question* count
+  (not context length) still moves a probability, because a solo pass and a batched pass round their row counts to
+  different buckets even after the fix above; `tests/test_gpu.py` bounds this at a twentieth of the existing
+  `COMPANION_MOVEMENT` tolerance the device tests already allow for a near-tie moving under batching (0.3), so at
+  most 0.015, and no decision has been observed to change.
+
+This is a process-wide setting, not a per-request one: it registers a fixed-tile kernel on `aten::mm`, `addmm`,
+`matmul` and `linear` for the whole process, including any unrelated torch code sharing it, and that registration is
+what the whole guarantee above rests on. There is no toggle to turn it off -- it runs unconditionally for every paged
+engine on CUDA, guarded by vLLM's own `current_platform.is_device_capability_family(80)` check (this project measured
+it on an L40S, device-capability family 80). On a vLLM build that lacks the batch-invariant module, or on a device
+outside that family, the registration is skipped, a note to that effect is appended to
+`engine.stats()["kernels"]["notes"]`, and the MoE-router axis is not invariant.
+
+Measured cost: a solo read's own throughput is within noise either way, with the registration present against a
+development build with it removed (19.2 against 18.6-18.7 questions/s), but a solo read's full put-ask-drop lifecycle
+rises from 224 to 247 ms (+10%), and
+`open_batch` throughput falls from 77.7 to 61.7 questions/s at group 32 (-20.6%) and from 90.2 to 70.3 at group 64
+(-22.1%) -- 21-22% either way, still 1.10-1.33x the vLLM saturated rate measured in
+[The ratio is a function, and the crossing is at twelve](#the-ratio-is-a-function-and-the-crossing-is-at-twelve)
+(48-50 questions/s there; 53-56 at the group and card this cost was measured on). This is the price of the guarantee
+above, not an unrelated regression: batch invariance is what the guarantee is made of, and this is what it costs.
+
+### Streaming many documents without running out of memory
+
+Admission accounts for two costs a resident document holds, not one: its tokens, in the page pool, and a per-document
+snapshot of the recurrent state its read ended in, outside the pool, roughly constant in size regardless of the
+document's length. Counting tokens alone, streaming RACE's 368 documents one at a time through a shelf on one L40S
+exhausted device memory at 97 residents holding 24,394 of a 65,536-token budget -- the token budget had room, the
+snapshots did not.
+
+Each document's own snapshot is now measured exactly rather than estimated, the shelf tracks the largest one seen, and
+admission evicts the least recently used resident whenever free device memory would fall under the existing memory
+margin for the documents about to be admitted -- the same reasoning the engine already applies to CUDA graph
+recordings, multiplied by the resident count so the check also answers how much is already held, not only whether one
+more fits. `SHELF_MAX_RESIDENTS` is a count-only backstop, independent of that memory measurement, set to 16 (twice
+the resident count the full open-loop benchmark on this hardware settles at), for the case where many short documents
+are each individually well under the token budget. Streaming the same 368 documents one at a time now has zero
+rejections, with memory plateauing by document 60 and staying flat through document 368; a document evicted under
+either limit is simply re-read the next time a question names it, at the usual read cost.
+
+Both margin checks also reclaim cached-but-unallocated device memory with `torch.cuda.empty_cache()` before declining
+a recording or evicting a resident: after a rate=10 burst, the allocator was measured holding 7.6 GiB in blocks no
+live tensor needed, with `mem_get_info` reporting only 2.16 GiB free (below both margins); one `empty_cache()` call
+recovered it in full, to 9.54 GiB free. Reclaiming can
+only raise free memory, never lower it, so a cooldown that skips the call for one second once an attempt has already
+left free memory at or below the margin is conservative either way: the margin check during that second uses a
+reading that was already tight, which can cost an unneeded eviction or decline but never an over-admission.
+
+### Why a recording was skipped
+
+`stats()["graphs_skip_reasons"]` reports why a CUDA graph recording attempt did not happen, broken out by cause
+instead of folded into one count: the economics bar (the pass was not worth recording, [Recording the batched pass is
+not the next thing, and why](#recording-the-batched-pass-is-not-the-next-thing-and-why)), a standing decline already
+in place for that shape, or `room_to_record` finding no free recording slot. Without the breakdown, a device that
+never has two free slots at once shows zero declines and zero replays with no record of which of the three stopped
+it.
+
+### Independent lanes
+
+[Concurrency, and the ceiling that actually binds](#concurrency-and-the-ceiling-that-actually-binds) measured one
+engine answering one request at a time: throughput held flat and concurrency only moved who waited.
+`prismyra.schedule.Batcher(lanes=N)` builds `N` fully independent shelf-pool-worker stacks behind one request router,
+each running its own pass under its own lock and its own CUDA stream, so lanes can answer concurrently rather than
+queueing behind each other -- a document's repeat questions keep landing on the same lane by hashing its content
+digest, so a shelf's cache stays useful across requests for that document, at the cost of pinning a hot document to
+one lane. CUDA graph recording, and so the short-input replay in [One short question,
+recorded](#one-short-question-recorded), stays off for every lane past the first, since capturing on a second stream
+concurrently with another lane's pass is not yet supported; lane 0 behaves as a `lanes=1` `Batcher` already does.
+
+What is verified: a sequential round, where no pass ever carries more than one document, rules out cross-lane state
+leakage by answering bit-exact against `ask()`; a concurrent round, with passes genuinely overlapping across lanes,
+leaves every decision unmoved and every probability inside the existing companion-movement bound rather than
+bit-exact. **What is not yet measured is throughput at `lanes=2` or higher, or how memory divides across `N`
+independent shelves on one device** -- lanes are shown not to corrupt answers under real concurrency, not shown yet
+to raise questions served per second. Treat "concurrent lanes can raise how many requests are served" as the
+direction this is built for, not as a measured result.
+
+### Open-loop arrival, and the one rate it still trails vLLM
+
+The closed-loop figures above measure callers arriving together, which answers "how many at once" rather than what a
+steady stream of independent requests does. `Batcher.form` used to wait up to `linger_ms` for a companion on every
+pass, including the one request in five that had no companion coming at a sparse arrival rate (measured against real
+documents at a fixed open-loop/Poisson rate with a 500 ms deadline). At 10 documents/s, that unconditional wait raised
+the median end-to-end latency from 386.8 ms (no wait) to
+436.9 ms, and dropped the deadline-hit rate from 0.875 (no wait, which happens to equal vLLM's own hit rate at this
+rate, see the table) to 0.713. Removing the wait unconditionally fixes 10 documents/s but breaks a busier rate: at 20
+documents/s, where a companion usually is coming, skipping the wait made the median latency worse (496.8 ms to 625.7
+ms) and the hit rate worse (0.506 to 0.206) -- there, the amortised read was paying for the wait.
+
+`Batcher.form` now distinguishes the two cases by a fact the scheduler already has rather than a configured arrival
+rate: whether another request is already queued the instant this one is picked up. It lingers only when one is.
+
+| arrival rate | deadline-hit rate, unconditional linger (previous) | deadline-hit rate, conditional linger (this release) | vLLM |
+|---|---|---|---|
+| 10 documents/s | 0.713 | 0.825 | **0.875** |
+| 20, 40, 60, 80 documents/s | behind vLLM at every one | meets or beats vLLM at all four (exact figures: `evals/against_vllm.py` open-loop mode) | -- |
+
+**Ten documents a second is the one rate this does not close.** The deadline-hit rate improves from 0.713 to 0.825
+without reaching vLLM's 0.875 there. Scaling the wait by a measured recent arrival gap, rather than a yes/no decision,
+is the next lever and has not been attempted. No document answered alone differs from `ask()` bit for bit; the
+answers that do move under open-loop arrival come from the companion question-count axis left open above (47
+answers across the same five rates, against 49 before this release's scheduling change -- within noise of each
+other, and not what this change targets).
+
 ### A wider group does not buy throughput
 
 The per-row cost of a branch pass is flat in the width -- 0.109 GiB at width 1 and at width 32 -- so a wider group looked
@@ -484,7 +616,7 @@ Measured on one L40S at 3,040 context tokens, eight questions each, through `pri
 **Throughput does not move.** One device serves one request at a time, so it cannot: service time stays at about 925 ms
 whatever arrives, and every millisecond added by concurrency is queueing. That is worth knowing before building anything
 for multiple users, because it says what such work could and could not achieve -- it can decide who waits, not how many
-are served.
+are served. (One engine behind one `prismyra.queue.Worker`; see [Independent lanes](#independent-lanes) for `N`.)
 
 What bound instead was memory, and that has been fixed. **Nineteen contexts of 3,040 tokens can be open at once, where
 three could**, because the context is now held once rather than once per branch:
@@ -922,6 +1054,80 @@ model with a term missing or a term assumed constant, and none was a kernel beha
   not memory: a page pool is a fixed allocation with the lengths carried in `seqused_k` as data, so **one graph would
   serve every context length** rather than one per open context -- which is the difference between a session workload
   getting 3.7x and every workload getting it.
+
+## One short question, recorded
+
+A single question about a short text is the one-pass read, and on the supported model that read is **host-bound**.
+Profiled on an L40S with the 36-layer checkpoint at 232 tokens of context plus question: 92 ms of wall clock, 39.9 ms
+of kernel time, 2,564 kernel launches. At 781 tokens the kernel time is 62.1 ms and the wall clock is still about the
+same, which is why a single question cost about 97 ms whatever its length. The kernels themselves were not the
+problem -- the routed experts are 28.4 of the 39.9 ms and read every expert's weights once -- so the read is now
+recorded per length bucket at start-up and replayed (`prismyra/onepass.py`, on by default where the one-pass path
+runs; `short_graphs=False` or `prismyra-serve --no-short-graphs` turns it off).
+
+Measured on one L40S, the 36-layer checkpoint, two warm-ups and five repetitions of every request:
+
+| | before | after |
+|---|---|---|
+| 20 routing prompts (18 to 567 context tokens), in Python, median | 97.7 ms | **43.4 ms** |
+| the same, p90 | 98.2 ms | 51.5 ms |
+| the same over HTTP through `prismyra-serve`, median | 98.1 ms | **44.7 ms** |
+| the same over HTTP, p90 | 99.1 ms | 53.1 ms |
+| RACE, 579 questions each asked alone, median | 96.3 ms | **45.9 ms** |
+| decisions changed, of 579 + 20 + 100 over HTTP | | **0** |
+| largest probability movement | | **0.0** |
+
+**Zero, not within a tolerance.** Every probability is the same float as before, which is the bar this was held to
+from the start and is also the only bar that is honest here: one of the twenty routing prompts sits at 0.44 against
+0.54, and anything short of identical arithmetic moves it.
+
+What it costs: 1.7 GiB of device memory for 24 buckets from 64 to 2,048 tokens (admission subtracts it from what it
+counts as available), and about 15 s of start-up to record and prove them. A request longer than 2,048 tokens reads
+eagerly, as before.
+
+### Padding is causal and the libraries are not
+
+A recording has one shape, so a request is right-padded to its bucket and read at its last real token. Every layer is
+causal, so a padded token cannot reach a real one through the model. That argument is correct and **it was not
+enough**: the first version padded and recorded the whole pass, its proof on a random probe passed with a
+disagreement of exactly zero for all thirteen buckets, and on the routing prompts it changed four answers.
+
+The cause was the router. Its projection is a bf16 `F.linear`, and the library chooses the algorithm by the number of
+rows: the same 581 rows multiplied as the head of 640 come back with different bits in some logits, one rounding step,
+which moves a token's experts and, on the 0.44 against 0.54 prompt, the answer. The probe missed it because a
+reduction in a different order almost always rounds to the same bfloat16, so equal outputs on random rows are weak
+evidence of an equal algorithm. A scan of every projection on random rows at every length up to 2,048 confirmed that:
+it reported buckets as matching where real activations then disagreed in two rows of 65.
+
+The fix is to not record those projections at all. A **piecewise** recording ends a capture at each projection whose
+algorithm depends on the row count -- the bf16 `nn.Linear` calls, which on this model are the router, the shared
+expert's gate and the recurrence's two small input projections, 126 calls a pass -- runs it eagerly on exactly the
+request's real rows, which is the call the eager path makes, and copies the result into the buffer the next recorded
+piece reads. Everything between them is block-quantised Triton, attention, the recurrence and elementwise work, which
+compute each row the same way however many rows there are, and that is proved rather than assumed: each bucket is
+replayed at the shortest and the longest length it serves and compared bit for bit with the eager read, and a bucket
+that differs in one bit is not kept. None did.
+
+A pass is 127 recorded pieces and 126 islands, so a replay still runs about five milliseconds of Python. That is under
+the kernel time of the pieces between islands, so the host stays ahead of the device and the replay costs what its
+kernels cost: 41.3 ms at 232 tokens against 39.9 ms of kernel time.
+
+Two things did not survive measurement on the way:
+
+* **a stream per bucket.** The caching allocator keeps what a stream frees for that stream, so each recording's warm-up
+  pass left its activations reserved on a stream nothing would use again: 24 buckets held 8.9 GiB. One stream for all
+  of them: 1.7 GiB.
+* **island inputs held per bucket.** A graph keeps nothing alive, so the first piecewise version held every island's
+  input for every bucket, 126 tensors at each length. All buckets now share one staging buffer for island inputs and
+  one output buffer per island, because buckets never replay at once.
+
+The router change also removes work from the eager path: `FusedExperts` used to call the framework's router module,
+which computes a softmax, a top-k and a renormalisation that `fused_topk` then computes again. It now takes the
+router's projection directly -- the first line of the same forward, so the same bits -- and the duplicate is gone.
+
+What is left is the kernels. At 232 tokens the routed experts are 71% of the pass and read every expert's weights,
+which is a bandwidth floor rather than a launch cost; the remaining lever on short requests is a smaller checkpoint,
+not a faster runtime.
 
 ## What a recording can and cannot outlive
 

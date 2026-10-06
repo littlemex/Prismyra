@@ -35,6 +35,7 @@ that forgets to open the window reads one document, which is the behaviour that 
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -113,33 +114,41 @@ class Boundaries:
         return torch.cat([torch.arange(n, device=device) for n in self.lengths]).unsqueeze(0)
 
 
-#: The boundaries the pass in progress covers, or None when a pass covers one document. Module-level because the kernels
-#: are reached through the framework's own module-level names and there is no argument to thread down to them.
-_current: Boundaries | None = None
+#: The boundaries the pass in progress covers, or None when a pass covers one document. Ambient because the kernels
+#: are reached through the framework's own module-level names and there is no argument to thread down to them --
+#: see the module docstring. Thread-local rather than a single module global (2026-10-05, THROUGHPUT.md "本当に
+#:効く経路" lane=2): the engine's own fork, `fork.OWNED`, and now this are all ambient state reached by a thread
+#: calling into the model rather than by an argument, and lane=2 (`prismyra.schedule.Batcher(lanes=2)`) runs one
+#: pass per lane *concurrently*, each synchronously on its own worker thread -- `current()`'s four callers
+#: (`paged.py`, `kernels/qwen3_moe.py`) are all reached from inside the same `backbone(...)` call `reading()`
+#: wraps, on the same thread that opened it, so a thread-local gives each lane's pass its own boundaries without
+#: needing to invent an argument this module exists because there wasn't one for. A plain global, as this was
+#: until lane=2, raised "these do not nest" the first time two lanes' reads genuinely overlapped -- correctly: a
+#: shared global would have let one lane's boundaries leak into another's kernels, silently.
+_local = threading.local()
 
 
 def current() -> Boundaries | None:
-    """The boundaries of the pass in progress, if it carries more than one document."""
-    return _current
+    """The boundaries of the pass in progress on *this thread*, if it carries more than one document."""
+    return getattr(_local, "current", None)
 
 
 @contextmanager
 def reading(lengths: list[int], device: str | torch.device):
-    """Declare that the pass inside this block carries these documents, in this order.
+    """Declare that the pass inside this block, on this thread, carries these documents, in this order.
 
     A context manager rather than a pair of calls, because the failure from leaving it set is a later pass reading its
     single document as though it were several -- which does not raise.
     """
-    global _current  # noqa: PLW0603 - see the module docstring: there is no argument to thread down to the kernels
     if not lengths:
         raise ValueError("a batched read needs at least one document")
     if any(n <= 0 for n in lengths):
         raise ValueError(f"every document needs at least one token: {lengths}")
-    if _current is not None:
-        raise RuntimeError("a batched read is already in progress; these do not nest")
+    if getattr(_local, "current", None) is not None:
+        raise RuntimeError("a batched read is already in progress on this thread; these do not nest")
     offsets = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
-    _current = Boundaries(offsets=offsets, lengths=tuple(lengths))
+    _local.current = Boundaries(offsets=offsets, lengths=tuple(lengths))
     try:
-        yield _current
+        yield _local.current
     finally:
-        _current = None
+        _local.current = None

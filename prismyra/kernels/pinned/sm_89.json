@@ -1,0 +1,47 @@
+{
+ "measured_on": "NVIDIA L40S (sm_89), driver 580.178.04, Triton 3.7.1, vLLM 0.27.1. The fastest summed time over the keys recorded by a cold start whose answers match the published numbers; merge_16x16_to_64x64_inverse_kernel chosen among num_warps=4 candidates, the arrangement those numbers were measured with (num_warps=2 changes probabilities by up to 0.59).",
+ "kernels": {
+  "chunk_fwd_kernel_o": {
+   "kwargs": {
+    "BK": 64,
+    "BV": 32
+   },
+   "num_stages": 3,
+   "num_warps": 2
+  },
+  "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": {
+   "kwargs": {
+    "BV": 64
+   },
+   "num_stages": 3,
+   "num_warps": 4
+  },
+  "chunk_local_cumsum_scalar_kernel": {
+   "kwargs": {},
+   "num_stages": 3,
+   "num_warps": 1
+  },
+  "chunk_scaled_dot_kkt_fwd_kernel": {
+   "kwargs": {
+    "BK": 64
+   },
+   "num_stages": 4,
+   "num_warps": 8
+  },
+  "merge_16x16_to_64x64_inverse_kernel": {
+   "kwargs": {},
+   "num_stages": 5,
+   "num_warps": 4
+  },
+  "recompute_w_u_fwd_kernel": {
+   "kwargs": {},
+   "num_stages": 4,
+   "num_warps": 8
+  },
+  "w8a8_block_dynamic_fp8_matmul_kernel": {
+   "kwargs": {},
+   "num_stages": 4,
+   "num_warps": 8
+  }
+ }
+}

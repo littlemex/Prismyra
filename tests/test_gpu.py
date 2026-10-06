@@ -487,6 +487,7 @@ def test_a_replayed_pass_answers_exactly_as_the_eager_one_did(engine, monkeypatc
     finally:
         engine.graphs = was
         engine.declined_recordings.clear()
+        engine._economics_needed.clear()
         engine.replays.clear()
 
     # Either a recording was used, in which case every group must match exactly, or it was refused -- and a refusal is a
@@ -505,6 +506,100 @@ def test_a_replayed_pass_answers_exactly_as_the_eager_one_did(engine, monkeypatc
             assert got[name][0] == want[name][0], f"group {n}, question {name} changed its answer"
             for option, p in want[name][1].items():
                 assert got[name][1][option] == pytest.approx(p, abs=1e-4), f"group {n}, {name}, option {option}"
+
+
+def _context_with_remainder(tokenizer, base: str, target_remainder: int) -> str:
+    """`base`, extended with filler sentences, at a token count that shares `target_remainder` modulo the page block
+    but is not `base`'s own count.
+
+    Built for one thing: a second document whose length differs from the first's but whose branch writes land at the
+    same offset inside a page, which is the only thing a paged recording's `usable` check accepts as the same shape
+    now that it is not pinned to one exact length. If the two happened to need the same text this test would prove
+    nothing, so the loop also refuses to return `base` unchanged.
+    """
+    from prismyra.paged import BLOCK
+
+    filler = " Additionally, the warranty card must be retained for the full coverage period."
+    text = base
+    for _ in range(64):
+        n = len(tokenizer(text)["input_ids"])
+        if n % BLOCK == target_remainder and text != base:
+            return text
+        text += filler
+    raise RuntimeError(f"could not reach remainder {target_remainder} by extending the context with filler sentences")
+
+
+def test_a_paged_recording_answers_a_later_document_of_a_different_length(engine_paged, monkeypatch):
+    """The point of bucketing a paged recording by remainder rather than by exact length: it has to answer about a
+    document it was never taken on.
+
+    `graphs.Recording.usable` used to refuse any context whose length did not match the one the recording was taken
+    at, which made a recording useless the moment the shelf moved on to a different document -- every real workload
+    does that on every request. The paged storage's branch write only depends on the context length modulo the page
+    block (`docs/PERFORMANCE.md`, "Recording the batched pass is not the next thing, and why"), so a recording taken
+    on one document is bucketed on that remainder and reused for any other document sharing it.
+
+    The shelf is what makes the cache -- and so the recording -- outlive one document: `put`, `ask`, `drop`, and the
+    cache the recording holds the addresses of is the one the next document is read into. Without the shelf a fresh
+    cache per document would never let a recording see a second one at all, which was the gap this test was written
+    to close.
+    """
+    asked = questions(4)
+    was = engine_paged.graphs
+    # The economics suspended, as in the test above: this tests whether a replayed answer is right, not whether taking
+    # one was worth it.
+    monkeypatch.setattr("prismyra.engine.keeping_pays", lambda *a, **k: None)
+    tokenizer = engine_paged.tokenizer
+
+    from prismyra.paged import BLOCK
+
+    base_tokens = len(tokenizer(CONTEXT)["input_ids"])
+    doc_b = _context_with_remainder(tokenizer, SECOND_CONTEXT, base_tokens % BLOCK)
+    tokens_b = len(tokenizer(doc_b)["input_ids"])
+    assert tokens_b != base_tokens and tokens_b % BLOCK == base_tokens % BLOCK
+
+    try:
+        engine_paged.graphs = False
+        with engine_paged.open_shelf() as shelf:
+            handle = shelf.put(CONTEXT)
+            eager_a = shelf.ask({handle: asked})[handle]
+            shelf.drop(handle)
+            handle = shelf.put(doc_b)
+            eager_b = shelf.ask({handle: asked})[handle]
+            shelf.drop(handle)
+
+        engine_paged.graphs = True
+        engine_paged.replays.clear()
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        with engine_paged.open_shelf() as shelf:
+            # Enough passes about the first document's shape for a recording to be worth taking (`graphs.pays_from`),
+            # then one pass about a document of a different length that shares its remainder.
+            for _ in range(GROUPS_FOR_A_REPLAY):
+                handle = shelf.put(CONTEXT)
+                replayed_a = shelf.ask({handle: asked})[handle]
+                shelf.drop(handle)
+            replays_before = sum(engine_paged.stats()["graphs_replays"].values())
+            handle = shelf.put(doc_b)
+            replayed_b = shelf.ask({handle: asked})[handle]
+            shelf.drop(handle)
+        replays_after = sum(engine_paged.stats()["graphs_replays"].values())
+        declined = dict(engine_paged.stats()["graphs_declined"])
+    finally:
+        engine_paged.graphs = was
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        engine_paged.replays.clear()
+
+    assert replays_before > 0, f"no recording ever answered about the first document: {declined}"
+    assert replays_after > replays_before, (
+        f"the second document did not replay the first document's recording: {declined}"
+    )
+    for q in asked:
+        assert replayed_a[q.id].option == eager_a[q.id].option, f"{q.id} changed its answer on the first document"
+        assert replayed_b[q.id].option == eager_b[q.id].option, f"{q.id} changed its answer on the second document"
+        for option, p in eager_b[q.id].probabilities.items():
+            assert replayed_b[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (q.id, option)
 
 
 def test_a_recording_judged_not_to_pay_is_declined_rather_than_raising(engine, monkeypatch):
@@ -529,6 +624,7 @@ def test_a_recording_judged_not_to_pay_is_declined_rather_than_raising(engine, m
     finally:
         engine.graphs = was
         engine.declined_recordings.clear()
+        engine._economics_needed.clear()
         engine.replays.clear()
         engine.replay_cost.clear()
 
@@ -538,6 +634,60 @@ def test_a_recording_judged_not_to_pay_is_declined_rather_than_raising(engine, m
     for want, got in zip(eager, answered, strict=True):
         for q in asked:
             assert got[q.id].option == want[q.id].option
+
+
+def test_a_declined_recording_is_retried_once_enough_more_passes_arrive(engine_paged):
+    """The fix for the gap `prismyra-branch-graphs-paged-remainder-bucket` found: a shape declined once used to stay
+    declined forever, which on 368 real documents meant a shape measured to pay 1.94x on its own replay was kept
+    exactly zero times.
+
+    The attempt gate (`expected >= pays_from()`, the generous short one-pass ratio) fires at a shape's eighth
+    sighting; the keep decision (`keeping_pays`, this shape's own measured ratio) usually needs a few more than
+    that. So the only attempt a shape without `_economics_needed` ever got arrived already below the bar, was
+    declined, and `key in self.declined_recordings` then blocked every later sighting from trying again -- not
+    because the shape could not pay, but because nothing was watching for the point where it would.
+
+    This runs enough groups on one shelved document for both halves to show: a decline near the gate's own
+    threshold, then a successful retry once `expected` clears the bar `_economics_needed` remembered.
+    """
+    asked = questions(4)
+    was = engine_paged.graphs
+    try:
+        engine_paged.graphs = False
+        with engine_paged.open_shelf() as shelf:
+            handle = shelf.put(CONTEXT)
+            eager = shelf.ask({handle: asked})[handle]
+            shelf.drop(handle)
+
+        engine_paged.graphs = True
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        engine_paged.replays.clear()
+        with engine_paged.open_shelf() as shelf:
+            # Comfortably past any realistic needed-passes count for this shape (measured elsewhere at 11-12), so a
+            # decline early in this loop gets the chance to be reopened and kept before the loop ends.
+            for _ in range(30):
+                handle = shelf.put(CONTEXT)
+                answered = shelf.ask({handle: asked})[handle]
+                shelf.drop(handle)
+        declined = dict(engine_paged.stats()["graphs_declined"])
+        retry_at = dict(engine_paged.stats()["graphs_retry_at"])
+        replays = sum(engine_paged.stats()["graphs_replays"].values())
+    finally:
+        engine_paged.graphs = was
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        engine_paged.replays.clear()
+        engine_paged.replay_cost.clear()
+
+    assert replays > 0, (
+        f"no recording was ever kept across 30 passes of one shape, so the retry never happened: "
+        f"declined={declined}, retry_at={retry_at}"
+    )
+    for q in asked:
+        assert answered[q.id].option == eager[q.id].option, f"{q.id} changed its answer"
+        for option, p in eager[q.id].probabilities.items():
+            assert answered[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (q.id, option)
 
 
 def test_the_engine_measures_what_a_replay_costs_before_it_trusts_one(engine):
@@ -563,6 +713,7 @@ def test_the_engine_measures_what_a_replay_costs_before_it_trusts_one(engine):
     finally:
         engine.graphs = was
         engine.declined_recordings.clear()
+        engine._economics_needed.clear()
         engine.replays.clear()
         engine.replay_cost.clear()
 
@@ -617,6 +768,52 @@ def test_one_pass_answers_about_two_documents_exactly_as_two_passes_did(engine_p
                 assert abs(mixed[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
 
 
+def test_graphs_never_corrupt_a_batch_naming_more_than_one_document(engine_paged):
+    """The bug an open-loop measurement found: a paged recording's bucket key carries one remainder (the longest
+    document's), but a mixed batch's other rows write their own branches at an offset from *their* remainder --
+    which the key never saw. Replaying a recording taken on one mix of documents onto a different mix sharing only
+    the longest one's remainder moved a probability by 0.277 and changed four decisions, over an open-loop run
+    against real documents.
+
+    `_run_recorded`'s `homogeneous` flag is the fix: a batch naming more than one document always runs eagerly. This
+    repeats the same two documents' mixed batch, with `graphs=True` and enough times to clear the attempt gate several
+    times over, and checks every repeat against the single-document baseline rather than trusting the first one --
+    the corruption above did not show up until documents had been mixed differently across many batches, not on the
+    first repeat of the same mix.
+    """
+    about_returns = [Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?")]
+    about_cards = [Boolean(id="cash", prompt="Can a gift card be exchanged for cash?")]
+    was = engine_paged.graphs
+    try:
+        engine_paged.graphs = False
+        with engine_paged.open_context(CONTEXT) as first:
+            alone_returns = first.ask(about_returns)
+        with engine_paged.open_context(SECOND_CONTEXT) as second:
+            alone_cards = second.ask(about_cards)
+
+        engine_paged.graphs = True
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        engine_paged.replays.clear()
+        for _ in range(GROUPS_FOR_A_REPLAY + 5):
+            with engine_paged.open_batch([CONTEXT, SECOND_CONTEXT]) as batch:
+                together = batch.ask([about_returns, about_cards])
+            for alone, mixed, asked in (
+                (alone_returns, together[0], about_returns),
+                (alone_cards, together[1], about_cards),
+            ):
+                for q in asked:
+                    assert mixed[q.id].option == alone[q.id].option, f"{q.id} changed its answer in a mixed batch"
+                    for option, p in alone[q.id].probabilities.items():
+                        assert abs(mixed[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
+    finally:
+        engine_paged.graphs = was
+        engine_paged.declined_recordings.clear()
+        engine_paged._economics_needed.clear()
+        engine_paged.replays.clear()
+        engine_paged.replay_cost.clear()
+
+
 def test_a_mixed_batch_really_used_the_pages(engine_paged):
     """The witness, because the whole first version of the paged path reported itself installed and never ran."""
     from prismyra.paged import PagedForkLayer
@@ -666,6 +863,288 @@ def test_a_document_on_a_shelf_answers_as_one_read_fresh(engine_paged):
             assert shelved[q.id].option == alone[q.id].option, f"{q.id} changed its answer on a shelf"
             for option, p in alone[q.id].probabilities.items():
                 assert abs(shelved[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
+
+
+def test_a_shelf_matches_ask_bit_for_bit(engine_paged):
+    """The bug an open-loop measurement found, with graphs off, so it has nothing to do with recordings: a document
+    put on a shelf and asked about alone -- never mixed with another document in the same pass -- still answered
+    differently from `ask()` on the identical document and questions. Real RACE data moved a decision outright
+    (0.339 against 0.512 on the deciding option) at 10 documents a second and again, differently, at 20.
+
+    The root cause, found by bisecting the two code paths against each other one difference at a time: `ask()`'s
+    `_packed_groups` tightens a branch pass's width to the longest question it carries, rounded only to
+    `PACK_ALIGN`; `_answer_batch` (which `Shelf.ask` and `open_batch` both go through) used the untightened `WIDTHS`
+    bucket and stopped there. The two paddings are not an equivalent rounding of each other -- the extra columns
+    reach the recurrent layers' kernels and move the hidden state at a row's own last token. Matching only this
+    width made the two paths bit-exact; matching only the question order (`ask()` sorts by length, a shelf answers
+    in the order it was given) changed nothing by itself. `_round_pack_align` is the fix, shared by both paths.
+
+    Documents stay on the shelf and are dropped before and after the one under test, because the bug this is written
+    against is specifically about a shelf that has already held other documents -- `prismyra.schedule.Batcher`'s own
+    name for it is putting several documents "on" one cache over time, not necessarily several in one pass.
+
+    This is bit-exact rather than within `COMPANION_MOVEMENT` because the document under test is answered alone, with
+    nothing else sharing its pass to blame a difference on -- the comparison this guards is `ask()` against itself,
+    through a different door.
+    """
+    asked = [
+        Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?"),
+        Boolean(id="unopened", prompt="Are unopened items refunded in full?"),
+        Choice(
+            id="opened",
+            prompt="What happens to an opened item?\nA. Refunded\nB. Exchanged\nC. Kept\nD. Discarded",
+            choices=["A", "B", "C", "D"],
+        ),
+        Choice(
+            id="shipping",
+            prompt=(
+                "Who pays return shipping when the item turns out to have a manufacturing fault, confirmed after "
+                "inspection by the seller's own technician working from the original receipt?\n"
+                "A. The buyer\nB. The seller\nC. Nobody, it is refunded\nD. It depends on the courier\nE. The maker"
+            ),
+            choices=["A", "B", "C", "D", "E"],
+        ),
+        Boolean(id="exchange", prompt="Is an opened item ever refunded rather than exchanged?"),
+    ]
+
+    # The gap this test exists to close only shows up when the longest question's rendered width does not already
+    # sit on a `WIDTHS` bucket -- otherwise `ask()`'s tightening and `_answer_batch`'s old untightened bucket are
+    # the same number and there is nothing to catch. Checked rather than assumed, so this fails loudly instead of
+    # silently passing if the question text above is ever edited down to a width that no longer exercises it.
+    from prismyra.engine import PACK_ALIGN
+    from prismyra.fork import branch_ids, round_width
+    from prismyra.readout import plan
+
+    plans = [plan(q, engine_paged.tokenizer) for q in asked]
+    longest = max(len(branch_ids(p.text, engine_paged.tokenizer)) for p in plans)
+    bucket = round_width(longest)
+    tightened = -(-longest // PACK_ALIGN) * PACK_ALIGN
+    assert tightened < bucket, (
+        f"this question set rounds to the same width both ways ({tightened} == {bucket}); it no longer exercises "
+        f"the gap this test exists to close -- lengthen one question's prompt"
+    )
+
+    want = engine_paged.ask(CONTEXT, asked)
+    with engine_paged.open_shelf() as shelf:
+        warm_up = shelf.put(SECOND_CONTEXT)
+        shelf.ask({warm_up: [Boolean(id="cash", prompt="Can a gift card be exchanged for cash?")]})
+        shelf.drop(warm_up)
+
+        handle = shelf.put(CONTEXT)
+        got = shelf.ask({handle: asked})[handle]
+        shelf.drop(handle)
+
+        after = shelf.put(SECOND_CONTEXT)
+        shelf.ask({after: [Boolean(id="replaced", prompt="Is a lost gift card replaced on proof of purchase?")]})
+        shelf.drop(after)
+
+    for q in asked:
+        assert got[q.id].option == want[q.id].option, f"{q.id} changed its answer on a shelf"
+        for option, p in want[q.id].probabilities.items():
+            assert got[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (q.id, option)
+
+
+def test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length(engine_paged):
+    """The mismatch an open-loop measurement found that neither the width fix (`test_a_shelf_matches_ask_bit_for_bit`)
+    nor row-count padding (`_round_rows`) closed on their own: `open_batch`'s `fused_experts` router projection
+    (`kernels.qwen3_moe.FusedExperts._route`, a plain bf16 `F.linear`) picked its own reduction order by the
+    *context read*'s total row count, the same row-count-chosen-algorithm effect `onepass.py`'s islands already
+    guard against during a *recording* but nothing guarded against during an ordinary read or branch pass.
+
+    Found decisively (`diag_layer0_op_divergence.py`): the same document, companioned by two documents of
+    completely different content but the identical total length, was bit-identical through every layer-0
+    operation. Companioned instead by documents of *different* total length, the first and only divergent
+    operation was the router's logits -- not the chunked recurrence, not the convolution, not either RMSNorm.
+    `Prismyra._enable_batch_invariance` (vLLM's `enable_batch_invariant_mode` plus `VLLM_BATCH_INVARIANT=1` for
+    `fused_moe.py`'s own row-count-keyed config, on by default for a paged engine on CUDA since this was found)
+    is the fix for that axis, and the full RACE validation set (80 documents, 11 batches,
+    `diag_openbatch_vs_ask.py`) now answers `open_batch` bit-identical to `ask()` -- zero mismatches, where there
+    were three before this and the context-length padding together.
+
+    What this fix does *not* reach, found while writing this test rather than assumed: a companion with a
+    different *question count* -- not context length -- still moves a probability a little
+    (measured: 0.0128, with a two-question target and a one-question companion forcing two different `_round_rows`
+    buckets, 2 against 4, for the branch pass itself). Decisions do not change and the movement is a twentieth of
+    `COMPANION_MOVEMENT` (0.3), so this is checked against that bound rather than claimed as zero -- the
+    context-length axis is closed, the row-count axis inside the branch pass is narrowed but not yet, and that gap
+    is recorded in `THROUGHPUT.md` rather than hidden by loosening this test further than the measurement.
+    """
+    long_companion = SECOND_CONTEXT * 6  # several times CONTEXT's own length: the context-read axis this closes.
+    asked = [
+        Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?"),
+        Choice(
+            id="opened",
+            prompt="What happens to an opened item?\nA. Refunded\nB. Exchanged\nC. Kept\nD. Discarded",
+            choices=["A", "B", "C", "D"],
+        ),
+    ]
+    about_companion = [Boolean(id="replaced", prompt="Is a lost gift card replaced on proof of purchase?")]
+
+    want = engine_paged.ask(CONTEXT, asked)
+
+    with engine_paged.open_batch([CONTEXT, SECOND_CONTEXT]) as short_batch:
+        with_short = short_batch.ask([asked, about_companion])[0]
+    with engine_paged.open_batch([CONTEXT, long_companion]) as long_batch:
+        with_long = long_batch.ask([asked, about_companion])[0]
+
+    for label, mixed in (("short companion", with_short), ("long companion", with_long)):
+        for q in asked:
+            assert mixed[q.id].option == want[q.id].option, f"{label}: {q.id} changed its answer"
+            for option, p in want[q.id].probabilities.items():
+                assert mixed[q.id].probabilities[option] == pytest.approx(p, abs=COMPANION_MOVEMENT / 20), (
+                    label, q.id, option
+                )
+
+
+def test_a_shelf_evicts_on_memory_pressure_even_with_tokens_to_spare(engine_paged, monkeypatch):
+    """The second bug an open-loop measurement found: streaming RACE's 368 documents through a shelf one at a time
+    exhausted a 44 GiB card at 97 resident documents holding 24,394 of a 65,536-token budget -- nowhere near full
+    by the only thing `Batcher._make_room` checked. Each resident document also keeps a clone of the recurrent
+    state it ended on (`Shelved.snapshot_bytes`), outside the page pool and roughly the same size whatever the
+    document's length, and nothing bounded how many of those a shelf could hold at once.
+
+    Reproduced here without filling a real card: `torch.cuda.mem_get_info` is monkeypatched to report free memory
+    just under `schedule.SHELF_MEMORY_MARGIN` once one small document is already resident -- a state the token
+    budget alone would never ask for an eviction over.
+    """
+    from prismyra import schedule as schedule_module
+    from prismyra.schedule import Batcher
+
+    batcher = Batcher(engine_paged, linger_ms=0.0).start()
+    try:
+        first = batcher.submit(CONTEXT, [Boolean(id="q1", prompt="Is there a return policy?")])
+        assert first.done.wait(timeout=30), "the first document never answered"
+        assert first.error is None, first.error
+        assert len(batcher._resident) == 1
+        assert batcher._slot_bytes > 0, (
+            "nothing was measured for the first document, so this test would pass without the fix doing anything"
+        )
+
+        monkeypatch.setattr(
+            torch.cuda, "mem_get_info", lambda *_a, **_k: (schedule_module.SHELF_MEMORY_MARGIN // 2, 1 << 40)
+        )
+        second = batcher.submit(SECOND_CONTEXT, [Boolean(id="q2", prompt="Can a gift card be exchanged for cash?")])
+        assert second.done.wait(timeout=30), "the second document never answered"
+        assert second.error is None, second.error
+
+        assert len(batcher._resident) <= 1, (
+            "a second document was admitted while free memory was reported below the margin, and the first "
+            "resident was not evicted for it -- the token budget alone decided, which is the bug"
+        )
+    finally:
+        batcher.stop()
+
+
+def test_shelf_resident_count_stays_at_the_cap_with_room_to_spare(engine_paged):
+    """`SHELF_MAX_RESIDENTS` (THROUGHPUT.md 2026-10-05, task item 1): the margin check above only ever fires when
+    the device is already short, which never happens while many *short* documents are each well under the token
+    budget -- measured, the lane=2 go/no-go harness's own rate=10 burst piled up 33-37 residents with gigabytes of
+    free memory still unspent. Reproduced here with plenty of real free memory (no monkeypatch): more than the cap
+    worth of distinct, short documents are shelved one at a time, and resident count must never exceed the cap even
+    though neither the token budget nor the memory margin would ever have asked for an eviction on their own.
+    """
+    from prismyra import schedule as schedule_module
+    from prismyra.schedule import Batcher
+
+    cap = schedule_module.SHELF_MAX_RESIDENTS
+    batcher = Batcher(engine_paged, linger_ms=0.0).start()
+    try:
+        for i in range(cap + 4):
+            context = f"Document number {i}: a short policy note with nothing in common with its neighbours."
+            job = batcher.submit(context, [Boolean(id="q", prompt="Is this a policy note?")])
+            assert job.done.wait(timeout=30), f"document {i} never answered"
+            assert job.error is None, job.error
+            assert len(batcher._resident) <= cap, (
+                f"after document {i}, {len(batcher._resident)} documents are resident, above the cap of {cap} -- "
+                f"neither the token budget nor the memory margin would have evicted for this short a document"
+            )
+    finally:
+        batcher.stop()
+
+
+def test_lanes_two_answers_match_ask_bit_for_bit_when_isolated(engine_paged):
+    """`Batcher(lanes=2)` (THROUGHPUT.md 2026-10-05, "本当に効く経路"): two lanes, each its own `Shelf`/`Pool`,
+    sharing only the model's weights (read-only) and a lane-tagged `fork.OWNED` scratch buffer (`fork._owned`'s
+    `lane` argument) and a thread-local `varlen._current` (fixed in this same session -- a plain module global
+    there raised "a batched read is already in progress" the first time two lanes' reads genuinely overlapped,
+    which is the correct failure for ambient state shared by two threads, not a bug to tolerate).
+
+    One document at a time, waited for before the next is submitted, so no pass ever carries more than this one
+    document (`Batcher.form`'s own "backlogged" check never sees another job queued) -- the comparison against
+    `engine.ask()` is bit-exact (`abs=1e-6`) because nothing else could move a probability to blame a difference
+    on if one appears. Twenty distinct documents, alternating across both lanes by construction (`submit`'s
+    digest-hash routing), each repeated once more straight after (the shelf-hit path, a second question about a
+    document already resident on its lane -- not a second read).
+    """
+    from prismyra.schedule import Batcher
+
+    docs = [
+        (
+            f"Document {i}: a short, self-contained policy note with its own number and nothing shared with its "
+            f"neighbours, so a lane crossing wires with another lane's buffer would show up as this document "
+            f"answering a question about a different one.",
+            Boolean(id="q", prompt=f"Does this note mention the number {i}?"),
+        )
+        for i in range(20)
+    ]
+    truth = {i: engine_paged.ask(context, [question]) for i, (context, question) in enumerate(docs)}
+
+    batcher = Batcher(engine_paged, lanes=2, lane_room=2048, linger_ms=0.0).start()
+    try:
+        for i, (context, question) in enumerate(docs):
+            for round_ in ("first", "repeat"):
+                job = batcher.submit(context, [question])
+                assert job.done.wait(timeout=30), f"document {i} ({round_}) never answered"
+                assert job.error is None, (i, round_, job.error)
+                want = truth[i]["q"]
+                got = job.result["q"]
+                assert got.option == want.option, (
+                    f"document {i} ({round_}) changed its answer under lanes=2 ({got} vs {want})"
+                )
+                for option, p in want.probabilities.items():
+                    assert got.probabilities[option] == pytest.approx(p, abs=1e-6), (i, round_, option)
+    finally:
+        batcher.stop()
+
+
+def test_lanes_two_decisions_under_a_burst_do_not_move(engine_paged):
+    """The same claim as `test_lanes_two_answers_match_ask_bit_for_bit_when_isolated`, but under a real burst: all
+    twenty documents submitted without waiting for each one, so jobs are genuinely in flight on both lanes at
+    once and `Batcher.form`'s own "backlogged" check lets same-lane jobs share a pass exactly as it would for a
+    single lane.
+
+    `test_an_answer_does_not_depend_on_its_companions` already states this file's standard for a companion
+    effect: "the decision is asserted exactly and the distribution behind it within a measured tolerance ...
+    only [the decision] is a promise". The first version of this test used synthetic, near-50/50 documents and
+    found decisions moving under *both* `lanes=1` and `lanes=2` on the same burst (`diag_lanes_control.py`:
+    identical flips, matching probabilities to the sixth decimal place, so not a lanes=2 regression) -- a
+    pre-existing sensitivity of borderline questions to which companions share a pass, consistent with how
+    `NEARLY_SIX` elsewhere in this file documents the same thing happening to a *single* document's result when
+    the recurrence kernel changed. That is real but orthogonal to what lane=2 adds, and testing it with
+    borderline documents conflates the two. This test uses the decisive, already-established `CONTEXT` and
+    `faulty` question instead (confidently "yes" -- `test_an_answer_does_not_depend_on_its_companions` already
+    relies on this), with twenty distinguishing suffixes only so each document's digest routes differently and
+    the full 368-document open-loop benchmark (THROUGHPUT.md 2026-10-05) measured zero decisions changed across
+    every arrival rate with the production (`lanes=1`) `Batcher`, which is the bar lanes=2 is held to here.
+    """
+    from prismyra.schedule import Batcher
+
+    question = Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?")
+    docs = [f"{CONTEXT} (document {i} of this run, otherwise identical to its neighbours.)" for i in range(20)]
+    truth = engine_paged.ask(CONTEXT, [question])["faulty"]
+
+    batcher = Batcher(engine_paged, lanes=2, lane_room=2048, linger_ms=0.0).start()
+    try:
+        jobs = [batcher.submit(context, [question]) for context in docs]
+        for i, job in enumerate(jobs):
+            assert job.done.wait(timeout=30), f"document {i} never answered"
+            assert job.error is None, (i, job.error)
+            got = job.result["faulty"]
+            assert got.option == truth.option, f"document {i} changed its decision under lanes=2 ({got} vs {truth})"
+            for option, p in truth.probabilities.items():
+                assert abs(got.probabilities[option] - p) < COMPANION_MOVEMENT, (i, option)
+    finally:
+        batcher.stop()
 
 
 def test_asking_twice_about_a_shelved_document_does_not_read_it_twice(engine_paged):
@@ -815,17 +1294,173 @@ def test_one_pass_refuses_a_question_wider_than_a_branch_as_the_fork_does(engine
         opened.ask([wide])
 
 
-def test_require_kernels_starts_with_nothing_skipped():
-    """What `prismyra-serve --require-kernels` checks before it will answer a single request.
+def test_a_short_question_replays_exactly_as_it_reads_eagerly(engine):
+    """The one-pass recordings must change nothing but the time: the same probabilities, to the bit, as the eager read.
 
-    A separate construction from `engine` above, deliberately: `require_kernels` is a constructor argument, and
-    the thing this guards against -- a kernel that is skipped on this environment without anyone asking for that --
-    is exactly what a shared, already-built engine could not show. Loads the checkpoint a second time, on the same
-    device, at the cost this test accepts for testing what the flag is actually for.
+    Not a tolerance. A replay pads the request to a bucket, and the only reason that can be exact is that every
+    projection whose algorithm depends on the row count runs as an island at the real row count -- which is the thing
+    this test exists to catch going wrong. A near-tie at 0.44 against 0.54 changed its answer when the router's
+    projection alone was recorded at the padded length, so equality is the bar. Several lengths, so that more than one
+    bucket and more than one amount of padding are exercised.
     """
-    if not torch.cuda.is_available():
-        pytest.skip("no CUDA device")
-    engine = Prismyra(MODEL, require_kernels=True)
-    applied = engine.stats()["kernels"]
-    assert applied["complete"] is True, applied
-    assert applied["skipped"] == [], applied
+    graphs = engine.stats()["short_graphs"]
+    if not graphs:
+        pytest.skip("the one-pass recordings are not taken on this engine")
+    assert graphs["buckets"] and not graphs["declined"], graphs
+    assert all(moved == 0.0 for moved in graphs["proved"].values()), graphs["proved"]
+    q = Choice(
+        id="opened",
+        prompt="What happens to an opened item?\nA. Refunded\nB. Exchanged\nC. Kept",
+        choices=["A", "B", "C"],
+    )
+    held = engine._one_pass
+    for copies in (1, 2, 5, 9):
+        context = " ".join([CONTEXT] * copies)
+        before = sum(engine.stats()["short_graphs"]["replays"].values())
+        replayed = engine.ask(context, [q])
+        assert sum(engine.stats()["short_graphs"]["replays"].values()) == before + 1, "the request did not replay"
+        engine._one_pass = None
+        try:
+            eager = engine.ask(context, [q])
+        finally:
+            engine._one_pass = held
+        assert replayed[q.id].probabilities == eager[q.id].probabilities, copies
+
+
+
+
+HEAD_OPTIONS = ["seller", "buyer"]
+HEAD_BIAS = [2.0, -1.0]
+NOT_HEADED = [
+    Boolean(id="returnable", prompt="Can an opened item be returned for a refund?"),
+    Choice(id="three", prompt="Who pays return shipping for a faulty item?", choices=["seller", "buyer", "courier"]),
+    Choice(id="other", prompt="Who pays return shipping for a faulty item?", choices=["seller", "courier"]),
+]
+HEADED = Choice(id="pays", prompt="Who pays return shipping for a faulty item?", choices=HEAD_OPTIONS)
+#: The same set declared in the other order: answered by the head, with its probabilities in this question's order.
+HEADED_SWAPPED = Choice(id="swapped", prompt="Who pays return shipping for a faulty item?", choices=HEAD_OPTIONS[::-1])
+
+
+def _heads_for(engine, tmp_path):
+    """A head that ignores the hidden state (zero weights, a fixed bias), so the probabilities it gives are known."""
+    import json
+
+    from safetensors.torch import save_file
+
+    from prismyra.heads import Heads
+
+    weights = {"W": torch.zeros(2, engine.hidden_size), "b": torch.tensor(HEAD_BIAS)}
+    save_file(weights, str(tmp_path / "pays.safetensors"))
+    (tmp_path / "heads.json").write_text(
+        json.dumps([{"name": "who-pays", "options": HEAD_OPTIONS, "form": "linear", "weights": "pays.safetensors"}])
+    )
+    return Heads(str(tmp_path / "heads.json"), engine.hidden_size, engine.device)
+
+
+def _with_heads(engine, heads, answer):
+    saved = engine.heads
+    try:
+        engine.heads = heads
+        return answer()
+    finally:
+        engine.heads = saved
+
+
+def _check_heads(before, after):
+    expected = torch.softmax(torch.tensor(HEAD_BIAS), dim=-1).tolist()
+    for q in NOT_HEADED:
+        assert after[q.id].probabilities == before[q.id].probabilities, q.id   # bit-identical, not merely close
+        assert after[q.id].read_by is None
+    for q in (HEADED, HEADED_SWAPPED):
+        got = after[q.id]
+        assert before[q.id].read_by is None and got.read_by == "who-pays"
+        assert [got.probabilities[o] for o in HEAD_OPTIONS] == pytest.approx(expected, abs=1e-6)
+        assert got.option == "seller"
+
+
+def test_a_head_answers_only_its_option_list_and_leaves_every_other_question_bit_identical(engine, tmp_path):
+    """Registering a head must not move any question whose options it does not name: one question in one pass, and
+    several questions in a fork."""
+    heads = _heads_for(engine, tmp_path)
+    for answer in (
+        lambda: {q.id: engine.ask(CONTEXT, [q])[q.id] for q in [*NOT_HEADED, HEADED, HEADED_SWAPPED]},
+        lambda: engine.ask(CONTEXT, [*NOT_HEADED, HEADED, HEADED_SWAPPED]),
+    ):
+        _check_heads(answer(), _with_heads(engine, heads, answer))
+
+
+def test_a_head_in_a_batch_across_documents_moves_nothing_else(engine_paged, tmp_path):
+    """The same, on the path that answers about several documents in one pass."""
+    heads = _heads_for(engine_paged, tmp_path)
+    cards = [Boolean(id="cash", prompt="Can a gift card be exchanged for cash?")]
+
+    def answer():
+        with engine_paged.open_batch([CONTEXT, SECOND_CONTEXT]) as batch:
+            return batch.ask([[*NOT_HEADED, HEADED, HEADED_SWAPPED], cards])
+
+    before, after = answer(), _with_heads(engine_paged, heads, answer)
+    _check_heads(before[0], after[0])
+    assert after[1]["cash"].probabilities == before[1]["cash"].probabilities
+
+
+def test_recorded_hidden_states_are_the_ones_the_read_out_scores(engine):
+    """`record_hidden` must hand a head the very state the output embedding reads: scoring a recorded row with the
+    option tokens' embedding rows has to give back the probabilities the engine answered with."""
+    from prismyra.heads import record_hidden
+    from prismyra.readout import plan
+
+    with record_hidden(engine, HEADED.options) as rec:
+        one = engine.ask(CONTEXT, [HEADED])[HEADED.id]
+        fork = engine.ask(CONTEXT, [*NOT_HEADED, HEADED])[HEADED.id]
+    assert len(rec.rows) == 2
+    ids = plan(HEADED, engine.tokenizer).token_ids
+    for h, answered in zip(rec.rows, (one, fork), strict=True):
+        p = torch.softmax(h @ engine.unembedding[ids].float().cpu().t(), dim=-1).tolist()
+        # abs=1e-5 rather than 1e-6: a paged engine now runs the router's projection (and every other plain bf16
+        # `F.linear`) through vLLM's batch-invariant Triton matmul (`engine._enable_batch_invariant`), which does
+        # not pick its reduction by row count -- the fix for a real companion-dependent mismatch
+        # (`diag_layer0_op_divergence.py`), at the cost of a reduction order that differs from this test's own CPU
+        # float32 softmax by a hair more than the old tolerance allowed (measured: 1.3e-6, not 1.3e-5).
+        assert p == pytest.approx([answered.probabilities[o] for o in HEADED.options], abs=1e-5)
+
+
+def test_a_headed_question_replays_exactly_as_it_reads_eagerly(engine, tmp_path):
+    """The head reads the hidden state the one-pass read returns, so it must see the same state whether the read was
+    replayed from a recording or run eagerly. A head whose answer depends on that state (random weights), at several
+    lengths so that more than one bucket is exercised: the probabilities must be equal to the bit."""
+    import json
+
+    from safetensors.torch import save_file
+
+    from prismyra.heads import Heads
+
+    if not engine.stats()["short_graphs"]:
+        pytest.skip("the one-pass recordings are not taken on this engine")
+    g = torch.Generator().manual_seed(0)
+    weights = {
+        "W1": torch.randn(16, engine.hidden_size, generator=g) * 0.05,
+        "b1": torch.zeros(16),
+        "W2": torch.randn(2, 16, generator=g),
+        "b2": torch.zeros(2),
+    }
+    save_file(weights, str(tmp_path / "pays.safetensors"))
+    (tmp_path / "heads.json").write_text(
+        json.dumps([{"name": "who-pays", "options": HEAD_OPTIONS, "form": "mlp", "weights": "pays.safetensors"}])
+    )
+    saved, held = engine.heads, engine._one_pass
+    try:
+        engine.heads = Heads(str(tmp_path / "heads.json"), engine.hidden_size, engine.device)
+        for copies in (1, 3, 7):
+            context = " ".join([CONTEXT] * copies)
+            before = sum(engine.stats()["short_graphs"]["replays"].values())
+            replayed = engine.ask(context, [HEADED])[HEADED.id]
+            assert sum(engine.stats()["short_graphs"]["replays"].values()) == before + 1, "the request did not replay"
+            engine._one_pass = None
+            try:
+                eager = engine.ask(context, [HEADED])[HEADED.id]
+            finally:
+                engine._one_pass = held
+            assert replayed.read_by == eager.read_by == "who-pays"
+            assert replayed.probabilities == eager.probabilities, copies
+    finally:
+        engine.heads = saved

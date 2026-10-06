@@ -104,14 +104,14 @@ help and one figure this project published and then withdrew.
 **There is no release on PyPI**, so it installs from the repository, pinned to a tag:
 
 ```bash
-pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.2.2"                  # runs, and leaves every borrowed kernel on its fallback
-pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.2.2"             # the kernels: needs vLLM and Triton, so Linux and CUDA
+pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.3.0"                  # runs, and leaves every borrowed kernel on its fallback
+pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.3.0"             # the kernels: needs vLLM and Triton, so Linux and CUDA
 ```
 
 A clone works the same way, checked out at the same tag:
 
 ```bash
-git clone --branch v0.2.2 https://github.com/littlemex/Prismyra
+git clone --branch v0.3.0 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e .                  # runs, and leaves every borrowed kernel on its fallback
 pip install -e ".[fast]"          # the kernels: needs vLLM and Triton, so Linux and CUDA
@@ -268,6 +268,20 @@ and callers queue. Requests entering the model together are correct but slow in 
 so all of them finish late instead of the first one finishing first. Measured, at eight arriving together: median
 latency 2,113 ms interleaved against 945 ms queued, and the first answer home at 2,113 ms against 214 ms.
 
+When documents are each asked about more than once, `engine.open_shelf()` keeps a document's cache on the device
+between questions instead of reading it again. On the measurement this is checked against (RACE, 80 documents) its
+answers match `ask()` exactly; two narrower axes are bounded rather than matched exactly, documented in full below.
+It admits and evicts by measured per-document memory, not token count alone, so it can stream hundreds of short
+documents without exhausting the device. `prismyra.schedule.Batcher(lanes=N)` runs `N` such shelves on independent
+CUDA streams, which is intended to raise how many requests a device serves rather than only reorder who waits -- a
+single `prismyra.queue.Worker` only ever does the latter -- though throughput at `lanes>1` is not yet measured. See
+[shelf correctness](docs/PERFORMANCE.md#a-shelf-answers-like-ask) and [lanes](docs/PERFORMANCE.md#independent-lanes).
+
+Separately, the scheduler now lingers for a companion only when one is already queued, rather than on every pass.
+Measured against vLLM at a fixed open-loop arrival rate with a 500 ms deadline, this closes the deadline-hit-rate gap
+at 20, 40, 60 and 80 documents a second and narrows it at 10, where it still trails: 0.825 against vLLM's 0.875. See
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md#open-loop-arrival-and-the-one-rate-it-still-trails-vllm).
+
 ## What a probability means
 
 Each option's single token is scored by the model's own output embedding at the branch's final position, and those
@@ -276,6 +290,11 @@ is not calibrated and it is not comparable across different option sets. There i
 
 `result.scoring_version` travels with the numbers; store it if you store answers. Full statement:
 [docs/READOUT.md](docs/READOUT.md).
+
+A question you ask on every request can instead be answered by an option-set head: a small learned read-out over the
+same hidden state, registered for one set of options and used only by questions that declare exactly that set. Every
+other question is read as above, bit for bit, and each answer's `read_by` says which read produced it. See
+[docs/HEADS.md](docs/HEADS.md).
 
 Two things are refused rather than answered wrongly: an option that is more than one token with a leading space, and two
 options whose first token is the same. Both need the model's tokenizer, so they are refused by `engine.validate` before
@@ -315,7 +334,10 @@ total ~= 138 ms  +  92 ms x ceil(questions / 32)
 ```
 
 One question is the exception: it is read together with the context in one pass, so it costs the context pass alone.
-A group's traversal is as wide as its longest question, and questions are grouped by length, so a request whose
+Up to 2,048 tokens of context and question, that pass is replayed from a recording taken at start-up, with the same
+probabilities to the bit as reading it eagerly: on an L40S, twenty single-question routing prompts went from 98 ms to
+45 ms each over HTTP, for 1.7 GiB of device memory (`short_graphs=False` or `prismyra-serve --no-short-graphs` turns
+it off; see [docs/PERFORMANCE.md](docs/PERFORMANCE.md#one-short-question-recorded)). A group's traversal is as wide as its longest question, and questions are grouped by length, so a request whose
 questions vary in length pays for less padding than one width for all of them would cost. Both constants grow with
 the context length. Numbers come from
 [`benchmarks/results/`](benchmarks/results/) and are refreshed by hand on the machine each file names --
@@ -334,6 +356,7 @@ prismyra-bench compare --against benchmarks/results/qwen3_6_35b_a3b_fp8__rtx_pro
 |---|---|
 | [docs/FORK.md](docs/FORK.md) | How one context serves many questions, and the asymmetry it rests on |
 | [docs/READOUT.md](docs/READOUT.md) | What a probability is, exactly |
+| [docs/HEADS.md](docs/HEADS.md) | A learned read-out for one option set, used only by the questions that declare that set |
 | [docs/KERNELS.md](docs/KERNELS.md) | Each replacement, what it is worth, and what was rejected |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | How the numbers were measured and how to reproduce them |
 | [docs/ACCURACY.md](docs/ACCURACY.md) | Whether the answers are right, on public labels, and where they are not |
@@ -350,7 +373,7 @@ that depends on how the work was arranged, so `0.999492` and `0.99974` are the s
 differs from one below, that is worth reporting.
 
 ```bash
-git clone --branch v0.2.2 https://github.com/littlemex/Prismyra
+git clone --branch v0.3.0 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e ".[server,fast]"
 prismyra-serve --host 127.0.0.1 --port 8000

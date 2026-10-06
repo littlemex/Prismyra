@@ -138,16 +138,23 @@ def _restore_lengths(layer, lengths: dict) -> None:
 OWNED = "_prismyra_state"
 
 
-def _owned(layer, attr: str, key, like: torch.Tensor, width: int, rows: int) -> torch.Tensor:
+def _owned(layer, attr: str, key, like: torch.Tensor, width: int, rows: int, lane: int = 0) -> torch.Tensor:
     """The full-width buffer for this piece of state, and the view of its first `rows` rows.
 
     `like` is the snapshot's one-row tensor, which gives the shape of everything but the batch. Allocated on first use
     and never again: a caller may hold the view, and a recorded pass holds the address.
+
+    `lane` names a second (or further) independent store on the same layer object, for lane=2 concurrency
+    (THROUGHPUT.md 2026-10-05): two passes racing to fork the *same* layer's `OWNED` buffer is exactly the hazard
+    `self._lock` existed to prevent, and two lanes sharing one buffer would still have it even if everything else
+    about them is kept apart. `lane=0` keeps today's attribute name (`OWNED`) so every existing caller and
+    recording is unaffected; `lane>0` costs a second full-width buffer (~1 GiB, measured) rather than sharing one.
     """
-    store = getattr(layer, OWNED, None)
+    name = OWNED if lane == 0 else f"{OWNED}_{lane}"
+    store = getattr(layer, name, None)
     if store is None:
         store = {}
-        setattr(layer, OWNED, store)
+        setattr(layer, name, store)
     slot = store.get((attr, key))
     full = slot["full"] if slot else None
     want = (width, *like.shape[1:])
@@ -161,6 +168,30 @@ def _owned(layer, attr: str, key, like: torch.Tensor, width: int, rows: int) -> 
         view = full[:rows]
         slot["views"][rows] = view
     return view
+
+
+def snapshot_bytes(snap: dict) -> int:
+    """How many bytes one document's slice of a snapshot holds. Measured, not estimated: the tensors are already in
+    hand -- the same slice `pick` hands to a `Shelved` -- and a budget that counts what it was actually given is
+    sounder than one that predicts it from the context length, which this does not depend on at all: a recurrent
+    layer's state is the same size whatever the document was.
+
+    What this does not count is pages: those are `Pool`'s own accounting, already bounded by `Pool.admit` refusing
+    by name. This is the other half, which nothing was counting -- a document kept on a shelf also keeps a clone of
+    the recurrent state it ended on, and a shelf holding many short documents can run out of memory on that count
+    alone while the page pool still has tokens to spare. See `schedule.Batcher._make_room`.
+    """
+    total = 0
+    for entry in snap.values():
+        for attr in ("recurrent_states", "conv_states"):
+            for v in entry.get(attr, {}).values():
+                if torch.is_tensor(v):
+                    total += v.numel() * v.element_size()
+        for attr in ("keys", "values"):
+            v = entry.get(attr)
+            if torch.is_tensor(v):
+                total += v.numel() * v.element_size()
+    return total
 
 
 def pick(snap: dict, row: int) -> dict:
@@ -186,7 +217,11 @@ def pick(snap: dict, row: int) -> dict:
 
 
 def restore_and_fork_many(
-    cache, parts: list[tuple[dict, int]], width: int | None = None, rows_for: list[int] | None = None
+    cache,
+    parts: list[tuple[dict, int]],
+    width: int | None = None,
+    rows_for: list[int] | None = None,
+    lane: int = 0,
 ) -> None:
     """Fork several documents into one batch: each document's state into the rows answering about it.
 
@@ -223,7 +258,7 @@ def restore_and_fork_many(
                 if example is None:
                     bound[key] = None
                     continue
-                held = _owned(layer, attr, key, example, width or rows, rows)
+                held = _owned(layer, attr, key, example, width or rows, rows, lane=lane)
                 _fill_per_document(held, [(snap[i][attr][key], count) for snap, count in parts])
                 bound[key] = held
         if _holds_attention(layer):
@@ -231,7 +266,7 @@ def restore_and_fork_many(
         for attr in ("keys", "values"):
             if attr not in shape:
                 continue
-            held = _owned(layer, attr, attr, shape[attr], width or rows, rows)
+            held = _owned(layer, attr, attr, shape[attr], width or rows, rows, lane=lane)
             _fill_per_document(held, [(snap[i][attr], count) for snap, count in parts])
             setattr(layer, attr, held)
 
@@ -261,7 +296,7 @@ def _takes_rows(begin) -> bool:
         return False
 
 
-def restore_and_fork(cache, snap: dict, rows: int, width: int | None = None) -> None:
+def restore_and_fork(cache, snap: dict, rows: int, width: int | None = None, lane: int = 0) -> None:
     """Put the one-row state back, then widen it to `rows`.
 
     The two kinds of state widen differently, and that difference is the design:
@@ -294,7 +329,7 @@ def restore_and_fork(cache, snap: dict, rows: int, width: int | None = None) -> 
                 # Into a buffer this package owns at the full width, with a cached view of the rows this group needs.
                 # See `OWNED`: the alternative reallocated whenever the row count changed, which moved the addresses a
                 # recorded pass had written down and left a reused cache holding the previous group's batch dimension.
-                held = _owned(layer, attr, k, v, width or rows, rows)
+                held = _owned(layer, attr, k, v, width or rows, rows, lane=lane)
                 held.copy_(v.expand((rows, *v.shape[1:])) if v.shape[0] == 1 else v[:rows])
                 d[k] = held
         if _holds_attention(layer):
@@ -308,7 +343,7 @@ def restore_and_fork(cache, snap: dict, rows: int, width: int | None = None) -> 
             # Materialised, not a view of the snapshot. A layer that writes its own keys in place would otherwise
             # write through every row at once and through the snapshot, making every later group wrong rather than
             # failing.
-            held = _owned(layer, attr, attr, t, width or rows, rows)
+            held = _owned(layer, attr, attr, t, width or rows, rows, lane=lane)
             held.copy_(t.expand((rows, *t.shape[1:])))
             setattr(layer, attr, held)
 
