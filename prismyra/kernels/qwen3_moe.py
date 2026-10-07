@@ -711,8 +711,44 @@ def _install_conv() -> bool:
         # the original, which is the implementation those cases were written for.
         if not _measured_conv(weight):
             return original(x, weight, bias, activation=activation, **kwargs)
-        if bias is not None or x.dim() != 3 or x.shape[0] != 1 or not x.is_cuda:
+        if bias is not None or x.dim() != 3 or not x.is_cuda:
             return original(x, weight, bias, activation=activation, **kwargs)
+        if x.shape[0] != 1:
+            # inv5 (round 7): a branch pass answering about several documents at once calls this with one row per
+            # document (`x.shape == (companions, channels, width)`, `width` = this branch's own token count plus
+            # the carried-over convolution state, identical per row) -- which used to fall through to the line
+            # below, the framework's own fallback. That silently ran a *different implementation* than the B=1
+            # case above (not the same kernel with a different schedule), which is why `audit_sm120.py`/
+            # `diag_round6_matrix.py`'s question-count=1 residual traced here: the branch is answered through
+            # this fast path when it is one document and through the framework's path when it is several, and
+            # the two do not agree bit-for-bit.
+            #
+            # Each row's own `width` tokens are already self-contained (the caller baked its own carried-over
+            # state into the leading positions, same as the B=1 case's `extra` prefix), so flattening the batch
+            # into one token-major run and marking each row's own span with `seq_starts` is exactly the existing
+            # multi-document mechanism below, just with the boundaries declared by this call's own shape instead
+            # of by `varlen.current()` -- nothing bleeds across a row boundary because `causal_depthwise_conv1d`
+            # already refuses to read before `seq_start` for every output position.
+            batch, channels, width = x.shape
+            flat = x.transpose(1, 2).reshape(batch * width, channels)
+            if not flat.is_contiguous():
+                flat = flat.contiguous()
+            # Every row has the same `width`, known in Python rather than discovered from a device tensor, so this
+            # builds the per-token start array directly instead of going through `starts_from_boundaries` (which
+            # derives its `repeats` from `cu_seqlens` as a *tensor*, forcing `repeat_interleave` onto the
+            # dynamic-output-size path -- a device-to-host size resolution that is not capturable inside a CUDA
+            # graph). `repeats=width` here is a plain Python int, so `repeat_interleave`'s output size is static
+            # and known at trace time, which is what let a graph-recording test capture this path at all: without
+            # this, a (4, 24)-shaped branch recording failed with "operation failed due to a previous error during
+            # capture" (inv5, round 7 -- the first version of this fix broke `test_a_paged_recording_answers_a_
+            # later_document_of_a_different_length` and two neighbouring recording tests on both cards).
+            row_starts = torch.arange(
+                0, batch * width, width, device=x.device, dtype=torch.int32
+            ).repeat_interleave(width)
+            out = causal_depthwise_conv1d(
+                flat, weight, seq_starts=row_starts, activation=activation if activation is not None else "silu"
+            )
+            return out.reshape(batch, width, channels).transpose(1, 2)
         tokens_major = x.squeeze(0).t()
         if not tokens_major.is_contiguous():
             tokens_major = tokens_major.contiguous()
