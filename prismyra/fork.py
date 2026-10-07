@@ -13,6 +13,7 @@ docs/FORK.md.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -68,6 +69,30 @@ class Prefill:
     group: int | None = None
 
 
+def snapshot_layer(layer) -> dict:
+    """One layer's own slice of `snapshot()` -- what that function would put at this layer's index.
+
+    Factored out for S4c (layer-interleaved fork, RUN-fp8spd.md): the interleaved path takes this snapshot one
+    layer at a time, immediately after that layer's own context forward and before that layer's branch forward
+    runs -- rather than waiting for the whole 36-layer stack to finish, which is what `snapshot()` requires and
+    is exactly the extra pass this path exists to remove. Calling this once per layer as the interleaved loop
+    goes and calling `snapshot()` once after a separate context-only pass produce the same dict: a later
+    `restore_and_fork`/`_branch` fork from either cannot tell them apart.
+    """
+    entry: dict = {}
+    for attr in ("recurrent_states", "conv_states"):
+        d = getattr(layer, attr, None)
+        if isinstance(d, dict):
+            entry[attr] = {k: (None if v is None else v.clone()) for k, v in d.items()}
+    if not _holds_attention(layer):
+        for attr in ("keys", "values"):
+            t = getattr(layer, attr, None)
+            if torch.is_tensor(t):
+                entry[attr] = t.clone()
+    entry[LENGTHS] = _lengths(layer)
+    return entry
+
+
 def snapshot(cache) -> dict:
     """Clone the batch-of-one state so it can be forked more than once.
 
@@ -75,21 +100,51 @@ def snapshot(cache) -> dict:
     state back regardless of what the caller asked for. Without this, a second group of branches would start from a
     state the first group had already advanced -- and would answer plausibly.
     """
-    snap: dict = {}
-    for i, layer in enumerate(cache.layers):
-        entry: dict = {}
+    return {i: snapshot_layer(layer) for i, layer in enumerate(cache.layers)}
+
+
+@contextmanager
+def widen_for_branch(layer, rows: int, width: int, lane: int = 0):
+    """Give one recurrent layer's just-written context state to `rows` branch rows, for exactly the call this
+    wraps -- S4c (layer-interleaved fork, RUN-fp8spd.md). The per-layer analogue of `restore_and_fork`'s own
+    widening, with one difference: there is no snapshot here. What is widened is whatever this layer holds
+    *right now* -- called immediately after this layer's own context forward and before this layer's branch
+    forward, that is this context forward's own final recurrent and convolution state, not a clone taken
+    earlier.
+
+    Restored to the layer's own one-row tensors on exit, not cleared: the next layer's context forward is a
+    different layer object and is unaffected either way, but a later branch group forking from a snapshot taken
+    at or after this layer (`snapshot_layer`) must still find the pure one-row context tensors here, not the
+    `rows`-wide view this branch call read from -- `_fork`'s own fork is what would otherwise widen it to that
+    group's row count a second time, from a buffer that is already the wrong width.
+
+    Attention layers (`ForkLayer`) have no `recurrent_states`/`conv_states` and are not touched here:
+    `begin_branches()`, called once per layer by the caller, already does the equivalent job for keys and
+    values from the write order alone, and nothing needs to be undone afterwards -- see that method's own
+    docstring.
+    """
+    held: dict[tuple, torch.Tensor] = {}
+    for attr in ("recurrent_states", "conv_states"):
+        d = getattr(layer, attr, None)
+        if not isinstance(d, dict):
+            continue
+        for k, v in list(d.items()):
+            if v is None:
+                continue
+            held[(attr, k)] = v
+            view = _owned(layer, attr, k, v, width or rows, rows, lane=lane)
+            view.copy_(v.expand((rows, *v.shape[1:])) if v.shape[0] == 1 else v[:rows])
+            d[k] = view
+    try:
+        yield
+    finally:
         for attr in ("recurrent_states", "conv_states"):
             d = getattr(layer, attr, None)
-            if isinstance(d, dict):
-                entry[attr] = {k: (None if v is None else v.clone()) for k, v in d.items()}
-        if not _holds_attention(layer):
-            for attr in ("keys", "values"):
-                t = getattr(layer, attr, None)
-                if torch.is_tensor(t):
-                    entry[attr] = t.clone()
-        entry[LENGTHS] = _lengths(layer)
-        snap[i] = entry
-    return snap
+            if not isinstance(d, dict):
+                continue
+            for k in list(d.keys()):
+                if (attr, k) in held:
+                    d[k] = held[(attr, k)]
 
 
 def _holds_attention(layer) -> bool:

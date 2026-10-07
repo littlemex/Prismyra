@@ -18,7 +18,7 @@ import torch
 if TYPE_CHECKING:  # pragma: no cover - the framework's cache type, for the annotation only
     from transformers.cache_utils import Cache
 
-from . import kernels, onepass, varlen
+from . import interleave, kernels, onepass, varlen
 from .cache import build_cache, cache_bytes, join_bytes_per_token
 from .calibration import Calibration
 from .fork import (
@@ -411,6 +411,7 @@ class Prismyra:
         heads: str | list | None = None,
         pin_autotune: bool = True,
         wide_group: bool = False,
+        interleaved_fork: bool = False,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -435,6 +436,15 @@ class Prismyra:
         # flagged, so it stays off (`None` from `_group_for`, unchanged behaviour) until it clears this project's
         # accuracy-judgment gate (SYNTHESIS.md A0/A2) rather than being shipped as a free speed win on a hunch.
         self.wide_group = wide_group
+        # fp8spd (S4c / SYNTHESIS.md P5, out/p1_speed_opus.md P5), **opt-in, off by default**: `ask()` with more
+        # than one question goes through `interleave.read_and_branch` instead of `open_context(...).ask(...)` --
+        # one layer-interleaved pass fusing the context's and the first branch group's dense/MoE compute per
+        # layer, instead of two full passes. `torch.equal`-gated against today's two-pass path (RUN-fp8spd.md)
+        # before being wired in here; left off by default for the same reason `wide_group` is -- a change to
+        # what gets computed, not merely to how it is scheduled, earns a default only after the project's own
+        # accuracy-judgment gate, not by being bit-identical on the cases measured so far. Requires the borrowed
+        # kernels (`self._borrowed_kernel`, decided below, after the kernels are applied) -- see `ask`'s guard.
+        self.interleaved_fork = interleaved_fork
         # The caches are held by the engine and mutated in place, so two threads asking at once would interleave one
         # another's branches. The lock makes that safe; `prismyra.queue.Worker` is still what makes it fast.
         self._lock = threading.RLock()
@@ -808,6 +818,11 @@ class Prismyra:
         if len(questions) == 1 and not images and not videos and self.calibration is None and not self.paged:
             return self._ask_in_one_pass(context, questions[0])
         group = self._group_for(len(questions)) if self.wide_group else None
+        # fp8spd (S4c): the same restrictions `_ask_in_one_pass` and `open_batch` already state for the same
+        # reasons -- media move the positions during the read, calibration measures its priors through branch
+        # passes of its own shape, and the paged storage's pages belong to a pool this path does not draw from.
+        if self.interleaved_fork and not images and not videos and self.calibration is None and not self.paged:
+            return self._ask_interleaved(context, questions, group)
         with self._lock, self.open_context(context, images=images, videos=videos, group=group) as opened:
             assert opened._prefill is not None
             answered = self._answer(opened._prefill, questions, opened.tokens, context_ms=opened.context_ms)
@@ -825,6 +840,86 @@ class Prismyra:
         if n_questions > WIDE_GROUP_FROM and self.group < WIDE_GROUP:
             return WIDE_GROUP
         return None
+
+    def _ask_interleaved(self, context: str, questions: list[Question], group: int | None) -> Result:
+        """`ask()`'s S4c path: the context and the first branch group through one layer-interleaved pass
+        (`interleave.read_and_branch`) instead of a separate `open_context` read and `_branch` pass. See that
+        module's docstring for what is fused and why, and `RUN-fp8spd.md` for the `torch.equal` and interleaved
+        speed measurements this went through before `interleaved_fork=True` was wired in here.
+
+        A second (or further) group of questions -- more than `group` of them -- runs through `self._branch`,
+        unmodified, from the `Prefill` the interleaved pass returns; see `interleave.read_and_branch`'s own
+        docstring for why that `Prefill`'s snapshot is interchangeable with one `_read` would have taken.
+
+        Admission is not updated from this path's own peak (unlike `_answer`'s `_observe_peak` and
+        `open_context`'s `_observe_reading`): the peak this pass reaches is the context's read and the first
+        branch group's answer at once, which is not the shape either of those two counters means to describe,
+        and feeding it to either would mis-calibrate admission for the ordinary two-pass path too. `_check_fits`
+        below still runs, from whatever either counter already holds -- this path does not admit anything the
+        two-pass path's own figures would have refused, it just does not sharpen them.
+        """
+        if not context.strip():
+            raise PrismyraError("a context cannot be empty")
+        encoded = encode(context, None, None, self.processor, self.tokenizer, self.device)
+        self._check_fits(encoded.tokens)
+        effective_group = group or self.group
+        plans = [plan(q, self.tokenizer) for q in questions]
+        token_ids = [p.token_ids for p in plans]
+        width = self._width_for(plans)
+        groups = self._packed_groups(plans, width, group=effective_group)
+        first_members, first_width = groups[0]
+        first_texts = [plans[i].text for i in first_members]
+        first_padded = _round_rows(len(first_members), effective_group)
+
+        start = _now(self.torch_device)
+        with self._lock, torch.inference_mode():
+            try:
+                by_index: dict[int, torch.Tensor] = {}
+                hidden0, prefill = interleave.read_and_branch(
+                    self, encoded, first_texts, width=first_width, group=effective_group, padded_rows=first_padded
+                )
+                scored0 = self.heads.apply(
+                    hidden0,
+                    [questions[i].options for i in first_members],
+                    score(hidden0, self.unembedding, [token_ids[i] for i in first_members], None),
+                )
+                by_index.update(zip(first_members, scored0, strict=True))
+                for n, (members, group_width) in enumerate(groups[1:], start=1):
+                    chunk = [plans[i].text for i in members]
+                    padded = _round_rows(len(members), prefill.group or self.group)
+                    same_shape_left = sum(
+                        1
+                        for m, w in groups[n + 1 :]
+                        if _round_rows(len(m), prefill.group or self.group) == padded and w == group_width
+                    )
+                    hidden = self._branch(prefill, chunk, len(chunk), group_width, remaining=same_shape_left)
+                    scored = self.heads.apply(
+                        hidden,
+                        [questions[i].options for i in members],
+                        score(hidden, self.unembedding, [token_ids[i] for i in members], None),
+                    )
+                    by_index.update(zip(members, scored, strict=True))
+                probabilities = [by_index[i] for i in range(len(questions))]
+            except torch.OutOfMemoryError as e:
+                raise PrismyraError(
+                    f"ran out of memory answering {len(questions)} questions about {encoded.tokens} context "
+                    f"tokens at group={effective_group} (interleaved_fork). Ask fewer questions at a time, or "
+                    f"build the engine with a smaller group; the context itself is held once and is not what "
+                    f"grew."
+                ) from e
+        readout_ms = _since(start, self.torch_device)
+
+        answers = {
+            q.id: _answer_for(q, p.tolist(), self.heads.name_for(q.options))
+            for q, p in zip(questions, probabilities, strict=True)
+        }
+        return Result(
+            answers=answers,
+            model=self.model_name,
+            context_tokens=encoded.tokens,
+            scoring="raw",
+            timing=Timing(context_ms=0.0, readout_ms=readout_ms),
+        )
 
     def _ask_in_one_pass(self, context: str, question: Question) -> Result:
         """The context and the question as one sequence, read once, answered at its last position.
