@@ -126,12 +126,23 @@ class FusedExpertsFp4(nn.Module):
             del block.experts
 
 
+    def _route(self, x: torch.Tensor) -> torch.Tensor:
+        # `self.gate` is `Qwen3_5MoeTopKRouter`: its forward is `F.linear(x, self.weight)` followed by a softmax, a
+        # `torch.topk` (the plain, un-fused `at::native::sbtopk::gatherTopK`) and a renormalisation -- then it returns
+        # the logits alongside the weights/ids it just computed. Calling it and keeping only the logits (as this did
+        # before) runs that softmax+topk+renormalisation once inside the module and discards it, then `fused_topk`
+        # below runs the identical softmax+topk+renormalisation a second time on a fused kernel: the gatherTopK call is
+        # that first, thrown-away pass (measured: 36 calls, ~4.13ms on a 36-layer read, one per layer). The router's own
+        # linear is the first line of that forward; calling just the linear and letting `fused_topk` do the rest once
+        # removes the duplicate, exactly as `kernels.qwen3_moe.FusedExperts._route` already does for the FP8 experts.
+        return torch.nn.functional.linear(x, self.gate.weight)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_topk
 
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
-        logits, _, _ = self.gate(x)
+        logits = self._route(x)
         weights, ids = fused_topk(x, logits, self.top_k, renormalize=True)[:2]
         out = self.routed(x, weights, ids)
         shared = torch.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
