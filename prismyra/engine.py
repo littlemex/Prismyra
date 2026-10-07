@@ -2243,6 +2243,15 @@ def _enable_batch_invariance() -> None:
 
     Kept only when the borrowed kernels this engine's batching depends on are actually in use (`paged` on CUDA): a
     joined-storage engine never shares a pass across documents, so it has nothing this buys.
+    2026-10-07 (inv, SYNTHESIS 0-2/0-3): the early return below used to leave sm_120 (RTX PRO 4500, the only card
+    `nvfp4-36l` serves on) with *no* process-wide protection at all -- not even vLLM's own fallback for
+    non-SM80 CUDA. Reading `vllm.model_executor.layers.batch_invariant.enable_batch_invariant_mode` (the function
+    this one was written to narrow, not to replace) shows it has an explicit branch for exactly this case: "Hopper
+    (SM90) and Blackwell (SM100): the only source of batch variance is split-k, which we disable via the cuBLAS
+    workspace config" (`CUBLAS_WORKSPACE_CONFIG`/`CUBLASLT_WORKSPACE_SIZE`). This function's own `else: return`
+    dropped that branch by omission, not by measurement -- there is no comment or diag log claiming it was tried
+    and found insufficient on sm_120, only the comment that it "was not measured here". `audit_sm120.py` (this
+    branch) is the first time it has been.
     """
     import os
 
@@ -2259,23 +2268,36 @@ def _enable_batch_invariance() -> None:
     # pass's row count M, independent of anything registered on the dispatcher below.
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
-    if not current_platform.is_cuda() or not current_platform.is_device_capability_family(80):
-        # The SM80-family (Ampere/Ada/Hopper-adjacent) Triton persistent matmul is what this was measured against
-        # (L40S, SM89). A different family's registration (vLLM's own `enable_batch_invariant_mode` has an SM90/
-        # Blackwell branch that only pins the cuBLAS workspace config) was not measured here; fall back to the
-        # router+tiling fix alone rather than assume it carries over.
+    if not current_platform.is_cuda():
         return
 
-    lib = torch.library.Library("aten", "IMPL")
-    key = current_platform.dispatch_key
-    lib.impl("aten::mm", mm_batch_invariant, key)
-    lib.impl("aten::addmm", addmm_batch_invariant, key)
-    lib.impl("aten::matmul", matmul_batch_invariant, key)
-    lib.impl("aten::linear", linear_batch_invariant, key)
-    # Kept alive for the process's lifetime (matching `enable_batch_invariant_mode`'s own module-level singleton):
-    # letting it be garbage-collected would un-register the dispatcher entries it just installed.
-    global _BATCH_INVARIANT_DISPATCH_LIB
-    _BATCH_INVARIANT_DISPATCH_LIB = lib
+    if current_platform.is_device_capability_family(80):
+        # The SM80-family (Ampere/Ada/Hopper-adjacent) Triton persistent matmul is what this was measured against
+        # (L40S, SM89).
+        lib = torch.library.Library("aten", "IMPL")
+        key = current_platform.dispatch_key
+        lib.impl("aten::mm", mm_batch_invariant, key)
+        lib.impl("aten::addmm", addmm_batch_invariant, key)
+        lib.impl("aten::matmul", matmul_batch_invariant, key)
+        lib.impl("aten::linear", linear_batch_invariant, key)
+        # Kept alive for the process's lifetime (matching `enable_batch_invariant_mode`'s own module-level
+        # singleton): letting it be garbage-collected would un-register the dispatcher entries it just installed.
+        global _BATCH_INVARIANT_DISPATCH_LIB
+        _BATCH_INVARIANT_DISPATCH_LIB = lib
+        return
+
+    # Every other CUDA family, including sm_120 (RTX PRO 4500, Blackwell "Server Edition"): vLLM's own fallback
+    # for Hopper/Blackwell. cuBLAS's split-K reduction is the row-count-dependent step on these cards (no Triton
+    # override needed); pinning the workspace size to the single-K-split layout removes split-K as a choice at
+    # all, which is cheaper to verify than "which of several row-counts picked split-K" and is vLLM's own answer
+    # for this family, not a guess made for this project.
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
+    # Cheap on every card this project measured (`diag_isolate_invariance_lever_combined.py`); kept here too since
+    # this family has no dispatcher override to fall back on if either flag alone turns out insufficient.
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    torch.backends.cuda.preferred_blas_library(backend="cublaslt")
 
 
 _BATCH_INVARIANT_DISPATCH_LIB = None
