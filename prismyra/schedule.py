@@ -53,6 +53,7 @@ from typing import Any
 
 import torch
 
+from .engine import _round_rows
 from .queue import Job, QueueFull, Worker, WorkerStopped
 from .schema import PrismyraError, Question, Result
 
@@ -251,6 +252,11 @@ class Batcher:
         #: total -- so a q/s measurement that shows little effect can be told apart from one where the path
         #: rarely engages at all. See `RUN-fp8spd.md` round 5.
         self._fused_single_passes = 0
+        #: fp8spd6 (round 7): how many passes took the generalised fused path -- every document in the pass
+        #: fresh, two or more of them -- out of the same `_total_passes` denominator above. See
+        #: `RUN-fp8spd.md` round 7, "本題": this is what raises the single-document path's own 10.4% fusion
+        #: rate under congestion, where a pass's companions are themselves almost always fresh documents too.
+        self._fused_many_passes = 0
         self._total_passes = 0
         self._empty_cache_calls = 0
         self._empty_cache_ms = 0.0
@@ -417,6 +423,53 @@ class Batcher:
             self._clock += 1
             self.reads.append(1)
             return [result]
+
+        # fp8spd6 (round 7): the generalised case -- every document this pass names is fresh, two or more of
+        # them, none already resident -- fuses the same way, through `interleave.read_and_branch_shelf_many`
+        # instead of one document at a time. `len(fresh) == len(formed.jobs)` is what the single-document
+        # branch above's own `len(fresh) == 1 and len(formed.jobs) == 1` generalises to: `fresh` already
+        # de-duplicates by digest, so this many fresh digests for this many jobs means no two jobs name the
+        # same document and none is resident -- a pass naming a resident document, or two jobs for the same
+        # still-fresh document, falls through to the two-step path below unchanged, same as before. See
+        # `RUN-fp8spd.md` round 7, "本題", for why this -- not loosening the single-document condition's own
+        # exact-match -- is what the round-6 10.4%-fusion-rate finding under congestion needed.
+        #
+        # `padded_total <= self.engine.group`, checked **before** taking this path: `form()`'s own admission
+        # (`Formed.questions`) bounds the *raw* question count a pass carries to `self.limits.questions`, not
+        # the *padded* one -- and `interleave.read_and_branch_shelf_many` rounds each document's own branch
+        # rows independently (this function's own docstring says why: rounding the combined total once, the
+        # way the non-interleaved `_branch_across` does, is the exact design RUN-inv.md round 3 traced a
+        # cross-document residual to). Independent rounding means the *sum* of several documents' own rounded
+        # counts is no longer bounded by `cap` the way one document's own `_round_rows(count, cap) <= cap`
+        # always is -- found on real hardware (RUN-fp8spd.md round 7): three fresh documents in one pass with
+        # a combined raw count of 32 rounded, independently, to a combined 44 and crashed the pool
+        # ("44 rows asked for and this pool holds 32") rather than disagreeing on an answer. A pass whose
+        # padded total does not fit falls through to the two-step path below, unchanged -- not a smaller
+        # version of this one, the same safe path every pass took before this round.
+        padded_total = sum(_round_rows(len(job.payload.questions), self.engine.group) for job in formed.jobs)
+        if (
+            self.engine.interleaved_fork
+            and len(fresh) == len(formed.jobs)
+            and len(fresh) >= 2
+            and padded_total <= self.engine.group
+        ):
+            self._fused_many_passes += 1
+            jobs = formed.jobs
+            self._make_room(jobs, keep={job.payload.digest for job in jobs})
+            triples = self.engine._shelf_ask_interleaved_many(
+                shelf, [job.payload.context for job in jobs], [list(job.payload.questions) for job in jobs]
+            )
+            results = []
+            for job, (result, handle, shelved) in zip(jobs, triples, strict=True):
+                self._resident[job.payload.digest] = handle
+                self._digest_of[handle] = job.payload.digest
+                shelf.documents[handle] = shelved
+                self._slot_bytes = max(self._slot_bytes, shelved.snapshot_bytes)
+                self._used[handle] = self._clock
+                self._clock += 1
+                results.append(result)
+            self.reads.append(len(jobs))
+            return results
 
         if fresh:
             jobs = list(fresh.values())
@@ -612,6 +665,7 @@ class Batcher:
             "empty_cache_calls": self._empty_cache_calls,
             "empty_cache_ms": round(self._empty_cache_ms, 1),
             "fused_single_passes": self._fused_single_passes,
+            "fused_many_passes": self._fused_many_passes,
             "total_passes": self._total_passes,
         }
 
