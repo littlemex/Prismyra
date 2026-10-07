@@ -136,6 +136,14 @@ class FusedExperts(nn.Module):
 
 
 # --------------------------------------------------------------------------- dense projections
+#: fp8spd (S3 / SYNTHESIS.md P4b), round 3: an earlier version of this file carried its own duplicate-and-override
+#: wrapper around `w8a8_triton_block_scaled_mm` to use per-M-bucket configs. Removed in favour of
+#: `kernels.fp8_tuning` (adopted from fp4spd's `feat/fp4spd-nvfp4-speed`, RUN-fp8spd.md round 3): that module ships
+#: the tuned per-row-count tables as JSON files in vLLM's *own* format and installs them into vLLM's *own* configs
+#: directory, so `w8a8_triton_block_scaled_mm` picks them up through its existing, unmodified lookup
+#: (`get_w8a8_block_fp8_configs`) -- no duplicated kernel-call code to keep in sync with vLLM's own, and every other
+#: caller of that function (not just `Fp8Linear`) benefits too. See `kernels/fp8_tuning.py` and
+#: `kernels/pinned/fp8_block_configs/*.json`.
 class Fp8Linear(nn.Module):
     """A block-quantised projection on a faster kernel, wrapping the original module's weights."""
 
