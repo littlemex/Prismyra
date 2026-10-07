@@ -58,6 +58,14 @@ class Prefill:
     room: int | None = None
     position_from: int = 0
     snapshot: dict | None = field(default=None, repr=False)
+    #: The branch-row capacity this document's own fork buffers were allocated at. `None` means "whatever the
+    #: engine's own `self.group` was when this was read" -- the historical, single behaviour every call site before
+    #: this field existed. Set explicitly (fp8spd, S4a / SYNTHESIS.md) when a document is read for a request already
+    #: known to need more than one `group`-worth of rows, so its *own* fork buffers are sized for that from the read
+    #: onward instead of being capped at the engine's construction-time default and silently truncating a wider
+    #: branch pass. Per-document (the buffers it names live on this document's own cache's layers, see `_owned`), so
+    #: this never changes what any other concurrently-held document pays.
+    group: int | None = None
 
 
 def snapshot(cache) -> dict:

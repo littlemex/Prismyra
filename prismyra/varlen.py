@@ -133,6 +133,34 @@ def current() -> Boundaries | None:
     return getattr(_local, "current", None)
 
 
+def in_branch() -> bool:
+    """Whether the pass in progress on *this thread* is a branch pass (fp8spd, S4b / SYNTHESIS.md P4).
+
+    A branch ends at the answer token: nothing downstream of it ever reads the recurrent or convolution state it
+    leaves the gated-delta-net layers in, because the next thing that touches this document's cache is always
+    another `fork()`, which restores every layer's state from `Prefill.snapshot` before running anything -- the
+    branch's own ending state is overwritten, unread, every time. `kernels.qwen3_moe._delta_wrapper` reads this to
+    tell the borrowed kernel `output_final_state=False` on exactly this path, skipping a write nothing uses. See
+    `branching()` for who sets it.
+    """
+    return getattr(_local, "branch", False)
+
+
+@contextmanager
+def branching():
+    """Declare that the pass inside this block, on this thread, is a branch pass. See `in_branch()`.
+
+    Thread-local for the same reason `reading()` is: lane=2 runs one pass per lane concurrently, each on its own
+    worker thread, and a plain global would let one lane's branch flag leak into another's context read.
+    """
+    previous = getattr(_local, "branch", False)
+    _local.branch = True
+    try:
+        yield
+    finally:
+        _local.branch = previous
+
+
 @contextmanager
 def reading(lengths: list[int], device: str | torch.device):
     """Declare that the pass inside this block, on this thread, carries these documents, in this order.

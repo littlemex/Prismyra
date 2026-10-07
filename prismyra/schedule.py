@@ -246,6 +246,9 @@ class Batcher:
         #: Monotonic deadline before `_make_room` tries `empty_cache()` again, once an attempt has already left
         #: free memory at or below `SHELF_MEMORY_MARGIN`. See `RECLAIM_COOLDOWN_S`.
         self._reclaim_cooldown_until = 0.0
+        #: fp8spd (S5 / SYNTHESIS.md): measurement only, see `engine.Prismyra._empty_cache_calls`.
+        self._empty_cache_calls = 0
+        self._empty_cache_ms = 0.0
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> Batcher:
@@ -469,11 +472,24 @@ class Batcher:
                 now = time.perf_counter()
                 if not fits_memory and not tried_reclaim and now >= self._reclaim_cooldown_until:
                     tried_reclaim = True
-                    torch.cuda.empty_cache()
-                    free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
-                    fits_memory = free - incoming_snapshot > SHELF_MEMORY_MARGIN
-                    if not fits_memory:
-                        self._reclaim_cooldown_until = now + RECLAIM_COOLDOWN_S
+                    # fp8spd (S5 / SYNTHESIS.md): same fix as `engine._run_recorded`'s GRAPH_MEMORY_MARGIN check
+                    # -- only pay for the call when PyTorch's own `reserved - allocated` slack does not already
+                    # cover the margin by itself. See that check's comment for why a cached-but-unallocated block
+                    # does not need the driver's memory back to serve the next allocation.
+                    allocated = torch.cuda.memory_allocated(self.engine.torch_device)
+                    reserved = torch.cuda.memory_reserved(self.engine.torch_device)
+                    cached_slack = max(0, reserved - allocated)
+                    if free - incoming_snapshot + cached_slack > SHELF_MEMORY_MARGIN:
+                        fits_memory = True
+                    else:
+                        started = time.perf_counter()
+                        torch.cuda.empty_cache()
+                        self._empty_cache_calls += 1
+                        self._empty_cache_ms += (time.perf_counter() - started) * 1e3
+                        free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
+                        fits_memory = free - incoming_snapshot > SHELF_MEMORY_MARGIN
+                        if not fits_memory:
+                            self._reclaim_cooldown_until = now + RECLAIM_COOLDOWN_S
             if fits_tokens and fits_memory and fits_count:
                 return
             oldest = min(
@@ -552,6 +568,8 @@ class Batcher:
             "documents_answered_without_reading": answered - sum(self.reads),
             "resident": len(self._resident),
             "queue": self._worker.stats(),
+            "empty_cache_calls": self._empty_cache_calls,
+            "empty_cache_ms": round(self._empty_cache_ms, 1),
         }
 
 

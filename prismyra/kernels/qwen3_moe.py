@@ -472,6 +472,22 @@ def _delta_wrapper(kernel, original):
             # state per document**, which is exactly the per-document state a fork needs -- so the thing that makes a
             # batched read possible and the thing that makes it useful are the same argument.
             passed["cu_seqlens"] = boundaries.offsets
+        # fp8spd (S4b / SYNTHESIS.md P4), tried and NOT adopted: forcing `output_final_state=False` here for a
+        # branch pass (`varlen.in_branch()`) is the kernel-level half of what P4 proposed, and it is exactly what
+        # the borrowed kernel's own signature supports. It does not work as a kernel-only change: the framework's
+        # `Qwen3_5MoeLinearAttention.forward` (`modeling_qwen3_5_moe.py`, not something this module patches)
+        # unconditionally calls `cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)` after
+        # every forward with a cache, and `cache_utils.py`'s own `update_recurrent_state` does
+        # `self.recurrent_states[state_idx].copy_(recurrent_states)` -- an **in-place** copy with no guard for
+        # `None`. `output_final_state=False` makes the kernel return `None` for that argument (see
+        # `torch_chunk_gated_delta_rule`'s own `if not output_final_state: last_recurrent_state = None`), so this
+        # crashes every branch pass with `TypeError: copy_(): argument 'other' ... must be Tensor, not NoneType`
+        # (reproduced on real hardware, RUN-fp8spd.md). Making this safe needs a second patch at the
+        # `Qwen3_5MoeLinearAttention.forward` or `Cache.update_recurrent_state` level to skip the copy when given
+        # `None` -- a monkeypatch of framework code one layer higher than any kernel swap this module makes
+        # elsewhere, and risky to get right without also touching the context-read path, which needs this write.
+        # Left out of this change; `varlen.in_branch()` stays (harmless, no caller yet) for whoever picks this
+        # back up with that second patch in scope.
         return kernel(query, key, value, g=g, beta=beta, **passed)
 
     call.replaced = original
