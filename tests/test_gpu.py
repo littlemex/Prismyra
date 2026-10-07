@@ -292,7 +292,11 @@ def test_the_counted_kernels_match_what_the_config_implies(engine):
     assert got == {k: v for k, v in want.items() if k in got}
 
     verified = {s.name for s in engine.applied.swaps if s.verified}
-    assert verified == {"norm", "dense_matmul", "gated_norm"}, engine.applied.as_dict()
+    # 2026-10-07 (integ, merging fp4spd): fp4spd's dense-projection fusion (`_fuse_pair`,
+    # prismyra/kernels/qwen3_moe.py) is found and verified by structure, the same way `norm`/`dense_matmul`/
+    # `gated_norm` already are -- this set was not updated when that swap was added (reproduced on fp4spd's own
+    # branch standalone, before any merge, so it is that branch's own gap, not something the merge introduced).
+    assert verified == {"norm", "dense_matmul", "gated_norm", "dense_fusion"}, engine.applied.as_dict()
 
 
 # --------------------------------------------------------------------------- the convolution on its own
