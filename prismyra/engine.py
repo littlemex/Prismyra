@@ -64,6 +64,21 @@ PACK_ALIGN = 8
 WIDE_GROUP_FROM = 32
 WIDE_GROUP = 64
 
+#: fp8spd4 (S4c round5 follow-up, RUN-fp8spd.md "座長指示: 64問の2つ目の枝グループも層交互の経路に乗せる"):
+#: widening to `WIDE_GROUP` for `interleaved_fork` costs 36 layers' worth of wider GDN state buffers, paid once
+#: whatever the context holds; it is worth it only while the restream it removes is still the larger of the two.
+#: An alternating length sweep on L40S, fp8-36l, 64 questions (`tools/s4c_64q_length_sweep.py`) found the sign
+#: flip between 7,068 context tokens (-4.06% vs the two-pass baseline, widening still wins) and 9,044 (+0.95%,
+#: widening now loses) -- a linear interpolation puts the crossing at about 8,669 tokens. This constant sits
+#: below the measured losing point with a margin, not at the interpolated crossing itself, because the sweep's
+#: own two neighbouring points already bracket it to within ~2,000 tokens and this only needs to stay on the
+#: winning side of that bracket, not pinpoint it exactly. A context this long or longer keeps using the
+#: non-widened interleaved path instead of falling all the way back to two-pass: that path never regressed at
+#: any length this round tested, including 20,064 tokens (`tools/s4c_16q_length_check.py`, -3.19%) and is what
+#: fp8spd3's own round5 measured for 64 non-widened questions at long context (-0.7%) -- strictly better than
+#: paying the widening's cost and strictly better than giving up the fusion altogether.
+INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT = 8192
+
 #: How much more than the model predicts a branch pass is budgeted at. An allocator's peak is blocks rounded up and
 #: reused rather than a sum of tensor sizes, and the prediction is two terms answering to a handful of measurements.
 #: One number in one place, so there is one thing to argue with.
@@ -832,18 +847,17 @@ class Prismyra:
             # own (still off-by-default) setting. torch.equal-gated against the two-32-row-group path before
             # being wired in here -- see RUN-fp8spd.md round 5.
             #
-            # **Known regression at long contexts, not yet guarded here.** Measured bit-identical at both
-            # lengths, but the interleaved round-robin (RUN-fp8spd.md round 5) found this wins on a ~5,016-token
-            # document (-9.6% vs the two-pass baseline) and *loses* on a ~20,064-token one (+6.0%, slower than
-            # even the two-32-row-group fused path at +6.8%) -- widening every one of 36 layers' GDN state
-            # buffers to 64 rows costs more than fusing the second group saves once the context itself, not the
-            # restream, dominates a pass. This override does not look at `encoded.tokens` to decide, so a caller
-            # with `interleaved_fork=True` and long documents pays this regression unconditionally at 64
-            # questions. A context-length-aware threshold is the next step, not attempted this round.
-            interleaved_group = group
-            if len(questions) == WIDE_GROUP and self.group < WIDE_GROUP:
-                interleaved_group = WIDE_GROUP
-            return self._ask_interleaved(context, questions, interleaved_group)
+            # fp8spd4: widening every one of 36 layers' GDN state buffers to 64 rows costs more than fusing the
+            # second group saves once the context itself, not the restream, dominates a pass -- round5 measured
+            # this as a win at ~5,016 tokens (-9.6%) and a loss at ~20,064 (+6.0%). `_ask_interleaved` now
+            # decides whether to widen *after* it has `encoded.tokens` (`INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT`,
+            # measured crossover ~8,669 tokens), rather than this call site guessing blind before the context is
+            # even tokenized. A caller that asks 64 questions about a long document still gets the fused path --
+            # just at `self.group` (32) rather than widened to 64 -- because the non-widened fused path never
+            # regressed at any length this round tested (`tools/s4c_16q_length_check.py`, down to -3.19% at
+            # 20,064 tokens; fp8spd3 round5's own 64-question non-widened measurement: -0.7% at long context),
+            # which is strictly better than falling all the way back to the two-pass baseline.
+            return self._ask_interleaved(context, questions, group)
         with self._lock, self.open_context(context, images=images, videos=videos, group=group) as opened:
             assert opened._prefill is not None
             answered = self._answer(opened._prefill, questions, opened.tokens, context_ms=opened.context_ms)
@@ -872,6 +886,17 @@ class Prismyra:
         unmodified, from the `Prefill` the interleaved pass returns; see `interleave.read_and_branch`'s own
         docstring for why that `Prefill`'s snapshot is interchangeable with one `_read` would have taken.
 
+        **The exactly-64-questions widen decision is made here, not at the call site** (fp8spd4), because only
+        here is `encoded.tokens` known without tokenizing the context twice. See
+        `INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT`'s own comment for the length sweep this threshold comes from and why
+        a long document keeps the (never-regressed) non-widened fused path at `self.group` instead of losing the
+        fusion altogether. This only ever widens past what `group` (`self.wide_group`'s own, separately-gated
+        33-64 mechanism, still off by default) already asked for -- a caller running both `wide_group` and
+        `interleaved_fork` together already gets 64 from `group` itself before this method is reached, and nothing
+        here narrows that back down; this round's length guard is scoped to the width `interleaved_fork` decides
+        on its own, not to the two features used together, a combination neither this round nor S4a's own gate
+        has measured.
+
         Admission is not updated from this path's own peak (unlike `_answer`'s `_observe_peak` and
         `open_context`'s `_observe_reading`): the peak this pass reaches is the context's read and the first
         branch group's answer at once, which is not the shape either of those two counters means to describe,
@@ -884,6 +909,12 @@ class Prismyra:
         encoded = encode(context, None, None, self.processor, self.tokenizer, self.device)
         self._check_fits(encoded.tokens)
         effective_group = group or self.group
+        if (
+            len(questions) == WIDE_GROUP
+            and effective_group < WIDE_GROUP
+            and encoded.tokens < INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT
+        ):
+            effective_group = WIDE_GROUP
         plans = [plan(q, self.tokenizer) for q in questions]
         token_ids = [p.token_ids for p in plans]
         width = self._width_for(plans)
@@ -2114,19 +2145,24 @@ class Prismyra:
         if self.torch_device.type == "cuda" and free <= GRAPH_MEMORY_MARGIN:
             now = time.monotonic()
             if now >= self._reclaim_cooldown_until:
-                # fp8spd (S5 / SYNTHESIS.md): measured first, instrumented-but-unfixed (RUN-fp8spd.md step 0),
-                # then fixed below -- the call is only worth paying for when PyTorch's own cached-but-unallocated
-                # blocks (`reserved - allocated`) do not *already* cover the margin on their own. When they do,
-                # the next allocation this engine makes is served from that cache directly (PyTorch's allocator
-                # always checks its own pool before asking the driver for more), so returning it to the driver
-                # and immediately asking the driver for it back is pure overhead -- the 2-4% this margin's own
-                # docstring already measured and accepted as the correctness fix's cost. `empty_cache()` is still
-                # exactly what the comment above describes when the slack genuinely is not there.
+                # fp8spd4 (correcting fp8spd3's S5 / SYNTHESIS.md): the previous version of this check predicted
+                # that `empty_cache()` would raise `mem_get_info`'s free number by `reserved - allocated` and
+                # added that prediction straight into `free`, without ever calling `empty_cache()` or re-reading
+                # `mem_get_info` to confirm it actually moved. `prismyra/schedule.py`'s `_make_room` carried the
+                # identical "same fix" (this comment used to say so) and integ's bisection (RUN-integ.md 2.5)
+                # found it broke `tests/test_gpu.py::test_a_shelf_evicts_on_memory_pressure_even_with_tokens_
+                # to_spare` -- a case where the externally reported free number is genuinely tight for a reason
+                # this process's own allocator slack does not explain, exactly the scenario this margin exists
+                # to catch (see this check's own comment above, "97 documents... exhausted a 44 GiB card"). No
+                # test exercises this copy the same way, but the reasoning is identical, so the same correction
+                # applies here: `cached_slack == 0` is the one case the prediction can never be wrong about
+                # (nothing cached to give back, so the call could not help and skipping it is a true no-op);
+                # every other case now calls `empty_cache()` and re-reads the real number, as it did before S5.
                 allocated = torch.cuda.memory_allocated(self.torch_device)
                 reserved = torch.cuda.memory_reserved(self.torch_device)
                 cached_slack = max(0, reserved - allocated)
-                if free + cached_slack > GRAPH_MEMORY_MARGIN:
-                    free += cached_slack
+                if cached_slack == 0:
+                    pass
                 else:
                     started = time.perf_counter()
                     torch.cuda.empty_cache()

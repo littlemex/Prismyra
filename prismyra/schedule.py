@@ -499,15 +499,29 @@ class Batcher:
                 now = time.perf_counter()
                 if not fits_memory and not tried_reclaim and now >= self._reclaim_cooldown_until:
                     tried_reclaim = True
-                    # fp8spd (S5 / SYNTHESIS.md): same fix as `engine._run_recorded`'s GRAPH_MEMORY_MARGIN check
-                    # -- only pay for the call when PyTorch's own `reserved - allocated` slack does not already
-                    # cover the margin by itself. See that check's comment for why a cached-but-unallocated block
-                    # does not need the driver's memory back to serve the next allocation.
+                    # fp8spd4 (correcting fp8spd3's S5 / SYNTHESIS.md): the previous version of this check
+                    # *predicted* that `empty_cache()` would raise `mem_get_info`'s free number by
+                    # `reserved - allocated` and set `fits_memory = True` on that prediction alone, without
+                    # calling `empty_cache()` or re-reading `mem_get_info` to confirm it. integ's bisection
+                    # (RUN-integ.md 2.5) found this broke `test_a_shelf_evicts_on_memory_pressure_even_with_
+                    # tokens_to_spare`: that test monkeypatches `mem_get_info` to report a free number pinned
+                    # below the margin regardless of what this process's allocator does, which is exactly the
+                    # case the module docstring's own history (`SHELF_MAX_RESIDENTS`'s "97 documents... exhausted
+                    # a 44 GiB card") this check exists to catch -- an externally (OS/driver) reported shortage
+                    # that this process's own `reserved - allocated` slack does not explain and could not fix.
+                    # The fix keeps the one case the prediction is *never* wrong about -- `cached_slack == 0`,
+                    # nothing cached-but-unused to give back, so the call could not possibly help and skipping
+                    # it is a true no-op -- and calls `empty_cache()` and re-reads the real `mem_get_info` for
+                    # every other case, the same as before S5 existed. DOSSIER.md's own recorded decision
+                    # ("`empty_cache()`の呼び出しはmargin checkの正しさに必要で、そのコストは意図して受け入れた")
+                    # is what this restores; S5's round1/round5 own measurements never established the skip's
+                    # real-world savings against a baseline (RUN-fp8spd.md), so there is nothing demonstrated to
+                    # trade the correctness back for.
                     allocated = torch.cuda.memory_allocated(self.engine.torch_device)
                     reserved = torch.cuda.memory_reserved(self.engine.torch_device)
                     cached_slack = max(0, reserved - allocated)
-                    if free - incoming_snapshot + cached_slack > SHELF_MEMORY_MARGIN:
-                        fits_memory = True
+                    if cached_slack == 0:
+                        pass
                     else:
                         started = time.perf_counter()
                         torch.cuda.empty_cache()
