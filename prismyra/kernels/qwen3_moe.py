@@ -472,22 +472,15 @@ def _delta_wrapper(kernel, original):
             # state per document**, which is exactly the per-document state a fork needs -- so the thing that makes a
             # batched read possible and the thing that makes it useful are the same argument.
             passed["cu_seqlens"] = boundaries.offsets
-        # fp8spd (S4b / SYNTHESIS.md P4), tried and NOT adopted: forcing `output_final_state=False` here for a
-        # branch pass (`varlen.in_branch()`) is the kernel-level half of what P4 proposed, and it is exactly what
-        # the borrowed kernel's own signature supports. It does not work as a kernel-only change: the framework's
-        # `Qwen3_5MoeLinearAttention.forward` (`modeling_qwen3_5_moe.py`, not something this module patches)
-        # unconditionally calls `cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)` after
-        # every forward with a cache, and `cache_utils.py`'s own `update_recurrent_state` does
-        # `self.recurrent_states[state_idx].copy_(recurrent_states)` -- an **in-place** copy with no guard for
-        # `None`. `output_final_state=False` makes the kernel return `None` for that argument (see
-        # `torch_chunk_gated_delta_rule`'s own `if not output_final_state: last_recurrent_state = None`), so this
-        # crashes every branch pass with `TypeError: copy_(): argument 'other' ... must be Tensor, not NoneType`
-        # (reproduced on real hardware, RUN-fp8spd.md). Making this safe needs a second patch at the
-        # `Qwen3_5MoeLinearAttention.forward` or `Cache.update_recurrent_state` level to skip the copy when given
-        # `None` -- a monkeypatch of framework code one layer higher than any kernel swap this module makes
-        # elsewhere, and risky to get right without also touching the context-read path, which needs this write.
-        # Left out of this change; `varlen.in_branch()` stays (harmless, no caller yet) for whoever picks this
-        # back up with that second patch in scope.
+        # fp8spd (S4b / SYNTHESIS.md P4): a branch pass ends at the answer token, so no one ever reads the final
+        # state it would leave in `cache_params` -- `varlen.in_branch()`'s own docstring says why the next thing to
+        # touch this document's cache always overwrites it first (another `fork()`, which restores from
+        # `Prefill.snapshot`). `output_final_state=False` makes the borrowed kernel skip computing and returning
+        # that state. On its own this crashes (`_install_recurrent_state_none_guard`'s own docstring has the
+        # traceback and why), so this is only switched on once that second patch is installed, which it is,
+        # together with this one, by `_install_gated_delta_rule`.
+        if varlen.in_branch() and passed.get("output_final_state"):
+            passed["output_final_state"] = False
         return kernel(query, key, value, g=g, beta=beta, **passed)
 
     call.replaced = original
@@ -573,7 +566,53 @@ def _install_gated_delta_rule(decoder, device, verify: bool = True) -> tuple[int
         setattr(modeling, name, wrapper)
         installed += 1
     del torch
+    _install_recurrent_state_none_guard()
     return installed, None
+
+
+def _install_recurrent_state_none_guard() -> None:
+    """Let a branch pass skip the GDN final-state write it never reads back (fp8spd, S4b / SYNTHESIS.md P4).
+
+    `_delta_wrapper.call` tells the borrowed kernel `output_final_state=False` for a branch pass (`varlen.in_branch()`),
+    which makes the kernel return `None` for the state. Nothing in this module's own patches is downstream of that
+    return value, but the framework's own call site is: `Qwen3_5MoeLinearAttention.forward`
+    (`modeling_qwen3_5_moe.py`, not patched by this module) always calls
+    `cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)` once a cache is in use, and
+    `transformers.cache_utils.LinearAttentionLayer.update_recurrent_state` always did
+    `self.recurrent_states[state_idx].copy_(recurrent_states)` -- reproduced crashing on real hardware before this
+    patch existed:
+
+        TypeError: copy_(): argument 'other' (position 1) must be Tensor, not NoneType
+
+    The fix is one guard at that one call site: `None` means "nothing to write" (every reader of this project's own
+    `output_final_state=False` is a branch pass, and a branch's ending state is always overwritten by the next
+    `fork()` before anything else touches this document's cache -- see `varlen.in_branch()`), so the patched method
+    returns the state unchanged instead of copying into it. A context read never takes this path: it always asks
+    for `output_final_state=True` (`cache_params is not None`, true for every pass including branches, but only
+    branches are additionally told to decline it), so `recurrent_states` is never `None` there and the original
+    `copy_` runs exactly as before -- this guard changes nothing for reads.
+
+    Installed once per process, on the class (`LinearAttentionLayer` is shared by every layer instance), the same
+    module-wide trade `_install_gated_delta_rule` and the convolution replacement both already make.
+    """
+    import importlib
+
+    try:
+        cache_utils = importlib.import_module("transformers.cache_utils")
+    except ImportError:
+        return
+    layer_cls = getattr(cache_utils, "LinearAttentionLayer", None)
+    if layer_cls is None or getattr(layer_cls.update_recurrent_state, "_fp8spd_none_guard", False):
+        return
+    original = layer_cls.update_recurrent_state
+
+    def guarded(self, recurrent_states, state_idx: int = 0, **kwargs):
+        if recurrent_states is None:
+            return self.recurrent_states[state_idx]
+        return original(self, recurrent_states, state_idx, **kwargs)
+
+    guarded._fp8spd_none_guard = True
+    layer_cls.update_recurrent_state = guarded
 
 
 def _delta_disagreement(original, wrapper, decoder, device) -> float | None:
