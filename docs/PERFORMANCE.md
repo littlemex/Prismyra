@@ -454,33 +454,44 @@ closed:
   contributor measured. Registering vLLM's fixed-tile batch-invariant kernel on `aten::mm`/`addmm`/`matmul`/`linear`,
   and setting `fused_moe`'s own `VLLM_BATCH_INVARIANT` guard, took the same 80-document, 11-batch benchmark from 3
   mismatches to the 0 cited above.
-* **Context length and companion question count: two axes still open, each bounded rather than closed.** A context
-  read, solo or joint, is padded to the same length bucket a solo read already rounds to, which is why the 0-mismatch
-  benchmark above holds; but a solo document and an eight-document batch round to different buckets by construction,
-  and pairings that land in different buckets still disagree. Closing that needs every read, solo included, padded to
-  one shared length, which would cost a short solo read padding throughput it does not need, so the shared length stays
-  a workload-dependent setting rather than a fixed one. Separately, a companion carrying a different *question* count
-  (not context length) still moves a probability, because a solo pass and a batched pass round their row counts to
-  different buckets even after the fix above; `tests/test_gpu.py` bounds this at a twentieth of the existing
-  `COMPANION_MOVEMENT` tolerance the device tests already allow for a near-tie moving under batching (0.3), so at
-  most 0.015, and no decision has been observed to change.
+* **Context length and companion question count: both closed.** A context read, solo or joint, is padded to the same
+  length bucket a solo read already rounds to, which is why the 0-mismatch benchmark above holds across companion
+  counts. A companion carrying a different *question* count used to move a probability too, because a solo pass and a
+  batched pass rounded their row counts to different buckets; closing that needed the row-count padding fix above, not
+  a second one. `tools/audit_sm120.py` is the full-matrix check this rests on: every pairing of companion count ({1, 2,
+  3, 8} documents) and question count ({1, 2, 3, 31, 32, 33} per document) against the solo `ask()` ground truth, on
+  both supported cards -- **4,392 probability checks, 4,392 bit-exact, 0 decision flips, worst move 0.000000**. A few
+  individual fixtures in `tests/test_gpu.py` (`COMPANION_MOVEMENT_QN1_ATTENTION`, `COMPANION_MOVEMENT_ROW_COUNT`) still
+  carry small nonzero tolerances left over from before this matrix closed; they have not been retightened to match, so
+  treat them as not yet re-measured rather than as evidence either axis is still open.
+* **Which engine construction built the answer: closed.** Building two engines with different constructor flags
+  (`interleaved_fork`, `wide_group`, `paged`) used to answer a single, companion-free question differently, by up to
+  0.208 on the same card and document -- not from anything either flag computes, but because only one of them happened
+  to be the sole opt-in to a dispatcher registration that an un-pinned cuBLAS/cuBLASLt heuristic needed to stay
+  reproducible from one construction to the next. Every CUDA engine now claims that registration unconditionally,
+  regardless of which flags built it, which closes both the cross-flag gap and the weaker version of it a plain
+  restart used to show: three independent cold starts, each a fresh process with an empty Triton cache, answer the
+  same document and question bit-identically (`tests/test_gpu_cold_start.py`).
 
 This is a process-wide setting, not a per-request one: it registers a fixed-tile kernel on `aten::mm`, `addmm`,
 `matmul` and `linear` for the whole process, including any unrelated torch code sharing it, and that registration is
-what the whole guarantee above rests on. There is no toggle to turn it off -- it runs unconditionally for every paged
-engine on CUDA, guarded by vLLM's own `current_platform.is_device_capability_family(80)` check (this project measured
-it on an L40S, device-capability family 80). On a vLLM build that lacks the batch-invariant module, or on a device
-outside that family, the registration is skipped, a note to that effect is appended to
-`engine.stats()["kernels"]["notes"]`, and the MoE-router axis is not invariant.
+what the whole guarantee above rests on. It runs unconditionally for every CUDA engine this project builds, paged or
+not -- there is no supported way to turn it off. `PRISMYRA_INVARIANCE_SCOPE=narrow` skips it in favour of a handful of
+cheaper, targeted call-site fixes (the router projection and the recurrent gate projections); it exists as a
+diagnostic opt-in, not a default, because it is measurably **not** equivalent on Blackwell -- `audit_sm120.py` finds it
+non-exact on 150 of 4,392 checks there, against 0 for the default. On a vLLM build that lacks the batch-invariant
+module at all, construction falls back to the targeted fixes alone and appends a note saying so to
+`engine.stats()["kernels"]["notes"]`.
 
-Measured cost: a solo read's own throughput is within noise either way, with the registration present against a
-development build with it removed (19.2 against 18.6-18.7 questions/s), but a solo read's full put-ask-drop lifecycle
-rises from 224 to 247 ms (+10%), and
-`open_batch` throughput falls from 77.7 to 61.7 questions/s at group 32 (-20.6%) and from 90.2 to 70.3 at group 64
-(-22.1%) -- 21-22% either way, still 1.10-1.33x the vLLM saturated rate measured in
-[The ratio is a function, and the crossing is at twelve](#the-ratio-is-a-function-and-the-crossing-is-at-twelve)
-(48-50 questions/s there; 53-56 at the group and card this cost was measured on). This is the price of the guarantee
-above, not an unrelated regression: batch invariance is what the guarantee is made of, and this is what it costs.
+Measured cost: solo and `open_batch` throughput are both within noise of a build with the registration removed
+entirely -- a solo read's full put-ask-drop lifecycle moved -1.2% (271.981 against 275.351 ms, median of 15
+alternating runs), `open_batch` moved -0.6% at group 32 and -1.2% at group 64, all three under this project's own 5%
+bar for a measured difference. The figures this replaces (+10% solo, -20.6%/-22.1% on `open_batch`) measured a
+development build with *every* invariance mechanism removed, back when the dispatcher registration was the only one
+that existed; several call sites (the router, the two recurrent gate projections, the convolution) have since moved to
+cheap, targeted fixes of their own, so removing the dispatcher registration today no longer removes the guarantee,
+only this one layer of it -- which is why the cost of removing it alone is noise rather than the double-digit figure a
+previous release measured.
 
 ### Streaming many documents without running out of memory
 
@@ -536,6 +547,23 @@ bit-exact. **What is not yet measured is throughput at `lanes=2` or higher, or h
 independent shelves on one device** -- lanes are shown not to corrupt answers under real concurrency, not shown yet
 to raise questions served per second. Treat "concurrent lanes can raise how many requests are served" as the
 direction this is built for, not as a measured result.
+
+## Settings that change speed, not the answer
+
+Each row's **default** is bit-identical to the setting it replaced, verified on real hardware before shipping; where a
+row also has a faster, non-default alternative, that alternative is not bit-identical and stays opt-in until it clears
+this project's own accuracy-judgment gate.
+
+| setting | default | what it changes | is the default bit-exact against what it replaced | measured effect |
+|---|---|---|---|---|
+| `interleaved_fork` | `True` (this release; `False` before it) | `ask()` with more than one question fuses the context's read and the first branch group into one layer-interleaved pass instead of two separate ones | yes, both supported cards, every question count `ask()` routes differently (1, 2, 3, 16, 33, 64), two context lengths an order of magnitude apart (`tests/test_gpu.py::test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did`) | L40S: -15.2% at 16 questions, -9.6% at 64; RTX PRO 4500: -5.9% at 16, -1.3% at 64; no measurable change at 1 question on either card. `engine.open_batch()` itself is unaffected either way -- the flag only reaches `ask()`'s own multi-question path and `Batcher`'s multi-document fusion, not the direct batched-read API |
+| `PRISMYRA_WITHOUT=dense_fusion` | unset (fusion on) | three groups of same-input dense-FP8 calls (attention's q/k/v, the gated delta net's qkv/z, a shared expert's gate/up) run as one combined matmul below `FUSION_MAX_ROWS` (512) rows instead of several separate ones | yes, every group this project ships, both checkpoints (`engine.applied.verified["dense_fusion"]`) | 32-54% faster per group at branch width (16-32 rows); a wash to a measured loss at context width, which is why the fusion itself turns off above `FUSION_MAX_ROWS` rather than relying on this switch for that -- see [docs/KERNELS.md](KERNELS.md#notes-on-the-ones-with-a-catch) |
+| `PRISMYRA_INVARIANCE_SCOPE` | `global` | which call sites keep an answer from moving when who else shares a pass changes: `global` registers a fixed-tile kernel for every plain matmul in the process; the non-default `narrow` relies on a handful of targeted call-site fixes instead and skips that registration | the default (`global`) is -- `tools/audit_sm120.py`'s full matrix is 0 non-exact under it; the non-default `narrow` is **not** (150 of the same 4,392 checks non-exact on Blackwell), which is why it ships as a diagnostic opt-in rather than a faster default | `global` costs noise either way, both solo and `open_batch` (see [the measured cost above](#a-shelf-answers-like-ask)) -- `narrow` is for isolating which call site a residual comes from, not a speed setting to reach for |
+| `wide_group` | `False` | a document asked 33-63 questions gets one `WIDE_GROUP`-wide (64) branch pass instead of two `self.group`-wide (32) ones, for *every* request in that range, not only the exactly-64-question case `interleaved_fork` already handles on its own | the default (`False`, unchanged two-pass behaviour) is trivially exact; the non-default `True` is **not** -- found not bit-identical at 33 and 40 questions specifically (the row-count-dependent recurrent kernel sees a different shape once the smaller remainder is folded into one wide pass instead of padded on its own); the one width that divides evenly (64 = 32+32) happened to pass, which is not evidence the range does | not shipped as a default on the strength of being fast -- it stays off until it clears this project's accuracy-judgment gate (not yet attempted) rather than being enabled on cases measured bit-identical so far |
+
+`interleaved_fork`, `PRISMYRA_WITHOUT=dense_fusion` and `PRISMYRA_INVARIANCE_SCOPE` are independent switches; building
+an engine with more than one of them set to a non-default value is not itself a combination any of the measurements
+above exercised together.
 
 ### Open-loop arrival, and the one rate it still trails vLLM
 

@@ -68,16 +68,25 @@ What the entry's own comment describes -- `num_stages=4` winning at the branch's
 that fits every shape's shared memory -- is real, but it now happens one layer down, in `w8a8_triton_block_scaled_mm`
 (`prismyra/kernels/fp8_tuning.py` has the detail). That function is a plain `@triton.jit` kernel, not a
 `triton.autotune` one, so `autotune.py`'s pinning (above) never touches it; it looks up its tile size from a static,
-per-shape, per-row-count table that vLLM reads from inside its own installed package. The project's tuner
-(`/Users/akazawt/tmp/smr/next/spain/tune_fp8.py`) writes that table straight into the pip-installed path, so it is
-real on whichever pod ran it and **absent on every pod built since** -- a fresh pod silently falls back to one
-untuned tile for every row count (vLLM logs `Using default W8A8 Block FP8 kernel config` once per shape) until
-`fp8_tuning.install()` copies this project's own shipped copy (`pinned/fp8_block_configs/`) into place. `kernels.apply()`
-calls it before any dense FP8 matmul runs. Measured, RTX PRO 4500, this is worth 2.7-2.9% on top of the autotune pin
-above (276.1-277.2 ms against 283.6-285.2 ms over three interleaved pairs, 1-question read); the per-shape, per-row-
-count tile choice itself was checked `torch.equal` against the untuned fallback at all 70 (shape, row-count) cells
-this checkpoint uses before any file in `pinned/fp8_block_configs/` was kept, so this is purely a speed change, not an
-accuracy one.
+per-shape, per-row-count table that vLLM reads from inside its own installed package. This project's own tuning
+script writes that table straight into the pip-installed path, so it is real on whichever machine ran it and
+**absent on every machine built since** -- a fresh install silently falls back to one untuned tile for every row
+count (vLLM logs `Using default W8A8 Block FP8 kernel config` once per shape) until `fp8_tuning.install()` copies
+this project's own shipped copy (`pinned/fp8_block_configs/`) into place. `kernels.apply()` calls it before any dense
+FP8 matmul runs. Measured, RTX PRO 4500, this is worth 2.7-2.9% on top of the autotune pin above (276.1-277.2 ms
+against 283.6-285.2 ms over three interleaved pairs, 1-question read); the per-shape, per-row-count tile choice itself
+was checked `torch.equal` against the untuned fallback at all 70 (shape, row-count) cells this checkpoint uses before
+any file in `pinned/fp8_block_configs/` was kept, so this is purely a speed change, not an accuracy one.
+
+The dense-projection fusion below adds three shapes (N=9,216, 12,288 and 1,024, all K=2,048) that the table above did
+not have cells for, so a fresh install used to fall back to the same untuned tile for all three until a dedicated
+sweep (checked `torch.equal` against the untuned default before timing anything, not the other way around) found a
+matching candidate for every cell and added it to `pinned/fp8_block_configs/`. Done for the RTX PRO 4500 (sm_120)
+only; the L40S (sm_89) still runs these three shapes untuned. This project's own measurements show the fusion gaining
+less on an L40S than on an RTX PRO 4500 at context width (one checkpoint, three groups, alternating against
+`origin/main`: Spain -1.5% to -2.3% across widths, L40S a mix of a smaller gain and one measurement within noise) and
+suspects, but has not confirmed, that the untuned shapes above are why -- carried over once the same sweep is run on
+an L40S.
 
 ## What each replacement is worth
 
@@ -144,6 +153,19 @@ launches went with them.
 Both kernels sit the same distance from a float32 reference (2.58e-02 against 2.64e-02), and that distance is dominated by
 quantising the activations, not by either kernel -- so the swap is not a loss of accuracy, it is a different rounding.
 
+**Fusing the projections that share an input.** Three groups each call the same per-model dense-FP8 kernel more than
+once on the same input: attention's `q_proj`/`k_proj`/`v_proj`, the gated delta net's `in_proj_qkv`/`in_proj_z`, and a
+shared expert's `gate_proj`/`up_proj`. `_FusedDenseProjection` concatenates each group's weights and scales once at
+construction, quantises and runs one matmul instead of several, and splits the result back out -- verified
+bit-identical against the separate calls it replaces (`engine.applied.verified["dense_fusion"]`, checked on every
+group this checkpoint has, both checkpoints this project ships). The branch-width pass this helps (16-32 rows) is
+32-54% faster per group; the context-width pass (several thousand rows) is a wash for two of the three groups and a
+measured loss for the gated delta net's group, because the fused call's wider output picks a worse matmul tile than
+either separate call does on its own. Both shapes are bit-identical, so the fused path is used only below
+`FUSION_MAX_ROWS` rows (512, the branch width this project caps a pass at) and falls back to the original separate
+calls above it -- each slot decides this independently from its own input, with no coordination needed between the
+slots in a group. `PRISMYRA_WITHOUT=dense_fusion` disables it.
+
 ## Routed experts in NVFP4 (Blackwell only, optional)
 
 A second routed-expert path, `prismyra.kernels.nvfp4`, alongside the fused FP8 kernel above rather than replacing it:
@@ -167,15 +189,26 @@ the un-quantised FP8 checkpoint (−0.07 points on a 1,400-question set, 95% int
 ahead of the 32-layer checkpoint it would otherwise be compared against; that accuracy measurement predates this
 checkpoint's `prismyra-serve` integration and used a different serving path than the speed figures below.
 
-Speed, measured through `prismyra-serve` (median of 5 runs after 2 warm-up calls, one race-comprehension document of
-about 5,300 tokens, "N questions" meaning N questions asked about that document in one call), same card, with this
-project's own tuned FP8 kernel tables installed: one question in 279 ms against the 32-layer FP8 checkpoint's 268 ms,
-sixteen in 411 ms against 393 ms -- about 4% behind at both widths measured. The 32-layer FP8 checkpoint could not
-complete the sixty-four-question measurement at all on this card (it ran out of device memory; the NVFP4 checkpoint
-answered in 743 ms). The gap's leading suspect is the NVFP4 MoE kernel's own per-shape autotuning (`autotune_tactics`):
-its tuning buckets are powers of two, and a context pass's internal chunk sizes are not, so some shapes fall back to
-an untuned tactic (`falling back to runner=MoERunner tactic=-1` in the kernel's own log) every time they occur. Not
-yet closed.
+Why a 32-layer FP8 checkpoint is not a usable comparison on this card: it cannot complete a sixty-four-question request
+at all here (device memory runs out), where the 36-layer NVFP4 checkpoint can, so a width-for-width speed comparison
+between the two checkpoints is not available at the one width most exposes a difference. Speed is instead tracked
+against this project's own earlier releases, same checkpoint, same card, alternating with `origin/main` three times
+each (one race-comprehension document, about 5,300 tokens, median of 5 runs after 2 warm-up calls, this project's own
+tuned FP8 kernel tables installed): one question 1.47% faster, sixteen 2.34% faster, sixty-four 3.18% faster, with the
+alternating runs' own min-max ranges not overlapping at any of the three widths -- the dense-projection fusion and
+wider branch read above, carried over from the FP8 kernel they are not specific to. `interleaved_fork` (below) adds a
+further 5.9% at sixteen questions and 1.3% at sixty-four, measured the same way, toggled on one already-built engine
+rather than against a separate release.
+
+The NVFP4 MoE kernel's own per-shape autotuning (`autotune_tactics`) is a separate, still-open gap: its tuning buckets
+are powers of two, and a context pass's internal chunk sizes are not, so some shapes fall back to an untuned tactic
+(`falling back to runner=MoERunner tactic=-1` in the kernel's own log) every time they occur. The tactic this project's
+own race-comprehension document already selects at this width is the fastest of the tactics FlashInfer offers at that
+bucket, so there is no untried candidate left to switch to without changing the underlying CUTLASS grouped-GEMM
+implementation itself -- out of this project's scope for now.
+
+See [docs/PERFORMANCE.md's settings table](PERFORMANCE.md#settings-that-change-speed-not-the-answer) for
+`interleaved_fork` and `wide_group`, the two flags that change how a multi-question request reaches these kernels.
 
 ## Measured and rejected
 
