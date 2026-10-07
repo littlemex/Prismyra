@@ -458,9 +458,9 @@ closed:
   `tools/audit_sm120.py` is the full-matrix check this rests on: every pairing of companion count ({1, 2, 3, 8}
   documents, of varying real lengths) and question count ({1, 2, 3, 31, 32, 33} per document) against the solo
   `ask()` ground truth -- **4,392 probability checks per card, 4,392 bit-exact on each of the two supported cards
-  independently, 0 decision flips, worst move 0.000000**. This is the same matrix, and the same two previously-open
-  cases, that the 0-mismatch benchmark above and this project's own tests already cover; it is reported again here
-  because the project's own documentation had fallen behind what the matrix already showed. A few individual
+  independently, 0 decision flips, worst move 0.000000**. This matrix stood at 1,692 non-exact of 4,392 the first time
+  it was run against the RTX PRO 4500; a sequence of fixes closed it to 258, then 72, then the 0 above, each one
+  landing within the same release that documents the result. A few individual
   fixtures in `tests/test_gpu.py` (`COMPANION_MOVEMENT_QN1_ATTENTION`, `COMPANION_MOVEMENT_ROW_COUNT`) still carry
   small nonzero tolerances left over from before this matrix closed; they have not been retightened to match, so
   treat them as not yet re-measured rather than as evidence either axis is still open. The non-default `narrow`
@@ -479,10 +479,11 @@ This is a process-wide setting, not a per-request one: it registers a fixed-tile
 what the whole guarantee above rests on. By default (`global` scope) it runs unconditionally for every CUDA engine
 this project builds, paged or not. `PRISMYRA_INVARIANCE_SCOPE=narrow` is the one setting that turns part of it off:
 it skips this registration in favour of a handful of cheaper, targeted call-site fixes (the router projection and
-the recurrent gate projections) instead, and it is not a safe substitute for the default -- `audit_sm120.py` finds
-it non-exact on 150 of 4,392 checks on the RTX PRO 4500 (0 for the default there; `narrow` has not been separately
-measured on the L40S), which is why it ships as a diagnostic opt-in for isolating a residual's call site, not as an
-alternative default on either card. On a vLLM build that lacks the batch-invariant module at all, construction falls
+the recurrent gate projections) instead, and it is not a safe substitute for the default -- `audit_sm120.py` found
+it non-exact on 150 of 4,392 checks on the RTX PRO 4500, measured before the convolution call site this project later
+closed was fixed, and not re-measured since (0 for the default there now; `narrow` has not
+been separately measured on the L40S at any point), which is why it ships as a diagnostic opt-in for isolating a
+residual's call site, not as an alternative default on either card. On a vLLM build that lacks the batch-invariant module at all, construction falls
 back to the targeted fixes alone and appends a note saying so to `engine.stats()["kernels"]["notes"]`.
 
 Measured cost, on the L40S: a solo read's full put-ask-drop lifecycle moved -1.2% with the registration against
@@ -557,19 +558,20 @@ direction this is built for, not as a measured result.
 ## Four speed settings, two that risk the answer
 
 For each row, the question is whether its default answers bit-identically to the alternative it could instead be set
-to. `interleaved_fork` and `PRISMYRA_WITHOUT=dense_fusion` do -- their non-default side is measurably faster in some
-cases and never slower by more than noise in the rest, so shipping it as the default cost nothing in correctness and
-gained speed. `PRISMYRA_INVARIANCE_SCOPE` and `wide_group` do not: each has a non-default side (`narrow`, `True`)
-that is a real, measured change to the answer in at least one case, not only a schedule change, and *neither* has
-been shown faster -- `narrow`'s only speed data point (the registration's L40S cost, above) is itself noise, and
-`wide_group`'s speed has not been separately measured in this project's own records. Both ship with the side that
-does not carry that risk; `wide_group`'s specifically stays off until it clears this project's own accuracy-judgment
-gate, which has not yet been attempted, rather than being enabled on the strength of the cases measured bit-identical
-so far.
+to. `interleaved_fork` and `PRISMYRA_WITHOUT=dense_fusion` do -- the fast side of each (fusing, in both cases) is
+measurably faster in some cases and never slower by more than noise in the rest, and ships as the default, costing
+nothing in correctness and gaining speed. `PRISMYRA_INVARIANCE_SCOPE` and `wide_group` do not: each has a non-default
+side (`narrow`, `True`) that is a real, measured change to the answer in at least one case, not only a schedule
+change, and neither's non-default side is both shown faster and confirmed bit-identical at once -- `narrow`'s own
+only speed data point (the registration's L40S cost, above) is itself noise, and `wide_group`'s own one data point
+(−4.2% at 64 questions on the L40S) predates this release's construction-flag-dependent determinism fix and has not
+been reconfirmed since that fix landed. Both ship with the side that does not carry the correctness risk;
+`wide_group`'s specifically stays off until it clears this project's own accuracy-judgment gate, which has not yet
+been attempted, rather than being enabled on the strength of the cases measured bit-identical so far.
 
 | setting | default | what it changes | is the default bit-exact against the non-default alternative | measured effect |
 |---|---|---|---|---|
-| `interleaved_fork` | `True` (this release; `False` before it) | `ask()` with more than one question fuses the context's read and the first branch group into one layer-interleaved pass instead of two separate ones | yes, both supported cards, every question count `ask()` routes differently (1, 2, 3, 16, 33, 64), context lengths from about 5,000 to about 20,000 tokens (`tests/test_gpu.py::test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did`) | latency, same engine with the flag toggled, 15 alternating rounds, min-max ranges not overlapping at every width reported: L40S 15.2% lower at 16 questions, 9.6% lower at 64; RTX PRO 4500 5.9% lower at 16, 1.3% lower at 64; no measurable change at 1 question on either card. `engine.open_batch()` itself is unaffected either way (within 0.2% on both cards) -- the flag only reaches `ask()`'s own multi-question path and `Batcher`'s multi-document fusion, not the direct batched-read API |
+| `interleaved_fork` | `True` (new in this release) | `ask()` with more than one question fuses the context's read and the first branch group into one layer-interleaved pass instead of two separate ones | yes, both supported cards, context lengths from about 5,000 to about 20,000 tokens: question counts 16, 32, 33 and 64 by the permanent regression test (`tests/test_gpu.py::test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did`), and 1, 2 and 3 (the other code paths `ask()` routes a question count through) checked the same way against real hardware without a committed test | latency, same engine with the flag toggled, 15 alternating rounds, min-max ranges not overlapping at every width reported: L40S 15.2% lower at 16 questions, 9.6% lower at 64; RTX PRO 4500 5.9% lower at 16, 1.3% lower at 64; no measurable change at 1 question on either card. `engine.open_batch()` itself is unaffected either way (within 0.2% on both cards) -- the flag only reaches `ask()`'s own multi-question path and `Batcher`'s multi-document fusion, not the direct batched-read API |
 | `PRISMYRA_WITHOUT=dense_fusion` | unset (fusion on) | three groups of same-input dense-FP8 calls (attention's q/k/v, the gated delta net's qkv/z, a shared expert's gate/up) run as one combined matmul below `FUSION_MAX_ROWS` (512) rows instead of several separate ones | yes, every group this checkpoint has, on both checkpoints this was checked against (`fp8-36l`, `nvfp4-36l`; `engine.applied.verified["dense_fusion"]`) | 32-54% faster per group at branch width (16-32 rows); a wash to a measured loss at context width, which is why fusing is chosen by width (above/below `FUSION_MAX_ROWS`) rather than left to this switch alone -- see [docs/KERNELS.md](KERNELS.md#notes-on-the-ones-with-a-catch) |
 | `PRISMYRA_INVARIANCE_SCOPE` | `global` | which call sites keep an answer from moving when who else shares a pass changes: `global` registers a fixed-tile kernel for every plain matmul in the process; the non-default `narrow` relies on a handful of targeted call-site fixes instead and skips that registration | **no**, on the RTX PRO 4500 -- `tools/audit_sm120.py`'s full matrix is 0 non-exact under `global` there and 150 non-exact under `narrow`. Not separately measured on the L40S; ships off there too | not a speed setting either way: `global`'s own cost is noise on the L40S (see [the measured cost above](#a-shelf-answers-like-ask)), and `narrow` has no speed measurement of its own -- it exists for isolating which call site a residual comes from |
 | `wide_group` | `False` | a document asked more than 32 questions gets one `WIDE_GROUP`-wide (64) branch pass instead of two `self.group`-wide (32) ones, for every question count above 32, not only the exactly-64 count `interleaved_fork` already widens on its own (above, under the token-length limit there) | **no** -- found not bit-identical at 33 and 40 questions specifically (the row-count-dependent recurrent kernel sees a different shape once the smaller remainder is folded into one wide pass instead of padded on its own); 64 (32+32, the one count in the 33-64 range that divides evenly) passed that same check, which is not evidence the 33-63 counts that do not divide evenly would | not shipped as a default on the strength of being fast -- it stays off until it clears this project's accuracy-judgment gate (not yet attempted) rather than being enabled on the cases measured bit-identical so far |

@@ -81,12 +81,13 @@ any file in `pinned/fp8_block_configs/` was kept, so this is purely a speed chan
 The dense-projection fusion below adds three shapes (N=9,216, 12,288 and 1,024, all K=2,048) that the table above did
 not have cells for, so a fresh install used to fall back to the same untuned tile for all three until a dedicated
 sweep (checked `torch.equal` against the untuned default before timing anything, not the other way around) found a
-matching candidate for every cell and added it to `pinned/fp8_block_configs/`. Done for the RTX PRO 4500 (sm_120)
-only; the L40S (sm_89) still runs these three shapes untuned. This project's own measurements show the fusion gaining
-less on an L40S than on an RTX PRO 4500 at context width, same checkpoint, three rounds each alternating against
-`origin/main` (RTX PRO 4500: -1.5% to -2.3% across the widths it was asked about; L40S: a smaller gain at some widths
-and one measurement within this project's noise bar) -- and suspects, but has not confirmed, that the untuned shapes
-above are why. Revisit once the same sweep is run on an L40S.
+matching candidate for every cell and added it to `pinned/fp8_block_configs/`. Run first for the RTX PRO 4500
+(sm_120), then repeated for the L40S (sm_89) within the same release, so both cards now carry tuned tables for all
+three shapes. This project's own measurements still show the fusion gaining less on an L40S than on an RTX PRO 4500
+at context width, same checkpoint, three rounds each alternating against `origin/main` (RTX PRO 4500: -1.5% to
+-2.3% across the widths it was asked about; L40S: a smaller gain at some widths and one measurement within this
+project's noise bar) -- with the per-shape tuning table now ruled out as the explanation on both cards, since both
+have one.
 
 ## What each replacement is worth
 
@@ -160,11 +161,12 @@ construction, quantises and runs one matmul instead of several, and splits the r
 bit-identical against the separate calls it replaces (`engine.applied.verified["dense_fusion"]`, checked on every
 group this checkpoint has, on both checkpoints this verification ran against, `fp8-36l` and `nvfp4-36l`). The
 branch-width pass this helps (16-32 rows) is 32-54% faster per group; the context-width pass (several thousand rows)
-is a wash for two of the three groups and a measured loss for the gated delta net's group, because the fused call's
-wider output picks a worse matmul tile than either separate call does on its own. Fusing and not fusing are
-bit-identical either way, so which one runs is chosen on speed alone: below `FUSION_MAX_ROWS` rows (512, the largest
-width this project's own packing ever hands a branch pass) the fused call is faster and runs; above it, where fusing
-would lose, each slot falls back to its own original separate call instead -- decided independently from each
+is a real gain for the shared expert's group (+17.0%), a wash for attention's (+0.5%, within noise), and a measured
+loss for the gated delta net's group (-9.4%), because that group's fused call's wider output picks a worse matmul
+tile than either separate call does on its own. Fusing and not fusing are bit-identical either way, so which one
+runs is chosen on speed alone, for every group alike rather than only the one that loses: at or below
+`FUSION_MAX_ROWS` rows (512, the largest width this project's own packing ever hands a branch pass) the fused call
+runs; above it, each slot falls back to its own original separate call instead -- decided independently from each
 slot's own input, with no coordination needed between the slots in a group. `PRISMYRA_WITHOUT=dense_fusion` disables
 fusion outright, at both widths.
 
@@ -208,13 +210,15 @@ with the fusion already in place on both sides: toggled on one already-built eng
 `origin/main` checkout, fifteen alternating rounds, min-max ranges not overlapping at either width reported, it adds
 a further 5.9% at sixteen questions and 1.3% at sixty-four.
 
-The NVFP4 MoE kernel's own per-shape autotuning (`autotune_tactics`) is a separate, still-open gap: its tuning buckets
-are powers of two, and a context pass's internal chunk sizes are not, so some shapes fall back to an untuned tactic
-(`falling back to runner=MoERunner tactic=-1` in the kernel's own log) every time they occur. The bucket this
-project's own race-comprehension document falls into is not one of those -- the tactic already selected for it is
-the fastest FlashInfer offers at that bucket, so there is no untried candidate left for that one bucket specifically
-without changing the underlying CUTLASS grouped-GEMM implementation itself. Every other bucket, and the shapes that
-do fall back to the untuned tactic, are not checked by this and remain open -- out of this project's scope for now.
+The NVFP4 MoE kernel's own per-shape autotuning (`autotune_tactics`) used to profile a different tactic per
+power-of-two token-count bucket, which is exactly the row-count-dependent-algorithm shape of bug this project
+guards against everywhere else: two passes carrying the identical real row at a different total row count could
+cross a bucket boundary and get a different tactic, and so a different, non-bit-identical answer for that
+unchanged row. Within this same release, this is now pinned to one bucket (at this checkpoint's largest expected
+row count, `round_up=True`), so every real call -- a small questions-only pass or a full `open_batch` -- maps to
+the same profiled tactic by construction, closing the gap rather than bounding it. The cost is that a small pass
+now runs the tactic chosen for the largest one rather than its own dedicated choice; this project's own measurements
+of that cost are recorded against the row-count-invariance fix itself, not assumed.
 
 See [docs/PERFORMANCE.md's settings table](PERFORMANCE.md#four-speed-settings-two-that-risk-the-answer) for
 `interleaved_fork` and `wide_group`, the two flags that change how a multi-question request reaches these kernels.
