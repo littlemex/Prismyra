@@ -10,6 +10,8 @@ vLLM installed -- slower, and the adapter says so.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -756,6 +758,14 @@ class Qwen3MoeAdapter:
                 tolerance=2 * BF16_ULP,
             )
             _swap_and_verify(applied, text, "dense_matmul", None, [("fp8", Fp8Linear)], tolerance=5e-2)
+            # Experimental (PRISMYRA_DECODER_FUSION=1), off by default: fuses every residual add with the RMSNorm
+            # that reads it, including across the decoder-layer boundary. See decoder_fusion.py for why this one
+            # needs the layer loop's cooperation rather than a module swap, and RUN-fp4spd.md for the end-to-end
+            # torch.equal check this has (or has not) passed.
+            if os.environ.get("PRISMYRA_DECODER_FUSION") == "1":
+                from . import decoder_fusion
+
+                decoder_fusion.install(applied, text)
         else:
             applied.skipped.append("vllm is not installed: the borrowed kernels are unavailable")
         # Triton rather than vLLM, so it is not gated on the borrowed kernels.
