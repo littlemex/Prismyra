@@ -42,7 +42,7 @@ from __future__ import annotations
 import torch
 
 from . import varlen
-from .fork import Prefill, build_suffixes, snapshot_layer, widen_for_branch
+from .fork import Prefill, build_suffixes, snapshot_bytes, snapshot_layer, widen_for_branch
 
 
 def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, padded_rows: int):
@@ -150,3 +150,210 @@ def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, p
         group=group,
     )
     return out, prefill
+
+
+def read_and_branch_shelf(engine, shelf, context: str, texts: list[str], width: int, padded_rows: int):
+    """`read_and_branch`'s counterpart for `Shelf`/`Batcher` (round 5): fuse one *fresh* document's read into the
+    shelf with its first (and, in `Batcher`, only -- a request's own questions already fit one group,
+    `schedule.Limits.questions`) branch group, through the same per-layer loop.
+
+    **Scope.** Exactly one document, read for the first time this call (an already-resident document, or a pass
+    naming more than one document, still goes through `Shelf.put_many`/`Shelf.ask` unchanged -- see
+    `schedule.Batcher._answer`, the only caller). Text only, same restriction `read_and_branch` states.
+
+    **Why the paged cache needed nothing new for the GDN layers.** `cache.build_cache` gives every cache the
+    *same* recurrent/convolution storage (the framework's own layer class) whether `paged` is on or off -- only
+    the attention layers switch between `ForkLayer` and `PagedForkLayer`. So `fork.widen_for_branch` and
+    `fork.snapshot_layer`, written against that storage, run here completely unchanged. What *is* new:
+
+    * **admission.** A paged attention layer has to be told which document it is about to write
+      (`begin_document`), which the joined `ForkLayer` never needed (a joined cache only ever holds one).
+    * **the branch read.** `PagedForkLayer.begin_branches` takes a `rows_for` argument (`fork._takes_rows` is the
+      existing dispatch this project already uses in `restore_and_fork_many` to tell it apart from the joined
+      layer's own no-argument version) -- naming which rows answer about this document, needed because a page
+      table has more than one document's pages to choose from in general, even though this cut only ever puts
+      one document's rows in `rows_for`.
+    * **the padding segment.** `Shelf.put_many` always reads a document (even alone) alongside a padding
+      segment, through `engine._pad_context_lengths`, so that the borrowed chunked recurrent kernel -- whose
+      configuration is chosen by a read's *total* length, not by what it contains (`engine._read`'s own
+      comment) -- picks the same configuration whatever else later shares this shelf's reads. That makes the
+      context forward a *two-document* flat run (the real document, then padding), which this function keeps as
+      one flat `(1, tokens, hidden)` tensor exactly as `read_and_branch`'s own single-document `hidden_ctx` is --
+      a flat run does not care how many logical documents it holds. Two things do: each GDN layer's own
+      `recurrent_states`/`conv_states` come back from the framework **one row per document** once
+      `varlen.reading()` is active (the same reason `engine._check_batched_read` exists), and this project's own
+      `_put_back_conv_states` exists because the framework's convolution state is otherwise sliced from the
+      *end* of the flat run -- the padding's end, not the real document's. Both are narrowed to the real
+      document's own row, right here, layer by layer, rather than in the bulk pass `Shelf.put_many` runs after
+      its own single whole-model call returns: the tail each convolution needs is appended to
+      `varlen.current().conv_tails`, in layer order, the moment that layer's own borrowed kernel runs
+      (`kernels/qwen3_moe.py`'s patched `causal_conv1d_fn`) -- already correct and already available by the time
+      this loop reaches that layer, which is what makes computing it layer-by-layer rather than in one pass
+      afterward exactly as correct as `Shelf.put_many`'s own bulk version, not an approximation of it.
+
+    Returns `(hidden, handle, shelved)`: `hidden` is this group's answer, same shape and `torch.equal`-gated
+    contract as `read_and_branch`'s own return; `handle` is the shelf handle the real document was given;
+    `shelved` is the `engine.Shelved` the caller stores at `shelf.documents[handle]`, built the same way
+    `Shelf.put_many` builds one.
+    """
+    from .engine import Shelved, _forget_recurrent_state
+
+    text_model = engine.backbone.language_model if hasattr(engine.backbone, "language_model") else engine.backbone
+    layers = text_model.layers
+    device = engine.device
+    hidden_size = engine.hidden_size
+    decoder = getattr(engine.config, "text_config", engine.config)
+    layer_types = list(decoder.layer_types)
+
+    cache = shelf._cache
+    encoded = engine.encode_context(context)
+    if encoded.has_media:
+        raise ValueError("a shelf is text only for now, for the same reason a batch is: media move the positions")
+
+    _forget_recurrent_state(cache)
+
+    handle = shelf._next_handle
+    shelf._next_handle += 1
+    pad_ids, lengths = engine._pad_context_lengths([encoded.tokens], [encoded.input_ids])
+    has_pad = pad_ids.shape[1] > 0
+    pad_handle = None
+    if has_pad:
+        pad_handle = shelf._next_handle
+        shelf._next_handle += 1
+    doc_handles = [handle, pad_handle] if has_pad else [handle]
+    ctx_ids = torch.cat([encoded.input_ids, pad_ids], dim=1) if has_pad else encoded.input_ids
+    ctx_tokens = ctx_ids.shape[1]
+
+    branch_ids, read_at, _ = build_suffixes(texts, engine.tokenizer, device, padded_rows, width)
+    branch_width = branch_ids.shape[1]
+    hidden_branch = text_model.embed_tokens(branch_ids)
+    branch_positions = torch.arange(
+        encoded.tokens, encoded.tokens + branch_width, device=device
+    ).unsqueeze(0).expand(padded_rows, -1)
+    branch_rope = text_model.rotary_emb(hidden_branch, branch_positions)
+
+    for layer in cache.layers:
+        begin = getattr(layer, "begin_documents", None)
+        if begin is not None:
+            begin(doc_handles)
+
+    hidden_ctx = text_model.embed_tokens(ctx_ids)
+    # Pure arithmetic on `lengths` -- the same thing `Boundaries.positions` computes -- so this needs no
+    # `varlen.reading()` entered yet: positions restart at zero for the padding document, same as any other.
+    ctx_positions = (
+        torch.cat([torch.arange(n, device=device) for n in lengths]).unsqueeze(0)
+        if has_pad
+        else torch.arange(ctx_tokens, device=device).unsqueeze(0)
+    )
+    ctx_rope = text_model.rotary_emb(hidden_ctx, ctx_positions)
+
+    snap: dict[int, dict] = {}
+    for i, decoder_layer in enumerate(layers):
+        layer_cache = cache.layers[i]
+        residual_ctx, residual_branch = hidden_ctx, hidden_branch
+        normed_ctx = decoder_layer.input_layernorm(hidden_ctx)
+        normed_branch = decoder_layer.input_layernorm(hidden_branch)
+
+        if layer_types[i] == "linear_attention":
+            # `varlen.reading()` scoped to just this call, not the branch call below: the borrowed kernel reads
+            # `varlen.current()` on *every* call regardless of which flag set it, so leaving the two-document
+            # boundaries active for the branch call too (entering once for the whole function, as
+            # `read_and_branch`'s single-document version has no reason to distinguish) made the branch's
+            # `padded_rows` rows look like a mismatched *document* count to the framework ("expected 2 initial
+            # states... rather than 1") -- found running this on real hardware (RUN-fp8spd.md round 5).
+            if has_pad:
+                with varlen.reading(lengths, device) as boundaries:
+                    out_ctx = decoder_layer.linear_attn(normed_ctx, cache_params=cache, attention_mask=None)
+                    # The framework's convolution state is sliced from the end of the flat run (the padding's
+                    # end); the tail this layer's own borrowed kernel already recorded, per document, is correct
+                    # (see this function's own docstring) and is still in scope here, before `reading()` exits
+                    # and clears it. Applied now, one layer early relative to `engine._put_back_conv_states`'s
+                    # own bulk pass, because `widen_for_branch` below needs the real document's row of the
+                    # *corrected* one and nothing later in this loop needs the uncorrected value.
+                    conv = getattr(layer_cache, "conv_states", None)
+                    if isinstance(conv, dict) and boundaries.conv_tails:
+                        tail = boundaries.conv_tails[-1]
+                        if tail.shape[0] != len(doc_handles):
+                            raise ValueError(
+                                f"this layer's convolution recorded a tail for {tail.shape[0]} documents and "
+                                f"{len(doc_handles)} were read -- a document's row would be the wrong one"
+                            )
+                        for key, held in list(conv.items()):
+                            conv[key] = tail[:1].to(dtype=held.dtype) if held is not None else tail[:1]
+                    # The recurrence itself already returns one row per document once `varlen.reading()` is
+                    # active (the same guarantee `engine._check_batched_read` checks for the ordinary
+                    # batched-read path; checked by hand here, inline, because `_check_batched_read` wants the
+                    # *unnarrowed* row count and this narrows it immediately).
+                    rec = getattr(layer_cache, "recurrent_states", None)
+                    if isinstance(rec, dict):
+                        for key, held in list(rec.items()):
+                            if held is None:
+                                continue
+                            if held.shape[0] != len(doc_handles):
+                                raise ValueError(
+                                    f"this layer's recurrent state has {held.shape[0]} rows and "
+                                    f"{len(doc_handles)} documents were read -- a document's row would be the "
+                                    f"wrong one"
+                                )
+                            rec[key] = held[:1].clone()
+            else:
+                out_ctx = decoder_layer.linear_attn(normed_ctx, cache_params=cache, attention_mask=None)
+            snap[i] = snapshot_layer(layer_cache)
+            with widen_for_branch(layer_cache, padded_rows, padded_rows), varlen.branching():
+                out_branch = decoder_layer.linear_attn(normed_branch, cache_params=cache, attention_mask=None)
+        else:
+            if has_pad:
+                with varlen.reading(lengths, device):
+                    out_ctx, _ = decoder_layer.self_attn(
+                        normed_ctx, position_embeddings=ctx_rope, attention_mask=None, past_key_values=cache
+                    )
+            else:
+                out_ctx, _ = decoder_layer.self_attn(
+                    normed_ctx, position_embeddings=ctx_rope, attention_mask=None, past_key_values=cache
+                )
+            snap[i] = snapshot_layer(layer_cache)
+            begin_branches = getattr(layer_cache, "begin_branches", None)
+            if begin_branches is not None:
+                begin_branches([handle] * padded_rows)
+            with varlen.branching():
+                out_branch, _ = decoder_layer.self_attn(
+                    normed_branch, position_embeddings=branch_rope, attention_mask=None, past_key_values=cache
+                )
+
+        hidden_ctx = residual_ctx + out_ctx
+        hidden_branch = residual_branch + out_branch
+
+        residual_ctx, residual_branch = hidden_ctx, hidden_branch
+        normed2_ctx = decoder_layer.post_attention_layernorm(hidden_ctx)
+        normed2_branch = decoder_layer.post_attention_layernorm(hidden_branch)
+        combined = torch.cat(
+            (normed2_ctx.reshape(-1, hidden_size), normed2_branch.reshape(-1, hidden_size)), dim=0
+        )
+        moe_out = decoder_layer.mlp(combined)
+        if isinstance(moe_out, tuple):
+            moe_out = moe_out[0]
+        moe_ctx, moe_branch = moe_out.split([ctx_tokens, padded_rows * branch_width], dim=0)
+        hidden_ctx = residual_ctx + moe_ctx.reshape(1, ctx_tokens, hidden_size)
+        hidden_branch = residual_branch + moe_branch.reshape(padded_rows, branch_width, hidden_size)
+
+    hidden_branch = text_model.norm(hidden_branch)
+    out = hidden_branch[torch.arange(padded_rows, device=device), read_at][: len(texts)]
+
+    for layer in cache.layers:
+        finish = getattr(layer, "finish_branches", None)
+        if finish is not None:
+            finish()
+    if has_pad:
+        for layer in cache.layers:
+            release = getattr(layer, "release_document", None)
+            if release is not None:
+                release(pad_handle)
+
+    shelved = Shelved(
+        handle=handle,
+        tokens=encoded.tokens,
+        snapshot=snap,
+        position_from=encoded.tokens,
+        snapshot_bytes=snapshot_bytes(snap),
+    )
+    return out, handle, shelved
