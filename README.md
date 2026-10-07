@@ -310,27 +310,31 @@ every kernel; see [docs/KERNELS.md](docs/KERNELS.md). A different architecture w
 the kernels until an adapter is written and measured for it.
 
 Four checkpoints in this family are published with the decision adapter already folded in: three FP8 checkpoints at
-40, 36 and 32 of the base model's 40 layers, and one NVFP4 checkpoint (36 layers, routed experts converted to 4-bit
-floating point) for the one card family the FP8 checkpoints do not fit on:
+40, 36 and 32 of the base model's 40 layers, and one NVFP4 checkpoint (36 layers, routed experts converted on top of
+the FP8 weights to 4-bit floating point) for a card the 36- and 40-layer FP8 checkpoints do not fit on:
 
 | checkpoint | layers | card | Hugging Face |
 |---|---|---|---|
 | `prismyra-decision-qwen3.6-35b-a3b-fp8-40l` | 40 | any this project's kernels support | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-40l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-40l) |
-| `prismyra-decision-qwen3.6-35b-a3b-fp8-36l` | 36 | any this project's kernels support | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l) (revision `9d7cd0bc`) |
-| `prismyra-decision-qwen3.6-35b-a3b-fp8-32l` | 32 | any this project's kernels support | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-32l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-32l) |
-| `prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l) (revision `719db987`) |
+| `prismyra-decision-qwen3.6-35b-a3b-fp8-36l` | 36 | any this project's kernels support | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l) (revision `9d7cd0bc` as of this release; the 40- and 32-layer checkpoints are not re-pinned this round) |
+| `prismyra-decision-qwen3.6-35b-a3b-fp8-32l` | 32 | any this project's kernels support, including the one below | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-32l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-32l) |
+| `prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l) (revision `719db987` as of this release) |
 
-The 36-layer FP8 checkpoint is the one to start with on a card the full-precision checkpoints fit on: on the five sets
-it is measured against it ties or clears every bar the 40-layer checkpoint does, while running faster. The 32-layer
-checkpoint is faster still, and beats both longer checkpoints on the two long-context sets, but is the one of the
-three that misses a bar (BoolQ, by a single question). See [recipes/decision-lora/](recipes/decision-lora/) for the
-per-set numbers, what each margin is worth against run-to-run noise, and the comparisons against other decision
-models and against general-purpose LLMs on the same questions. The NVFP4 checkpoint exists because the 36-layer FP8
-checkpoint's routed experts alone are about 29 GB, which does not fit a 32 GB Blackwell card beside everything else a
-context pass needs; converting only the experts to NVFP4 takes the full 36 layers to about 16 GB of expert weight
-instead, at an accuracy cost this project measured as indistinguishable from noise against the un-quantised FP8
-checkpoint. See [docs/KERNELS.md](docs/KERNELS.md#routed-experts-in-nvfp4-blackwell-only-optional) for how it is
-loaded (`PRISMYRA_EXPERTS=nvfp4` plus the two side files it needs) and what it costs.
+The 36-layer FP8 checkpoint is the one to start with on a card the 36- and 40-layer FP8 checkpoints both fit on: on
+the five sets it is measured against it ties or clears every bar the 40-layer checkpoint does, while running faster.
+The 32-layer checkpoint is faster still, fits a smaller card than the other two FP8 checkpoints, and beats both
+longer checkpoints on the two long-context sets, but is the one of the three that misses a bar (BoolQ, by a single
+question). See [recipes/decision-lora/](recipes/decision-lora/) for the per-set numbers, what each margin is worth
+against run-to-run noise, and the comparisons against other decision models and against general-purpose LLMs on the
+same questions. The NVFP4 checkpoint exists because the 36-layer FP8 checkpoint's routed experts alone are about
+29 GB, which does not fit a 32 GB Blackwell card beside everything else a context pass needs (the 32-layer FP8
+checkpoint does fit such a card, which is why it exists too, but is a shallower network, not this same one at lower
+precision); converting only the experts to NVFP4 takes the full 36 layers to about 16 GB of expert weight instead, at
+an accuracy cost this project measured as indistinguishable from noise against this checkpoint's own FP8 weights
+before that conversion -- measured through a different serving path than the one this release ships, see
+[docs/KERNELS.md](docs/KERNELS.md#routed-experts-in-nvfp4-blackwell-only-optional) for the figure, its interval and
+that caveat. The same page covers how the NVFP4 checkpoint is loaded (`PRISMYRA_EXPERTS=nvfp4` plus the two side
+files it needs) and what it costs in speed.
 
 ## Performance
 
@@ -357,19 +361,21 @@ prismyra-bench compare --against benchmarks/results/qwen3_6_35b_a3b_fp8__rtx_pro
 
 `compare` exits non-zero on any point more than ten per cent slower. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-A handful of engine settings trade speed for a change in how an answer is computed, each verified bit-identical
-against the alternative before shipping with the default it ships with (one, `wide_group`, is not, and stays off):
-see [the settings table](docs/PERFORMANCE.md#settings-that-change-speed-not-the-answer). The one most requests meet,
-`interleaved_fork`, is on by default as of this release:
+A handful of engine settings trade speed for a change in how an answer is computed. Two ship with a default verified
+bit-identical to its non-default alternative; two (`wide_group`, and `PRISMYRA_INVARIANCE_SCOPE`'s non-default
+`narrow`) have a faster non-default side that is not bit-identical and so stays off/undefaulted. See
+[the settings table](docs/PERFORMANCE.md#four-speed-settings-two-that-risk-the-answer) for which is which. The one most
+requests meet, `interleaved_fork`, is on by default as of this release; latency, same engine with the flag toggled:
 
 | questions | L40S, `fp8-36l` | RTX PRO 4500, `nvfp4-36l` |
 |---|---|---|
 | 1 | no measurable change | no measurable change |
-| 16 | 15.2% faster | 5.9% faster |
-| 64 | 9.6% faster | 1.3% faster |
+| 16 | 15.2% lower | 5.9% lower |
+| 64 | 9.6% lower | 1.3% lower |
 
-Measured on one race-comprehension document (about 5,300 tokens), the flag toggled on an already-built engine so the
-comparison is only the fused pass against the two-pass path it replaces, nothing else.
+Measured on one document built by joining RACE articles until it reaches about 5,300 tokens, 15 alternating rounds,
+the flag toggled on an already-built engine so the comparison is only the fused pass against the two-pass path it
+replaces, nothing else.
 
 ## Documentation
 

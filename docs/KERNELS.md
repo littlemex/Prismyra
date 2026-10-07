@@ -83,10 +83,10 @@ not have cells for, so a fresh install used to fall back to the same untuned til
 sweep (checked `torch.equal` against the untuned default before timing anything, not the other way around) found a
 matching candidate for every cell and added it to `pinned/fp8_block_configs/`. Done for the RTX PRO 4500 (sm_120)
 only; the L40S (sm_89) still runs these three shapes untuned. This project's own measurements show the fusion gaining
-less on an L40S than on an RTX PRO 4500 at context width (one checkpoint, three groups, alternating against
-`origin/main`: Spain -1.5% to -2.3% across widths, L40S a mix of a smaller gain and one measurement within noise) and
-suspects, but has not confirmed, that the untuned shapes above are why -- carried over once the same sweep is run on
-an L40S.
+less on an L40S than on an RTX PRO 4500 at context width, same checkpoint, three rounds each alternating against
+`origin/main` (RTX PRO 4500: -1.5% to -2.3% across the widths it was asked about; L40S: a smaller gain at some widths
+and one measurement within this project's noise bar) -- and suspects, but has not confirmed, that the untuned shapes
+above are why. Revisit once the same sweep is run on an L40S.
 
 ## What each replacement is worth
 
@@ -158,13 +158,15 @@ once on the same input: attention's `q_proj`/`k_proj`/`v_proj`, the gated delta 
 shared expert's `gate_proj`/`up_proj`. `_FusedDenseProjection` concatenates each group's weights and scales once at
 construction, quantises and runs one matmul instead of several, and splits the result back out -- verified
 bit-identical against the separate calls it replaces (`engine.applied.verified["dense_fusion"]`, checked on every
-group this checkpoint has, both checkpoints this project ships). The branch-width pass this helps (16-32 rows) is
-32-54% faster per group; the context-width pass (several thousand rows) is a wash for two of the three groups and a
-measured loss for the gated delta net's group, because the fused call's wider output picks a worse matmul tile than
-either separate call does on its own. Both shapes are bit-identical, so the fused path is used only below
-`FUSION_MAX_ROWS` rows (512, the branch width this project caps a pass at) and falls back to the original separate
-calls above it -- each slot decides this independently from its own input, with no coordination needed between the
-slots in a group. `PRISMYRA_WITHOUT=dense_fusion` disables it.
+group this checkpoint has, on both checkpoints this verification ran against, `fp8-36l` and `nvfp4-36l`). The
+branch-width pass this helps (16-32 rows) is 32-54% faster per group; the context-width pass (several thousand rows)
+is a wash for two of the three groups and a measured loss for the gated delta net's group, because the fused call's
+wider output picks a worse matmul tile than either separate call does on its own. Fusing and not fusing are
+bit-identical either way, so which one runs is chosen on speed alone: below `FUSION_MAX_ROWS` rows (512, the largest
+width this project's own packing ever hands a branch pass) the fused call is faster and runs; above it, where fusing
+would lose, each slot falls back to its own original separate call instead -- decided independently from each
+slot's own input, with no coordination needed between the slots in a group. `PRISMYRA_WITHOUT=dense_fusion` disables
+fusion outright, at both widths.
 
 ## Routed experts in NVFP4 (Blackwell only, optional)
 
@@ -182,32 +184,39 @@ before the adapter above runs, and the adapter recognises the already-converted 
 re-wrapping them in the FP8 path -- the only place the two paths touch.
 
 Why a 36-layer checkpoint needs this at all: the routed experts are most of a layer's weight, and 36 layers of them in
-FP8 (about 29 GB) do not fit one 32 GB Blackwell card beside everything else a context pass needs -- the checkpoint
-this project would otherwise serve on such a card is cut to 32 layers. Converting only the experts to NVFP4 takes
-them to about 16 GB and lets the full 36 layers fit, at a measured accuracy cost indistinguishable from noise against
-the un-quantised FP8 checkpoint (−0.07 points on a 1,400-question set, 95% interval [−0.86, +0.79]) and 1.86 points
-ahead of the 32-layer checkpoint it would otherwise be compared against; that accuracy measurement predates this
-checkpoint's `prismyra-serve` integration and used a different serving path than the speed figures below.
+FP8 (about 29 GB) do not fit one 32 GB Blackwell card beside everything else a context pass needs -- the FP8
+checkpoint this project would otherwise serve on such a card (the 36-layer or 40-layer one) is cut to 32 layers
+instead. Converting only the experts to NVFP4 takes them to about 16 GB and lets the full 36 layers fit, at a
+measured accuracy cost indistinguishable from noise against this checkpoint's own FP8 weights before that conversion
+(−0.07 points on a 1,400-question set, 95% interval [−0.86, +0.79]) and 1.86 points ahead of the 32-layer FP8
+checkpoint it would otherwise be compared against; that accuracy measurement predates this checkpoint's
+`prismyra-serve` integration and used a different serving path than the speed figures below.
 
-Why a 32-layer FP8 checkpoint is not a usable comparison on this card: it cannot complete a sixty-four-question request
-at all here (device memory runs out), where the 36-layer NVFP4 checkpoint can, so a width-for-width speed comparison
-between the two checkpoints is not available at the one width most exposes a difference. Speed is instead tracked
-against this project's own earlier releases, same checkpoint, same card, alternating with `origin/main` three times
-each (one race-comprehension document, about 5,300 tokens, median of 5 runs after 2 warm-up calls, this project's own
-tuned FP8 kernel tables installed): one question 1.47% faster, sixteen 2.34% faster, sixty-four 3.18% faster, with the
-alternating runs' own min-max ranges not overlapping at any of the three widths -- the dense-projection fusion and
-wider branch read above, carried over from the FP8 kernel they are not specific to. `interleaved_fork` (below) adds a
-further 5.9% at sixteen questions and 1.3% at sixty-four, measured the same way, toggled on one already-built engine
-rather than against a separate release.
+Why the 32-layer FP8 checkpoint (the one FP8 checkpoint that does fit this card) is not used as the speed comparison
+here: it cannot complete a sixty-four-question request at all on this card (device memory runs out), where the
+36-layer NVFP4 checkpoint can, so a width-for-width comparison between the two is not available at the width most
+exposes a difference, and this project no longer treats a narrower comparison (one or sixteen questions only) as a
+usable stand-in for it. Speed is instead tracked release to release: this checkpoint, this card, three rounds
+alternating against `origin/main` (one document built by joining RACE articles until it reaches about 5,300 tokens,
+median of 5 runs after 2 warm-up calls each round, this project's own tuned FP8 kernel tables installed) -- one
+question 1.47% faster, sixteen 2.34% faster, sixty-four 3.18% faster, with the alternating rounds' own min-max ranges
+not overlapping at any of the three widths. `interleaved_fork` was off (this release's old default) on both sides of
+that comparison; the dense-projection fusion above is this project's leading explanation for the gain, since it is
+the one change in this comparison not specific to NVFP4, but the comparison itself is release to release and so also
+carries whatever else changed in between. `interleaved_fork`'s own effect is measured separately, on top of this,
+with the fusion already in place on both sides: toggled on one already-built engine rather than against a separate
+`origin/main` checkout, fifteen alternating rounds, min-max ranges not overlapping at either width reported, it adds
+a further 5.9% at sixteen questions and 1.3% at sixty-four.
 
 The NVFP4 MoE kernel's own per-shape autotuning (`autotune_tactics`) is a separate, still-open gap: its tuning buckets
 are powers of two, and a context pass's internal chunk sizes are not, so some shapes fall back to an untuned tactic
-(`falling back to runner=MoERunner tactic=-1` in the kernel's own log) every time they occur. The tactic this project's
-own race-comprehension document already selects at this width is the fastest of the tactics FlashInfer offers at that
-bucket, so there is no untried candidate left to switch to without changing the underlying CUTLASS grouped-GEMM
-implementation itself -- out of this project's scope for now.
+(`falling back to runner=MoERunner tactic=-1` in the kernel's own log) every time they occur. The bucket this
+project's own race-comprehension document falls into is not one of those -- the tactic already selected for it is
+the fastest FlashInfer offers at that bucket, so there is no untried candidate left for that one bucket specifically
+without changing the underlying CUTLASS grouped-GEMM implementation itself. Every other bucket, and the shapes that
+do fall back to the untuned tactic, are not checked by this and remain open -- out of this project's scope for now.
 
-See [docs/PERFORMANCE.md's settings table](PERFORMANCE.md#settings-that-change-speed-not-the-answer) for
+See [docs/PERFORMANCE.md's settings table](PERFORMANCE.md#four-speed-settings-two-that-risk-the-answer) for
 `interleaved_fork` and `wide_group`, the two flags that change how a multi-question request reaches these kernels.
 
 ## Measured and rejected
