@@ -17,12 +17,23 @@ import torch
 from torch import nn
 
 from .. import varlen
+from ..fork import WIDTHS
 from ..onepass import rows_exact
 from . import Applied, Swap, register
 from .conv import available as triton_available
 from .conv import causal_depthwise_conv1d, starts_from_boundaries
 
 BLOCK = (128, 128)
+
+#: Rows at or below this width take a fused group's one combined matmul (`_ProjectionSlot`); above it, each slot
+#: falls back to its own separate `Fp8Linear` call. Both sides are bit-identical to the pre-fusion separate calls
+#: (`_fuse_pair` checks the fused side against them), so switching on M changes nothing a caller reads back -- only
+#: which kernel calls computed it. The split exists because the fused matmul measurably loses to the separate
+#: calls at context width for one group (GDN's in_proj_qkv+in_proj_z, -9.4% at M=5309, RUN-fp4spd2.md section 2.4):
+#: a different N there picks a different tile than either separate call would. `WIDTHS[-1]` is the widest a branch
+#: pass ever is (`prismyra/fork.py`), so this keeps every branch call fused and every context-sized call (always
+#: wider) separate, for all three fused groups alike rather than special-casing just the one that measured worse.
+FUSION_MAX_ROWS = WIDTHS[-1]
 
 #: The router's own matmul, made row-count invariant at its one call site, rather than through the process-wide
 #: `aten::linear` override `engine._enable_batch_invariance` used to be the only way to reach it. vLLM's own fixed-tile
@@ -198,27 +209,38 @@ class _ProjectionSlot(nn.Module):
     sibling by its own attribute (`q_proj`, `in_proj_z`, ...) one call at a time rather than through one combined
     call.
 
-    The slots sharing one `_FusedDenseProjection` are always called back-to-back on the identical input, in the
-    fixed order the fusion was built from -- checked once in `_fuse_pair`, against the separate `Fp8Linear` calls
-    this replaces, before any slot is installed; the model's own generated `forward` is what calls them in that
-    order, and nothing else addresses these attributes. The first slot in that order runs the one combined matmul
-    and stashes the other slots' shares for them to pop; a later slot that popped nothing raises `AttributeError`
-    rather than returning someone else's share, because a call that did not happen in the checked order is not an
-    arithmetic question this class can answer. The stash is `threading.local` because this project's own two-lane
-    concurrency (`engine.py`'s lane-tagged scratch) can run two forward passes through the same model weights on two
-    threads at once, and a plain instance attribute would let one lane's share leak into the other's read.
+    Rows at or below `FUSION_MAX_ROWS` go through the fused group matmul: the slots sharing one
+    `_FusedDenseProjection` are always called back-to-back on the identical input, in the fixed order the fusion
+    was built from -- checked once in `_fuse_pair`, against the separate `Fp8Linear` calls this replaces, before
+    any slot is installed; the model's own generated `forward` is what calls them in that order, and nothing else
+    addresses these attributes. The first slot in that order runs the one combined matmul and stashes the other
+    slots' shares for them to pop; a later slot that popped nothing raises `AttributeError` rather than returning
+    someone else's share, because a call that did not happen in the checked order is not an arithmetic question
+    this class can answer. The stash is `threading.local` because this project's own two-lane concurrency
+    (`engine.py`'s lane-tagged scratch) can run two forward passes through the same model weights on two threads
+    at once, and a plain instance attribute would let one lane's share leak into the other's read.
+
+    Rows above `FUSION_MAX_ROWS` skip the group entirely: this slot calls its own `original` (the separate
+    `Fp8Linear` `_fuse_pair` found and verified), independently of its siblings. Nothing to coordinate -- every
+    slot in the group sees the same `x` and so takes the same branch on the same call, without needing to agree.
     """
 
-    def __init__(self, fused: _FusedDenseProjection, index: int, order: list["_ProjectionSlot"]):
+    def __init__(
+        self, fused: _FusedDenseProjection, index: int, order: list["_ProjectionSlot"], original: Fp8Linear
+    ):
         super().__init__()
         self.fused = fused
         self.index = index
         self.order = order  # one list, shared by every slot in the group, in call order
+        self.original = original
         self.in_features = fused.in_features
         self.out_features = fused.sizes[index]
         self._local = threading.local()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rows = x.numel() // x.shape[-1]
+        if rows > FUSION_MAX_ROWS:
+            return self.original(x)
         if self is self.order[0]:
             parts = self.fused(x)
             for slot, part in zip(self.order[1:], parts[1:]):
@@ -231,7 +253,8 @@ class _ProjectionSlot(nn.Module):
 
 def _fuse_pair(applied, parent: nn.Module, names: tuple[str, ...], label: str) -> bool:
     """Replace `names` on `parent` with one `_FusedDenseProjection` and its `_ProjectionSlot`s, in that call order,
-    once a probe shows the combined matmul agrees bit-for-bit with the separate `Fp8Linear` calls it would replace.
+    once two probes -- one at or below `FUSION_MAX_ROWS`, one above it -- show both of `_ProjectionSlot`'s
+    branches agree bit-for-bit with the separate `Fp8Linear` calls it would replace.
 
     Declines (and records why) rather than guessing: if `dense_matmul` has not run yet, or ran but found this
     particular projection unsuited to the fast kernel (`_is_block_quantised` said no), the attributes are not
@@ -242,18 +265,19 @@ def _fuse_pair(applied, parent: nn.Module, names: tuple[str, ...], label: str) -
         applied.skipped.append(f"{label}: not all of {names} are Fp8Linear, left separate")
         return False
     device = originals[0].weight.device
-    probe = torch.randn(2, 3, originals[0].in_features, device=device, dtype=torch.bfloat16)
-    with torch.inference_mode():
-        want = [o(probe) for o in originals]
+    in_features = originals[0].in_features
     fused = _FusedDenseProjection(originals)
     order: list[_ProjectionSlot] = []
     for i in range(len(names)):
-        order.append(_ProjectionSlot(fused, i, order))
-    with torch.inference_mode():
-        got = [slot(probe) for slot in order]
-    if not all(torch.equal(w, g) for w, g in zip(want, got)):
-        applied.skipped.append(f"{label}: the combined matmul disagreed with the separate calls, left separate")
-        return False
+        order.append(_ProjectionSlot(fused, i, order, originals[i]))
+    for rows, branch in ((6, "fused"), (FUSION_MAX_ROWS + 7, "separate")):
+        probe = torch.randn(rows, in_features, device=device, dtype=torch.bfloat16)
+        with torch.inference_mode():
+            want = [o(probe) for o in originals]
+            got = [slot(probe) for slot in order]
+        if not all(torch.equal(w, g) for w, g in zip(want, got)):
+            applied.skipped.append(f"{label}: the {branch} branch disagreed with the separate calls, left separate")
+            return False
     for n, slot in zip(names, order):
         setattr(parent, n, slot)
     return True
