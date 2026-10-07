@@ -43,9 +43,16 @@ class FakeEngine:
 
     `group` and `longest_context` are what the limits are read from. Nothing here runs a model, so the batches recorded
     are exactly the scheduler's decisions with nothing else mixed in.
+
+    `wide_group` and `interleaved_fork` stay `False`: both route `Batcher._answer`/`_on_shelf` to real-engine-only
+    methods this stand-in does not implement (`_shelf_ask_interleaved`, `_shelf_ask_interleaved_many`), and this
+    file's own job is the forming/admission rule the two-step `open_batch` path below already exercises, not the
+    device-dependent fused one. See `tests/test_gpu.py` for the fused path's own coverage.
     """
 
     paged = True
+    wide_group = False
+    interleaved_fork = False
 
     def __init__(
         self,
@@ -93,7 +100,7 @@ class FakeEngine:
             time.sleep(self.per_call)
         return FakeBatch(list(contexts))
 
-    def open_shelf(self, room: int | None = None, lane: int = 0) -> FakeShelf:
+    def open_shelf(self, room: int | None = None, lane: int = 0, group: int | None = None) -> FakeShelf:
         self.shelves += 1
         return FakeShelf(self)
 
@@ -280,7 +287,7 @@ def test_a_failing_pass_fails_every_request_in_it():
     worker handed over were completed."""
 
     class Broken(FakeEngine):
-        def open_shelf(self, room: int | None = None, lane: int = 0):
+        def open_shelf(self, room: int | None = None, lane: int = 0, group: int | None = None):
             raise RuntimeError("the pass failed")
 
     engine = Broken(group=8)

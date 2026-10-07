@@ -18,7 +18,7 @@ import torch
 if TYPE_CHECKING:  # pragma: no cover - the framework's cache type, for the annotation only
     from transformers.cache_utils import Cache
 
-from . import kernels, onepass, varlen
+from . import interleave, kernels, onepass, varlen
 from .cache import build_cache, cache_bytes, join_bytes_per_token
 from .calibration import Calibration
 from .fork import (
@@ -55,6 +55,29 @@ GROUP = 32
 #: A packed branch group is rounded up to a multiple of this many tokens. Eight keeps the matmul tiles aligned
 #: without giving back much of what packing saves.
 PACK_ALIGN = 8
+#: fp8spd (S4a / SYNTHESIS.md P1): the question count above which `ask()` widens this one document's own branch-row
+#: capacity to `WIDE_GROUP` instead of leaving it at `self.group`. A document with more questions than
+#: `WIDE_GROUP_FROM` pays for `ceil(questions / self.group)` branch passes today, each re-streaming the whole routed
+#: expert weight set; one pass of up to `WIDE_GROUP` rows removes that re-stream for the common two-pass case
+#: (33-64 questions). Measured on L40S, fp8-36l, interleaved: see RUN-fp8spd.md. Below this threshold nothing
+#: changes -- a request narrower than one `self.group`-wide pass already uses only as many rows as it has questions.
+WIDE_GROUP_FROM = 32
+WIDE_GROUP = 64
+
+#: fp8spd4 (S4c round5 follow-up, RUN-fp8spd.md "座長指示: 64問の2つ目の枝グループも層交互の経路に乗せる"):
+#: widening to `WIDE_GROUP` for `interleaved_fork` costs 36 layers' worth of wider GDN state buffers, paid once
+#: whatever the context holds; it is worth it only while the restream it removes is still the larger of the two.
+#: An alternating length sweep on L40S, fp8-36l, 64 questions (`tools/s4c_64q_length_sweep.py`) found the sign
+#: flip between 7,068 context tokens (-4.06% vs the two-pass baseline, widening still wins) and 9,044 (+0.95%,
+#: widening now loses) -- a linear interpolation puts the crossing at about 8,669 tokens. This constant sits
+#: below the measured losing point with a margin, not at the interpolated crossing itself, because the sweep's
+#: own two neighbouring points already bracket it to within ~2,000 tokens and this only needs to stay on the
+#: winning side of that bracket, not pinpoint it exactly. A context this long or longer keeps using the
+#: non-widened interleaved path instead of falling all the way back to two-pass: that path never regressed at
+#: any length this round tested, including 20,064 tokens (`tools/s4c_16q_length_check.py`, -3.19%) and is what
+#: fp8spd3's own round5 measured for 64 non-widened questions at long context (-0.7%) -- strictly better than
+#: paying the widening's cost and strictly better than giving up the fusion altogether.
+INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT = 8192
 
 #: How much more than the model predicts a branch pass is budgeted at. An allocator's peak is blocks rounded up and
 #: reused rather than a sum of tensor sizes, and the prediction is two terms answering to a handful of measurements.
@@ -402,6 +425,8 @@ class Prismyra:
         short_graphs: bool | None = None,
         heads: str | list | None = None,
         pin_autotune: bool = True,
+        wide_group: bool = False,
+        interleaved_fork: bool = True,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -416,6 +441,41 @@ class Prismyra:
         on_cuda = self.torch_device.type == "cuda"
         self.dtype = dtype or (torch.bfloat16 if on_cuda else torch.float32)
         self.group = group
+        # fp8spd (S4a / SYNTHESIS.md P1), **opt-in, off by default**: widening a document's own branch-row capacity
+        # past `self.group` when it is asked more than `WIDE_GROUP_FROM` questions (see `_group_for`).
+        # fp8spd3's own `torch.equal` gate first measured this as **not** bit-identical for 33 and 40 questions
+        # (RUN-fp8spd.md, "33問だけ不一致") and only bit-identical for the one case that divides evenly by
+        # `self.group` (64 = 32+32) -- the row-count-dependent GDN causal convolution took a different code path
+        # (the framework's own fallback, not the fast kernel) whenever a branch pass's row count was not exactly
+        # 1, which the leftover group from an uneven split always was and the full 32/64-row group never was.
+        # wg (RUN-wg.md) re-ran that gate across the whole 33-64 range on today's branch, after inv5's branch-pass
+        # convolution batch fix (`prismyra/kernels/qwen3_moe.py`'s `_install_conv`) closed that fallback for every
+        # row count, not only one: all 32 widths, both context lengths tested, both supported cards, come back
+        # `torch.equal` now, including with the batch-invariance claim below monkeypatched off (so that claim was
+        # never what fixed this). The mismatch this flag was switched off for is gone; it is kept off here anyway
+        # pending this project's own sign-off on flipping the default (RUN-wg.md's decision material), the same
+        # process `interleaved_fork` went through below before its default flipped.
+        self.wide_group = wide_group
+        # fp8spd (S4c / SYNTHESIS.md P5, out/p1_speed_opus.md P5), **on by default as of this release**: `ask()`
+        # with more than one question goes through `interleave.read_and_branch` instead of
+        # `open_context(...).ask(...)` -- one layer-interleaved pass fusing the context's and the first branch
+        # group's dense/MoE compute per layer, instead of two full passes. This used to stay off by default
+        # pending `torch.equal` confirmation and the construction-flag-dependent one-pass answer tracked at
+        # `_enable_batch_invariance`'s own call site below; both are now closed. `torch.equal` against the
+        # two-pass path is confirmed on real hardware across both supported cards (L40S/fp8-36l,
+        # RTX PRO 4500/nvfp4-36l), two context lengths an order of magnitude apart, and every question count this
+        # project asks it to handle differently (16, 32, 33, 64 -- see `tests/test_gpu.py`'s
+        # `test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did`, and RUN-fp8spd.md/RUN-recon.md
+        # for the real-hardware rounds this closed). Measured faster on real RACE documents at every width above
+        # one question on both cards (RUN-integ.md, RUN-recon.md); `False` remains available for a caller that
+        # wants to rule the fused path out while debugging. `self.wide_group` is a separate switch and stays off
+        # by default -- it widens a different range (33-63 questions in the *un-fused* path), which this flag
+        # does not touch. That range's own `torch.equal` mismatch (fp8spd3's "33問だけ不一致") has since been
+        # closed too (see `self.wide_group`'s own comment above and RUN-wg.md), independently of this flag; its
+        # default is a separate decision, still pending this project's sign-off.
+        # Requires the borrowed kernels (`self._borrowed_kernel`, decided below, after the kernels are applied)
+        # -- see `ask`'s guard.
+        self.interleaved_fork = interleaved_fork
         # The caches are held by the engine and mutated in place, so two threads asking at once would interleave one
         # another's branches. The lock makes that safe; `prismyra.queue.Worker` is still what makes it fast.
         self._lock = threading.RLock()
@@ -435,6 +495,12 @@ class Prismyra:
         #: Monotonic deadline before `empty_cache()` is tried again, once it has been tried and still left free
         #: memory at or below `GRAPH_MEMORY_MARGIN`. See `RECLAIM_COOLDOWN_S`.
         self._reclaim_cooldown_until = 0.0
+        #: fp8spd (S5 / SYNTHESIS.md): how many times this engine has actually called `torch.cuda.empty_cache()`
+        #: from `_run_recorded`'s margin check, and how many milliseconds those calls cost in total. Measurement
+        #: only -- nothing reads these to make a decision -- kept so an open-loop run can report the real count
+        #: and cost instead of the proxy "how many passes reached the below-margin branch" THROUGHPUT.md used.
+        self._empty_cache_calls = 0
+        self._empty_cache_ms = 0.0
         #: Whether to record a branch pass and replay it. Off by default, and the reason is memory rather than doubt: a
         #: recording holds a private allocator pool, and this engine refuses a context by name from a budget it
         #: measures, so a feature that quietly takes device memory behind that budget would make the refusal wrong.
@@ -442,8 +508,9 @@ class Prismyra:
         self.graphs = graphs
         #: Whether the attention read goes through a page table. Off by default. Its point is not memory -- that was
         #: measured at zero -- but that the read's shape stops depending on the context's length, so one recorded graph
-        #: serves every context instead of one per open context. See `prismyra/paged.py`.
-        self.paged = paged
+        #: serves every context instead of one per open context. See `prismyra/paged.py`. Assigned through the `paged`
+        #: property below (set once self.applied exists, further down this method) rather than here as a plain
+        #: attribute: see that property's own docstring for why.
         if paged:
             from .paged import PagedUnavailable, kernel_supports_pages
 
@@ -569,13 +636,74 @@ class Prismyra:
         #: stored in or handed to the framework's own attention as a strided view. That changes what a branch pass
         #: transiently allocates, so it changes what admission budgets.
         self._borrowed_kernel = self.applied.ok and not self.applied.skipped
-        if paged and on_cuda:
+        #: Whether *this* engine currently holds a claim on the process-wide batch-invariance registration -- see
+        #: the `paged` property. Must exist before the first assignment to `self.paged` below, which reads it.
+        self._invariance_claimed = False
+        # recon (round 1, 2026-10-07): a *second*, permanent claim, independent of `self._invariance_claimed`
+        # (which only tracks the `paged` property's own on/off toggle -- see that property's docstring). Found
+        # chasing RUN-integ.md 12.3's puzzle: an engine built with `interleaved_fork=True, wide_group=True`
+        # answered a single question (n=1, `_ask_in_one_pass` -- a method with no branch on either flag) up to
+        # 0.208 away from the default-off engine's answer to the identical document/question, on the same card.
+        # Root cause, isolated on real hardware one axis at a time (`tools/diag_onepass_capture.py`,
+        # `tools/diag_autotune_gap.py`, `tools/diag_on_reproducible.py`): `__init__` records the one-pass CUDA
+        # graphs (`onepass.record_all`, below) *after* whatever this constructor's flags did to the
+        # registration -- a graph capture bakes in whichever matmul kernel the dispatcher hands it at that exact
+        # moment, so an engine built with `interleaved_fork=True` (which used to claim the registration here)
+        # permanently replays the batch-invariant Triton kernel for n=1, while the default engine permanently
+        # replays whatever cuBLAS/cuBLASLt's own heuristic happened to pick that construction. Triton-autotuner
+        # racing was ruled out (`diag_autotune_gap.py`: every autotuner is already pinned to one candidate, zero
+        # cache entries, by the time construction finishes) and re-recording under a *held* registration state
+        # round-trips exactly (`diag_on_reproducible.py`: three independent re-recordings under "on" agreed to
+        # the bit) -- re-recording under the *default* state did not (two re-recordings under "off" differed by
+        # 0.0081, the same order as the on/off gap itself). That makes cuBLAS/cuBLASLt's own un-pinned heuristic
+        # the thing that was never actually deterministic, construction to construction, on the plain default
+        # path -- `interleaved_fork`'s old conditional claim was not adding a new side effect so much as it was
+        # the only existing way to opt into the one fix (the dispatcher override) that happens to close it.
+        # Claiming it unconditionally, for every CUDA engine, removes the construction-flag dependence by
+        # removing the non-deterministic default path entirely, for every caller, not only ones that opted into
+        # `paged` or `interleaved_fork` sharing a pass. A separate flag because `self._invariance_claimed` is
+        # the `paged` property's own on/off switch (`tests/test_gpu.py::engine_paged` flips it both ways on a
+        # shared engine, by design) -- reusing it here would let `engine.paged = False` drop this permanent
+        # claim as a side effect, reopening the exact cross-test leakage inv2 (round 4) already fixed once for a
+        # different pair of ops. Both flags add to the same reference count (`_enable_batch_invariance`'s own
+        # module-level counter), so holding both at once is safe and costs nothing extra -- the registration
+        # itself is only ever done once, no matter how many claims are outstanding.
+        self._invariance_base_claimed = False
+        if on_cuda:
             try:
                 _enable_batch_invariance()
+                self._invariance_base_claimed = True
             except ImportError as e:
                 self.applied.notes.append(
-                    f"batch-invariant mode not available ({e}); open_batch/Batcher may still move an answer by "
-                    "who else shares the pass -- see diag_layer0_op_divergence.py"
+                    f"batch-invariant mode not available ({e}); every answer on this engine may move by who "
+                    "else shares a pass, and a single question's answer may differ from one construction of "
+                    "this engine to the next -- see diag_onepass_capture.py"
+                )
+        # Through the property, not `self._paged = paged`: construction is one of the two places a caller can turn
+        # paging on (`Prismyra(..., paged=True)`), and the property is what makes that have the same effect as the
+        # other one (`engine.paged = True` after construction, which `tests/test_gpu.py::engine_paged` and any other
+        # caller flipping the flag between contexts does, by this file's own module docstring, "rather than loading
+        # a second copy"). See the `paged` property for why both have to run `_enable_batch_invariance()`. Redundant
+        # with the unconditional claim just above whenever that one succeeded (the registration is already on, so
+        # this is a second, independent claim on the same global count, not a second registration) -- kept so that
+        # `paged`'s own on/off toggle keeps working exactly as before even on a CUDA-unavailable `ImportError` path
+        # where the claim above did not run.
+        self.paged = paged
+        # fp8spd5 (round 7, RUN-fp8spd.md "本題/手2"): `interleaved_fork` used to need its own claim here for
+        # exactly the reason `paged` already had one -- `read_and_branch`'s one `mlp` call runs the context's and
+        # the branch's rows through the *same* routed-expert pass, and `fused_moe`'s own tile-size choice keys on
+        # that call's total row count unless `VLLM_BATCH_INVARIANT=1` is set (`_enable_batch_invariance`'s own
+        # docstring). That claim is now subsumed by the unconditional one above (every CUDA engine already holds
+        # it), so this block only still runs for the same reason the `paged` block above does: covering the
+        # `ImportError` path where the unconditional claim above did not succeed.
+        if interleaved_fork and not self._invariance_claimed and not self._invariance_base_claimed and on_cuda:
+            try:
+                _enable_batch_invariance()
+                self._invariance_claimed = True
+            except ImportError as e:
+                self.applied.notes.append(
+                    f"batch-invariant mode not available ({e}); open_batch/Batcher/read_and_branch may still "
+                    "move an answer by who else shares the pass -- see diag_layer0_op_divergence.py"
                 )
         self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
@@ -717,12 +845,84 @@ class Prismyra:
         rows = min(self.group, questions) if questions else self.group
         return self._observed_row_constant is not None and rows <= self._observed_at_rows
 
-    def open_context(self, context: str, *, images: list | None = None, videos: list | None = None) -> Context:
+    @property
+    def paged(self) -> bool:
+        """Whether the attention read goes through a page table. See `__init__`'s own comment on the attribute."""
+        return self._paged
+
+    @paged.setter
+    def paged(self, value: bool) -> None:
+        """Turning paging on is also the one condition `_enable_batch_invariance()` is gated on (`__init__`'s
+        comment on `self.applied`), and a caller can turn it on two ways: at construction (`Prismyra(...,
+        paged=True)`) or afterward, by assigning this attribute directly -- which this file's own module
+        docstring recommends ("flipping the flag between contexts rather than loading a second copy") and which
+        `tests/test_gpu.py::engine_paged` does, to share one set of weights between a joined-storage test and a
+        paged one. Before this property existed, only the first path ran the invariance setup: `self.paged =
+        paged` was a plain attribute, so `engine.paged = True` after construction left `open_batch`/`Batcher`
+        running with no protection at all against the row-count-chosen-GEMM-algorithm effect
+        `_enable_batch_invariance` exists for, silently, since nothing about assigning a bool raises or warns.
+
+        Found on the real checkpoint (inv2, round 4), while chasing `tests/test_gpu.py`'s own documented
+        0.008346 residual on `test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length`: a
+        synthetic, kernel-level reproduction of every op that test touches came back bit-identical across row
+        counts in isolation (`probe_attn_rowcount.py`, `probe_gdn_rowcount.py`, `probe_fused_moe_rowcount.py`,
+        `probe_dense_fp8_rowcount.py` -- all `torch.equal` across row counts 1-33, with
+        `_enable_batch_invariance()`'s dispatcher registered by hand first), which did not fit "a second,
+        separate, deeper cause" (round 3's own description of this residual). Reproducing `engine_paged`'s exact
+        two lines instead -- `Prismyra(MODEL)` then `engine.paged = True` -- showed `_BATCH_INVARIANT_DISPATCH_LIB`
+        stayed `None` (`check_invariance_fixture_gap.py`): the fixture's "flip the flag" path never ran the
+        dispatcher registration at all, in an engine constructed exactly as every `engine_paged`-based test in
+        this file constructs one. Fixing this property closed the residual on the real checkpoint to exactly
+        0.0 (`measure_residual_after_fix.py`, both the short and the long companion); reverting to the plain
+        attribute on the same weights, same process, same run reproduced a non-zero residual again (max
+        7.657e-05 here, a different run than round 3's own 0.008346 but the same sign and the same cause),
+        which is the before/after pair that makes this the actual cause rather than a correlate of it.
+
+        Reference-counted (`_enable_batch_invariance`/`_disable_batch_invariance`, both in this module), not a
+        one-shot: the first version of this fix left the dispatcher registered for the rest of the process once
+        any engine turned paging on, which (inv2, round 4) broke two *other*, unrelated tests on this same test
+        module's plain `engine` fixture (`test_a_short_question_replays_exactly_as_it_reads_eagerly` and
+        `test_a_headed_question_replays_exactly_as_it_reads_eagerly`) -- `onepass.py`'s one-pass CUDA graph
+        recording, left running under a dispatcher it was never recorded or verified against, once an earlier
+        `engine_paged` test flipped this attribute and never flipped it back off in the sense of undoing the
+        registration (`engine_paged`'s own `finally: engine.paged = was` restored this attribute but, before
+        this fix, nothing noticed and nothing reversed the dispatcher). Production code cannot hit that
+        collision -- `ask()`'s one-pass shortcut explicitly requires `not self.paged`, so one call never takes
+        both paths -- but this test module's shared-weights fixture does, by design (its own docstring: "the
+        same weights with the paged storage, by flipping the flag between contexts rather than loading a second
+        copy"). This setter now claims and releases one count per *instance* (`self._invariance_claimed`), so
+        turning paging back off on the engine that turned it on actually undoes the registration (confirmed by
+        hand that dropping a `torch.library.Library`'s last reference and `gc.collect()`-ing restores the
+        original op) once nothing else still needs it, instead of leaving it on for the rest of the process.
+        """
+        self._paged = value
+        if value and self.torch_device.type == "cuda" and not self._invariance_claimed:
+            try:
+                _enable_batch_invariance()
+                self._invariance_claimed = True
+            except ImportError as e:
+                self.applied.notes.append(
+                    f"batch-invariant mode not available ({e}); open_batch/Batcher may still move an answer by "
+                    "who else shares the pass -- see diag_layer0_op_divergence.py"
+                )
+        elif not value and self._invariance_claimed:
+            _disable_batch_invariance()
+            self._invariance_claimed = False
+
+    def open_context(
+        self, context: str, *, images: list | None = None, videos: list | None = None, group: int | None = None
+    ) -> Context:
         """Read a context and keep it open. The expensive half happens here, once.
 
         `images` and `videos` take anything the model's processor accepts -- a `PIL.Image`, a path, an array of frames
         -- and are read into the context alongside the text. This is where the design pays best: a frame costs the
         vision tower once and then behaves like any other context token, so the questions after it are nearly free.
+
+        `group` (fp8spd, S4a / SYNTHESIS.md) overrides `self.group` for this one document's own branch-row capacity.
+        `None` (the default, and every call site before this parameter existed) keeps the engine's own `self.group`.
+        See `ask`'s `_group_for` for the one caller that sets it, and `_read` for why it must be decided before the
+        read rather than widened later: the fork buffers it sizes are allocated once, while the context is read, and
+        a later widen would move that allocation's cost into the first branch pass that needed it instead.
 
         The returned context holds device memory until it is closed -- `Context.close`, or a `with` block. See
         `cache_bytes`.
@@ -738,7 +938,7 @@ class Prismyra:
             before = self._peak_baseline()
             try:
                 with torch.inference_mode():
-                    prefill = self._read(encoded)
+                    prefill = self._read(encoded, group=group)
             except torch.OutOfMemoryError as e:
                 raise PrismyraError(
                     f"ran out of memory reading a context of {encoded.tokens} tokens. This is the read rather than a "
@@ -774,10 +974,281 @@ class Prismyra:
         self.validate(questions)
         if len(questions) == 1 and not images and not videos and self.calibration is None and not self.paged:
             return self._ask_in_one_pass(context, questions[0])
-        with self._lock, self.open_context(context, images=images, videos=videos) as opened:
+        group = self._group_for(len(questions)) if self.wide_group else None
+        # fp8spd (S4c): the same restrictions `_ask_in_one_pass` and `open_batch` already state for the same
+        # reasons -- media move the positions during the read, calibration measures its priors through branch
+        # passes of its own shape, and the paged storage's pages belong to a pool this path does not draw from.
+        if self.interleaved_fork and not images and not videos and self.calibration is None and not self.paged:
+            # fp8spd3 (round 5): at the default `self.group` (32), 64 questions pack into exactly two 32-row
+            # groups -- the first takes the fused path below, the second still falls back to `self._branch`
+            # (`_ask_interleaved`'s own docstring). Widening to one 64-row group here puts every row through the
+            # fused path instead of half of them. Deliberately **not** the general `self.wide_group` switch
+            # above, kept as its own narrower condition rather than merged into it, even though both now verify
+            # bit-identical: `self.wide_group` also covers 33-63 questions, a range fp8spd3's own gate first
+            # measured *not* bit-identical (RUN-fp8spd.md, "33問だけ不一致") -- that mismatch's real cause (the
+            # GDN layer's causal convolution falling back to a different implementation whenever a branch
+            # pass's row count was not exactly 1, `prismyra/kernels/qwen3_moe.py`'s `_install_conv`) was closed
+            # by inv5's branch-pass convolution batch fix, independently of this flag, and 64-exact was simply
+            # the one width S4a's own gate happened to measure before that fix landed (wg, RUN-wg.md: 33-64
+            # re-verified bit-identical on today's branch, both cards, with and without the batch-invariance
+            # claim). torch.equal-gated against the two-32-row-group path before being wired in here -- see
+            # RUN-fp8spd.md round 5.
+            #
+            # fp8spd4: widening every one of 36 layers' GDN state buffers to 64 rows costs more than fusing the
+            # second group saves once the context itself, not the restream, dominates a pass -- round5 measured
+            # this as a win at ~5,016 tokens (-9.6%) and a loss at ~20,064 (+6.0%). `_ask_interleaved` now
+            # decides whether to widen *after* it has `encoded.tokens` (`INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT`,
+            # measured crossover ~8,669 tokens), rather than this call site guessing blind before the context is
+            # even tokenized. A caller that asks 64 questions about a long document still gets the fused path --
+            # just at `self.group` (32) rather than widened to 64 -- because the non-widened fused path never
+            # regressed at any length this round tested (`tools/s4c_16q_length_check.py`, down to -3.19% at
+            # 20,064 tokens; fp8spd3 round5's own 64-question non-widened measurement: -0.7% at long context),
+            # which is strictly better than falling all the way back to the two-pass baseline.
+            return self._ask_interleaved(context, questions, group)
+        with self._lock, self.open_context(context, images=images, videos=videos, group=group) as opened:
             assert opened._prefill is not None
             answered = self._answer(opened._prefill, questions, opened.tokens, context_ms=opened.context_ms)
         return answered
+
+    def _group_for(self, n_questions: int) -> int | None:
+        """`None` (keep `self.group`) unless this request needs more rows in one pass than `self.group` gives it.
+
+        fp8spd (S4a / SYNTHESIS.md P1). A document asked more than `WIDE_GROUP_FROM` questions pays for
+        `ceil(n_questions / self.group)` branch passes under the engine's own default (32); widening to
+        `WIDE_GROUP` (64) turns the common 33-64 question case into one pass instead of two, which removes one
+        whole re-stream of the routed expert weights. Only ever widens, never narrows: a caller who built this
+        engine with `group=128` already gets one pass up to 128 rows and this must not shrink that back to 64.
+        """
+        if n_questions > WIDE_GROUP_FROM and self.group < WIDE_GROUP:
+            return WIDE_GROUP
+        return None
+
+    def _ask_interleaved(self, context: str, questions: list[Question], group: int | None) -> Result:
+        """`ask()`'s S4c path: the context and the first branch group through one layer-interleaved pass
+        (`interleave.read_and_branch`) instead of a separate `open_context` read and `_branch` pass. See that
+        module's docstring for what is fused and why, and `RUN-fp8spd.md` for the `torch.equal` and interleaved
+        speed measurements this went through before `interleaved_fork=True` was wired in here.
+
+        A second (or further) group of questions -- more than `group` of them -- runs through `self._branch`,
+        unmodified, from the `Prefill` the interleaved pass returns; see `interleave.read_and_branch`'s own
+        docstring for why that `Prefill`'s snapshot is interchangeable with one `_read` would have taken.
+
+        **The exactly-64-questions widen decision is made here, not at the call site** (fp8spd4), because only
+        here is `encoded.tokens` known without tokenizing the context twice. See
+        `INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT`'s own comment for the length sweep this threshold comes from and why
+        a long document keeps the (never-regressed) non-widened fused path at `self.group` instead of losing the
+        fusion altogether. This only ever widens past what `group` (`self.wide_group`'s own, separately-gated
+        33-64 mechanism, still off by default) already asked for -- a caller running both `wide_group` and
+        `interleaved_fork` together already gets 64 from `group` itself before this method is reached, and nothing
+        here narrows that back down; this round's length guard is scoped to the width `interleaved_fork` decides
+        on its own, not to the two features used together, a combination neither this round nor S4a's own gate
+        has measured.
+
+        Admission is not updated from this path's own peak (unlike `_answer`'s `_observe_peak` and
+        `open_context`'s `_observe_reading`): the peak this pass reaches is the context's read and the first
+        branch group's answer at once, which is not the shape either of those two counters means to describe,
+        and feeding it to either would mis-calibrate admission for the ordinary two-pass path too. `_check_fits`
+        below still runs, from whatever either counter already holds -- this path does not admit anything the
+        two-pass path's own figures would have refused, it just does not sharpen them.
+        """
+        if not context.strip():
+            raise PrismyraError("a context cannot be empty")
+        encoded = encode(context, None, None, self.processor, self.tokenizer, self.device)
+        self._check_fits(encoded.tokens)
+        effective_group = group or self.group
+        if (
+            len(questions) == WIDE_GROUP
+            and effective_group < WIDE_GROUP
+            and encoded.tokens < INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT
+        ):
+            effective_group = WIDE_GROUP
+        plans = [plan(q, self.tokenizer) for q in questions]
+        token_ids = [p.token_ids for p in plans]
+        width = self._width_for(plans)
+        groups = self._packed_groups(plans, width, group=effective_group)
+        first_members, first_width = groups[0]
+        first_texts = [plans[i].text for i in first_members]
+        first_padded = _round_rows(len(first_members), effective_group)
+
+        start = _now(self.torch_device)
+        with self._lock, torch.inference_mode():
+            try:
+                by_index: dict[int, torch.Tensor] = {}
+                hidden0, prefill = interleave.read_and_branch(
+                    self, encoded, first_texts, width=first_width, group=effective_group, padded_rows=first_padded
+                )
+                scored0 = self.heads.apply(
+                    hidden0,
+                    [questions[i].options for i in first_members],
+                    score(hidden0, self.unembedding, [token_ids[i] for i in first_members], None),
+                )
+                by_index.update(zip(first_members, scored0, strict=True))
+                for n, (members, group_width) in enumerate(groups[1:], start=1):
+                    chunk = [plans[i].text for i in members]
+                    padded = _round_rows(len(members), prefill.group or self.group)
+                    same_shape_left = sum(
+                        1
+                        for m, w in groups[n + 1 :]
+                        if _round_rows(len(m), prefill.group or self.group) == padded and w == group_width
+                    )
+                    hidden = self._branch(prefill, chunk, len(chunk), group_width, remaining=same_shape_left)
+                    scored = self.heads.apply(
+                        hidden,
+                        [questions[i].options for i in members],
+                        score(hidden, self.unembedding, [token_ids[i] for i in members], None),
+                    )
+                    by_index.update(zip(members, scored, strict=True))
+                probabilities = [by_index[i] for i in range(len(questions))]
+            except torch.OutOfMemoryError as e:
+                raise PrismyraError(
+                    f"ran out of memory answering {len(questions)} questions about {encoded.tokens} context "
+                    f"tokens at group={effective_group} (interleaved_fork). Ask fewer questions at a time, or "
+                    f"build the engine with a smaller group; the context itself is held once and is not what "
+                    f"grew."
+                ) from e
+        readout_ms = _since(start, self.torch_device)
+
+        answers = {
+            q.id: _answer_for(q, p.tolist(), self.heads.name_for(q.options))
+            for q, p in zip(questions, probabilities, strict=True)
+        }
+        return Result(
+            answers=answers,
+            model=self.model_name,
+            context_tokens=encoded.tokens,
+            scoring="raw",
+            timing=Timing(context_ms=0.0, readout_ms=readout_ms),
+        )
+
+    def _shelf_ask_interleaved(self, shelf, context: str, questions: list[Question]) -> tuple[Result, int, "Shelved"]:
+        """`Batcher._answer`'s S4c path (round 5): one *fresh* document, read into `shelf` and answered in the
+        same layer-interleaved pass instead of `Shelf.put_many` followed later by `Shelf.ask`. See
+        `interleave.read_and_branch_shelf` for what the paged cache needed that `_ask_interleaved`'s joined-cache
+        version did not, and `RUN-fp8spd.md` round 5 for the torch.equal gate this went through before being
+        wired into `schedule.Batcher._answer`.
+
+        Scoped by the caller to exactly one document whose own questions already fit one group (every request
+        `Batcher` admits does, by `schedule.Limits.questions`) -- there is no second group to fall back to
+        `Shelf.ask` for here the way `_ask_interleaved` falls back to `self._branch`, so this returns a finished
+        `Result` plus the `(handle, Shelved)` pair the caller stores on the shelf, rather than a `Prefill` a
+        second call would still need.
+
+        `self.wide_group` (fp8spd6, round 8): the same 33-`WIDE_GROUP`-question, under-`INTERLEAVE_WIDE_GROUP_
+        TOKEN_LIMIT`-tokens widen `_ask_interleaved` already applies to the joined-cache path, applied here for
+        the shelf one. Tokenising once more to make that decision (`self.encode_context`, cheap next to the
+        forward pass this guards) rather than widening unconditionally: round 6 measured widening to cost more
+        than it saves past that token threshold on the *joined* path, and nothing about the shelf's own paged
+        pool changes that -- the extra GDN state a wider pass carries scales with context length the same way
+        either way. `shelf` must already have been opened with `group=WIDE_GROUP` room in its own paged pool
+        for this to be more than a decision with nowhere to act on it -- `schedule.Batcher` is the caller that
+        opens it that way when `self.wide_group`, see `Batcher._on_shelf`.
+        """
+        plans = [plan(q, self.tokenizer) for q in questions]
+        token_ids = [p.token_ids for p in plans]
+        width = self._width_for(plans)
+        group = self.group
+        if self.wide_group:
+            widened = self._group_for(len(questions))
+            if widened is not None and self.encode_context(context).tokens < INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT:
+                group = widened
+        padded_rows = _round_rows(len(questions), group)
+        texts = [p.text for p in plans]
+
+        start = _now(self.torch_device)
+        with self._lock, torch.inference_mode():
+            try:
+                hidden, handle, shelved = interleave.read_and_branch_shelf(
+                    self, shelf, context, texts, width=width, padded_rows=padded_rows
+                )
+                scored = self.heads.apply(hidden, [q.options for q in questions], score(hidden, self.unembedding, token_ids, None))
+            except torch.OutOfMemoryError as e:
+                raise PrismyraError(
+                    f"ran out of memory reading and answering {len(questions)} questions about a fresh document "
+                    f"on a shelf (interleaved_fork). Ask fewer questions at a time, or build the engine with a "
+                    f"smaller group."
+                ) from e
+        readout_ms = _since(start, self.torch_device)
+
+        answers = {
+            q.id: _answer_for(q, p.tolist(), self.heads.name_for(q.options))
+            for q, p in zip(questions, scored, strict=True)
+        }
+        result = Result(
+            answers=answers,
+            model=self.model_name,
+            context_tokens=shelved.tokens,
+            scoring="raw",
+            timing=Timing(context_ms=0.0, readout_ms=readout_ms),
+        )
+        return result, handle, shelved
+
+    def _shelf_ask_interleaved_many(
+        self, shelf, contexts: list[str], questions_per_doc: list[list[Question]]
+    ) -> list[tuple[Result, int, "Shelved"]]:
+        """`_shelf_ask_interleaved`'s own job for several *fresh* documents at once (round 7, "本題"): every
+        document in `formed.jobs` is fresh (`schedule.Batcher._answer`'s own generalised fusion condition --
+        see that function), so one layer-interleaved pass reads and answers all of them, instead of diluting
+        across `len(fresh)` separate single-document fused passes or falling back to `Shelf.put_many`+
+        `Shelf.ask`. See `interleave.read_and_branch_shelf_many` for what changed to carry `N` documents
+        instead of one, and `RUN-fp8spd.md` round 7 for the torch.equal gate this went through.
+
+        Each document's own `_round_rows(len(questions), group)` is computed here, independently, before the
+        fused call -- not recombined with any other document's count inside it (`interleave.
+        read_and_branch_shelf_many`'s own docstring is why that order matters). `group` is `self.group` unless
+        `self.wide_group` widens *that one document's own* count the same way `_shelf_ask_interleaved` does
+        (round 8) -- a mixed bin can have some documents at `self.group` and one at `WIDE_GROUP`, which is safe
+        for the same reason the per-document independence already is: nothing here depends on a companion's
+        own count, widened or not.
+        """
+        plans_per_doc = [[plan(q, self.tokenizer) for q in qs] for qs in questions_per_doc]
+        width = self._width_for([p for plans in plans_per_doc for p in plans])
+        groups_per_doc = []
+        for context, plans in zip(contexts, plans_per_doc, strict=True):
+            group = self.group
+            if self.wide_group:
+                widened = self._group_for(len(plans))
+                if widened is not None and self.encode_context(context).tokens < INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT:
+                    group = widened
+            groups_per_doc.append(group)
+        padded_rows_per_doc = [
+            _round_rows(len(plans), group) for plans, group in zip(plans_per_doc, groups_per_doc, strict=True)
+        ]
+        texts_per_doc = [[p.text for p in plans] for plans in plans_per_doc]
+
+        start = _now(self.torch_device)
+        with self._lock, torch.inference_mode():
+            try:
+                hidden, handles, shelved_list = interleave.read_and_branch_shelf_many(
+                    self, shelf, contexts, texts_per_doc, width=width, padded_rows_per_doc=padded_rows_per_doc
+                )
+                token_ids = [p.token_ids for plans in plans_per_doc for p in plans]
+                options = [q.options for qs in questions_per_doc for q in qs]
+                scored = self.heads.apply(hidden, options, score(hidden, self.unembedding, token_ids, None))
+            except torch.OutOfMemoryError as e:
+                raise PrismyraError(
+                    f"ran out of memory reading and answering {len(contexts)} fresh documents in one "
+                    f"layer-interleaved pass (interleaved_fork). Ask about fewer documents at a time."
+                ) from e
+        readout_ms = _since(start, self.torch_device)
+
+        results = []
+        at = 0
+        for questions, shelved in zip(questions_per_doc, shelved_list, strict=True):
+            answers = {
+                q.id: _answer_for(q, p.tolist(), self.heads.name_for(q.options))
+                for q, p in zip(questions, scored[at : at + len(questions)], strict=True)
+            }
+            at += len(questions)
+            results.append(
+                Result(
+                    answers=answers,
+                    model=self.model_name,
+                    context_tokens=shelved.tokens,
+                    scoring="raw",
+                    timing=Timing(context_ms=0.0, readout_ms=readout_ms),
+                )
+            )
+        return list(zip(results, handles, shelved_list, strict=True))
 
     def _ask_in_one_pass(self, context: str, question: Question) -> Result:
         """The context and the question as one sequence, read once, answered at its last position.
@@ -977,7 +1448,7 @@ class Prismyra:
                 f"{total / 1024**3:.1f} GiB is available. The context is held once, so {knobs}."
             )
 
-    def _read(self, encoded) -> Prefill:
+    def _read(self, encoded, group: int | None = None) -> Prefill:
         # A solo read and `open_batch`'s joint read of several documents go through the *same* borrowed chunked
         # recurrent kernel, and that kernel's own configuration is chosen by the *total* length of the varlen run
         # it is given -- not by any one document's content in it (measured decisively,
@@ -996,7 +1467,7 @@ class Prismyra:
             pad_ids, lengths = self._pad_context_lengths([encoded.tokens], [encoded.input_ids])
             if pad_ids.shape[1] > 0:
                 return self._read_padded(encoded, pad_ids, lengths)
-        cache, room = self._claim_cache(encoded.tokens)
+        cache, room = self._claim_cache(encoded.tokens, group=group)
         self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
         # Read after the forward, not before: the offset is something the model works out while reading the context.
         position_from = position_offset(self.backbone, encoded.tokens) if encoded.has_media else encoded.tokens
@@ -1007,7 +1478,8 @@ class Prismyra:
         # estimate and admission refused contexts of fifty tokens. It is held memory, so it is allocated while the
         # context is being read and counted as held.
         taken = snapshot(cache)
-        restore_and_fork(cache, taken, self.group, width=self.group)
+        effective_group = group or self.group
+        restore_and_fork(cache, taken, effective_group, width=effective_group)
         return Prefill(
             snapshot=taken,
             cache=cache,
@@ -1015,6 +1487,7 @@ class Prismyra:
             tokens=encoded.tokens,
             last_position=torch.tensor([encoded.tokens - 1], device=self.device),
             position_from=position_from,
+            group=effective_group,
         )
 
     def _missing_batched_read_kernels(self) -> set[str]:
@@ -1101,7 +1574,7 @@ class Prismyra:
         """
         return encode(context, None, None, self.processor, self.tokenizer, self.device)
 
-    def open_shelf(self, room: int | None = None, lane: int = 0) -> Shelf:
+    def open_shelf(self, room: int | None = None, lane: int = 0, group: int | None = None) -> Shelf:
         """One cache held open, with documents put on it and taken off as callers come and go.
 
         A `Batch` reads its documents, answers them and drops the cache, so asking twice about one document reads it
@@ -1119,6 +1592,15 @@ class Prismyra:
         shelf is not free -- opening one at `room=4096` plus 5 documents on each cost about 2.1 GiB total from a
         freshly loaded model's 8.6 GiB of free device memory -- so a second lane's `room` should be set with that
         in mind rather than left at the default (which is sized for *one* shelf being the only one).
+
+        `group` (fp8spd6, round 8, combining S4a's `wide_group` with the Shelf/Batcher path): overrides
+        `self.group` for *this shelf's own* paged attention pool capacity, the same override `_claim_cache`
+        already gives the joined-cache path. Built in at open time because the pool's page table is sized once,
+        not per call -- a document later asked up to `WIDE_GROUP` questions needs the pool to have room for that
+        many branch rows from the start, or `begin_branches` refuses the same way admitting more rows than a
+        pool holds always has (`"N rows asked for and this pool holds M"`, the crash RUN-fp8spd.md round 7's own
+        capacity-guard fix exists to keep out of the *fused* path; this is the same ceiling for the shelf's own
+        paged pool underneath it). `None` keeps today's single behaviour (`self.group`).
         """
         if not self.paged:
             raise PrismyraError(
@@ -1127,7 +1609,7 @@ class Prismyra:
             )
         wanted = room if room is not None else self._largest_shelf()
         self._check_fits(wanted)
-        cache, held = self._claim_cache(wanted)
+        cache, held = self._claim_cache(wanted, group=group)
         return Shelf(_engine=self, _cache=cache, room=held, lane=lane)
 
     def _largest_shelf(self) -> int:
@@ -1291,6 +1773,19 @@ class Prismyra:
             )
         if any(count == 0 for count in counts):
             raise PrismyraError("every document in a batch needs at least one question; drop it from the batch instead")
+        # 2026-10-07 (inv, round 3): the real check is on the *padded* total, not this one -- `_branch_across` now
+        # pads each document to its own bucket before summing (see there), which can need more rows than the real
+        # total alone would. Checked here too, before any tokenising, so a batch that cannot fit fails with one
+        # clear reason instead of a confusing one from deeper in the pass.
+        padded_total = sum(_round_rows(c, self.group) for c in counts)
+        if padded_total > self.group:
+            raise PrismyraError(
+                f"{sum(counts)} questions across {len(asked)} documents round up to {padded_total} rows once each "
+                f"document is padded to its own bucket independently of its companions, and a group of {self.group} "
+                f"cannot hold that many. Ask fewer documents or questions together, or build the engine with a "
+                f"larger group; the independent-padding rule is what makes two documents answered together give "
+                f"the same reduction order each one would alone (see `_round_rows`)."
+            )
 
         flat = [q for questions in asked for q in questions]
         plans = [plan(q, self.tokenizer) for q in flat]
@@ -1355,43 +1850,73 @@ class Prismyra:
         would take -- a few lines -- once the other half, `graphs.Recording` accepting a remainder bucket instead of an
         exact context length, makes a recording survive the batch's documents changing between passes.
         """
-        rows = sum(counts)
         # Batch-invariant: see `_round_rows`. The row count is the only thing that otherwise differs between "two
         # documents answered together" and "either one answered alone", once the width is matched (`_round_pack_align`)
         # -- and that alone moved an answer by up to 0.29 and flipped decisions. Padding every pass sharing documents
         # to the same row count a solo document would be padded to removes the difference entirely: `pad` extra rows
         # repeat the first document, discarded at the end exactly as `build_suffixes` already discards padded columns.
-        padded_rows = _round_rows(rows, self.group)
-        pad = padded_rows - rows
-        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, padded_rows, width)
+        #
+        # 2026-10-07 (inv, round 3): that single `padded_rows = _round_rows(rows, self.group)` rounded the
+        # *combined* total, which closes the context-length axis (`diag_openbatch_vs_ask_modes.py`'s 80-document
+        # benchmark) but not the question-count one: the same two real questions about the same document land in
+        # a 2-row pass alone and a 4-row pass once a one-question companion is added, even though neither document's
+        # own rows changed -- `tests/test_gpu.py`'s documented 0.0128/0.024 residual, confirmed on sm_120 too
+        # (`audit_sm120.py`, RUN-inv.md round 2). Padding *each document to its own bucket* first, then laying the
+        # padded blocks end to end, makes a document's own width a function of its own row count alone -- the
+        # property SYNTHESIS.md's round 3 asks for by name ("同席者に左右されない"). `restore_and_fork_many` already
+        # takes an arbitrary per-document row count in `parts` (it was only ever used with padding on the last
+        # document because that is all `_branch_across` built), so nothing downstream of this needed to change to
+        # accept it.
+        padded_counts = [_round_rows(c, self.group) for c in counts]
+        padded_rows = sum(padded_counts)
+
+        # `texts` is flat and real-only, in document order (`_answer_batch`'s `flat`). Insert each document's own
+        # pad entries right after its own real ones -- repeating that document's own first real text, the same
+        # convention `build_suffixes` already uses for the single-document case, just scoped per document instead
+        # of globally so a different document's padding can never be mistaken for this one's.
+        padded_texts: list[str] = []
+        real_row_at: list[int] = []  # index into `padded_texts`/the eventual padded rows for each real, flat row
+        at = 0
+        for count, padded in zip(counts, padded_counts):
+            block = texts[at : at + count]
+            real_row_at.extend(range(len(padded_texts), len(padded_texts) + count))
+            padded_texts.extend(block)
+            if padded > count:
+                padded_texts.extend([block[0]] * (padded - count))
+            at += count
+        ids, read_at, _ = build_suffixes(padded_texts, self.tokenizer, self.device, padded_rows, width)
+
+        # One start position per *padded* row: every row of a document, real or padding, starts at that document's
+        # own context end -- there is one such position per document, not per question, so repeating it for a
+        # document's pad rows is the same arithmetic as for its real ones, not a special case.
         starts = [
-            prefills[at].position_from or prefills[at].tokens for at, count in enumerate(counts) for _ in range(count)
+            prefills[at].position_from or prefills[at].tokens
+            for at, padded in enumerate(padded_counts)
+            for _ in range(padded)
         ]
-        # Padding extends the *last* document's own block, never a new one at the tail: `rows_for`'s rows are laid
-        # out contiguously per document (`paged.PagedForkLayer.begin_branches` rebuilds its row assignment from each
-        # document's *total* count in `rows_for`, not from the row positions themselves, so it assumes every row
-        # naming one document is contiguous). Padding with the first document while a different one is last split
-        # that document's rows across the gap and answered every row from the wrong table -- found by this file's
-        # own open-loop comparison moving a probability by 0.93 instead of removing the smaller 0.29 it was meant to.
-        if pad:
-            starts += [starts[-1]] * pad
         offsets = torch.tensor(starts, device=self.device).unsqueeze(1)
         positions = offsets + torch.arange(ids.shape[1], device=self.device).unsqueeze(0)
         cache = prefills[0].cache
 
-        parts = [(prefills[at].snapshot, count) for at, count in enumerate(counts)]
-        rows_for_padded = rows_for
-        if pad:
-            parts = [*parts[:-1], (parts[-1][0], parts[-1][1] + pad)]
-            rows_for_padded = [*rows_for, *([rows_for[-1]] * pad)]
+        # Each document gets its own padded count directly -- no more "extend the last document's block", because
+        # every document now carries its own padding rather than borrowing room at the tail.
+        parts = [(prefills[at].snapshot, padded_counts[at]) for at in range(len(counts))]
+        rows_for_padded: list[int] = []
+        at = 0
+        for count, padded in zip(counts, padded_counts):
+            name = rows_for[at]  # every real row of one document already names the same document
+            rows_for_padded.extend([name] * padded)
+            at += count
 
         def fork() -> None:
             restore_and_fork_many(cache, parts, width=self.group, rows_for=rows_for_padded, lane=lane)
 
         def run(suffix: torch.Tensor, suffix_positions: torch.Tensor) -> torch.Tensor:
-            out = self.backbone(
-                input_ids=suffix, position_ids=suffix_positions, use_cache=True, past_key_values=cache
-            )
+            # fp8spd (S4b): a branch pass, same reasoning as `_branch`'s `run` below.
+            with varlen.branching():
+                out = self.backbone(
+                    input_ids=suffix, position_ids=suffix_positions, use_cache=True, past_key_values=cache
+                )
             return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
         # One document's remainder is all a paged recording's bucket key carries (see `_run_recorded`), so a pass
@@ -1400,7 +1925,10 @@ class Prismyra:
         hidden = self._run_recorded(
             cache, fork, run, ids, positions, padded_rows, width, homogeneous=homogeneous, lane=lane
         )
-        return hidden[torch.arange(padded_rows, device=self.device), read_at][: len(texts)]
+        # Gather the real rows back out in the caller's original flat order -- they are no longer a contiguous
+        # prefix now that each document's own padding sits right after its own real rows instead of at the tail.
+        real_idx = torch.tensor(real_row_at, device=self.device)
+        return hidden[torch.arange(padded_rows, device=self.device), read_at][real_idx]
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
         # Already validated: both public entry points call `validate` before the context is read, and repeating it
@@ -1415,7 +1943,10 @@ class Prismyra:
         plans = [plan(q, self.tokenizer) for q in questions]
         token_ids = [p.token_ids for p in plans]
         width = self._width_for(plans)
-        groups = self._packed_groups(plans, width)
+        # fp8spd (S4a): this document's own branch-row capacity, set by `ask`'s `_group_for` at read time and
+        # carried on `prefill` ever since -- `None` (every prefill from before this field existed, and every one
+        # `open_batch` still builds) means "use `self.group`, as always".
+        groups = self._packed_groups(plans, width, group=prefill.group)
 
         # Before the clock starts, and outside the lock's timed section: a prior is cached per question, so charging
         # the first request for every later one's correction would report a cost that is not there.
@@ -1435,9 +1966,11 @@ class Prismyra:
                     # recording the pass can pay for itself. Compared on the padded row count `_branch` actually
                     # runs at (`_round_rows`), not the raw member count: two groups of 5 and 7 real questions run
                     # the identical padded-to-8 pass now, so they are the same shape for this count too.
-                    padded = _round_rows(len(members), self.group)
+                    padded = _round_rows(len(members), prefill.group or self.group)
                     same_shape_left = sum(
-                        1 for m, w in groups[n + 1 :] if _round_rows(len(m), self.group) == padded and w == group_width
+                        1
+                        for m, w in groups[n + 1 :]
+                        if _round_rows(len(m), prefill.group or self.group) == padded and w == group_width
                     )
                     hidden = self._branch(prefill, chunk, len(chunk), group_width, remaining=same_shape_left)
                     scored = self.heads.apply(
@@ -1547,7 +2080,7 @@ class Prismyra:
         except TooWide as e:
             raise PrismyraError(str(e)) from e
 
-    def _packed_groups(self, plans: list, width: int) -> list[tuple[list[int], int]]:
+    def _packed_groups(self, plans: list, width: int, group: int | None = None) -> list[tuple[list[int], int]]:
         """Which questions share a branch pass, and how wide each pass is.
 
         A pass is as wide as its longest question, and every shorter row pays for the difference in padding that each
@@ -1562,13 +2095,14 @@ class Prismyra:
         asking the same questions again produces the same groups, so each shape recurs and is recorded on its own.
         """
         n = len(plans)
+        group = group or self.group
         if self.calibration is not None:
-            return [(list(range(lo, min(n, lo + self.group))), width) for lo in range(0, n, self.group)]
+            return [(list(range(lo, min(n, lo + group))), width) for lo in range(0, n, group)]
         lengths = [len(branch_ids(p.text, self.tokenizer)) for p in plans]
         order = sorted(range(n), key=lambda i: lengths[i])
         groups = []
-        for lo in range(0, n, self.group):
-            members = order[lo : lo + self.group]
+        for lo in range(0, n, group):
+            members = order[lo : lo + group]
             longest = max(lengths[i] for i in members)
             # The same rule whether recording is on or not. A recording must answer exactly as the eager pass it was
             # taken from, and a different width is a different reduction: rounding to the pinned buckets only under
@@ -1583,10 +2117,11 @@ class Prismyra:
         if prefill.snapshot is None:
             prefill.snapshot = snapshot(prefill.cache)
 
-        # Batch-invariant: see `_round_rows`. Every row buffer downstream is already sized for `self.group`, so
-        # padding up to it costs nothing to allocate -- only the padded rows' own compute, which `remaining` below
-        # also now measures economics against at this padded shape rather than the raw one.
-        padded_rows = _round_rows(rows, self.group)
+        # Batch-invariant: see `_round_rows`. Every row buffer downstream is already sized for `prefill.group`
+        # (`self.group` unless `ask`'s `_group_for` widened it for this document -- S4a), so padding up to it costs
+        # nothing to allocate -- only the padded rows' own compute, which `remaining` below also now measures
+        # economics against at this padded shape rather than the raw one.
+        padded_rows = _round_rows(rows, prefill.group or self.group)
         ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, padded_rows, width)
         # From where the model thinks the context reached, which is past its token count when media widened it.
         start = prefill.position_from or prefill.tokens
@@ -1606,10 +2141,17 @@ class Prismyra:
             buffer rather than a kept constant -- `graphs.record` says why: a different document starts its branch at
             a different position, and a recording that answered every document at the position its first one needed
             would be wrong rather than slow.
+
+            fp8spd (S4b): wrapped in `varlen.branching()` so the borrowed gated-delta-rule kernel is told
+            `output_final_state=False` -- see that function's docstring for why nothing downstream of a branch
+            ever reads the state it would otherwise write. A CUDA-graph capture of this call bakes in whichever
+            kernel launches ran during capture, and capture always goes through this same `run`, so a replay gets
+            the skip too without needing to know about it.
             """
-            out = self.backbone(
-                input_ids=suffix, position_ids=suffix_positions, use_cache=True, past_key_values=prefill.cache
-            )
+            with varlen.branching():
+                out = self.backbone(
+                    input_ids=suffix, position_ids=suffix_positions, use_cache=True, past_key_values=prefill.cache
+                )
             return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
         hidden = self._run_branch(prefill, run, ids, padded_rows, width, positions, remaining)
@@ -1676,8 +2218,13 @@ class Prismyra:
             self._cache_recordings[id(cache)] = held
         return held
 
-    def _claim_cache(self, tokens: int):
+    def _claim_cache(self, tokens: int, group: int | None = None):
         """A cache sized for a bucket rather than for this context, reused if one is free.
+
+        `group` (fp8spd, S4a / SYNTHESIS.md) overrides `self.group` for this one cache's branch-row capacity -- the
+        caller already knows, before any pages exist, that this document's own branch passes will need more rows
+        than the engine's construction-time default allows (see `ask`'s `_group_for`). `None` keeps today's single
+        behaviour.
 
         **Bucketed** means the allocation stops depending on the exact context length, so contexts of similar length
         share one size. That is shipped, and it is one of the two things a recorded pass needs to outlive one document.
@@ -1700,7 +2247,7 @@ class Prismyra:
         """
         room = self.room_for(tokens)
         cache = build_cache(
-            self.config, room + WIDTHS[-1], self.group, self.dtype, self.device, WIDTHS[-1], paged=self.paged
+            self.config, room + WIDTHS[-1], group or self.group, self.dtype, self.device, WIDTHS[-1], paged=self.paged
         )
         self._made_caches += 1
         return cache, room
@@ -1722,7 +2269,11 @@ class Prismyra:
         passes would have the second and third continuing from the first.
         """
         assert prefill.snapshot is not None
-        restore_and_fork(prefill.cache, prefill.snapshot, rows, width=self.group)
+        # `prefill.group` (S4a): this document's own fork buffers were sized at read time for `prefill.group` rows
+        # (`self.group` unless `ask`'s `_group_for` widened it) -- `width` must match whatever that was, or `_owned`
+        # reallocates a new buffer here, inside the branch pass, which is exactly the "surprise allocation lands in
+        # the wrong budget" failure `_read`'s own docstring describes for the read side.
+        restore_and_fork(prefill.cache, prefill.snapshot, rows, width=prefill.group or self.group)
 
     def _run_branch(self, prefill, run, ids, rows: int, width: int, positions, remaining: int = 0):
         """The single-document branch pass, through the shared recording machinery. See `_run_recorded`."""
@@ -1877,10 +2428,32 @@ class Prismyra:
         if self.torch_device.type == "cuda" and free <= GRAPH_MEMORY_MARGIN:
             now = time.monotonic()
             if now >= self._reclaim_cooldown_until:
-                torch.cuda.empty_cache()
-                free, _ = torch.cuda.mem_get_info(self.torch_device)
-                if free <= GRAPH_MEMORY_MARGIN:
-                    self._reclaim_cooldown_until = now + RECLAIM_COOLDOWN_S
+                # fp8spd4 (correcting fp8spd3's S5 / SYNTHESIS.md): the previous version of this check predicted
+                # that `empty_cache()` would raise `mem_get_info`'s free number by `reserved - allocated` and
+                # added that prediction straight into `free`, without ever calling `empty_cache()` or re-reading
+                # `mem_get_info` to confirm it actually moved. `prismyra/schedule.py`'s `_make_room` carried the
+                # identical "same fix" (this comment used to say so) and integ's bisection (RUN-integ.md 2.5)
+                # found it broke `tests/test_gpu.py::test_a_shelf_evicts_on_memory_pressure_even_with_tokens_
+                # to_spare` -- a case where the externally reported free number is genuinely tight for a reason
+                # this process's own allocator slack does not explain, exactly the scenario this margin exists
+                # to catch (see this check's own comment above, "97 documents... exhausted a 44 GiB card"). No
+                # test exercises this copy the same way, but the reasoning is identical, so the same correction
+                # applies here: `cached_slack == 0` is the one case the prediction can never be wrong about
+                # (nothing cached to give back, so the call could not help and skipping it is a true no-op);
+                # every other case now calls `empty_cache()` and re-reads the real number, as it did before S5.
+                allocated = torch.cuda.memory_allocated(self.torch_device)
+                reserved = torch.cuda.memory_reserved(self.torch_device)
+                cached_slack = max(0, reserved - allocated)
+                if cached_slack == 0:
+                    pass
+                else:
+                    started = time.perf_counter()
+                    torch.cuda.empty_cache()
+                    self._empty_cache_calls += 1
+                    self._empty_cache_ms += (time.perf_counter() - started) * 1e3
+                    free, _ = torch.cuda.mem_get_info(self.torch_device)
+                    if free <= GRAPH_MEMORY_MARGIN:
+                        self._reclaim_cooldown_until = now + RECLAIM_COOLDOWN_S
         fits_memory_margin = free > GRAPH_MEMORY_MARGIN
         fits_kept_count = len(store["taken"]) < MAX_KEPT_RECORDINGS
         room_to_record = fits_memory_margin and fits_kept_count
@@ -1949,7 +2522,19 @@ def _round_rows(rows: int, cap: int) -> int:
     run at 8, with the extra rows a harmless repeat of an existing row (discarded the same way `build_suffixes`
     already discards padded columns). Two documents or one document asked twice then see the identical kernel
     dispatch their row count would get alone, which is what makes answering together stop moving an answer.
+
+    2026-10-07 (inv, round 2): the power-of-two bucketing above closes most of the row-count effect but not all of
+    it, because it rounds the *pass's total* row count, not each document's own -- a target alone and the same
+    target plus a one-question companion can combine to totals either side of a power-of-two boundary even though
+    the target's own row count never changed (the documented residual: `tests/test_gpu.py`'s `COMPANION_MOVEMENT /
+    20`, measured 0.0128 on L40S; `audit_sm120.py` found the matching case on sm_120 at 0.057, i.e. this is not a
+    different bug per card, it is the same one at a different magnitude). `PRISMYRA_ROUND_ROWS_TO_GROUP=1` rounds
+    every pass straight to `cap` instead -- the simplest version of "every pass runs at the same width", so a
+    document's own padding can no longer depend on who shares the pass -- at the cost of always paying for a
+    full-width pass; see RUN-inv.md for the measured speed cost before deciding whether this becomes the default.
     """
+    if os.environ.get("PRISMYRA_ROUND_ROWS_TO_GROUP") == "1":
+        return cap
     if rows >= cap:
         return cap
     return min(cap, 1 << (max(rows, 1) - 1).bit_length())
@@ -2055,8 +2640,40 @@ def _enable_batch_invariance() -> None:
     Dropping them is a correctness simplification -- fewer process-wide side effects for whatever future kernel
     might actually use `torch.bmm` or care which BLAS backend is preferred -- not a speed win in this measurement.
 
-    Kept only when the borrowed kernels this engine's batching depends on are actually in use (`paged` on CUDA): a
-    joined-storage engine never shares a pass across documents, so it has nothing this buys.
+    Kept only when a pass can actually share rows across more than one logical document (`paged` on CUDA, where
+    `open_batch`/`Batcher` share a pass across several documents) or across a context and a branch in one call
+    (`interleaved_fork` on CUDA, round 7 -- see this `__init__`'s own call site): plain `ask()`/`open_context()`
+    on a joined, non-interleaved cache never shares a pass across anything, so it has nothing this buys.
+    2026-10-07 (inv, SYNTHESIS 0-2/0-3): the early return below used to leave sm_120 (RTX PRO 4500, the only card
+    `nvfp4-36l` serves on) with *no* process-wide protection at all -- not even vLLM's own fallback for
+    non-SM80 CUDA. Reading `vllm.model_executor.layers.batch_invariant.enable_batch_invariant_mode` (the function
+    this one was written to narrow, not to replace) shows it has an explicit branch for exactly this case: "Hopper
+    (SM90) and Blackwell (SM100): the only source of batch variance is split-k, which we disable via the cuBLAS
+    workspace config" (`CUBLAS_WORKSPACE_CONFIG`/`CUBLASLT_WORKSPACE_SIZE`). This function's own `else: return`
+    dropped that branch by omission, not by measurement -- there is no comment or diag log claiming it was tried
+    and found insufficient on sm_120, only the comment that it "was not measured here". `audit_sm120.py` (this
+    branch) is the first time it has been.
+
+    2026-10-07 (inv2, round 4): reference-counted (`_BATCH_INVARIANT_REFCOUNT`), where it used to be a one-shot
+    guarded only by `_BATCH_INVARIANT_DISPATCH_LIB is None`. Needed once `prismyra/engine.py`'s `paged` property
+    started calling this on *every* `engine.paged = True`, not only at construction (see that property's own
+    docstring for why): `tests/test_gpu.py` shares one engine object between `engine_paged` tests, which flip
+    `paged` on and restore it to `False` in a `finally`, and a *second*, unrelated feature on the very same
+    shared object -- `onepass.py`'s one-pass CUDA graph recording, which production code never combines with a
+    paged engine (`Prismyra.ask`'s own `not self.paged` guard on the one-pass shortcut) but this test module's
+    shared-weights fixture does. With the dispatcher registration left permanently on after the first
+    `engine_paged` test, `test_a_short_question_replays_exactly_as_it_reads_eagerly` and
+    `test_a_headed_question_replays_exactly_as_it_reads_eagerly` (both on the plain, non-paged `engine` fixture)
+    started failing: a graph recorded and replayed consistently under the persistent-tile Triton matmul this
+    function installs is not bit-identical to the one it was eager-compared against before this round -- a real,
+    separate incompatibility between the two features, not an ordering artifact (confirmed by registering the
+    dispatcher from the very first line of the `engine` fixture instead of from a later `engine_paged` test: the
+    same two tests failed with the identical values either way). Production code structurally cannot hit this
+    (paged and one-pass are mutually exclusive on one `ask()` call), so the correct fix is for the dispatcher
+    registration to go away again once nothing paged still needs it, which is what the refcount buys: `paged`
+    going back to `False` calls `_disable_batch_invariance()`, which drops the count and, at zero, drops the
+    `torch.library.Library` and lets it be garbage-collected -- confirmed by hand that `del lib; gc.collect()`
+    actually restores the original dispatch (`torch.library.Library`'s own documented behaviour, not assumed).
     """
     import os
 
@@ -2069,30 +2686,125 @@ def _enable_batch_invariance() -> None:
     )
     from vllm.platforms import current_platform
 
+    global _BATCH_INVARIANT_REFCOUNT
+    _BATCH_INVARIANT_REFCOUNT += 1
+
     # fused_moe.py's own guard (`get_default_config`): picks a fixed MoE tiling config instead of one keyed by the
-    # pass's row count M, independent of anything registered on the dispatcher below.
+    # pass's row count M, independent of anything registered on the dispatcher below. Reset on every call (cheap,
+    # idempotent) rather than only on the first, so a caller that disabled and re-enabled sees it reapplied too.
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
-    if not current_platform.is_cuda() or not current_platform.is_device_capability_family(80):
-        # The SM80-family (Ampere/Ada/Hopper-adjacent) Triton persistent matmul is what this was measured against
-        # (L40S, SM89). A different family's registration (vLLM's own `enable_batch_invariant_mode` has an SM90/
-        # Blackwell branch that only pins the cuBLAS workspace config) was not measured here; fall back to the
-        # router+tiling fix alone rather than assume it carries over.
+    if _BATCH_INVARIANT_REFCOUNT > 1:
+        return  # already registered by an earlier claim; nothing left to do
+
+    if not current_platform.is_cuda():
         return
 
+    # 2026-10-07 (inv3/inv4, S2 step 1/2): "global" (the default, unchanged) registers the four aten ops below for
+    # every plain bf16 matmul in the whole model -- `diag_invariance_cost_profile.py` measured this at +14.5ms
+    # (6.8%) on a solo `ask()` and +18.9ms (1.8%) on a 32-document `open_batch`, on an L40S, almost all of it in
+    # `matmul_kernel_persistent` calls that `diag_dispatch_inventory.py` (same round) shows are not at one of the
+    # three call sites that are actually row-count dependent: the router (`_route`, narrowed since round 1) and the
+    # two `GatedDeltaNet` gate projections (`in_proj_a`/`in_proj_b`, narrowed by `_patch_gdn_gates` this round,
+    # unconditionally -- see `qwen3_moe.Qwen3MoeAdapter.replace`). "narrow" skips this registration (and the
+    # Hopper/Blackwell cuBLAS workspace change below) and relies on those two narrow fixes plus the
+    # `VLLM_BATCH_INVARIANT` env var above instead.
+    #
+    # inv4: the sibling draft of this comment once claimed "narrow" was measured safe on `audit_sm120.py`'s own
+    # companion matrix. It was not, by the time the measurement actually ran (`narrow_report_sm120.json`,
+    # /Users/akazawt/tmp/smr/inv-wt-logs/inv3/): on sm_120, "narrow" leaves 150/4,392 probability checks non-exact
+    # against "global"'s 72/4,392, and -- more to the point than the raw count -- it breaks question-counts
+    # {2, 3, 31, 32} that "global" does not touch at all (`global`'s 72 are 100% question-count=1, a different,
+    # already-tracked residual; see `diag_qn1_residual_round5.py`). That means at least one more plain `F.linear`/
+    # `torch.mm` call this project has not yet narrowed is still row-count dependent on sm_120, and the global
+    # dispatcher registration is the only thing currently catching it. "narrow" stays an opt-in diagnostic switch
+    # for exactly this reason -- it is not a candidate default until whatever call site the 2→150 jump comes from
+    # is found and narrowed too. See RUN-inv.md (inv3/inv4, round 5) for the numbers.
+    if os.environ.get("PRISMYRA_INVARIANCE_SCOPE", "global") == "narrow":
+        return
+
+    # 2026-10-07 (inv, round 2): the Triton persistent matmul this registers (`mm_batch_invariant` et al.) is not
+    # itself gated to SM80 anywhere in its own implementation -- `linear_batch_invariant` just calls
+    # `matmul_persistent`, a plain Triton kernel, unconditionally. `_ROUTER_LINEAR` (`kernels/qwen3_moe.py`) was
+    # already calling it directly on sm_120 (RTX PRO 4500, Blackwell) for the FP8 router with no crash and no
+    # family check at all, which is the evidence that it runs there -- "vLLM's Triton version on sm_120" was a
+    # question `audit_sm120.py`'s own code answers by example, not something that needed a separate try. The
+    # round-1 version of this function treated SM80 and "everything else" as needing *different* fixes (dispatcher
+    # vs. cuBLAS workspace config only); registering the dispatcher everywhere closes a residual the cuBLAS-only
+    # fix left (measured: `audit_sm120.py` non-exact 258/4392 -> see RUN-inv.md for the after-this-change number).
     lib = torch.library.Library("aten", "IMPL")
     key = current_platform.dispatch_key
     lib.impl("aten::mm", mm_batch_invariant, key)
     lib.impl("aten::addmm", addmm_batch_invariant, key)
     lib.impl("aten::matmul", matmul_batch_invariant, key)
     lib.impl("aten::linear", linear_batch_invariant, key)
-    # Kept alive for the process's lifetime (matching `enable_batch_invariant_mode`'s own module-level singleton):
-    # letting it be garbage-collected would un-register the dispatcher entries it just installed.
+    # Kept alive while the refcount is above zero (matching `enable_batch_invariant_mode`'s own module-level
+    # singleton while it is wanted at all): letting it be garbage-collected is now how `_disable_batch_invariance`
+    # un-registers these four, deliberately, rather than something to avoid happening by accident.
     global _BATCH_INVARIANT_DISPATCH_LIB
     _BATCH_INVARIANT_DISPATCH_LIB = lib
 
+    if not current_platform.is_device_capability_family(80):
+        # Belt and suspenders on every other family (Hopper/Blackwell, including sm_120): vLLM's own fallback for
+        # these cards disables cuBLAS split-K the same way, for anything that reaches cuBLAS directly rather than
+        # through one of the four aten ops above (e.g. a custom op that calls `at::cuda::blas::gemm` itself).
+        # Original values saved on the module (`_BATCH_INVARIANT_SAVED_BACKENDS`) so `_disable_batch_invariance`
+        # can put them back rather than guessing torch's defaults.
+        global _BATCH_INVARIANT_SAVED_BACKENDS
+        _BATCH_INVARIANT_SAVED_BACKENDS = (
+            os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            os.environ.get("CUBLASLT_WORKSPACE_SIZE"),
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        )
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+        os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.backends.cuda.preferred_blas_library(backend="cublaslt")
+
+
+def _disable_batch_invariance() -> None:
+    """The other half of the refcount `_enable_batch_invariance` keeps (inv2, round 4): drops this caller's claim
+    and, only once nothing else still holds one, actually reverses the registration -- un-registering the
+    dispatcher override by dropping the last reference to its `torch.library.Library` (confirmed by hand that
+    `del lib; gc.collect()` restores the original op, which is what makes doing this safe at all) and restoring
+    the cuBLAS/TF32 backend flags `_enable_batch_invariance` saved before overwriting them. Does not touch
+    `VLLM_BATCH_INVARIANT`: unlike the dispatcher registration, nothing has shown that env var alone breaks
+    anything un-paged, and leaving a stray env var set is a smaller risk than mis-timing when fused_moe.py reads
+    it.
+    """
+    global _BATCH_INVARIANT_REFCOUNT, _BATCH_INVARIANT_DISPATCH_LIB, _BATCH_INVARIANT_SAVED_BACKENDS
+    if _BATCH_INVARIANT_REFCOUNT == 0:
+        return
+    _BATCH_INVARIANT_REFCOUNT -= 1
+    if _BATCH_INVARIANT_REFCOUNT > 0:
+        return
+    if _BATCH_INVARIANT_DISPATCH_LIB is None:
+        return  # never actually registered (e.g. this process is not on CUDA) -- nothing to undo
+    import gc
+    import os
+
+    import torch
+
+    _BATCH_INVARIANT_DISPATCH_LIB = None
+    gc.collect()
+    if _BATCH_INVARIANT_SAVED_BACKENDS is not None:
+        cublas_cfg, cublaslt_size, fp16_rpr, bf16_rpr = _BATCH_INVARIANT_SAVED_BACKENDS
+        for name, value in (("CUBLAS_WORKSPACE_CONFIG", cublas_cfg), ("CUBLASLT_WORKSPACE_SIZE", cublaslt_size)):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = fp16_rpr
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = bf16_rpr
+        torch.backends.cuda.preferred_blas_library(backend="default")
+        _BATCH_INVARIANT_SAVED_BACKENDS = None
+
 
 _BATCH_INVARIANT_DISPATCH_LIB = None
+_BATCH_INVARIANT_REFCOUNT = 0
+_BATCH_INVARIANT_SAVED_BACKENDS = None
 
 
 def _now(device: torch.device) -> float:

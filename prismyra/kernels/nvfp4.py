@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 import torch
 from torch import nn
@@ -129,9 +130,23 @@ class FusedExpertsFp4(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_topk
 
+        from .qwen3_moe import _ROUTER_LINEAR
+
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
-        logits, _, _ = self.gate(x)
+        # 2026-10-07 (fp4spd + inv, merged by integ): this used to be `logits, _, _ = self.gate(x)` -- calling the
+        # router module's own `forward` whole, which is `F.linear(hidden_states, self.weight)` followed by a
+        # softmax/top-k this function immediately recomputes with `fused_topk` and discards (the identical "called
+        # it twice, threw one away" pattern `kernels.qwen3_moe.FusedExperts._route`, the FP8 path's router, already
+        # comments on; measured by fp4spd: 36 calls, ~4.13ms on a 36-layer read, one per layer). fp4spd's original
+        # fix (a `_route` helper calling plain `torch.nn.functional.linear`) only removed the duplicate call; inv
+        # found, separately, that this path never went through the row-count-invariant kernel the FP8 path's
+        # `_route` already uses (`diag_nvfp4_gate_type.py`, after `audit_sm120.py` measured a 5.9% non-bit-exact
+        # residual the Blackwell cuBLAS-workspace fix alone did not close). inv's version is a strict superset of
+        # fp4spd's (same duplicate-call removal, plus row-count invariance), so it is the one kept here; the
+        # standalone `_route` method fp4spd added is dropped as dead code.
+        linear = _ROUTER_LINEAR or torch.nn.functional.linear
+        logits = linear(x, self.gate.weight)
         weights, ids = fused_topk(x, logits, self.top_k, renormalize=True)[:2]
         out = self.routed(x, weights, ids)
         shared = torch.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
@@ -141,11 +156,30 @@ class FusedExpertsFp4(nn.Module):
     _ws_size: dict = {}
 
     def _workspace(self, m: int, x_dtype) -> torch.Tensor:
-        """One scratch buffer for every MoE layer (they share shapes), grown to the largest token count seen, instead of
-        the kernel allocating and freeing its scratch on each call."""
+        """One scratch buffer per calling thread for every MoE layer (they share shapes), grown to the largest
+        token count that thread has seen, instead of the kernel allocating and freeing its scratch on each call.
+
+        inv5 (round 8): keyed by `threading.get_ident()` as well as device and `fused_finalize`, not just the
+        latter two. `Batcher(lanes=N)` runs `N` fully independent worker threads, each driving its own CUDA
+        stream, and every one of the 36 MoE layers shared this one class-level buffer across all of them -- two
+        lanes could genuinely call this at the same instant (`test_lanes_two_decisions_under_a_burst_do_not_
+        move`'s burst does exactly that), and the check-then-create below is not atomic across threads: both
+        could see a cache miss, both allocate their own buffer, and whichever one loses the race to the shared
+        dict slot has its own buffer dropped out from under a CUDA kernel that is still writing into it on its
+        own stream -- a used-after-dropped scratch buffer, which reads as the illegal-memory-access crash and
+        the NaN probabilities this round was asked to fix (RUN-fp8spd.md: FlashInfer's own autotuner warning
+        for an unseen shape appears immediately before the NaN, which is the same first-use race one layer up).
+        Even with the race on the dict closed, one physical buffer still cannot be *used* by two lanes at once
+        -- the CUTLASS kernel treats it as private scratch for the one call it was handed to -- so the fix is
+        to give each lane its own, the same trade `fork._owned`'s own `lane` parameter already makes (one more
+        full buffer per additional lane, not a smaller one shared unsafely). A thread id rather than an
+        explicit `lane` parameter because nothing from `Batcher`'s own `lane` plumbing (`fork.py`, `engine.py`)
+        reaches this deep into the model's forward pass; each lane is a dedicated, long-lived worker thread, so
+        its identity is already a correct and available proxy for "which lane".
+        """
         from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
 
-        key = (self.w1.device, self.fused_finalize)
+        key = (self.w1.device, self.fused_finalize, threading.get_ident())
         size = FusedExpertsFp4._ws_size.get((key, m))
         if size is None:
             size = FusedExpertsFp4._ws_size[(key, m)] = cutlass_fused_moe_workspace_size(
@@ -246,41 +280,43 @@ _INFERENCE_AUTOTUNE_CTX = None
 
 
 def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
-    """Pick the fused MoE kernel's tactic (tile shape and schedule) per token-count bucket by timing them on this card.
+    """Pick the fused MoE kernel's tactic (tile shape and schedule) by timing it on this card.
 
     Without this FlashInfer runs one default tactic for every size. Every MoE layer has the same shapes, so one layer's
-    choices serve all of them; FlashInfer keeps the choices for the rest of the process. Inputs are random: the timing
-    depends on the shapes and the routing spread, not on the values. Buckets are the powers of two; a size between two
-    is meant to run the lower one's choice (`round_up=False`, FlashInfer's own historical default) -- adding the points
-    half way between them was measured and not kept: 1 question 259.3 against 260, 64 questions 655 against 650 ms.
-    That rounding needs an `autotune()` context active at the moment a real request runs, which the profiling loop's
-    own `with` block does not provide once it exits; `_INFERENCE_AUTOTUNE_CTX` below is what keeps one open.
+    choice serves all of them; FlashInfer keeps the choice for the rest of the process. Inputs are random: the timing
+    depends on the shapes and the routing spread, not on the values.
 
-    The choice is made by timing, so two processes can pick differently between near-equal tactics, and a different
-    tactic adds in a different order. `PRISMYRA_NVFP4_TACTICS` names a JSON file: loaded if it exists, written if not,
-    so every process that shares it runs the same tactics.
+    2026-10-07 (inv, SYNTHESIS 0-4/S2): one bucket, not the powers-of-two ladder this used to profile. The previous
+    version picked a *different* tactic per power-of-two bucket (`round_up=False`, so a size between two buckets ran
+    the lower one's choice) -- which is exactly the row-count-dependent-algorithm shape of bug this project calls the
+    companion effect everywhere else: two passes carrying the identical real row at a different *total* M could cross
+    a bucket boundary (e.g. 32 companion questions -> 33) and get a different tactic, hence a different GEMM
+    reduction order, hence a non-bit-identical answer for that unchanged row. This was never caught because no
+    device test exercises an NVFP4 pass across a bucket boundary (`audit_sm120.py`, this branch, is the first to).
+    One bucket at `max_tokens` with `round_up=True` makes every real M (small questions-only pass or a full
+    `open_batch`) map to the *same* profiled tactic, by construction -- determinism first, matching this project's
+    standing rule; the speed cost of using the large-M tactic at small M is measured in RUN-inv.md rather than assumed.
+
+    The choice is made by timing, so two processes can pick differently if FlashInfer finds two tactics near-equal at
+    this one bucket; `PRISMYRA_NVFP4_TACTICS` names a JSON file: loaded if it exists, written if not, so every
+    process that shares it runs the same tactic.
     """
     from flashinfer.autotuner import autotune
 
     global _INFERENCE_AUTOTUNE_CTX
-    buckets, m = [], 1
-    while m <= max_tokens:
-        buckets.append(m)
-        m *= 2
-    buckets = tuple(sorted(set(buckets)))
+    buckets = (max_tokens,)
     cache = os.environ.get("PRISMYRA_NVFP4_TACTICS")
     with torch.inference_mode(), autotune(True, cache=cache, tuning_buckets=buckets):
-        for m in buckets:
-            x = torch.randn(m, layer.k, device=layer.w1.device, dtype=torch.bfloat16)
-            ids = torch.rand(m, layer.e, device=x.device).argsort(1)[:, : layer.top_k].int().contiguous()
-            w = torch.full((m, layer.top_k), 1.0 / layer.top_k, device=x.device)
-            layer.routed(x, w, ids)
+        m = max_tokens
+        x = torch.randn(m, layer.k, device=layer.w1.device, dtype=torch.bfloat16)
+        ids = torch.rand(m, layer.e, device=x.device).argsort(1)[:, : layer.top_k].int().contiguous()
+        w = torch.full((m, layer.top_k), 1.0 / layer.top_k, device=x.device)
+        layer.routed(x, w, ids)
     torch.cuda.synchronize()
     # Opened and never exited: every call to `routed()` for the rest of this process now runs inside it, with
-    # tune_mode=False (look up the cached tactic rather than re-profile) and round_up=False (the historical,
-    # already-measured choice above) so a runtime size between two buckets gets the lower bucket's tactic instead
-    # of falling back to an untuned one.
-    ctx = autotune(False, cache=cache, tuning_buckets=buckets, round_up=False)
+    # tune_mode=False (look up the cached tactic rather than re-profile) and round_up=True so every real M -- below,
+    # at, or (should it ever happen) above `max_tokens` -- maps to this one bucket's tactic, never a different one.
+    ctx = autotune(False, cache=cache, tuning_buckets=buckets, round_up=True)
     ctx.__enter__()
     _INFERENCE_AUTOTUNE_CTX = ctx
 
