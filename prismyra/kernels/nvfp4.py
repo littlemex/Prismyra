@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 import torch
 from torch import nn
@@ -153,11 +154,30 @@ class FusedExpertsFp4(nn.Module):
     _ws_size: dict = {}
 
     def _workspace(self, m: int, x_dtype) -> torch.Tensor:
-        """One scratch buffer for every MoE layer (they share shapes), grown to the largest token count seen, instead of
-        the kernel allocating and freeing its scratch on each call."""
+        """One scratch buffer per calling thread for every MoE layer (they share shapes), grown to the largest
+        token count that thread has seen, instead of the kernel allocating and freeing its scratch on each call.
+
+        inv5 (round 8): keyed by `threading.get_ident()` as well as device and `fused_finalize`, not just the
+        latter two. `Batcher(lanes=N)` runs `N` fully independent worker threads, each driving its own CUDA
+        stream, and every one of the 36 MoE layers shared this one class-level buffer across all of them -- two
+        lanes could genuinely call this at the same instant (`test_lanes_two_decisions_under_a_burst_do_not_
+        move`'s burst does exactly that), and the check-then-create below is not atomic across threads: both
+        could see a cache miss, both allocate their own buffer, and whichever one loses the race to the shared
+        dict slot has its own buffer dropped out from under a CUDA kernel that is still writing into it on its
+        own stream -- a used-after-dropped scratch buffer, which reads as the illegal-memory-access crash and
+        the NaN probabilities this round was asked to fix (RUN-fp8spd.md: FlashInfer's own autotuner warning
+        for an unseen shape appears immediately before the NaN, which is the same first-use race one layer up).
+        Even with the race on the dict closed, one physical buffer still cannot be *used* by two lanes at once
+        -- the CUTLASS kernel treats it as private scratch for the one call it was handed to -- so the fix is
+        to give each lane its own, the same trade `fork._owned`'s own `lane` parameter already makes (one more
+        full buffer per additional lane, not a smaller one shared unsafely). A thread id rather than an
+        explicit `lane` parameter because nothing from `Batcher`'s own `lane` plumbing (`fork.py`, `engine.py`)
+        reaches this deep into the model's forward pass; each lane is a dedicated, long-lived worker thread, so
+        its identity is already a correct and available proxy for "which lane".
+        """
         from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
 
-        key = (self.w1.device, self.fused_finalize)
+        key = (self.w1.device, self.fused_finalize, threading.get_ident())
         size = FusedExpertsFp4._ws_size.get((key, m))
         if size is None:
             size = FusedExpertsFp4._ws_size[(key, m)] = cutlass_fused_moe_workspace_size(
