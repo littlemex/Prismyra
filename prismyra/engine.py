@@ -442,14 +442,19 @@ class Prismyra:
         self.dtype = dtype or (torch.bfloat16 if on_cuda else torch.float32)
         self.group = group
         # fp8spd (S4a / SYNTHESIS.md P1), **opt-in, off by default**: widening a document's own branch-row capacity
-        # past `self.group` when it is asked more than `WIDE_GROUP_FROM` questions (see `_group_for`) is NOT
-        # bit-identical to today's `ceil(questions / self.group)`-passes behaviour in the general case --
-        # `torch.equal` gated it on real hardware (RUN-fp8spd.md) and it **failed** for 33 and 40 questions (the
-        # row-count-dependent GDN kernel sees a different shape when the last, smaller group is folded into one
-        # wide pass instead of padded on its own) and only happened to pass for the one case that divides evenly
-        # by `self.group` (64 = 32+32). This is exactly the "medium determinism risk" the proposal that led here
-        # flagged, so it stays off (`None` from `_group_for`, unchanged behaviour) until it clears this project's
-        # accuracy-judgment gate (SYNTHESIS.md A0/A2) rather than being shipped as a free speed win on a hunch.
+        # past `self.group` when it is asked more than `WIDE_GROUP_FROM` questions (see `_group_for`).
+        # fp8spd3's own `torch.equal` gate first measured this as **not** bit-identical for 33 and 40 questions
+        # (RUN-fp8spd.md, "33問だけ不一致") and only bit-identical for the one case that divides evenly by
+        # `self.group` (64 = 32+32) -- the row-count-dependent GDN causal convolution took a different code path
+        # (the framework's own fallback, not the fast kernel) whenever a branch pass's row count was not exactly
+        # 1, which the leftover group from an uneven split always was and the full 32/64-row group never was.
+        # wg (RUN-wg.md) re-ran that gate across the whole 33-64 range on today's branch, after inv5's branch-pass
+        # convolution batch fix (`prismyra/kernels/qwen3_moe.py`'s `_install_conv`) closed that fallback for every
+        # row count, not only one: all 32 widths, both context lengths tested, both supported cards, come back
+        # `torch.equal` now, including with the batch-invariance claim below monkeypatched off (so that claim was
+        # never what fixed this). The mismatch this flag was switched off for is gone; it is kept off here anyway
+        # pending this project's own sign-off on flipping the default (RUN-wg.md's decision material), the same
+        # process `interleaved_fork` went through below before its default flipped.
         self.wide_group = wide_group
         # fp8spd (S4c / SYNTHESIS.md P5, out/p1_speed_opus.md P5), **on by default as of this release**: `ask()`
         # with more than one question goes through `interleave.read_and_branch` instead of
@@ -464,8 +469,10 @@ class Prismyra:
         # for the real-hardware rounds this closed). Measured faster on real RACE documents at every width above
         # one question on both cards (RUN-integ.md, RUN-recon.md); `False` remains available for a caller that
         # wants to rule the fused path out while debugging. `self.wide_group` is a separate switch and stays off
-        # by default -- it widens a different, still-unproven range (33-63 questions in the *un-fused* path) that
-        # fp8spd's own gate found not bit-identical at 33 and 40 questions, which this flag does not touch.
+        # by default -- it widens a different range (33-63 questions in the *un-fused* path), which this flag
+        # does not touch. That range's own `torch.equal` mismatch (fp8spd3's "33問だけ不一致") has since been
+        # closed too (see `self.wide_group`'s own comment above and RUN-wg.md), independently of this flag; its
+        # default is a separate decision, still pending this project's sign-off.
         # Requires the borrowed kernels (`self._borrowed_kernel`, decided below, after the kernels are applied)
         # -- see `ask`'s guard.
         self.interleaved_fork = interleaved_fork
@@ -976,11 +983,16 @@ class Prismyra:
             # groups -- the first takes the fused path below, the second still falls back to `self._branch`
             # (`_ask_interleaved`'s own docstring). Widening to one 64-row group here puts every row through the
             # fused path instead of half of them. Deliberately **not** the general `self.wide_group` switch
-            # above: that one also covers 33-63 questions, a range S4a's own gate found *not* bit-identical
-            # (RUN-fp8spd.md, "33問だけ不一致"); 64-exact is the one width S4a verified bit-identical regardless
-            # of that switch, so this is scoped to exactly that width and is independent of `self.wide_group`'s
-            # own (still off-by-default) setting. torch.equal-gated against the two-32-row-group path before
-            # being wired in here -- see RUN-fp8spd.md round 5.
+            # above, kept as its own narrower condition rather than merged into it, even though both now verify
+            # bit-identical: `self.wide_group` also covers 33-63 questions, a range fp8spd3's own gate first
+            # measured *not* bit-identical (RUN-fp8spd.md, "33問だけ不一致") -- that mismatch's real cause (the
+            # GDN layer's causal convolution falling back to a different implementation whenever a branch
+            # pass's row count was not exactly 1, `prismyra/kernels/qwen3_moe.py`'s `_install_conv`) was closed
+            # by inv5's branch-pass convolution batch fix, independently of this flag, and 64-exact was simply
+            # the one width S4a's own gate happened to measure before that fix landed (wg, RUN-wg.md: 33-64
+            # re-verified bit-identical on today's branch, both cards, with and without the batch-invariance
+            # claim). torch.equal-gated against the two-32-row-group path before being wired in here -- see
+            # RUN-fp8spd.md round 5.
             #
             # fp8spd4: widening every one of 36 layers' GDN state buffers to 64 rows costs more than fusing the
             # second group saves once the context itself, not the restream, dominates a pass -- round5 measured

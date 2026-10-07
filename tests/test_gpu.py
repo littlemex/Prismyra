@@ -1378,8 +1378,7 @@ def test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did(engin
     back to the ordinary `_branch` rather than fusing), and the one count this engine's own non-`wide_group`
     construction still widens for (64, `effective_group` bumped past `self.group` inside `_ask_interleaved`
     itself when the context is short enough -- see `INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT`). `self.wide_group`
-    stays off throughout, since widening the general 33-63 case is a separate, still-unproven switch (fp8spd
-    S4a found it not bit-identical at 33 and 40 questions) that this test does not exercise.
+    stays off throughout -- it is a separate switch with its own regression test, below.
 
     `engine` is module-scoped and shared with every other test in this file, so the flag is restored in
     `finally` the same way `engine_paged` restores `paged`.
@@ -1398,6 +1397,41 @@ def test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did(engin
                     assert fused[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (n, q.id, option)
     finally:
         engine.interleaved_fork = was
+
+
+def test_wide_group_widening_answers_as_the_two_pass_path_did(engine):
+    """`wide_group` widens a document's own branch-row capacity past `self.group` once it is asked more than
+    `WIDE_GROUP_FROM` questions (`ask`'s own `_group_for`), turning the common 33-64 question case into one
+    pass instead of two. fp8spd3's own gate first measured this as **not** bit-identical at 33 and 40
+    questions (RUN-fp8spd.md, "33問だけ不一致") -- the GDN layer's causal convolution fell back to a different
+    implementation whenever a branch pass's row count was not exactly 1, which the leftover group from an
+    uneven split always was and a full 32- or 64-row group never was. inv5's branch-pass convolution batch fix
+    (`prismyra/kernels/qwen3_moe.py`'s `_install_conv`) closed that for every row count, independently of this
+    flag; wg re-verified the whole 33-64 range bit-identical on both supported cards and two context lengths
+    an order of magnitude apart (RUN-wg.md) -- this is the permanent version of that gate, the same bar
+    `test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did` holds `interleaved_fork` to.
+
+    Covers the narrow end (33 = 32+1, the width the old mismatch was sharpest at), the wide end (63 = 32+31,
+    the other side of the same uneven split), the midpoint (48), and the one width that already divided evenly
+    before this fix (64 = 32+32, kept here as a continuity check rather than because it is expected to move).
+
+    `engine` is module-scoped and shared with every other test in this file, so the flag is restored in
+    `finally` the same way `engine_paged` restores `paged`.
+    """
+    was = engine.wide_group
+    try:
+        for n in (33, 48, 63, 64):
+            asked = questions(n)
+            engine.wide_group = False
+            two_pass = engine.ask(CONTEXT, asked)
+            engine.wide_group = True
+            widened = engine.ask(CONTEXT, asked)
+            for q in asked:
+                assert two_pass[q.id].option == widened[q.id].option, (n, q.id)
+                for option, p in two_pass[q.id].probabilities.items():
+                    assert widened[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (n, q.id, option)
+    finally:
+        engine.wide_group = was
 
 
 def test_one_pass_refuses_a_question_wider_than_a_branch_as_the_fork_does(engine):
