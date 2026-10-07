@@ -822,7 +822,28 @@ class Prismyra:
         # reasons -- media move the positions during the read, calibration measures its priors through branch
         # passes of its own shape, and the paged storage's pages belong to a pool this path does not draw from.
         if self.interleaved_fork and not images and not videos and self.calibration is None and not self.paged:
-            return self._ask_interleaved(context, questions, group)
+            # fp8spd3 (round 5): at the default `self.group` (32), 64 questions pack into exactly two 32-row
+            # groups -- the first takes the fused path below, the second still falls back to `self._branch`
+            # (`_ask_interleaved`'s own docstring). Widening to one 64-row group here puts every row through the
+            # fused path instead of half of them. Deliberately **not** the general `self.wide_group` switch
+            # above: that one also covers 33-63 questions, a range S4a's own gate found *not* bit-identical
+            # (RUN-fp8spd.md, "33問だけ不一致"); 64-exact is the one width S4a verified bit-identical regardless
+            # of that switch, so this is scoped to exactly that width and is independent of `self.wide_group`'s
+            # own (still off-by-default) setting. torch.equal-gated against the two-32-row-group path before
+            # being wired in here -- see RUN-fp8spd.md round 5.
+            #
+            # **Known regression at long contexts, not yet guarded here.** Measured bit-identical at both
+            # lengths, but the interleaved round-robin (RUN-fp8spd.md round 5) found this wins on a ~5,016-token
+            # document (-9.6% vs the two-pass baseline) and *loses* on a ~20,064-token one (+6.0%, slower than
+            # even the two-32-row-group fused path at +6.8%) -- widening every one of 36 layers' GDN state
+            # buffers to 64 rows costs more than fusing the second group saves once the context itself, not the
+            # restream, dominates a pass. This override does not look at `encoded.tokens` to decide, so a caller
+            # with `interleaved_fork=True` and long documents pays this regression unconditionally at 64
+            # questions. A context-length-aware threshold is the next step, not attempted this round.
+            interleaved_group = group
+            if len(questions) == WIDE_GROUP and self.group < WIDE_GROUP:
+                interleaved_group = WIDE_GROUP
+            return self._ask_interleaved(context, questions, interleaved_group)
         with self._lock, self.open_context(context, images=images, videos=videos, group=group) as opened:
             assert opened._prefill is not None
             answered = self._answer(opened._prefill, questions, opened.tokens, context_ms=opened.context_ms)
@@ -920,6 +941,53 @@ class Prismyra:
             scoring="raw",
             timing=Timing(context_ms=0.0, readout_ms=readout_ms),
         )
+
+    def _shelf_ask_interleaved(self, shelf, context: str, questions: list[Question]) -> tuple[Result, int, "Shelved"]:
+        """`Batcher._answer`'s S4c path (round 5): one *fresh* document, read into `shelf` and answered in the
+        same layer-interleaved pass instead of `Shelf.put_many` followed later by `Shelf.ask`. See
+        `interleave.read_and_branch_shelf` for what the paged cache needed that `_ask_interleaved`'s joined-cache
+        version did not, and `RUN-fp8spd.md` round 5 for the torch.equal gate this went through before being
+        wired into `schedule.Batcher._answer`.
+
+        Scoped by the caller to exactly one document whose own questions already fit one group (every request
+        `Batcher` admits does, by `schedule.Limits.questions`) -- there is no second group to fall back to
+        `Shelf.ask` for here the way `_ask_interleaved` falls back to `self._branch`, so this returns a finished
+        `Result` plus the `(handle, Shelved)` pair the caller stores on the shelf, rather than a `Prefill` a
+        second call would still need.
+        """
+        plans = [plan(q, self.tokenizer) for q in questions]
+        token_ids = [p.token_ids for p in plans]
+        width = self._width_for(plans)
+        padded_rows = _round_rows(len(questions), self.group)
+        texts = [p.text for p in plans]
+
+        start = _now(self.torch_device)
+        with self._lock, torch.inference_mode():
+            try:
+                hidden, handle, shelved = interleave.read_and_branch_shelf(
+                    self, shelf, context, texts, width=width, padded_rows=padded_rows
+                )
+                scored = self.heads.apply(hidden, [q.options for q in questions], score(hidden, self.unembedding, token_ids, None))
+            except torch.OutOfMemoryError as e:
+                raise PrismyraError(
+                    f"ran out of memory reading and answering {len(questions)} questions about a fresh document "
+                    f"on a shelf (interleaved_fork). Ask fewer questions at a time, or build the engine with a "
+                    f"smaller group."
+                ) from e
+        readout_ms = _since(start, self.torch_device)
+
+        answers = {
+            q.id: _answer_for(q, p.tolist(), self.heads.name_for(q.options))
+            for q, p in zip(questions, scored, strict=True)
+        }
+        result = Result(
+            answers=answers,
+            model=self.model_name,
+            context_tokens=shelved.tokens,
+            scoring="raw",
+            timing=Timing(context_ms=0.0, readout_ms=readout_ms),
+        )
+        return result, handle, shelved
 
     def _ask_in_one_pass(self, context: str, question: Question) -> Result:
         """The context and the question as one sequence, read once, answered at its last position.

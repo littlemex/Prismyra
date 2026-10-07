@@ -247,6 +247,11 @@ class Batcher:
         #: free memory at or below `SHELF_MEMORY_MARGIN`. See `RECLAIM_COOLDOWN_S`.
         self._reclaim_cooldown_until = 0.0
         #: fp8spd (S5 / SYNTHESIS.md): measurement only, see `engine.Prismyra._empty_cache_calls`.
+        #: fp8spd3 (round 5): how many passes took the fused single-fresh-document path, out of how many passes
+        #: total -- so a q/s measurement that shows little effect can be told apart from one where the path
+        #: rarely engages at all. See `RUN-fp8spd.md` round 5.
+        self._fused_single_passes = 0
+        self._total_passes = 0
         self._empty_cache_calls = 0
         self._empty_cache_ms = 0.0
 
@@ -391,6 +396,28 @@ class Batcher:
         for job in formed.jobs:
             if job.payload.digest not in self._resident:
                 fresh.setdefault(job.payload.digest, job)
+
+        # fp8spd3 (round 5): the common low-concurrency case -- a formed pass naming exactly one document, and
+        # that document fresh -- can skip `Shelf.put_many` and the later `Shelf.ask` entirely: one layer-
+        # interleaved pass over `interleave.read_and_branch_shelf` does the read and this one request's own
+        # (single, by `Limits.questions`) branch group together. A pass naming more than one document, or a
+        # document already resident, still goes through the two-step path below unchanged. See
+        # `Prismyra._shelf_ask_interleaved` and RUN-fp8spd.md round 5 for the gate this went through.
+        self._total_passes += 1
+        if self.engine.interleaved_fork and len(fresh) == 1 and len(formed.jobs) == 1:
+            self._fused_single_passes += 1
+            job = formed.jobs[0]
+            self._make_room([job], keep={job.payload.digest})
+            result, handle, shelved = self.engine._shelf_ask_interleaved(shelf, job.payload.context, list(job.payload.questions))
+            self._resident[job.payload.digest] = handle
+            self._digest_of[handle] = job.payload.digest
+            shelf.documents[handle] = shelved
+            self._slot_bytes = max(self._slot_bytes, shelved.snapshot_bytes)
+            self._used[handle] = self._clock
+            self._clock += 1
+            self.reads.append(1)
+            return [result]
+
         if fresh:
             jobs = list(fresh.values())
             self._make_room(jobs, keep={job.payload.digest for job in formed.jobs})
@@ -570,6 +597,8 @@ class Batcher:
             "queue": self._worker.stats(),
             "empty_cache_calls": self._empty_cache_calls,
             "empty_cache_ms": round(self._empty_cache_ms, 1),
+            "fused_single_passes": self._fused_single_passes,
+            "total_passes": self._total_passes,
         }
 
 
