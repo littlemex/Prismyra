@@ -27,6 +27,15 @@ import torch  # noqa: E402
 
 import tasks  # noqa: E402
 from prismyra import Prismyra  # noqa: E402
+from prismyra.schema import PrismyraError  # noqa: E402
+
+
+def _round_rows(rows: int, cap: int) -> int:
+    """Mirrors `prismyra.engine._round_rows` exactly, so this script can predict (not just discover by exception)
+    which companion/question combinations round 3's per-document padding will accept."""
+    if rows >= cap:
+        return cap
+    return min(cap, 1 << (max(rows, 1) - 1).bit_length())
 
 MODEL = os.environ.get("PRISMYRA_MODEL")
 N_DOCS = int(os.environ.get("PRISMYRA_N_DOCS", "24"))
@@ -71,17 +80,23 @@ report = {"model": MODEL, "mode": os.environ.get("PRISMYRA_MODE", "raw"), "n_doc
 total_checks = 0
 total_exact = 0
 
+skipped_capacity = []
 for group_size in GROUP_SIZES:
-    # `_answer_batch` refuses a batch whose *total* question count across every document in the pass exceeds
-    # `self.group` (64 here) -- a real constraint, not a test artefact. So the full question-count sweep (which
-    # deliberately crosses the group=64/_round_rows boundary at 33) only runs solo; larger companion counts use a
-    # fixed small per-document question count, which is still enough to exercise the companion-count axis.
-    qcounts_here = QCOUNTS if group_size == 1 else [n for n in QCOUNTS if n * group_size <= engine.group]
+    # `_answer_batch` refuses a batch whose *padded* question count across every document in the pass exceeds
+    # `self.group` (64 here) -- a real constraint, not a test artefact, and since round 3 (per-document padding,
+    # not combined-total padding) it is computed per document and summed, which rejects a few combinations the
+    # combined-total version used to accept (predicted here with the same `_round_rows`, not discovered by
+    # exception, so a genuine regression in the admission check itself still shows up as an unexpected raise below).
+    qcounts_here = [n for n in QCOUNTS if group_size * _round_rows(n, engine.group) <= engine.group]
     for qn in qcounts_here:
         for start in range(0, len(items) - group_size + 1, group_size):
             chunk = items[start : start + group_size]
-            with engine.open_batch([it.context for it in chunk]) as batch:
-                results = batch.ask([questions_at(it, qn) for it in chunk])
+            try:
+                with engine.open_batch([it.context for it in chunk]) as batch:
+                    results = batch.ask([questions_at(it, qn) for it in chunk])
+            except PrismyraError as e:
+                skipped_capacity.append({"group_size": group_size, "qn": qn, "error": str(e)})
+                continue
             for item, got in zip(chunk, results, strict=True):
                 qs = questions_at(item, qn)
                 want = truth[(id(item), qn)]
@@ -125,6 +140,11 @@ for m in report["mismatches"]:
     by_qn[m["qn"]] += 1
 print(f"non-exact count by question-count: {by_qn}")
 
+print(f"\nunexpectedly-refused combinations (admission bug if nonzero): {len(skipped_capacity)}")
+for s in skipped_capacity[:5]:
+    print(f"  group_size={s['group_size']} qn={s['qn']}: {s['error'][:120]}")
+
+report["skipped_capacity"] = skipped_capacity
 out_path = Path(os.environ.get("PRISMYRA_REPORT", "/tmp/audit_sm120_report.json"))
 out_path.write_text(json.dumps(report, indent=2))
 print(f"\nfull report written to {out_path}")

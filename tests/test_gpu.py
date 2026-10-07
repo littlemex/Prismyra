@@ -89,7 +89,37 @@ def questions(n: int) -> list[Boolean]:
 #: Set half again above the measured maximum rather than at it. A bound sitting exactly on the largest value a hundred
 #: questions produced would fail on the hundred-and-first without anything having regressed, and the guard that
 #: actually matters is the assertion that the decision did not change.
+#:
+#: Used by tests on the plain, unpaged `engine` fixture (no `paged=True`, so `_enable_batch_invariance` never runs
+#: for it -- see `Prismyra.__init__`) and by `test_lanes_two_decisions_under_a_burst_do_not_move` (a different,
+#: borderline-question sensitivity its own docstring argues against folding into a row-count bound). Not used by
+#: the `engine_paged` row-count tests below any more -- those carry the guarantee and have their own, measured,
+#: much tighter bounds (`COMPANION_MOVEMENT_PAGED_ROWS`, `COMPANION_MOVEMENT_ROW_COUNT`) instead of this one.
 COMPANION_MOVEMENT = 0.3
+
+#: 2026-10-07 (inv, round 3). How far a probability may move on a *paged* engine (the one `_enable_batch_invariance`
+#: protects) between a question asked alone and the same question asked alongside a companion, once `_round_rows`
+#: pads each document to its own bucket independently (round 3's fix) rather than to the pair's combined total.
+#: Measured directly on this file's own fixtures, not assumed: `test_one_pass_answers_about_two_documents_...`
+#: and `test_a_document_on_a_shelf_answers_as_one_read_fresh` both move by 0.023866 (the "replaced" question);
+#: `test_graphs_never_corrupt_a_batch_naming_more_than_one_document` moves by 0.023888 (the "faulty" question).
+#: Both before and after round 3 -- this residual is not something round 3 changed (confirmed by re-running
+#: against origin/main unmodified and getting the identical bit pattern, RUN-inv.md round 2) -- which is the
+#: evidence that it is not a `_round_rows` bucket-mismatch effect at all: these documents ask the *same* number of
+#: questions as each other, so neither one's own bucket ever depended on the other. It is a plainer fact about the
+#: pass's total row count changing between "alone" and "with a companion", however that total is reached, that
+#: this project's fixed-tile kernels do not fully flatten out. Set half again over 0.023888.
+COMPANION_MOVEMENT_PAGED_ROWS = 0.036
+
+#: 2026-10-07 (inv, round 3). The narrower residual left in `test_open_batch_matches_ask_bit_for_bit_whatever_the_
+#: companions_total_length` once round 3 removed the specific `_round_rows` bucket-mismatch component that test's
+#: own docstring used to attribute its whole 0.0128 bound to: measured there, directly, at 0.008346 (the "faulty"
+#: question, "no" option, short companion) after the fix -- down from 0.0128 before it, not to zero. This is
+#: `COMPANION_MOVEMENT_PAGED_ROWS`'s same underlying cause (the pass's total row count still changes between
+#: "alone" and "with a companion"), measured smaller here only because this test's specific questions and context
+#: happen to be less sensitive to it than `COMPANION_MOVEMENT_PAGED_ROWS`'s own fixtures, not because the cause
+#: is different. Set half again over 0.008346.
+COMPANION_MOVEMENT_ROW_COUNT = 0.0125
 
 #: The smallest answer to "how many seconds" that still shows the clip's timing reached the model. Five, not six.
 #:
@@ -765,7 +795,7 @@ def test_one_pass_answers_about_two_documents_exactly_as_two_passes_did(engine_p
         for q in asked:
             assert mixed[q.id].option == alone[q.id].option, f"{q.id} changed its answer in a mixed batch"
             for option, p in alone[q.id].probabilities.items():
-                assert abs(mixed[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
+                assert abs(mixed[q.id].probabilities[option] - p) < COMPANION_MOVEMENT_PAGED_ROWS, (q.id, option)
 
 
 def test_graphs_never_corrupt_a_batch_naming_more_than_one_document(engine_paged):
@@ -805,7 +835,7 @@ def test_graphs_never_corrupt_a_batch_naming_more_than_one_document(engine_paged
                 for q in asked:
                     assert mixed[q.id].option == alone[q.id].option, f"{q.id} changed its answer in a mixed batch"
                     for option, p in alone[q.id].probabilities.items():
-                        assert abs(mixed[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
+                        assert abs(mixed[q.id].probabilities[option] - p) < COMPANION_MOVEMENT_PAGED_ROWS, (q.id, option)
     finally:
         engine_paged.graphs = was
         engine_paged.declined_recordings.clear()
@@ -862,7 +892,7 @@ def test_a_document_on_a_shelf_answers_as_one_read_fresh(engine_paged):
         for q in asked:
             assert shelved[q.id].option == alone[q.id].option, f"{q.id} changed its answer on a shelf"
             for option, p in alone[q.id].probabilities.items():
-                assert abs(shelved[q.id].probabilities[option] - p) < COMPANION_MOVEMENT, (q.id, option)
+                assert abs(shelved[q.id].probabilities[option] - p) < COMPANION_MOVEMENT_PAGED_ROWS, (q.id, option)
 
 
 def test_a_shelf_matches_ask_bit_for_bit(engine_paged):
@@ -961,13 +991,17 @@ def test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length
     `diag_openbatch_vs_ask.py`) now answers `open_batch` bit-identical to `ask()` -- zero mismatches, where there
     were three before this and the context-length padding together.
 
-    What this fix does *not* reach, found while writing this test rather than assumed: a companion with a
-    different *question count* -- not context length -- still moves a probability a little
-    (measured: 0.0128, with a two-question target and a one-question companion forcing two different `_round_rows`
-    buckets, 2 against 4, for the branch pass itself). Decisions do not change and the movement is a twentieth of
-    `COMPANION_MOVEMENT` (0.3), so this is checked against that bound rather than claimed as zero -- the
-    context-length axis is closed, the row-count axis inside the branch pass is narrowed but not yet, and that gap
-    is recorded in `THROUGHPUT.md` rather than hidden by loosening this test further than the measurement.
+    2026-10-07 (inv, round 3): the 0.0128 bound this test used to carry came from one specific cause -- the
+    pre-round-3 `_round_rows` rounded the *combined* total of target and companion rows together, so a
+    two-question target and a one-question companion were forced onto the 4-row bucket even though the target
+    alone only ever needed 2. `_branch_across` now pads each document to its own bucket *before* laying the
+    padded blocks end to end (`_round_rows` applied per document, not to the sum), which removes that specific
+    width-mismatch component -- measured here, on this test's own fixtures, as a reduction from 0.0128 to 0.0083
+    (short companion) rather than to zero. The remainder is a second, separate cause this round narrowed down but
+    did not close: even with the width-mismatch gone, a document's own rows still sit in a pass whose *total* row
+    count differs between "alone" (2) and "with this companion" (3) -- `COMPANION_MOVEMENT_ROW_COUNT` is that
+    residual's own, tighter bound, replacing the derived `COMPANION_MOVEMENT / 20` this line used before. See
+    `COMPANION_MOVEMENT`'s own comment for what else carries the same residual and by how much.
     """
     long_companion = SECOND_CONTEXT * 6  # several times CONTEXT's own length: the context-read axis this closes.
     asked = [
@@ -991,7 +1025,7 @@ def test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length
         for q in asked:
             assert mixed[q.id].option == want[q.id].option, f"{label}: {q.id} changed its answer"
             for option, p in want[q.id].probabilities.items():
-                assert mixed[q.id].probabilities[option] == pytest.approx(p, abs=COMPANION_MOVEMENT / 20), (
+                assert mixed[q.id].probabilities[option] == pytest.approx(p, abs=COMPANION_MOVEMENT_ROW_COUNT), (
                     label, q.id, option
                 )
 

@@ -1291,6 +1291,19 @@ class Prismyra:
             )
         if any(count == 0 for count in counts):
             raise PrismyraError("every document in a batch needs at least one question; drop it from the batch instead")
+        # 2026-10-07 (inv, round 3): the real check is on the *padded* total, not this one -- `_branch_across` now
+        # pads each document to its own bucket before summing (see there), which can need more rows than the real
+        # total alone would. Checked here too, before any tokenising, so a batch that cannot fit fails with one
+        # clear reason instead of a confusing one from deeper in the pass.
+        padded_total = sum(_round_rows(c, self.group) for c in counts)
+        if padded_total > self.group:
+            raise PrismyraError(
+                f"{sum(counts)} questions across {len(asked)} documents round up to {padded_total} rows once each "
+                f"document is padded to its own bucket independently of its companions, and a group of {self.group} "
+                f"cannot hold that many. Ask fewer documents or questions together, or build the engine with a "
+                f"larger group; the independent-padding rule is what makes two documents answered together give "
+                f"the same reduction order each one would alone (see `_round_rows`)."
+            )
 
         flat = [q for questions in asked for q in questions]
         plans = [plan(q, self.tokenizer) for q in flat]
@@ -1355,35 +1368,63 @@ class Prismyra:
         would take -- a few lines -- once the other half, `graphs.Recording` accepting a remainder bucket instead of an
         exact context length, makes a recording survive the batch's documents changing between passes.
         """
-        rows = sum(counts)
         # Batch-invariant: see `_round_rows`. The row count is the only thing that otherwise differs between "two
         # documents answered together" and "either one answered alone", once the width is matched (`_round_pack_align`)
         # -- and that alone moved an answer by up to 0.29 and flipped decisions. Padding every pass sharing documents
         # to the same row count a solo document would be padded to removes the difference entirely: `pad` extra rows
         # repeat the first document, discarded at the end exactly as `build_suffixes` already discards padded columns.
-        padded_rows = _round_rows(rows, self.group)
-        pad = padded_rows - rows
-        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, padded_rows, width)
+        #
+        # 2026-10-07 (inv, round 3): that single `padded_rows = _round_rows(rows, self.group)` rounded the
+        # *combined* total, which closes the context-length axis (`diag_openbatch_vs_ask_modes.py`'s 80-document
+        # benchmark) but not the question-count one: the same two real questions about the same document land in
+        # a 2-row pass alone and a 4-row pass once a one-question companion is added, even though neither document's
+        # own rows changed -- `tests/test_gpu.py`'s documented 0.0128/0.024 residual, confirmed on sm_120 too
+        # (`audit_sm120.py`, RUN-inv.md round 2). Padding *each document to its own bucket* first, then laying the
+        # padded blocks end to end, makes a document's own width a function of its own row count alone -- the
+        # property SYNTHESIS.md's round 3 asks for by name ("同席者に左右されない"). `restore_and_fork_many` already
+        # takes an arbitrary per-document row count in `parts` (it was only ever used with padding on the last
+        # document because that is all `_branch_across` built), so nothing downstream of this needed to change to
+        # accept it.
+        padded_counts = [_round_rows(c, self.group) for c in counts]
+        padded_rows = sum(padded_counts)
+
+        # `texts` is flat and real-only, in document order (`_answer_batch`'s `flat`). Insert each document's own
+        # pad entries right after its own real ones -- repeating that document's own first real text, the same
+        # convention `build_suffixes` already uses for the single-document case, just scoped per document instead
+        # of globally so a different document's padding can never be mistaken for this one's.
+        padded_texts: list[str] = []
+        real_row_at: list[int] = []  # index into `padded_texts`/the eventual padded rows for each real, flat row
+        at = 0
+        for count, padded in zip(counts, padded_counts):
+            block = texts[at : at + count]
+            real_row_at.extend(range(len(padded_texts), len(padded_texts) + count))
+            padded_texts.extend(block)
+            if padded > count:
+                padded_texts.extend([block[0]] * (padded - count))
+            at += count
+        ids, read_at, _ = build_suffixes(padded_texts, self.tokenizer, self.device, padded_rows, width)
+
+        # One start position per *padded* row: every row of a document, real or padding, starts at that document's
+        # own context end -- there is one such position per document, not per question, so repeating it for a
+        # document's pad rows is the same arithmetic as for its real ones, not a special case.
         starts = [
-            prefills[at].position_from or prefills[at].tokens for at, count in enumerate(counts) for _ in range(count)
+            prefills[at].position_from or prefills[at].tokens
+            for at, padded in enumerate(padded_counts)
+            for _ in range(padded)
         ]
-        # Padding extends the *last* document's own block, never a new one at the tail: `rows_for`'s rows are laid
-        # out contiguously per document (`paged.PagedForkLayer.begin_branches` rebuilds its row assignment from each
-        # document's *total* count in `rows_for`, not from the row positions themselves, so it assumes every row
-        # naming one document is contiguous). Padding with the first document while a different one is last split
-        # that document's rows across the gap and answered every row from the wrong table -- found by this file's
-        # own open-loop comparison moving a probability by 0.93 instead of removing the smaller 0.29 it was meant to.
-        if pad:
-            starts += [starts[-1]] * pad
         offsets = torch.tensor(starts, device=self.device).unsqueeze(1)
         positions = offsets + torch.arange(ids.shape[1], device=self.device).unsqueeze(0)
         cache = prefills[0].cache
 
-        parts = [(prefills[at].snapshot, count) for at, count in enumerate(counts)]
-        rows_for_padded = rows_for
-        if pad:
-            parts = [*parts[:-1], (parts[-1][0], parts[-1][1] + pad)]
-            rows_for_padded = [*rows_for, *([rows_for[-1]] * pad)]
+        # Each document gets its own padded count directly -- no more "extend the last document's block", because
+        # every document now carries its own padding rather than borrowing room at the tail.
+        parts = [(prefills[at].snapshot, padded_counts[at]) for at in range(len(counts))]
+        rows_for_padded: list[int] = []
+        at = 0
+        for count, padded in zip(counts, padded_counts):
+            name = rows_for[at]  # every real row of one document already names the same document
+            rows_for_padded.extend([name] * padded)
+            at += count
 
         def fork() -> None:
             restore_and_fork_many(cache, parts, width=self.group, rows_for=rows_for_padded, lane=lane)
@@ -1400,7 +1441,10 @@ class Prismyra:
         hidden = self._run_recorded(
             cache, fork, run, ids, positions, padded_rows, width, homogeneous=homogeneous, lane=lane
         )
-        return hidden[torch.arange(padded_rows, device=self.device), read_at][: len(texts)]
+        # Gather the real rows back out in the caller's original flat order -- they are no longer a contiguous
+        # prefix now that each document's own padding sits right after its own real rows instead of at the tail.
+        real_idx = torch.tensor(real_row_at, device=self.device)
+        return hidden[torch.arange(padded_rows, device=self.device), read_at][real_idx]
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
         # Already validated: both public entry points call `validate` before the context is read, and repeating it
