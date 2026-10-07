@@ -619,13 +619,25 @@ class Prismyra:
         #: stored in or handed to the framework's own attention as a strided view. That changes what a branch pass
         #: transiently allocates, so it changes what admission budgets.
         self._borrowed_kernel = self.applied.ok and not self.applied.skipped
-        if paged and on_cuda:
+        # fp8spd5 (round 7, RUN-fp8spd.md "本題/手2"): `interleaved_fork` needs this guarantee for exactly the
+        # reason `paged` already does -- `read_and_branch`'s one `mlp` call runs the context's and the branch's
+        # rows through the *same* routed-expert pass, and `fused_moe`'s own tile-size choice keys on that call's
+        # total row count unless `VLLM_BATCH_INVARIANT=1` is set (`_enable_batch_invariance`'s own docstring).
+        # Found on real hardware, not reasoned to: a ~20,094-token document answered 3, 8, 16 or 32 questions
+        # through `read_and_branch` moved by up to 0.124 against the two-pass baseline, at *every* branch width
+        # tested except the ones that happened to land on the same tile boundary by chance (RUN-fp8spd.md,
+        # "diag_mlp_realreplay.py" -- replaying the branch pass's own captured context-row input alone,
+        # bit-identical to what the fused call received, reproduced the two-pass answer exactly; concatenating
+        # it with the branch's real rows before calling `mlp` is what moved it). `read_and_branch` is mutually
+        # exclusive with `paged` (`ask()`'s own guard), so the `if paged` branch below never ran for it before
+        # this; nothing here changes what `paged` alone already covered.
+        if (paged or interleaved_fork) and on_cuda:
             try:
                 _enable_batch_invariance()
             except ImportError as e:
                 self.applied.notes.append(
-                    f"batch-invariant mode not available ({e}); open_batch/Batcher may still move an answer by "
-                    "who else shares the pass -- see diag_layer0_op_divergence.py"
+                    f"batch-invariant mode not available ({e}); open_batch/Batcher/read_and_branch may still "
+                    "move an answer by who else shares the pass -- see diag_layer0_op_divergence.py"
                 )
         self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
@@ -2345,8 +2357,10 @@ def _enable_batch_invariance() -> None:
     Dropping them is a correctness simplification -- fewer process-wide side effects for whatever future kernel
     might actually use `torch.bmm` or care which BLAS backend is preferred -- not a speed win in this measurement.
 
-    Kept only when the borrowed kernels this engine's batching depends on are actually in use (`paged` on CUDA): a
-    joined-storage engine never shares a pass across documents, so it has nothing this buys.
+    Kept only when a pass can actually share rows across more than one logical document (`paged` on CUDA, where
+    `open_batch`/`Batcher` share a pass across several documents) or across a context and a branch in one call
+    (`interleaved_fork` on CUDA, round 7 -- see this `__init__`'s own call site): plain `ask()`/`open_context()`
+    on a joined, non-interleaved cache never shares a pass across anything, so it has nothing this buys.
     2026-10-07 (inv, SYNTHESIS 0-2/0-3): the early return below used to leave sm_120 (RTX PRO 4500, the only card
     `nvfp4-36l` serves on) with *no* process-wide protection at all -- not even vLLM's own fallback for
     non-SM80 CUDA. Reading `vllm.model_executor.layers.batch_invariant.enable_batch_invariant_mode` (the function

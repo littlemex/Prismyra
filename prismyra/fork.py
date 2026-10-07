@@ -147,6 +147,50 @@ def widen_for_branch(layer, rows: int, width: int, lane: int = 0):
                     d[k] = held[(attr, k)]
 
 
+@contextmanager
+def widen_for_branch_many(layer, parts: list[tuple[int, int]], lane: int = 0):
+    """`widen_for_branch`'s own job for several documents' context rows at once (S4c, multi-document fusion,
+    RUN-fp8spd.md round7 "本題"): the layer holds `N` real documents' just-written context state (one row each,
+    in row order) rather than one, and each document `d` gets its own `rows` branch rows, broadcast from its own
+    row and nobody else's.
+
+    `parts` is `(context_row, rows)` per document, in the branch's own row order -- document `d`'s branch rows
+    occupy a contiguous block of the combined buffer this builds, broadcast from `layer`'s row `context_row`
+    only (never averaged or confused with another document's row, the same guarantee a single document's own
+    `widen_for_branch` gives when there is only one row to begin with). Restored to the layer's own `N`-row
+    tensors on exit, for the same reason `widen_for_branch` restores to one row: a later branch group forking
+    from a snapshot taken at or after this layer must still find the pure `N`-row context tensors, not this
+    group's wider view.
+    """
+    held: dict[tuple, torch.Tensor] = {}
+    total_rows = sum(count for _, count in parts)
+    for attr in ("recurrent_states", "conv_states"):
+        d = getattr(layer, attr, None)
+        if not isinstance(d, dict):
+            continue
+        for k, v in list(d.items()):
+            if v is None:
+                continue
+            held[(attr, k)] = v
+            view = _owned(layer, attr, k, v, total_rows, total_rows, lane=lane)
+            at = 0
+            for context_row, rows in parts:
+                src = v[context_row : context_row + 1]
+                view[at : at + rows].copy_(src.expand((rows, *src.shape[1:])))
+                at += rows
+            d[k] = view
+    try:
+        yield
+    finally:
+        for attr in ("recurrent_states", "conv_states"):
+            d = getattr(layer, attr, None)
+            if not isinstance(d, dict):
+                continue
+            for k in list(d.keys()):
+                if (attr, k) in held:
+                    d[k] = held[(attr, k)]
+
+
 def _holds_attention(layer) -> bool:
     """Whether this layer stores keys and values rather than a recurrent state.
 
