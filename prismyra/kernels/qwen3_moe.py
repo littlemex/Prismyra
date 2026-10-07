@@ -11,6 +11,7 @@ vLLM installed -- slower, and the adapter says so.
 from __future__ import annotations
 
 import os
+import threading
 
 import torch
 from torch import nn
@@ -158,6 +159,142 @@ class Fp8Linear(nn.Module):
         xq, xs = per_token_group_quant_fp8(x.reshape(-1, shape[-1]), BLOCK[1])
         out = w8a8_triton_block_scaled_mm(xq, self.weight, xs, self.scale, list(BLOCK), output_dtype=x.dtype)
         return out.reshape(*shape[:-1], self.out_features)
+
+
+class _FusedDenseProjection(nn.Module):
+    """One block-FP8 matmul for several sibling `Fp8Linear` projections of the same input, split back into their
+    own widths.
+
+    Concatenating weight and scale along the output dimension does not change the per-row reduction order over the
+    input dimension -- `BLOCK[0]` (128) divides every sibling's own output width in this configuration, so no FP8
+    block straddles the seam between two of them, and `w8a8_triton_block_scaled_mm` fixes `BLOCK_SIZE_K` rather than
+    deriving it from the output width (measured for the dense matmul's own M-bucketed config search, RUN-fp4spd.md).
+    The input is quantised once here rather than once per sibling, which is the actual saving: three or four small
+    matmuls sharing one input become one matmul of their combined width.
+    """
+
+    def __init__(self, parts: list[Fp8Linear]):
+        super().__init__()
+        self.sizes = [p.out_features for p in parts]
+        self.in_features = parts[0].in_features
+        self.register_buffer("weight", torch.cat([p.weight for p in parts], dim=0), persistent=False)
+        self.register_buffer("scale", torch.cat([p.scale for p in parts], dim=0), persistent=False)
+        self.out_features = sum(self.sizes)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            per_token_group_quant_fp8,
+            w8a8_triton_block_scaled_mm,
+        )
+
+        shape = x.shape
+        xq, xs = per_token_group_quant_fp8(x.reshape(-1, shape[-1]), BLOCK[1])
+        out = w8a8_triton_block_scaled_mm(xq, self.weight, xs, self.scale, list(BLOCK), output_dtype=x.dtype)
+        return torch.split(out.reshape(*shape[:-1], self.out_features), self.sizes, dim=-1)
+
+
+class _ProjectionSlot(nn.Module):
+    """`nn.Linear`-shaped access to one share of a `_FusedDenseProjection`, for call sites that address each
+    sibling by its own attribute (`q_proj`, `in_proj_z`, ...) one call at a time rather than through one combined
+    call.
+
+    The slots sharing one `_FusedDenseProjection` are always called back-to-back on the identical input, in the
+    fixed order the fusion was built from -- checked once in `_fuse_pair`, against the separate `Fp8Linear` calls
+    this replaces, before any slot is installed; the model's own generated `forward` is what calls them in that
+    order, and nothing else addresses these attributes. The first slot in that order runs the one combined matmul
+    and stashes the other slots' shares for them to pop; a later slot that popped nothing raises `AttributeError`
+    rather than returning someone else's share, because a call that did not happen in the checked order is not an
+    arithmetic question this class can answer. The stash is `threading.local` because this project's own two-lane
+    concurrency (`engine.py`'s lane-tagged scratch) can run two forward passes through the same model weights on two
+    threads at once, and a plain instance attribute would let one lane's share leak into the other's read.
+    """
+
+    def __init__(self, fused: _FusedDenseProjection, index: int, order: list["_ProjectionSlot"]):
+        super().__init__()
+        self.fused = fused
+        self.index = index
+        self.order = order  # one list, shared by every slot in the group, in call order
+        self.in_features = fused.in_features
+        self.out_features = fused.sizes[index]
+        self._local = threading.local()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self is self.order[0]:
+            parts = self.fused(x)
+            for slot, part in zip(self.order[1:], parts[1:]):
+                slot._local.pending = part
+            return parts[0]
+        pending = self._local.pending
+        del self._local.pending
+        return pending
+
+
+def _fuse_pair(applied, parent: nn.Module, names: tuple[str, ...], label: str) -> bool:
+    """Replace `names` on `parent` with one `_FusedDenseProjection` and its `_ProjectionSlot`s, in that call order,
+    once a probe shows the combined matmul agrees bit-for-bit with the separate `Fp8Linear` calls it would replace.
+
+    Declines (and records why) rather than guessing: if `dense_matmul` has not run yet, or ran but found this
+    particular projection unsuited to the fast kernel (`_is_block_quantised` said no), the attributes are not
+    `Fp8Linear` and this leaves them exactly as found.
+    """
+    originals = [getattr(parent, n, None) for n in names]
+    if any(not isinstance(o, Fp8Linear) for o in originals):
+        applied.skipped.append(f"{label}: not all of {names} are Fp8Linear, left separate")
+        return False
+    device = originals[0].weight.device
+    probe = torch.randn(2, 3, originals[0].in_features, device=device, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        want = [o(probe) for o in originals]
+    fused = _FusedDenseProjection(originals)
+    order: list[_ProjectionSlot] = []
+    for i in range(len(names)):
+        order.append(_ProjectionSlot(fused, i, order))
+    with torch.inference_mode():
+        got = [slot(probe) for slot in order]
+    if not all(torch.equal(w, g) for w, g in zip(want, got)):
+        applied.skipped.append(f"{label}: the combined matmul disagreed with the separate calls, left separate")
+        return False
+    for n, slot in zip(names, order):
+        setattr(parent, n, slot)
+    return True
+
+
+def _fuse_dense_projections(applied, root: nn.Module) -> None:
+    """Concatenate three groups of sibling dense FP8 projections at load time: attention's q/k/v, the gated delta
+    net's in_proj_qkv+in_proj_z, and the shared expert's gate_proj+up_proj. Each shares one input across two or
+    three `Fp8Linear` calls today; after this, each is one block-FP8 matmul. Must run after `dense_matmul`'s own
+    swap (`Qwen3MoeAdapter.replace`), since it is what turns the plain `nn.Linear`s this targets into `Fp8Linear`.
+    """
+    fused_groups = 0
+    total_groups = 0
+    for module in root.modules():
+        if isinstance(module, FlashAttention):
+            total_groups += 1
+            if _fuse_pair(applied, module.inner, ("q_proj", "k_proj", "v_proj"), "dense_fusion: attention q/k/v"):
+                fused_groups += 1
+        elif type(module).__name__ == "Qwen3_5MoeGatedDeltaNet":
+            total_groups += 1
+            if _fuse_pair(
+                applied, module, ("in_proj_qkv", "in_proj_z"), "dense_fusion: GDN in_proj_qkv+in_proj_z"
+            ):
+                fused_groups += 1
+        elif hasattr(module, "shared_expert") and hasattr(module, "shared_expert_gate"):
+            # `FusedExperts` (FP8 routed experts) or `FusedExpertsFp4` (NVFP4 routed experts) -- whichever this
+            # checkpoint uses, both keep the shared expert as the framework's own `Qwen3_5MoeMLP`, untouched.
+            total_groups += 1
+            if _fuse_pair(
+                applied, module.shared_expert, ("gate_proj", "up_proj"), "dense_fusion: shared expert gate+up"
+            ):
+                fused_groups += 1
+    if total_groups:
+        applied.swaps.append(
+            Swap(
+                "dense_fusion",
+                fused_groups,
+                None,
+                verified=f"{fused_groups}/{total_groups} groups, combined matmul bit-identical to the separate calls",
+            )
+        )
 
 
 # --------------------------------------------------------------------------- normalisation
@@ -758,6 +895,11 @@ class Qwen3MoeAdapter:
                 tolerance=2 * BF16_ULP,
             )
             _swap_and_verify(applied, text, "dense_matmul", None, [("fp8", Fp8Linear)], tolerance=5e-2)
+            # Must run after the swap just above: it is what turns the plain `nn.Linear`s this targets into the
+            # `Fp8Linear`s it concatenates. See `_fuse_dense_projections` for the three groups and why concatenating
+            # them is bit-identical rather than an approximation.
+            if "dense_fusion" not in _withheld():
+                _fuse_dense_projections(applied, text)
             # Experimental (PRISMYRA_DECODER_FUSION=1), off by default: fuses every residual add with the RMSNorm
             # that reads it, including across the decoder-layer boundary. See decoder_fusion.py for why this one
             # needs the layer loop's cooperation rather than a module swap, and RUN-fp4spd.md for the end-to-end
