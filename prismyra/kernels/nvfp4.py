@@ -129,9 +129,21 @@ class FusedExpertsFp4(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_topk
 
+        from .qwen3_moe import _ROUTER_LINEAR
+
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
-        logits, _, _ = self.gate(x)
+        # 2026-10-07 (inv): this used to be `logits, _, _ = self.gate(x)` -- calling the router module's own
+        # `forward` whole, which is `F.linear(hidden_states, self.weight)` followed by a softmax/top-k this
+        # function immediately recomputes with `fused_topk` and discards (the identical "called it twice, threw
+        # one away" pattern `FusedExperts._route`, the FP8 path's router, already comments on). The FP8 path's
+        # `_route` already takes the one line that matters -- the `F.linear` -- through `_ROUTER_LINEAR` directly
+        # so it is row-count invariant; this path never did, which was found by inspecting `self.gate`'s own
+        # `forward` source (`diag_nvfp4_gate_type.py`) after `audit_sm120.py` measured a 5.9% non-bit-exact
+        # residual that the Blackwell cuBLAS-workspace fix alone did not close. Same fix as `_route`: call the one
+        # op this needs directly, on the invariant kernel when one is available.
+        linear = _ROUTER_LINEAR or torch.nn.functional.linear
+        logits = linear(x, self.gate.weight)
         weights, ids = fused_topk(x, logits, self.top_k, renormalize=True)[:2]
         out = self.routed(x, weights, ids)
         shared = torch.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)

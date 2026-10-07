@@ -1949,7 +1949,19 @@ def _round_rows(rows: int, cap: int) -> int:
     run at 8, with the extra rows a harmless repeat of an existing row (discarded the same way `build_suffixes`
     already discards padded columns). Two documents or one document asked twice then see the identical kernel
     dispatch their row count would get alone, which is what makes answering together stop moving an answer.
+
+    2026-10-07 (inv, round 2): the power-of-two bucketing above closes most of the row-count effect but not all of
+    it, because it rounds the *pass's total* row count, not each document's own -- a target alone and the same
+    target plus a one-question companion can combine to totals either side of a power-of-two boundary even though
+    the target's own row count never changed (the documented residual: `tests/test_gpu.py`'s `COMPANION_MOVEMENT /
+    20`, measured 0.0128 on L40S; `audit_sm120.py` found the matching case on sm_120 at 0.057, i.e. this is not a
+    different bug per card, it is the same one at a different magnitude). `PRISMYRA_ROUND_ROWS_TO_GROUP=1` rounds
+    every pass straight to `cap` instead -- the simplest version of "every pass runs at the same width", so a
+    document's own padding can no longer depend on who shares the pass -- at the cost of always paying for a
+    full-width pass; see RUN-inv.md for the measured speed cost before deciding whether this becomes the default.
     """
+    if os.environ.get("PRISMYRA_ROUND_ROWS_TO_GROUP") == "1":
+        return cap
     if rows >= cap:
         return cap
     return min(cap, 1 << (max(rows, 1) - 1).bit_length())
@@ -2085,33 +2097,35 @@ def _enable_batch_invariance() -> None:
     if not current_platform.is_cuda():
         return
 
-    if current_platform.is_device_capability_family(80):
-        # The SM80-family (Ampere/Ada/Hopper-adjacent) Triton persistent matmul is what this was measured against
-        # (L40S, SM89).
-        lib = torch.library.Library("aten", "IMPL")
-        key = current_platform.dispatch_key
-        lib.impl("aten::mm", mm_batch_invariant, key)
-        lib.impl("aten::addmm", addmm_batch_invariant, key)
-        lib.impl("aten::matmul", matmul_batch_invariant, key)
-        lib.impl("aten::linear", linear_batch_invariant, key)
-        # Kept alive for the process's lifetime (matching `enable_batch_invariant_mode`'s own module-level
-        # singleton): letting it be garbage-collected would un-register the dispatcher entries it just installed.
-        global _BATCH_INVARIANT_DISPATCH_LIB
-        _BATCH_INVARIANT_DISPATCH_LIB = lib
-        return
+    # 2026-10-07 (inv, round 2): the Triton persistent matmul this registers (`mm_batch_invariant` et al.) is not
+    # itself gated to SM80 anywhere in its own implementation -- `linear_batch_invariant` just calls
+    # `matmul_persistent`, a plain Triton kernel, unconditionally. `_ROUTER_LINEAR` (`kernels/qwen3_moe.py`) was
+    # already calling it directly on sm_120 (RTX PRO 4500, Blackwell) for the FP8 router with no crash and no
+    # family check at all, which is the evidence that it runs there -- "vLLM's Triton version on sm_120" was a
+    # question `audit_sm120.py`'s own code answers by example, not something that needed a separate try. The
+    # round-1 version of this function treated SM80 and "everything else" as needing *different* fixes (dispatcher
+    # vs. cuBLAS workspace config only); registering the dispatcher everywhere closes a residual the cuBLAS-only
+    # fix left (measured: `audit_sm120.py` non-exact 258/4392 -> see RUN-inv.md for the after-this-change number).
+    lib = torch.library.Library("aten", "IMPL")
+    key = current_platform.dispatch_key
+    lib.impl("aten::mm", mm_batch_invariant, key)
+    lib.impl("aten::addmm", addmm_batch_invariant, key)
+    lib.impl("aten::matmul", matmul_batch_invariant, key)
+    lib.impl("aten::linear", linear_batch_invariant, key)
+    # Kept alive for the process's lifetime (matching `enable_batch_invariant_mode`'s own module-level singleton):
+    # letting it be garbage-collected would un-register the dispatcher entries it just installed.
+    global _BATCH_INVARIANT_DISPATCH_LIB
+    _BATCH_INVARIANT_DISPATCH_LIB = lib
 
-    # Every other CUDA family, including sm_120 (RTX PRO 4500, Blackwell "Server Edition"): vLLM's own fallback
-    # for Hopper/Blackwell. cuBLAS's split-K reduction is the row-count-dependent step on these cards (no Triton
-    # override needed); pinning the workspace size to the single-K-split layout removes split-K as a choice at
-    # all, which is cheaper to verify than "which of several row-counts picked split-K" and is vLLM's own answer
-    # for this family, not a guess made for this project.
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-    os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
-    # Cheap on every card this project measured (`diag_isolate_invariance_lever_combined.py`); kept here too since
-    # this family has no dispatcher override to fall back on if either flag alone turns out insufficient.
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    torch.backends.cuda.preferred_blas_library(backend="cublaslt")
+    if not current_platform.is_device_capability_family(80):
+        # Belt and suspenders on every other family (Hopper/Blackwell, including sm_120): vLLM's own fallback for
+        # these cards disables cuBLAS split-K the same way, for anything that reaches cuBLAS directly rather than
+        # through one of the four aten ops above (e.g. a custom op that calls `at::cuda::blas::gemm` itself).
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+        os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.backends.cuda.preferred_blas_library(backend="cublaslt")
 
 
 _BATCH_INVARIANT_DISPATCH_LIB = None
