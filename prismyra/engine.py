@@ -1110,6 +1110,60 @@ class Prismyra:
         )
         return result, handle, shelved
 
+    def _shelf_ask_interleaved_many(
+        self, shelf, contexts: list[str], questions_per_doc: list[list[Question]]
+    ) -> list[tuple[Result, int, "Shelved"]]:
+        """`_shelf_ask_interleaved`'s own job for several *fresh* documents at once (round 7, "本題"): every
+        document in `formed.jobs` is fresh (`schedule.Batcher._answer`'s own generalised fusion condition --
+        see that function), so one layer-interleaved pass reads and answers all of them, instead of diluting
+        across `len(fresh)` separate single-document fused passes or falling back to `Shelf.put_many`+
+        `Shelf.ask`. See `interleave.read_and_branch_shelf_many` for what changed to carry `N` documents
+        instead of one, and `RUN-fp8spd.md` round 7 for the torch.equal gate this went through.
+
+        Each document's own `_round_rows(len(questions), self.group)` is computed here, independently, before
+        the fused call -- not recombined with any other document's count inside it (`interleave.
+        read_and_branch_shelf_many`'s own docstring is why that order matters).
+        """
+        plans_per_doc = [[plan(q, self.tokenizer) for q in qs] for qs in questions_per_doc]
+        width = self._width_for([p for plans in plans_per_doc for p in plans])
+        padded_rows_per_doc = [_round_rows(len(plans), self.group) for plans in plans_per_doc]
+        texts_per_doc = [[p.text for p in plans] for plans in plans_per_doc]
+
+        start = _now(self.torch_device)
+        with self._lock, torch.inference_mode():
+            try:
+                hidden, handles, shelved_list = interleave.read_and_branch_shelf_many(
+                    self, shelf, contexts, texts_per_doc, width=width, padded_rows_per_doc=padded_rows_per_doc
+                )
+                token_ids = [p.token_ids for plans in plans_per_doc for p in plans]
+                options = [q.options for qs in questions_per_doc for q in qs]
+                scored = self.heads.apply(hidden, options, score(hidden, self.unembedding, token_ids, None))
+            except torch.OutOfMemoryError as e:
+                raise PrismyraError(
+                    f"ran out of memory reading and answering {len(contexts)} fresh documents in one "
+                    f"layer-interleaved pass (interleaved_fork). Ask about fewer documents at a time."
+                ) from e
+        readout_ms = _since(start, self.torch_device)
+
+        results = []
+        at = 0
+        for questions, shelved in zip(questions_per_doc, shelved_list, strict=True):
+            answers = {
+                q.id: _answer_for(q, p.tolist(), self.heads.name_for(q.options))
+                for q, p in zip(questions, scored[at : at + len(questions)], strict=True)
+            }
+            at += len(questions)
+            results.append(
+                Result(
+                    answers=answers,
+                    model=self.model_name,
+                    context_tokens=shelved.tokens,
+                    scoring="raw",
+                    timing=Timing(context_ms=0.0, readout_ms=readout_ms),
+                )
+            )
+        return list(zip(results, handles, shelved_list, strict=True))
+
     def _ask_in_one_pass(self, context: str, question: Question) -> Result:
         """The context and the question as one sequence, read once, answered at its last position.
 

@@ -42,7 +42,7 @@ from __future__ import annotations
 import torch
 
 from . import varlen
-from .fork import Prefill, build_suffixes, snapshot_bytes, snapshot_layer, widen_for_branch
+from .fork import Prefill, build_suffixes, pick, snapshot_bytes, snapshot_layer, widen_for_branch, widen_for_branch_many
 
 
 def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, padded_rows: int):
@@ -357,3 +357,220 @@ def read_and_branch_shelf(engine, shelf, context: str, texts: list[str], width: 
         snapshot_bytes=snapshot_bytes(snap),
     )
     return out, handle, shelved
+
+
+def read_and_branch_shelf_many(
+    engine, shelf, contexts: list[str], texts_per_doc: list[list[str]], width: int, padded_rows_per_doc: list[int]
+):
+    """`read_and_branch_shelf`'s own job for several *fresh* documents at once (round 7, "本題" --
+    RUN-fp8spd.md): fuse `N` documents' reads into the shelf with each one's own (first, and in `Batcher`,
+    only -- see that function's own docstring) branch group, through one per-layer loop that carries every
+    document's rows at once instead of one.
+
+    **Scope.** `N >= 2` documents, every one read for the first time this call -- a pass naming an already
+    resident document, or exactly one fresh document, still goes through `Shelf.put_many`/`Shelf.ask` or
+    `read_and_branch_shelf` respectively (see `schedule.Batcher._answer`, the only caller, for which path a
+    pass takes). Text only, same restriction `read_and_branch`/`read_and_branch_shelf` state.
+
+    **Why each document's own branch rows are rounded independently.** `_branch_across` (the existing,
+    non-interleaved multi-document branch pass) rounds the *combined* row count once and pads only the last
+    document -- which is exactly the design RUN-inv.md round 3 traced a residual to: a document's own answer
+    moving when a companion's question count changes the bucket the *pair* rounds to, not the bucket either
+    one would round to alone. This function was written after that finding, not before it, so it rounds each
+    document's `padded_rows_per_doc[i]` on its own count alone (the caller already did this, in
+    `schedule.Batcher._answer`'s own `_round_rows` call per job) and never recombines it with anyone else's --
+    nothing here depends on how many rows a companion asked for, which is this project's own invariance
+    contract (BRIEF rule 2) by construction rather than by a later patch.
+
+    **The one new primitive this needed.** `fork.widen_for_branch_many` (first written, unwired, by fp8spd5):
+    `widen_for_branch`'s one-document broadcast, generalised to broadcast document `i`'s own just-written row
+    to its own `padded_rows_per_doc[i]` branch rows and nobody else's, for every document in one call -- the
+    same guarantee `widen_for_branch` gives a single document, extended rather than approximated.
+
+    **Everything else is `open_batch`'s own admission (`begin_documents`, one shared padding segment sized by
+    the *combined* total exactly as `Prismyra._pad_context_lengths` already does for any batched read) plus
+    `read_and_branch_shelf`'s own per-layer narrowing of the framework's end-of-run convolution tail and
+    its one-document-per-row recurrent state** (RUN-fp8spd.md round 5's own docstring explains both), run in
+    a loop over `N` documents instead of written out for one.
+
+    Returns `(hidden, handles, shelved)`: `hidden` is every document's own answer rows concatenated in the
+    order `contexts` was given, each trimmed to its own real question count -- the same shape and
+    `torch.equal`-gated contract `read_and_branch`/`read_and_branch_shelf` give for one document, extended to
+    `N`; `handles` and `shelved` are what the caller stores on the shelf, one per document, in that same order.
+    """
+    from .engine import Shelved, _forget_recurrent_state
+
+    text_model = engine.backbone.language_model if hasattr(engine.backbone, "language_model") else engine.backbone
+    layers = text_model.layers
+    device = engine.device
+    hidden_size = engine.hidden_size
+    decoder = getattr(engine.config, "text_config", engine.config)
+    layer_types = list(decoder.layer_types)
+
+    n = len(contexts)
+    if n < 2:
+        raise ValueError("read_and_branch_shelf_many needs at least two fresh documents; use read_and_branch_shelf for one")
+    if len(texts_per_doc) != n or len(padded_rows_per_doc) != n:
+        raise ValueError(f"{n} documents need {n} question lists and {n} padded-row counts, not "
+                          f"{len(texts_per_doc)} and {len(padded_rows_per_doc)}")
+
+    cache = shelf._cache
+    encoded = [engine.encode_context(c) for c in contexts]
+    if any(e.has_media for e in encoded):
+        raise ValueError("a shelf is text only for now, for the same reason a batch is: media move the positions")
+
+    _forget_recurrent_state(cache)
+
+    handles = list(range(shelf._next_handle, shelf._next_handle + n))
+    shelf._next_handle += n
+    lengths = [e.tokens for e in encoded]
+    pad_ids, lengths = engine._pad_context_lengths(lengths, [e.input_ids for e in encoded])
+    has_pad = pad_ids.shape[1] > 0
+    pad_handle = None
+    if has_pad:
+        pad_handle = shelf._next_handle
+        shelf._next_handle += 1
+    doc_handles = [*handles, pad_handle] if has_pad else list(handles)
+    ctx_ids = torch.cat([*(e.input_ids for e in encoded), pad_ids], dim=1) if has_pad else torch.cat(
+        [e.input_ids for e in encoded], dim=1
+    )
+    ctx_tokens = ctx_ids.shape[1]
+
+    branch_blocks, read_ats = [], []
+    for i in range(n):
+        ids_i, read_at_i, _ = build_suffixes(texts_per_doc[i], engine.tokenizer, device, padded_rows_per_doc[i], width)
+        branch_blocks.append(ids_i)
+        read_ats.append(read_at_i)
+    branch_ids_cat = torch.cat(branch_blocks, dim=0)
+    branch_width = branch_ids_cat.shape[1]
+    total_branch_rows = sum(padded_rows_per_doc)
+
+    for layer in cache.layers:
+        begin = getattr(layer, "begin_documents", None)
+        if begin is not None:
+            begin(doc_handles)
+
+    hidden_ctx = text_model.embed_tokens(ctx_ids)
+    hidden_branch = text_model.embed_tokens(branch_ids_cat)
+    # Pure arithmetic on `lengths` (`Boundaries.positions` would compute the same thing once `varlen.reading()`
+    # is entered, but rope needs this before the layer loop starts): each real document's own tokens start at
+    # zero, same as `open_batch`'s own positions for a batched read, and so does the shared padding segment's.
+    ctx_positions = torch.cat([torch.arange(ln, device=device) for ln in lengths]).unsqueeze(0)
+    ctx_rope = text_model.rotary_emb(hidden_ctx, ctx_positions)
+    # Each document's own branch rows start at that document's own end -- `encoded[i].tokens`, not the shared
+    # padding's end and not another document's -- same per-row-start-position reasoning `_branch_across` uses
+    # for a mixed batch.
+    starts = torch.cat(
+        [torch.full((padded_rows_per_doc[i],), encoded[i].tokens, device=device, dtype=torch.long) for i in range(n)]
+    )
+    branch_positions = starts.unsqueeze(1) + torch.arange(branch_width, device=device).unsqueeze(0)
+    branch_rope = text_model.rotary_emb(hidden_branch, branch_positions)
+
+    # Which document each branch row answers about, in row order -- `restore_and_fork_many`'s own `rows_for`
+    # contract, handed to the paged attention layer's `begin_branches` below.
+    rows_for = [h for i, h in enumerate(handles) for _ in range(padded_rows_per_doc[i])]
+
+    snap: dict[int, dict] = {}
+    for i, decoder_layer in enumerate(layers):
+        layer_cache = cache.layers[i]
+        residual_ctx, residual_branch = hidden_ctx, hidden_branch
+        normed_ctx = decoder_layer.input_layernorm(hidden_ctx)
+        normed_branch = decoder_layer.input_layernorm(hidden_branch)
+
+        if layer_types[i] == "linear_attention":
+            with varlen.reading(lengths, device) as boundaries:
+                out_ctx = decoder_layer.linear_attn(normed_ctx, cache_params=cache, attention_mask=None)
+                # The framework's convolution state is sliced from the end of the flat run (the padding's end,
+                # when there is one); the tail this layer's own borrowed kernel already recorded, one row per
+                # document in `doc_handles` order, is correct and still in scope here, before `reading()`
+                # exits and clears it (`read_and_branch_shelf`'s own docstring explains the same narrowing for
+                # one document; this keeps the first `n` real documents' rows and drops the padding's).
+                conv = getattr(layer_cache, "conv_states", None)
+                if isinstance(conv, dict) and boundaries.conv_tails:
+                    tail = boundaries.conv_tails[-1]
+                    if tail.shape[0] != len(doc_handles):
+                        raise ValueError(
+                            f"this layer's convolution recorded a tail for {tail.shape[0]} documents and "
+                            f"{len(doc_handles)} were read -- a document's row would be the wrong one"
+                        )
+                    for key, held in list(conv.items()):
+                        conv[key] = tail[:n].to(dtype=held.dtype) if held is not None else tail[:n]
+                rec = getattr(layer_cache, "recurrent_states", None)
+                if isinstance(rec, dict):
+                    for key, held in list(rec.items()):
+                        if held is None:
+                            continue
+                        if held.shape[0] != len(doc_handles):
+                            raise ValueError(
+                                f"this layer's recurrent state has {held.shape[0]} rows and "
+                                f"{len(doc_handles)} documents were read -- a document's row would be the "
+                                f"wrong one"
+                            )
+                        rec[key] = held[:n].clone()
+            snap[i] = snapshot_layer(layer_cache)
+            parts = [(doc_row, padded_rows_per_doc[doc_row]) for doc_row in range(n)]
+            with widen_for_branch_many(layer_cache, parts), varlen.branching():
+                out_branch = decoder_layer.linear_attn(normed_branch, cache_params=cache, attention_mask=None)
+        else:
+            with varlen.reading(lengths, device):
+                out_ctx, _ = decoder_layer.self_attn(
+                    normed_ctx, position_embeddings=ctx_rope, attention_mask=None, past_key_values=cache
+                )
+            snap[i] = snapshot_layer(layer_cache)
+            begin_branches = getattr(layer_cache, "begin_branches", None)
+            if begin_branches is not None:
+                begin_branches(rows_for)
+            with varlen.branching():
+                out_branch, _ = decoder_layer.self_attn(
+                    normed_branch, position_embeddings=branch_rope, attention_mask=None, past_key_values=cache
+                )
+
+        hidden_ctx = residual_ctx + out_ctx
+        hidden_branch = residual_branch + out_branch
+
+        residual_ctx, residual_branch = hidden_ctx, hidden_branch
+        normed2_ctx = decoder_layer.post_attention_layernorm(hidden_ctx)
+        normed2_branch = decoder_layer.post_attention_layernorm(hidden_branch)
+        combined = torch.cat(
+            (normed2_ctx.reshape(-1, hidden_size), normed2_branch.reshape(-1, hidden_size)), dim=0
+        )
+        moe_out = decoder_layer.mlp(combined)
+        if isinstance(moe_out, tuple):
+            moe_out = moe_out[0]
+        moe_ctx, moe_branch = moe_out.split([ctx_tokens, total_branch_rows * branch_width], dim=0)
+        hidden_ctx = residual_ctx + moe_ctx.reshape(1, ctx_tokens, hidden_size)
+        hidden_branch = residual_branch + moe_branch.reshape(total_branch_rows, branch_width, hidden_size)
+
+    hidden_branch = text_model.norm(hidden_branch)
+
+    outs, at = [], 0
+    for i in range(n):
+        pr = padded_rows_per_doc[i]
+        block = hidden_branch[at : at + pr]
+        outs.append(block[torch.arange(pr, device=device), read_ats[i]][: len(texts_per_doc[i])])
+        at += pr
+    out = torch.cat(outs, dim=0)
+
+    for layer in cache.layers:
+        finish = getattr(layer, "finish_branches", None)
+        if finish is not None:
+            finish()
+    if has_pad:
+        for layer in cache.layers:
+            release = getattr(layer, "release_document", None)
+            if release is not None:
+                release(pad_handle)
+
+    shelved = []
+    for i in range(n):
+        piece = pick(snap, i)
+        shelved.append(
+            Shelved(
+                handle=handles[i],
+                tokens=encoded[i].tokens,
+                snapshot=piece,
+                position_from=encoded[i].tokens,
+                snapshot_bytes=snapshot_bytes(piece),
+            )
+        )
+    return out, handles, shelved
