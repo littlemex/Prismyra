@@ -1367,6 +1367,39 @@ def test_one_question_in_one_pass_answers_as_the_fork_does(engine):
         assert once.timing.readout_ms == 0.0
 
 
+def test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did(engine):
+    """`interleaved_fork` fuses the context's read and the first branch group into one layer-interleaved pass
+    instead of two full passes (`ask`'s own docstring on `self.interleaved_fork`); this is the project's own
+    bar for shipping that as the default, not merely the companion-movement tolerance several other paths in
+    this file settle for.
+
+    Covers the three widths `_ask_interleaved` treats differently: fewer than one group (16, no second pass at
+    all), one group exactly (32, nothing left over), a group plus a remainder (33, a second group that falls
+    back to the ordinary `_branch` rather than fusing), and the one count this engine's own non-`wide_group`
+    construction still widens for (64, `effective_group` bumped past `self.group` inside `_ask_interleaved`
+    itself when the context is short enough -- see `INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT`). `self.wide_group`
+    stays off throughout, since widening the general 33-63 case is a separate, still-unproven switch (fp8spd
+    S4a found it not bit-identical at 33 and 40 questions) that this test does not exercise.
+
+    `engine` is module-scoped and shared with every other test in this file, so the flag is restored in
+    `finally` the same way `engine_paged` restores `paged`.
+    """
+    was = engine.interleaved_fork
+    try:
+        for n in (16, 32, 33, 64):
+            asked = questions(n)
+            engine.interleaved_fork = False
+            two_pass = engine.ask(CONTEXT, asked)
+            engine.interleaved_fork = True
+            fused = engine.ask(CONTEXT, asked)
+            for q in asked:
+                assert two_pass[q.id].option == fused[q.id].option, (n, q.id)
+                for option, p in two_pass[q.id].probabilities.items():
+                    assert fused[q.id].probabilities[option] == pytest.approx(p, abs=1e-4), (n, q.id, option)
+    finally:
+        engine.interleaved_fork = was
+
+
 def test_one_pass_refuses_a_question_wider_than_a_branch_as_the_fork_does(engine):
     """The one-pass path must not answer what the forked path refuses: a question longer than the widest branch."""
     wide = Boolean(id="wide", prompt="Is this long? " + "word " * 900)

@@ -426,7 +426,7 @@ class Prismyra:
         heads: str | list | None = None,
         pin_autotune: bool = True,
         wide_group: bool = False,
-        interleaved_fork: bool = False,
+        interleaved_fork: bool = True,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -451,14 +451,23 @@ class Prismyra:
         # flagged, so it stays off (`None` from `_group_for`, unchanged behaviour) until it clears this project's
         # accuracy-judgment gate (SYNTHESIS.md A0/A2) rather than being shipped as a free speed win on a hunch.
         self.wide_group = wide_group
-        # fp8spd (S4c / SYNTHESIS.md P5, out/p1_speed_opus.md P5), **opt-in, off by default**: `ask()` with more
-        # than one question goes through `interleave.read_and_branch` instead of `open_context(...).ask(...)` --
-        # one layer-interleaved pass fusing the context's and the first branch group's dense/MoE compute per
-        # layer, instead of two full passes. `torch.equal`-gated against today's two-pass path (RUN-fp8spd.md)
-        # before being wired in here; left off by default for the same reason `wide_group` is -- a change to
-        # what gets computed, not merely to how it is scheduled, earns a default only after the project's own
-        # accuracy-judgment gate, not by being bit-identical on the cases measured so far. Requires the borrowed
-        # kernels (`self._borrowed_kernel`, decided below, after the kernels are applied) -- see `ask`'s guard.
+        # fp8spd (S4c / SYNTHESIS.md P5, out/p1_speed_opus.md P5), **on by default as of this release**: `ask()`
+        # with more than one question goes through `interleave.read_and_branch` instead of
+        # `open_context(...).ask(...)` -- one layer-interleaved pass fusing the context's and the first branch
+        # group's dense/MoE compute per layer, instead of two full passes. This used to stay off by default
+        # pending `torch.equal` confirmation and the construction-flag-dependent one-pass answer tracked at
+        # `_enable_batch_invariance`'s own call site below; both are now closed. `torch.equal` against the
+        # two-pass path is confirmed on real hardware across both supported cards (L40S/fp8-36l,
+        # RTX PRO 4500/nvfp4-36l), two context lengths an order of magnitude apart, and every question count this
+        # project asks it to handle differently (16, 32, 33, 64 -- see `tests/test_gpu.py`'s
+        # `test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did`, and RUN-fp8spd.md/RUN-recon.md
+        # for the real-hardware rounds this closed). Measured faster on real RACE documents at every width above
+        # one question on both cards (RUN-integ.md, RUN-recon.md); `False` remains available for a caller that
+        # wants to rule the fused path out while debugging. `self.wide_group` is a separate switch and stays off
+        # by default -- it widens a different, still-unproven range (33-63 questions in the *un-fused* path) that
+        # fp8spd's own gate found not bit-identical at 33 and 40 questions, which this flag does not touch.
+        # Requires the borrowed kernels (`self._borrowed_kernel`, decided below, after the kernels are applied)
+        # -- see `ask`'s guard.
         self.interleaved_fork = interleaved_fork
         # The caches are held by the engine and mutated in place, so two threads asking at once would interleave one
         # another's branches. The lock makes that safe; `prismyra.queue.Worker` is still what makes it fast.
