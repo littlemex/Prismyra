@@ -623,28 +623,64 @@ class Prismyra:
         #: Whether *this* engine currently holds a claim on the process-wide batch-invariance registration -- see
         #: the `paged` property. Must exist before the first assignment to `self.paged` below, which reads it.
         self._invariance_claimed = False
+        # recon (round 1, 2026-10-07): a *second*, permanent claim, independent of `self._invariance_claimed`
+        # (which only tracks the `paged` property's own on/off toggle -- see that property's docstring). Found
+        # chasing RUN-integ.md 12.3's puzzle: an engine built with `interleaved_fork=True, wide_group=True`
+        # answered a single question (n=1, `_ask_in_one_pass` -- a method with no branch on either flag) up to
+        # 0.208 away from the default-off engine's answer to the identical document/question, on the same card.
+        # Root cause, isolated on real hardware one axis at a time (`tools/diag_onepass_capture.py`,
+        # `tools/diag_autotune_gap.py`, `tools/diag_on_reproducible.py`): `__init__` records the one-pass CUDA
+        # graphs (`onepass.record_all`, below) *after* whatever this constructor's flags did to the
+        # registration -- a graph capture bakes in whichever matmul kernel the dispatcher hands it at that exact
+        # moment, so an engine built with `interleaved_fork=True` (which used to claim the registration here)
+        # permanently replays the batch-invariant Triton kernel for n=1, while the default engine permanently
+        # replays whatever cuBLAS/cuBLASLt's own heuristic happened to pick that construction. Triton-autotuner
+        # racing was ruled out (`diag_autotune_gap.py`: every autotuner is already pinned to one candidate, zero
+        # cache entries, by the time construction finishes) and re-recording under a *held* registration state
+        # round-trips exactly (`diag_on_reproducible.py`: three independent re-recordings under "on" agreed to
+        # the bit) -- re-recording under the *default* state did not (two re-recordings under "off" differed by
+        # 0.0081, the same order as the on/off gap itself). That makes cuBLAS/cuBLASLt's own un-pinned heuristic
+        # the thing that was never actually deterministic, construction to construction, on the plain default
+        # path -- `interleaved_fork`'s old conditional claim was not adding a new side effect so much as it was
+        # the only existing way to opt into the one fix (the dispatcher override) that happens to close it.
+        # Claiming it unconditionally, for every CUDA engine, removes the construction-flag dependence by
+        # removing the non-deterministic default path entirely, for every caller, not only ones that opted into
+        # `paged` or `interleaved_fork` sharing a pass. A separate flag because `self._invariance_claimed` is
+        # the `paged` property's own on/off switch (`tests/test_gpu.py::engine_paged` flips it both ways on a
+        # shared engine, by design) -- reusing it here would let `engine.paged = False` drop this permanent
+        # claim as a side effect, reopening the exact cross-test leakage inv2 (round 4) already fixed once for a
+        # different pair of ops. Both flags add to the same reference count (`_enable_batch_invariance`'s own
+        # module-level counter), so holding both at once is safe and costs nothing extra -- the registration
+        # itself is only ever done once, no matter how many claims are outstanding.
+        self._invariance_base_claimed = False
+        if on_cuda:
+            try:
+                _enable_batch_invariance()
+                self._invariance_base_claimed = True
+            except ImportError as e:
+                self.applied.notes.append(
+                    f"batch-invariant mode not available ({e}); every answer on this engine may move by who "
+                    "else shares a pass, and a single question's answer may differ from one construction of "
+                    "this engine to the next -- see diag_onepass_capture.py"
+                )
         # Through the property, not `self._paged = paged`: construction is one of the two places a caller can turn
         # paging on (`Prismyra(..., paged=True)`), and the property is what makes that have the same effect as the
         # other one (`engine.paged = True` after construction, which `tests/test_gpu.py::engine_paged` and any other
         # caller flipping the flag between contexts does, by this file's own module docstring, "rather than loading
-        # a second copy"). See the `paged` property for why both have to run `_enable_batch_invariance()`.
+        # a second copy"). See the `paged` property for why both have to run `_enable_batch_invariance()`. Redundant
+        # with the unconditional claim just above whenever that one succeeded (the registration is already on, so
+        # this is a second, independent claim on the same global count, not a second registration) -- kept so that
+        # `paged`'s own on/off toggle keeps working exactly as before even on a CUDA-unavailable `ImportError` path
+        # where the claim above did not run.
         self.paged = paged
-        # fp8spd5 (round 7, RUN-fp8spd.md "本題/手2"): `interleaved_fork` needs this guarantee for exactly the
-        # reason `paged` already does -- `read_and_branch`'s one `mlp` call runs the context's and the branch's
-        # rows through the *same* routed-expert pass, and `fused_moe`'s own tile-size choice keys on that call's
-        # total row count unless `VLLM_BATCH_INVARIANT=1` is set (`_enable_batch_invariance`'s own docstring).
-        # Found on real hardware, not reasoned to: a ~20,094-token document answered 3, 8, 16 or 32 questions
-        # through `read_and_branch` moved by up to 0.124 against the two-pass baseline, at *every* branch width
-        # tested except the ones that happened to land on the same tile boundary by chance (RUN-fp8spd.md,
-        # "diag_mlp_realreplay.py" -- replaying the branch pass's own captured context-row input alone,
-        # bit-identical to what the fused call received, reproduced the two-pass answer exactly; concatenating
-        # it with the branch's real rows before calling `mlp` is what moved it). `read_and_branch` is mutually
-        # exclusive with `paged` (`ask()`'s own guard), so this is written to only claim the registration once:
-        # if `self.paged = paged` above already claimed it (paged=True), `self._invariance_claimed` is already
-        # True and this is a no-op; otherwise (paged=False), this is the only path that claims it for
-        # `interleaved_fork`, through the same instance-level flag the `paged` property setter uses, so turning
-        # paging on or off later cannot double-count or drop this engine's own claim.
-        if interleaved_fork and not self._invariance_claimed and on_cuda:
+        # fp8spd5 (round 7, RUN-fp8spd.md "本題/手2"): `interleaved_fork` used to need its own claim here for
+        # exactly the reason `paged` already had one -- `read_and_branch`'s one `mlp` call runs the context's and
+        # the branch's rows through the *same* routed-expert pass, and `fused_moe`'s own tile-size choice keys on
+        # that call's total row count unless `VLLM_BATCH_INVARIANT=1` is set (`_enable_batch_invariance`'s own
+        # docstring). That claim is now subsumed by the unconditional one above (every CUDA engine already holds
+        # it), so this block only still runs for the same reason the `paged` block above does: covering the
+        # `ImportError` path where the unconditional claim above did not succeed.
+        if interleaved_fork and not self._invariance_claimed and not self._invariance_base_claimed and on_cuda:
             try:
                 _enable_batch_invariance()
                 self._invariance_claimed = True
