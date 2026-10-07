@@ -377,29 +377,64 @@ class FlashAttention(nn.Module):
                 # length -- an upper bound is what that argument is for, and reading the real one would mean a
                 # device-to-host copy on the request path.
                 pool_keys, pool_values, table, seqused, capacity = layer.paged_read(rows)
-                # inv3, task 1 (SYNTHESIS 0): tried `num_splits=1` here to pin the KV-reduction split count the same
-                # way the fixed-tile matmul kernel pins its tile size (`diag_qn1_residual_round5.py` traced
-                # `audit_sm120.py`'s remaining 72/4392, question-count=1-only residual to this call). Measured and
-                # rejected, immediately: with `block_table`/`seqused_k` (the paged branch-read path, the only one
-                # that matters here), `num_splits=1` does not merely change the reduction order -- it corrupts the
-                # output outright (differences of 0.08-1.56 on hidden states that are normally within a few percent,
-                # cascading into every downstream layer), so this combination of arguments is not just row-count
-                # dependent, it is not supported at all. Left at the kernel's own default (`num_splits=0`, "let it
-                # choose") pending a fix that does not touch this argument -- see RUN-inv.md (inv3) for the
-                # before/after numbers that caught this before it reached any committed verification.
-                out = flash_attn_varlen_func(
-                    q,
-                    pool_keys,
-                    pool_values,
+                # inv3 (round 5) tried `num_splits=1` here to pin FA2's KV-reduction split count the same way the
+                # fixed-tile matmul kernel pins its tile size (`diag_qn1_residual_round5.py` traced `audit_sm120.py`'s
+                # question-count=1-only residual, 72/4,392, to this call). Rejected: with `block_table`/`seqused_k`,
+                # `num_splits=1` corrupts the output outright, and `diag_num_splits_sweep.py` (inv4, round 5) found
+                # this FA2 build rejects any `num_splits>1` at all (`NotImplementedError: FA2 does not support
+                # num_splits > 1`) -- so pinning FA2's own split count is not an available fix on this build.
+                #
+                # inv4 (round 6, chair's "fix it, don't accept the residual"): switched this call to vLLM's own
+                # `unified_attention` (`vllm.v1.attention.ops.triton_unified_attention`) instead of FA2's
+                # `flash_attn_varlen_func`. This is the exact kernel `TritonAttentionBackend` dispatches to under
+                # `VLLM_BATCH_INVARIANT=1` (`v1/attention/backends/triton_attn.py`), and reading its source shows why
+                # it does not have FA2's problem: when the "3D" segmented-softmax path's buffers are not supplied
+                # (`seq_threshold_3D=None` etc., below), `use_3d` is forced `False` and every row is tiled over KV
+                # length with a fixed `TILE_SIZE_PREFILL`/`TILE_SIZE_DECODE` -- a schedule that depends only on this
+                # row's own sequence length, never on how many other rows share the launch. That is the opposite of
+                # FA2's `num_splits=0` ("let the kernel choose based on the whole launch's occupancy"), which is the
+                # mechanism `diag_qn1_residual_round5.py` traced the residual to in the first place. The paged page
+                # pool's own layout (`PagedForkLayer._allocate`, `prismyra/paged.py`) already stores keys/values as
+                # `[num_pages, BLOCK, heads, head_dim]` with an int32 `block_table`/`seqused` -- vLLM's own paged KV
+                # cache layout -- so no reshape or copy is needed to hand them to this kernel.
+                try:
+                    from vllm.v1.attention.ops.triton_unified_attention import (
+                        unified_attention,
+                    )
+                except ImportError:
+                    out = flash_attn_varlen_func(
+                        q,
+                        pool_keys,
+                        pool_values,
+                        cu_seqlens_q=cu_q,
+                        max_seqlen_q=q_len,
+                        max_seqlen_k=capacity,
+                        softmax_scale=a.scaling,
+                        causal=True,
+                        block_table=table,
+                        seqused_k=seqused,
+                    )
+                    return self._finish(out[0] if isinstance(out, tuple) else out, gate, shape)
+                out = torch.empty_like(q)
+                unified_attention(
+                    q=q,
+                    k=pool_keys,
+                    v=pool_values,
+                    out=out,
                     cu_seqlens_q=cu_q,
                     max_seqlen_q=q_len,
+                    seqused_k=seqused,
                     max_seqlen_k=capacity,
                     softmax_scale=a.scaling,
                     causal=True,
+                    window_size=(-1, -1),
                     block_table=table,
-                    seqused_k=seqused,
+                    softcap=0.0,
+                    q_descale=None,
+                    k_descale=None,
+                    v_descale=None,
                 )
-                return self._finish(out[0] if isinstance(out, tuple) else out, gate, shape)
+                return self._finish(out, gate, shape)
 
             k_len = key.shape[-2]
             k = key.transpose(1, 2).reshape(rows * k_len, -1, a.head_dim)

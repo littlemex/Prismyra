@@ -12,6 +12,7 @@ Usage: PRISMYRA_MODEL=<repo> python3 diag_invariance_cost_profile.py
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 from pathlib import Path
@@ -21,30 +22,38 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch  # noqa: E402
 
-import tasks  # noqa: E402
-from prismyra import Prismyra  # noqa: E402
+from prismyra import Boolean, Prismyra  # noqa: E402
 import prismyra.engine as engine_mod  # noqa: E402
 
 MODEL = os.environ.get("PRISMYRA_MODEL", "Qwen/Qwen3.6-35B-A3B-FP8")
 N_DOCS = 32
 
-items = tasks.load("race", N_DOCS, split="validation", seed=2)
+# inv4, round 6: `tasks.load("race", ...)` needs the `datasets` package, which cannot be installed alongside this
+# image's pinned `transformers`/`tokenizers` (huggingface-hub<2.0) without breaking model loading outright
+# (confirmed on both the Spain and Tokyo pods this round). This profiles timing only, not correctness, so 32
+# synthetic documents of realistic length stand in for real RACE passages.
+_BASE_DOC = (
+    "Returns are accepted within thirty days of delivery. Unopened items are refunded in full. Opened items are "
+    "exchanged rather than refunded, unless a manufacturing fault is confirmed. Return shipping is paid by the "
+    "seller when the item is faulty and by the buyer otherwise. Gift cards never expire and are not redeemable "
+    "for cash. A lost gift card is replaced only with the original purchase receipt and a matching photo ID."
+)
+DOCS = [f"{_BASE_DOC} (document {i} of this profiling run, otherwise identical to its neighbours.)"
+        for i in range(N_DOCS)]
+QUESTION = Boolean(id="q", prompt="Is a refund limited to unopened items?")
 
 
-def one_question(item, i):
-    import dataclasses
-
-    return [dataclasses.replace(item.questions[0], id=f"q{i}")]
+def one_question(i):
+    return [dataclasses.replace(QUESTION, id=f"q{i}")]
 
 
 def run_solo(engine):
-    item = items[0]
-    engine.ask(item.context, one_question(item, 0))
+    engine.ask(DOCS[0], one_question(0))
 
 
 def run_open_batch32(engine):
-    with engine.open_batch([it.context for it in items]) as batch:
-        batch.ask([one_question(it, i) for i, it in enumerate(items)])
+    with engine.open_batch(DOCS) as batch:
+        batch.ask([one_question(i) for i in range(N_DOCS)])
 
 
 def force_dispatcher_off():
