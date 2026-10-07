@@ -48,12 +48,12 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
 
-from .engine import _round_rows
+from .engine import WIDE_GROUP, _round_rows
 from .queue import Job, QueueFull, Worker, WorkerStopped
 from .schema import PrismyraError, Question, Result
 
@@ -218,6 +218,14 @@ class Batcher:
         self._lane_room = lane_room
         self.engine = engine
         self.limits = Limits.of(engine) if linger_ms is None else Limits.of(engine, linger_ms=linger_ms)
+        # fp8spd6 (round 8): `Limits.of`'s own `questions=engine.group` is what `submit` checks a single
+        # request against (`"one request carries N questions and a pass has M rows"`) -- unchanged, that
+        # refuses a 33-64-question request outright on an engine built with `wide_group=True`, before
+        # `_shelf_ask_interleaved`'s own widen decision ever runs. Raised to `WIDE_GROUP` here, the one place
+        # that bound is read from a `Batcher`'s own construction, so such a request is admitted and widened
+        # downstream instead -- the shelf itself is opened with the matching pool capacity in `_on_shelf`.
+        if engine.wide_group and self.limits.questions < WIDE_GROUP:
+            self.limits = replace(self.limits, questions=WIDE_GROUP)
         self._worker = Worker(drive=self._drive, max_queue=max_queue)
         self._lock = threading.Lock()
         #: How wide each pass turned out to be, in order. The point of the whole exercise, so it is recorded rather than
@@ -257,6 +265,23 @@ class Batcher:
         #: `RUN-fp8spd.md` round 7, "本題": this is what raises the single-document path's own 10.4% fusion
         #: rate under congestion, where a pass's companions are themselves almost always fresh documents too.
         self._fused_many_passes = 0
+        #: fp8spd6 (round 8): why a pass of two or more documents did *not* take the fused-many path above,
+        #: counted on real hardware rather than guessed at (RUN-fp8spd.md round 8). `not_all_fresh` is a pass
+        #: naming a resident document or two jobs for the same still-fresh document (`len(fresh) !=
+        #: len(formed.jobs)`); `capacity` is every document fresh but their independently-rounded row counts
+        #: summing past `self.engine.group` in one fused call. At rate=40, capacity was 40 of 48 passes against
+        #: 1 for not-all-fresh -- overwhelmingly the majority cause, which is why round 8's own two attempts to
+        #: fix it (making `form()` admit by padded count, and splitting a pass into several smaller fused
+        #: calls that each fit) both targeted it. Both measured *worse* net throughput than leaving this gate
+        #: as it is (RUN-fp8spd.md round 8's own economic finding: a `form()`-assembled pass's two-step
+        #: baseline is always exactly 2 passes -- one combined read, one combined branch -- however many
+        #: documents it carries; splitting a fused pass into `B` smaller fused calls instead costs `B`
+        #: separate reads, which no longer amortise across all of a pass's documents the way one `put_many`
+        #: call does, so `B >= 2` is a loss `B == 1`'s own saving cannot make up). Kept as a counter, not
+        #: turned into a fix, for that reason -- it still answers "how often would raising the cap matter"
+        #: for whoever revisits this with a different fused-call design.
+        self._blocked_not_all_fresh = 0
+        self._blocked_capacity = 0
         self._total_passes = 0
         self._empty_cache_calls = 0
         self._empty_cache_ms = 0.0
@@ -446,12 +471,19 @@ class Batcher:
         # ("44 rows asked for and this pool holds 32") rather than disagreeing on an answer. A pass whose
         # padded total does not fit falls through to the two-step path below, unchanged -- not a smaller
         # version of this one, the same safe path every pass took before this round.
-        padded_total = sum(_round_rows(len(job.payload.questions), self.engine.group) for job in formed.jobs)
+        #
+        # fp8spd6 (round 8): `cap` is `WIDE_GROUP` rather than `self.engine.group` when `self.engine.wide_group`
+        # -- the shelf's own paged pool was opened with that much room (`_on_shelf`) precisely so a bin
+        # containing a 33-64-question document can actually use it. For every document asking `self.group` or
+        # fewer questions this changes nothing (`_round_rows(n, cap)` only differs once `n` would round past
+        # the smaller cap).
+        cap = WIDE_GROUP if self.engine.wide_group else self.engine.group
+        padded_total = sum(_round_rows(len(job.payload.questions), cap) for job in formed.jobs)
         if (
             self.engine.interleaved_fork
             and len(fresh) == len(formed.jobs)
             and len(fresh) >= 2
-            and padded_total <= self.engine.group
+            and padded_total <= cap
         ):
             self._fused_many_passes += 1
             jobs = formed.jobs
@@ -470,6 +502,15 @@ class Batcher:
                 results.append(result)
             self.reads.append(len(jobs))
             return results
+
+        # fp8spd6 (round 8): counted, not just reasoned about -- a pass of exactly one document that reaches
+        # here is the single document being resident already (nothing to fuse, not a miss), so only passes of
+        # two or more are attributed to one of the two causes the fused-many path's own condition can fail on.
+        if self.engine.interleaved_fork and len(formed.jobs) >= 2:
+            if len(fresh) != len(formed.jobs):
+                self._blocked_not_all_fresh += 1
+            elif len(fresh) >= 2 and padded_total > cap:
+                self._blocked_capacity += 1
 
         if fresh:
             jobs = list(fresh.values())
@@ -494,9 +535,15 @@ class Batcher:
         return [answers[self._resident[job.payload.digest]] for job in formed.jobs]
 
     def _on_shelf(self):
-        """The shelf, opened on the first pass rather than at construction, because opening it allocates."""
+        """The shelf, opened on the first pass rather than at construction, because opening it allocates.
+
+        `group=WIDE_GROUP` (fp8spd6, round 8) when `self.engine.wide_group`: the shelf's own paged pool is
+        sized once, here, not per call -- see `Prismyra.open_shelf`'s own docstring for why a document later
+        asked up to `WIDE_GROUP` questions needs that room to already exist.
+        """
         if self._shelf is None:
-            self._shelf = self.engine.open_shelf(room=self._lane_room, lane=self._lane_id)
+            group = WIDE_GROUP if self.engine.wide_group else None
+            self._shelf = self.engine.open_shelf(room=self._lane_room, lane=self._lane_id, group=group)
         return self._shelf
 
     def _make_room(self, fresh: list[Job], keep: set[str]) -> None:
@@ -666,6 +713,8 @@ class Batcher:
             "empty_cache_ms": round(self._empty_cache_ms, 1),
             "fused_single_passes": self._fused_single_passes,
             "fused_many_passes": self._fused_many_passes,
+            "blocked_not_all_fresh": self._blocked_not_all_fresh,
+            "blocked_capacity": self._blocked_capacity,
             "total_passes": self._total_passes,
         }
 

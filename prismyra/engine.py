@@ -1075,11 +1075,26 @@ class Prismyra:
         `Shelf.ask` for here the way `_ask_interleaved` falls back to `self._branch`, so this returns a finished
         `Result` plus the `(handle, Shelved)` pair the caller stores on the shelf, rather than a `Prefill` a
         second call would still need.
+
+        `self.wide_group` (fp8spd6, round 8): the same 33-`WIDE_GROUP`-question, under-`INTERLEAVE_WIDE_GROUP_
+        TOKEN_LIMIT`-tokens widen `_ask_interleaved` already applies to the joined-cache path, applied here for
+        the shelf one. Tokenising once more to make that decision (`self.encode_context`, cheap next to the
+        forward pass this guards) rather than widening unconditionally: round 6 measured widening to cost more
+        than it saves past that token threshold on the *joined* path, and nothing about the shelf's own paged
+        pool changes that -- the extra GDN state a wider pass carries scales with context length the same way
+        either way. `shelf` must already have been opened with `group=WIDE_GROUP` room in its own paged pool
+        for this to be more than a decision with nowhere to act on it -- `schedule.Batcher` is the caller that
+        opens it that way when `self.wide_group`, see `Batcher._on_shelf`.
         """
         plans = [plan(q, self.tokenizer) for q in questions]
         token_ids = [p.token_ids for p in plans]
         width = self._width_for(plans)
-        padded_rows = _round_rows(len(questions), self.group)
+        group = self.group
+        if self.wide_group:
+            widened = self._group_for(len(questions))
+            if widened is not None and self.encode_context(context).tokens < INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT:
+                group = widened
+        padded_rows = _round_rows(len(questions), group)
         texts = [p.text for p in plans]
 
         start = _now(self.torch_device)
@@ -1120,13 +1135,27 @@ class Prismyra:
         `Shelf.ask`. See `interleave.read_and_branch_shelf_many` for what changed to carry `N` documents
         instead of one, and `RUN-fp8spd.md` round 7 for the torch.equal gate this went through.
 
-        Each document's own `_round_rows(len(questions), self.group)` is computed here, independently, before
-        the fused call -- not recombined with any other document's count inside it (`interleave.
-        read_and_branch_shelf_many`'s own docstring is why that order matters).
+        Each document's own `_round_rows(len(questions), group)` is computed here, independently, before the
+        fused call -- not recombined with any other document's count inside it (`interleave.
+        read_and_branch_shelf_many`'s own docstring is why that order matters). `group` is `self.group` unless
+        `self.wide_group` widens *that one document's own* count the same way `_shelf_ask_interleaved` does
+        (round 8) -- a mixed bin can have some documents at `self.group` and one at `WIDE_GROUP`, which is safe
+        for the same reason the per-document independence already is: nothing here depends on a companion's
+        own count, widened or not.
         """
         plans_per_doc = [[plan(q, self.tokenizer) for q in qs] for qs in questions_per_doc]
         width = self._width_for([p for plans in plans_per_doc for p in plans])
-        padded_rows_per_doc = [_round_rows(len(plans), self.group) for plans in plans_per_doc]
+        groups_per_doc = []
+        for context, plans in zip(contexts, plans_per_doc, strict=True):
+            group = self.group
+            if self.wide_group:
+                widened = self._group_for(len(plans))
+                if widened is not None and self.encode_context(context).tokens < INTERLEAVE_WIDE_GROUP_TOKEN_LIMIT:
+                    group = widened
+            groups_per_doc.append(group)
+        padded_rows_per_doc = [
+            _round_rows(len(plans), group) for plans, group in zip(plans_per_doc, groups_per_doc, strict=True)
+        ]
         texts_per_doc = [[p.text for p in plans] for plans in plans_per_doc]
 
         start = _now(self.torch_device)
@@ -1488,7 +1517,7 @@ class Prismyra:
         """
         return encode(context, None, None, self.processor, self.tokenizer, self.device)
 
-    def open_shelf(self, room: int | None = None, lane: int = 0) -> Shelf:
+    def open_shelf(self, room: int | None = None, lane: int = 0, group: int | None = None) -> Shelf:
         """One cache held open, with documents put on it and taken off as callers come and go.
 
         A `Batch` reads its documents, answers them and drops the cache, so asking twice about one document reads it
@@ -1506,6 +1535,15 @@ class Prismyra:
         shelf is not free -- opening one at `room=4096` plus 5 documents on each cost about 2.1 GiB total from a
         freshly loaded model's 8.6 GiB of free device memory -- so a second lane's `room` should be set with that
         in mind rather than left at the default (which is sized for *one* shelf being the only one).
+
+        `group` (fp8spd6, round 8, combining S4a's `wide_group` with the Shelf/Batcher path): overrides
+        `self.group` for *this shelf's own* paged attention pool capacity, the same override `_claim_cache`
+        already gives the joined-cache path. Built in at open time because the pool's page table is sized once,
+        not per call -- a document later asked up to `WIDE_GROUP` questions needs the pool to have room for that
+        many branch rows from the start, or `begin_branches` refuses the same way admitting more rows than a
+        pool holds always has (`"N rows asked for and this pool holds M"`, the crash RUN-fp8spd.md round 7's own
+        capacity-guard fix exists to keep out of the *fused* path; this is the same ceiling for the shelf's own
+        paged pool underneath it). `None` keeps today's single behaviour (`self.group`).
         """
         if not self.paged:
             raise PrismyraError(
@@ -1514,7 +1552,7 @@ class Prismyra:
             )
         wanted = room if room is not None else self._largest_shelf()
         self._check_fits(wanted)
-        cache, held = self._claim_cache(wanted)
+        cache, held = self._claim_cache(wanted, group=group)
         return Shelf(_engine=self, _cache=cache, room=held, lane=lane)
 
     def _largest_shelf(self) -> int:
