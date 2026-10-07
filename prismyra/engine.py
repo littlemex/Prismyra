@@ -442,8 +442,9 @@ class Prismyra:
         self.graphs = graphs
         #: Whether the attention read goes through a page table. Off by default. Its point is not memory -- that was
         #: measured at zero -- but that the read's shape stops depending on the context's length, so one recorded graph
-        #: serves every context instead of one per open context. See `prismyra/paged.py`.
-        self.paged = paged
+        #: serves every context instead of one per open context. See `prismyra/paged.py`. Assigned through the `paged`
+        #: property below (set once self.applied exists, further down this method) rather than here as a plain
+        #: attribute: see that property's own docstring for why.
         if paged:
             from .paged import PagedUnavailable, kernel_supports_pages
 
@@ -569,14 +570,15 @@ class Prismyra:
         #: stored in or handed to the framework's own attention as a strided view. That changes what a branch pass
         #: transiently allocates, so it changes what admission budgets.
         self._borrowed_kernel = self.applied.ok and not self.applied.skipped
-        if paged and on_cuda:
-            try:
-                _enable_batch_invariance()
-            except ImportError as e:
-                self.applied.notes.append(
-                    f"batch-invariant mode not available ({e}); open_batch/Batcher may still move an answer by "
-                    "who else shares the pass -- see diag_layer0_op_divergence.py"
-                )
+        #: Whether *this* engine currently holds a claim on the process-wide batch-invariance registration -- see
+        #: the `paged` property. Must exist before the first assignment to `self.paged` below, which reads it.
+        self._invariance_claimed = False
+        # Through the property, not `self._paged = paged`: construction is one of the two places a caller can turn
+        # paging on (`Prismyra(..., paged=True)`), and the property is what makes that have the same effect as the
+        # other one (`engine.paged = True` after construction, which `tests/test_gpu.py::engine_paged` and any other
+        # caller flipping the flag between contexts does, by this file's own module docstring, "rather than loading
+        # a second copy"). See the `paged` property for why both have to run `_enable_batch_invariance()`.
+        self.paged = paged
         self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
         # measured question rather than an obvious one -- `evals/run.py` compares the two.
@@ -716,6 +718,70 @@ class Prismyra:
         """
         rows = min(self.group, questions) if questions else self.group
         return self._observed_row_constant is not None and rows <= self._observed_at_rows
+
+    @property
+    def paged(self) -> bool:
+        """Whether the attention read goes through a page table. See `__init__`'s own comment on the attribute."""
+        return self._paged
+
+    @paged.setter
+    def paged(self, value: bool) -> None:
+        """Turning paging on is also the one condition `_enable_batch_invariance()` is gated on (`__init__`'s
+        comment on `self.applied`), and a caller can turn it on two ways: at construction (`Prismyra(...,
+        paged=True)`) or afterward, by assigning this attribute directly -- which this file's own module
+        docstring recommends ("flipping the flag between contexts rather than loading a second copy") and which
+        `tests/test_gpu.py::engine_paged` does, to share one set of weights between a joined-storage test and a
+        paged one. Before this property existed, only the first path ran the invariance setup: `self.paged =
+        paged` was a plain attribute, so `engine.paged = True` after construction left `open_batch`/`Batcher`
+        running with no protection at all against the row-count-chosen-GEMM-algorithm effect
+        `_enable_batch_invariance` exists for, silently, since nothing about assigning a bool raises or warns.
+
+        Found on the real checkpoint (inv2, round 4), while chasing `tests/test_gpu.py`'s own documented
+        0.008346 residual on `test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length`: a
+        synthetic, kernel-level reproduction of every op that test touches came back bit-identical across row
+        counts in isolation (`probe_attn_rowcount.py`, `probe_gdn_rowcount.py`, `probe_fused_moe_rowcount.py`,
+        `probe_dense_fp8_rowcount.py` -- all `torch.equal` across row counts 1-33, with
+        `_enable_batch_invariance()`'s dispatcher registered by hand first), which did not fit "a second,
+        separate, deeper cause" (round 3's own description of this residual). Reproducing `engine_paged`'s exact
+        two lines instead -- `Prismyra(MODEL)` then `engine.paged = True` -- showed `_BATCH_INVARIANT_DISPATCH_LIB`
+        stayed `None` (`check_invariance_fixture_gap.py`): the fixture's "flip the flag" path never ran the
+        dispatcher registration at all, in an engine constructed exactly as every `engine_paged`-based test in
+        this file constructs one. Fixing this property closed the residual on the real checkpoint to exactly
+        0.0 (`measure_residual_after_fix.py`, both the short and the long companion); reverting to the plain
+        attribute on the same weights, same process, same run reproduced a non-zero residual again (max
+        7.657e-05 here, a different run than round 3's own 0.008346 but the same sign and the same cause),
+        which is the before/after pair that makes this the actual cause rather than a correlate of it.
+
+        Reference-counted (`_enable_batch_invariance`/`_disable_batch_invariance`, both in this module), not a
+        one-shot: the first version of this fix left the dispatcher registered for the rest of the process once
+        any engine turned paging on, which (inv2, round 4) broke two *other*, unrelated tests on this same test
+        module's plain `engine` fixture (`test_a_short_question_replays_exactly_as_it_reads_eagerly` and
+        `test_a_headed_question_replays_exactly_as_it_reads_eagerly`) -- `onepass.py`'s one-pass CUDA graph
+        recording, left running under a dispatcher it was never recorded or verified against, once an earlier
+        `engine_paged` test flipped this attribute and never flipped it back off in the sense of undoing the
+        registration (`engine_paged`'s own `finally: engine.paged = was` restored this attribute but, before
+        this fix, nothing noticed and nothing reversed the dispatcher). Production code cannot hit that
+        collision -- `ask()`'s one-pass shortcut explicitly requires `not self.paged`, so one call never takes
+        both paths -- but this test module's shared-weights fixture does, by design (its own docstring: "the
+        same weights with the paged storage, by flipping the flag between contexts rather than loading a second
+        copy"). This setter now claims and releases one count per *instance* (`self._invariance_claimed`), so
+        turning paging back off on the engine that turned it on actually undoes the registration (confirmed by
+        hand that dropping a `torch.library.Library`'s last reference and `gc.collect()`-ing restores the
+        original op) once nothing else still needs it, instead of leaving it on for the rest of the process.
+        """
+        self._paged = value
+        if value and self.torch_device.type == "cuda" and not self._invariance_claimed:
+            try:
+                _enable_batch_invariance()
+                self._invariance_claimed = True
+            except ImportError as e:
+                self.applied.notes.append(
+                    f"batch-invariant mode not available ({e}); open_batch/Batcher may still move an answer by "
+                    "who else shares the pass -- see diag_layer0_op_divergence.py"
+                )
+        elif not value and self._invariance_claimed:
+            _disable_batch_invariance()
+            self._invariance_claimed = False
 
     def open_context(self, context: str, *, images: list | None = None, videos: list | None = None) -> Context:
         """Read a context and keep it open. The expensive half happens here, once.
@@ -2122,6 +2188,27 @@ def _enable_batch_invariance() -> None:
     dropped that branch by omission, not by measurement -- there is no comment or diag log claiming it was tried
     and found insufficient on sm_120, only the comment that it "was not measured here". `audit_sm120.py` (this
     branch) is the first time it has been.
+
+    2026-10-07 (inv2, round 4): reference-counted (`_BATCH_INVARIANT_REFCOUNT`), where it used to be a one-shot
+    guarded only by `_BATCH_INVARIANT_DISPATCH_LIB is None`. Needed once `prismyra/engine.py`'s `paged` property
+    started calling this on *every* `engine.paged = True`, not only at construction (see that property's own
+    docstring for why): `tests/test_gpu.py` shares one engine object between `engine_paged` tests, which flip
+    `paged` on and restore it to `False` in a `finally`, and a *second*, unrelated feature on the very same
+    shared object -- `onepass.py`'s one-pass CUDA graph recording, which production code never combines with a
+    paged engine (`Prismyra.ask`'s own `not self.paged` guard on the one-pass shortcut) but this test module's
+    shared-weights fixture does. With the dispatcher registration left permanently on after the first
+    `engine_paged` test, `test_a_short_question_replays_exactly_as_it_reads_eagerly` and
+    `test_a_headed_question_replays_exactly_as_it_reads_eagerly` (both on the plain, non-paged `engine` fixture)
+    started failing: a graph recorded and replayed consistently under the persistent-tile Triton matmul this
+    function installs is not bit-identical to the one it was eager-compared against before this round -- a real,
+    separate incompatibility between the two features, not an ordering artifact (confirmed by registering the
+    dispatcher from the very first line of the `engine` fixture instead of from a later `engine_paged` test: the
+    same two tests failed with the identical values either way). Production code structurally cannot hit this
+    (paged and one-pass are mutually exclusive on one `ask()` call), so the correct fix is for the dispatcher
+    registration to go away again once nothing paged still needs it, which is what the refcount buys: `paged`
+    going back to `False` calls `_disable_batch_invariance()`, which drops the count and, at zero, drops the
+    `torch.library.Library` and lets it be garbage-collected -- confirmed by hand that `del lib; gc.collect()`
+    actually restores the original dispatch (`torch.library.Library`'s own documented behaviour, not assumed).
     """
     import os
 
@@ -2134,9 +2221,16 @@ def _enable_batch_invariance() -> None:
     )
     from vllm.platforms import current_platform
 
+    global _BATCH_INVARIANT_REFCOUNT
+    _BATCH_INVARIANT_REFCOUNT += 1
+
     # fused_moe.py's own guard (`get_default_config`): picks a fixed MoE tiling config instead of one keyed by the
-    # pass's row count M, independent of anything registered on the dispatcher below.
+    # pass's row count M, independent of anything registered on the dispatcher below. Reset on every call (cheap,
+    # idempotent) rather than only on the first, so a caller that disabled and re-enabled sees it reapplied too.
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
+
+    if _BATCH_INVARIANT_REFCOUNT > 1:
+        return  # already registered by an earlier claim; nothing left to do
 
     if not current_platform.is_cuda():
         return
@@ -2156,8 +2250,9 @@ def _enable_batch_invariance() -> None:
     lib.impl("aten::addmm", addmm_batch_invariant, key)
     lib.impl("aten::matmul", matmul_batch_invariant, key)
     lib.impl("aten::linear", linear_batch_invariant, key)
-    # Kept alive for the process's lifetime (matching `enable_batch_invariant_mode`'s own module-level singleton):
-    # letting it be garbage-collected would un-register the dispatcher entries it just installed.
+    # Kept alive while the refcount is above zero (matching `enable_batch_invariant_mode`'s own module-level
+    # singleton while it is wanted at all): letting it be garbage-collected is now how `_disable_batch_invariance`
+    # un-registers these four, deliberately, rather than something to avoid happening by accident.
     global _BATCH_INVARIANT_DISPATCH_LIB
     _BATCH_INVARIANT_DISPATCH_LIB = lib
 
@@ -2165,6 +2260,15 @@ def _enable_batch_invariance() -> None:
         # Belt and suspenders on every other family (Hopper/Blackwell, including sm_120): vLLM's own fallback for
         # these cards disables cuBLAS split-K the same way, for anything that reaches cuBLAS directly rather than
         # through one of the four aten ops above (e.g. a custom op that calls `at::cuda::blas::gemm` itself).
+        # Original values saved on the module (`_BATCH_INVARIANT_SAVED_BACKENDS`) so `_disable_batch_invariance`
+        # can put them back rather than guessing torch's defaults.
+        global _BATCH_INVARIANT_SAVED_BACKENDS
+        _BATCH_INVARIANT_SAVED_BACKENDS = (
+            os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            os.environ.get("CUBLASLT_WORKSPACE_SIZE"),
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        )
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
         os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -2172,7 +2276,47 @@ def _enable_batch_invariance() -> None:
         torch.backends.cuda.preferred_blas_library(backend="cublaslt")
 
 
+def _disable_batch_invariance() -> None:
+    """The other half of the refcount `_enable_batch_invariance` keeps (inv2, round 4): drops this caller's claim
+    and, only once nothing else still holds one, actually reverses the registration -- un-registering the
+    dispatcher override by dropping the last reference to its `torch.library.Library` (confirmed by hand that
+    `del lib; gc.collect()` restores the original op, which is what makes doing this safe at all) and restoring
+    the cuBLAS/TF32 backend flags `_enable_batch_invariance` saved before overwriting them. Does not touch
+    `VLLM_BATCH_INVARIANT`: unlike the dispatcher registration, nothing has shown that env var alone breaks
+    anything un-paged, and leaving a stray env var set is a smaller risk than mis-timing when fused_moe.py reads
+    it.
+    """
+    global _BATCH_INVARIANT_REFCOUNT, _BATCH_INVARIANT_DISPATCH_LIB, _BATCH_INVARIANT_SAVED_BACKENDS
+    if _BATCH_INVARIANT_REFCOUNT == 0:
+        return
+    _BATCH_INVARIANT_REFCOUNT -= 1
+    if _BATCH_INVARIANT_REFCOUNT > 0:
+        return
+    if _BATCH_INVARIANT_DISPATCH_LIB is None:
+        return  # never actually registered (e.g. this process is not on CUDA) -- nothing to undo
+    import gc
+    import os
+
+    import torch
+
+    _BATCH_INVARIANT_DISPATCH_LIB = None
+    gc.collect()
+    if _BATCH_INVARIANT_SAVED_BACKENDS is not None:
+        cublas_cfg, cublaslt_size, fp16_rpr, bf16_rpr = _BATCH_INVARIANT_SAVED_BACKENDS
+        for name, value in (("CUBLAS_WORKSPACE_CONFIG", cublas_cfg), ("CUBLASLT_WORKSPACE_SIZE", cublaslt_size)):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = fp16_rpr
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = bf16_rpr
+        torch.backends.cuda.preferred_blas_library(backend="default")
+        _BATCH_INVARIANT_SAVED_BACKENDS = None
+
+
 _BATCH_INVARIANT_DISPATCH_LIB = None
+_BATCH_INVARIANT_REFCOUNT = 0
+_BATCH_INVARIANT_SAVED_BACKENDS = None
 
 
 def _now(device: torch.device) -> float:

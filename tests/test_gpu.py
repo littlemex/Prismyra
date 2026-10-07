@@ -997,11 +997,21 @@ def test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length
     alone only ever needed 2. `_branch_across` now pads each document to its own bucket *before* laying the
     padded blocks end to end (`_round_rows` applied per document, not to the sum), which removes that specific
     width-mismatch component -- measured here, on this test's own fixtures, as a reduction from 0.0128 to 0.0083
-    (short companion) rather than to zero. The remainder is a second, separate cause this round narrowed down but
-    did not close: even with the width-mismatch gone, a document's own rows still sit in a pass whose *total* row
-    count differs between "alone" (2) and "with this companion" (3) -- `COMPANION_MOVEMENT_ROW_COUNT` is that
-    residual's own, tighter bound, replacing the derived `COMPANION_MOVEMENT / 20` this line used before. See
-    `COMPANION_MOVEMENT`'s own comment for what else carries the same residual and by how much.
+    (short companion) rather than to zero. Round 3 narrowed the remainder to a second, separate cause but did
+    not close it: even with the width-mismatch gone, a document's own rows still sat in a pass whose *total* row
+    count differs between "alone" (2) and "with this companion" (3).
+
+    2026-10-07 (inv2, round 4): that second cause was `engine.paged = True` (the only way this fixture turns
+    paging on) never having run `_enable_batch_invariance()` at all -- see `prismyra/engine.py`'s `paged`
+    property for the full finding. Fixed, this test is bit-exact: `tools/measure_residual_after_fix.py`, this
+    exact fixture, measured 0.0 for every option on both the short and the long companion, and reverting the
+    property to a plain attribute on the same weights, same process, same run reproduced a non-zero residual
+    again -- the before/after pair that makes the property fix the actual cause. `COMPANION_MOVEMENT_ROW_COUNT`
+    is retired for this test in favour of exact equality; it stays defined, and the module docstring still
+    describes what it bounded, as a record of the two things that closed it (round 3's width fix, round 4's
+    `paged` property fix) and because `COMPANION_MOVEMENT_PAGED_ROWS`'s own three tests, a different set of
+    fixtures sharing the same underlying cause, have not individually been re-measured at this bit-exact level
+    this round and still carry the measured, not-yet-zero, bound.
     """
     long_companion = SECOND_CONTEXT * 6  # several times CONTEXT's own length: the context-read axis this closes.
     asked = [
@@ -1025,9 +1035,9 @@ def test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length
         for q in asked:
             assert mixed[q.id].option == want[q.id].option, f"{label}: {q.id} changed its answer"
             for option, p in want[q.id].probabilities.items():
-                assert mixed[q.id].probabilities[option] == pytest.approx(p, abs=COMPANION_MOVEMENT_ROW_COUNT), (
-                    label, q.id, option
-                )
+                # Bit-exact since inv2, round 4 (see the docstring above): not pytest.approx(..., abs=...) any
+                # more, now that both causes of this test's old 0.0083 residual are closed.
+                assert mixed[q.id].probabilities[option] == p, (label, q.id, option)
 
 
 def test_a_shelf_evicts_on_memory_pressure_even_with_tokens_to_spare(engine_paged, monkeypatch):
