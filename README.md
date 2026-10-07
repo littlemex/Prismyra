@@ -361,11 +361,14 @@ prismyra-bench compare --against benchmarks/results/qwen3_6_35b_a3b_fp8__rtx_pro
 
 `compare` exits non-zero on any point more than ten per cent slower. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-A handful of engine settings trade speed for a change in how an answer is computed. Two ship with a default verified
-bit-identical to its non-default alternative; two (`wide_group`, and `PRISMYRA_INVARIANCE_SCOPE`'s non-default
-`narrow`) have a faster non-default side that is not bit-identical and so stays off/undefaulted. See
-[the settings table](docs/PERFORMANCE.md#four-speed-settings-two-that-risk-the-answer) for which is which. The one most
-requests meet, `interleaved_fork`, is on by default as of this release; latency, same engine with the flag toggled:
+A handful of engine settings trade speed for a change in how an answer is computed. Three (`interleaved_fork`,
+`PRISMYRA_WITHOUT=dense_fusion`, and `wide_group`) ship with a default verified bit-identical to its non-default
+alternative; only `PRISMYRA_INVARIANCE_SCOPE`'s non-default `narrow` setting has a side that is not bit-identical,
+which is why it stays undefaulted. `wide_group` stays off anyway: widening is slower than the two-pass path it
+replaces on the RTX PRO 4500 at every width and document length measured, and slower on the L40S too once a
+document's context is long. See [the settings table](docs/PERFORMANCE.md#four-speed-settings-one-that-risks-the-answer)
+for which is which. The one most requests meet, `interleaved_fork`, is on by default as of this release; latency,
+same engine with the flag toggled:
 
 | questions | L40S, `fp8-36l` | RTX PRO 4500, `nvfp4-36l` |
 |---|---|---|

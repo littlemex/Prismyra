@@ -220,7 +220,7 @@ the same profiled tactic by construction, closing the gap rather than bounding i
 now runs the tactic chosen for the largest one rather than its own dedicated choice; this project's own measurements
 of that cost are recorded against the row-count-invariance fix itself, not assumed.
 
-See [docs/PERFORMANCE.md's settings table](PERFORMANCE.md#four-speed-settings-two-that-risk-the-answer) for
+See [docs/PERFORMANCE.md's settings table](PERFORMANCE.md#four-speed-settings-one-that-risks-the-answer) for
 `interleaved_fork` and `wide_group`, the two flags that change how a multi-question request reaches these kernels.
 
 ## Measured and rejected

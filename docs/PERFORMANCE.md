@@ -555,26 +555,27 @@ independent shelves on one device** -- lanes are shown not to corrupt answers un
 to raise questions served per second. Treat "concurrent lanes can raise how many requests are served" as the
 direction this is built for, not as a measured result.
 
-## Four speed settings, two that risk the answer
+## Four speed settings, one that risks the answer
 
 For each row, the question is whether its default answers bit-identically to the alternative it could instead be set
-to. `interleaved_fork` and `PRISMYRA_WITHOUT=dense_fusion` do -- the fast side of each (fusing, in both cases) is
-measurably faster in some cases and never slower by more than noise in the rest, and ships as the default, costing
-nothing in correctness and gaining speed. `PRISMYRA_INVARIANCE_SCOPE` and `wide_group` do not: each has a non-default
-side (`narrow`, `True`) that is a real, measured change to the answer in at least one case, not only a schedule
-change, and neither's non-default side is both shown faster and confirmed bit-identical at once -- `narrow`'s own
-only speed data point (the registration's L40S cost, above) is itself noise, and `wide_group`'s own one data point
-(−4.2% at 64 questions on the L40S) predates this release's construction-flag-dependent determinism fix and has not
-been reconfirmed since that fix landed. Both ship with the side that does not carry the correctness risk;
-`wide_group`'s specifically stays off until it clears this project's own accuracy-judgment gate, which has not yet
-been attempted, rather than being enabled on the strength of the cases measured bit-identical so far.
+to. `interleaved_fork`, `PRISMYRA_WITHOUT=dense_fusion`, and `wide_group` all do. `wide_group`'s own torch.equal
+comparison, the same engine toggled in place, now covers every question count the one-pass widening applies to -- 33
+through 64, not only the 64-question case that happens to divide evenly into two 32-row passes -- on both supported
+cards and at both a short and a long document length, with no mismatch found. `wide_group` still ships off by
+default, for a reason that is now entirely about speed rather than correctness: on the RTX PRO 4500 the widened pass
+is slower than the two-pass path it replaces at every width and document length measured so far, by 2% to 9%; on the
+L40S it is slower by 4% to 9% once a document's context grows long, even though it is faster by 5% to 7% on that same
+card for a short document. `PRISMYRA_INVARIANCE_SCOPE` is the one setting left that does not answer bit-identically
+on its non-default side: `narrow` is a real, measured change to the answer in at least one case, not only a schedule
+change, and its own only speed data point (the registration's L40S cost, above) is itself noise -- it ships off for a
+correctness reason `wide_group` no longer carries.
 
 | setting | default | what it changes | is the default bit-exact against the non-default alternative | measured effect |
 |---|---|---|---|---|
 | `interleaved_fork` | `True` (new in this release) | `ask()` with more than one question fuses the context's read and the first branch group into one layer-interleaved pass instead of two separate ones | yes, both supported cards, context lengths from about 5,000 to about 20,000 tokens: question counts 16, 32, 33 and 64 by the permanent regression test (`tests/test_gpu.py::test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did`), and 1, 2 and 3 (the other code paths `ask()` routes a question count through) checked the same way against real hardware without a committed test | latency, same engine with the flag toggled, 15 alternating rounds, min-max ranges not overlapping at every width reported: L40S 15.2% lower at 16 questions, 9.6% lower at 64; RTX PRO 4500 5.9% lower at 16, 1.3% lower at 64; no measurable change at 1 question on either card. `engine.open_batch()` itself is unaffected either way (within 0.2% on both cards) -- the flag only reaches `ask()`'s own multi-question path and `Batcher`'s multi-document fusion, not the direct batched-read API |
 | `PRISMYRA_WITHOUT=dense_fusion` | unset (fusion on) | three groups of same-input dense-FP8 calls (attention's q/k/v, the gated delta net's qkv/z, a shared expert's gate/up) run as one combined matmul below `FUSION_MAX_ROWS` (512) rows instead of several separate ones | yes, every group this checkpoint has, on both checkpoints this was checked against (`fp8-36l`, `nvfp4-36l`; `engine.applied.verified["dense_fusion"]`) | 32-54% faster per group at branch width (16-32 rows); a wash to a measured loss at context width, which is why fusing is chosen by width (above/below `FUSION_MAX_ROWS`) rather than left to this switch alone -- see [docs/KERNELS.md](KERNELS.md#notes-on-the-ones-with-a-catch) |
 | `PRISMYRA_INVARIANCE_SCOPE` | `global` | which call sites keep an answer from moving when who else shares a pass changes: `global` registers a fixed-tile kernel for every plain matmul in the process; the non-default `narrow` relies on a handful of targeted call-site fixes instead and skips that registration | **no**, on the RTX PRO 4500 -- `tools/audit_sm120.py`'s full matrix is 0 non-exact under `global` there and 150 non-exact under `narrow`. Not separately measured on the L40S; ships off there too | not a speed setting either way: `global`'s own cost is noise on the L40S (see [the measured cost above](#a-shelf-answers-like-ask)), and `narrow` has no speed measurement of its own -- it exists for isolating which call site a residual comes from |
-| `wide_group` | `False` | a document asked more than 32 questions gets one `WIDE_GROUP`-wide (64) branch pass instead of two `self.group`-wide (32) ones, for every question count above 32, not only the exactly-64 count `interleaved_fork` already widens on its own (above, under the token-length limit there) | **no** -- found not bit-identical at 33 and 40 questions specifically (the row-count-dependent recurrent kernel sees a different shape once the smaller remainder is folded into one wide pass instead of padded on its own); 64 (32+32, the one count in the 33-64 range that divides evenly) passed that same check, which is not evidence the 33-63 counts that do not divide evenly would | not shipped as a default on the strength of being fast -- it stays off until it clears this project's accuracy-judgment gate (not yet attempted) rather than being enabled on the cases measured bit-identical so far |
+| `wide_group` | `False` | a document asked more than 32 questions gets one `WIDE_GROUP`-wide (64) branch pass instead of two `self.group`-wide (32) ones, for every question count above 32, not only the exactly-64 count `interleaved_fork` already widens on its own (above, under the token-length limit there) | **yes** -- `tools/wg_verify.py`'s torch.equal comparison, same engine toggled in place, every question count from 33 through 64, both supported cards, a short (about 5,000-token) and a long (about 15,000-to-20,000-token) document | stays off anyway: on the RTX PRO 4500 the widened pass is slower than the two-pass path at every width and document length measured, by 2% to 9%; on the L40S it is 5% to 7% faster for a short document but 4% to 9% slower once the document's context is long |
 
 `interleaved_fork`, `PRISMYRA_WITHOUT=dense_fusion` and `PRISMYRA_INVARIANCE_SCOPE` are independent switches; building
 an engine with more than one of them set to a non-default value is not itself a combination any of the measurements
