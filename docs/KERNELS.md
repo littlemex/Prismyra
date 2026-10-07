@@ -62,6 +62,23 @@ To add a generation: run the read path once with pinning off and an empty `TRITO
 fastest configuration from the cache's `*.autotune.json` records (summed over the keys it recorded), check it is valid
 at every shape, write the file, and run the cold-start test.
 
+**The `w8a8_block_dynamic_fp8_matmul_kernel` entry above is stale against the vLLM version this project pins today**
+(checked by name against `vllm==0.27.1`'s source: no `triton.autotune`-decorated kernel by that name exists any more).
+What the entry's own comment describes -- `num_stages=4` winning at the branch's shape, `num_stages=2` the only one
+that fits every shape's shared memory -- is real, but it now happens one layer down, in `w8a8_triton_block_scaled_mm`
+(`prismyra/kernels/fp8_tuning.py` has the detail). That function is a plain `@triton.jit` kernel, not a
+`triton.autotune` one, so `autotune.py`'s pinning (above) never touches it; it looks up its tile size from a static,
+per-shape, per-row-count table that vLLM reads from inside its own installed package. The project's tuner
+(`/Users/akazawt/tmp/smr/next/spain/tune_fp8.py`) writes that table straight into the pip-installed path, so it is
+real on whichever pod ran it and **absent on every pod built since** -- a fresh pod silently falls back to one
+untuned tile for every row count (vLLM logs `Using default W8A8 Block FP8 kernel config` once per shape) until
+`fp8_tuning.install()` copies this project's own shipped copy (`pinned/fp8_block_configs/`) into place. `kernels.apply()`
+calls it before any dense FP8 matmul runs. Measured, RTX PRO 4500, this is worth 2.7-2.9% on top of the autotune pin
+above (276.1-277.2 ms against 283.6-285.2 ms over three interleaved pairs, 1-question read); the per-shape, per-row-
+count tile choice itself was checked `torch.equal` against the untuned fallback at all 70 (shape, row-count) cells
+this checkpoint uses before any file in `pinned/fp8_block_configs/` was kept, so this is purely a speed change, not an
+accuracy one.
+
 ## What each replacement is worth
 
 Measured on one context of about 5,000 tokens. Each row is its own paired run -- the same process with and without that

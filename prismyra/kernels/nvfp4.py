@@ -133,15 +133,17 @@ class FusedExpertsFp4(nn.Module):
 
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
-        # 2026-10-07 (inv): this used to be `logits, _, _ = self.gate(x)` -- calling the router module's own
-        # `forward` whole, which is `F.linear(hidden_states, self.weight)` followed by a softmax/top-k this
-        # function immediately recomputes with `fused_topk` and discards (the identical "called it twice, threw
-        # one away" pattern `FusedExperts._route`, the FP8 path's router, already comments on). The FP8 path's
-        # `_route` already takes the one line that matters -- the `F.linear` -- through `_ROUTER_LINEAR` directly
-        # so it is row-count invariant; this path never did, which was found by inspecting `self.gate`'s own
-        # `forward` source (`diag_nvfp4_gate_type.py`) after `audit_sm120.py` measured a 5.9% non-bit-exact
-        # residual that the Blackwell cuBLAS-workspace fix alone did not close. Same fix as `_route`: call the one
-        # op this needs directly, on the invariant kernel when one is available.
+        # 2026-10-07 (fp4spd + inv, merged by integ): this used to be `logits, _, _ = self.gate(x)` -- calling the
+        # router module's own `forward` whole, which is `F.linear(hidden_states, self.weight)` followed by a
+        # softmax/top-k this function immediately recomputes with `fused_topk` and discards (the identical "called
+        # it twice, threw one away" pattern `kernels.qwen3_moe.FusedExperts._route`, the FP8 path's router, already
+        # comments on; measured by fp4spd: 36 calls, ~4.13ms on a 36-layer read, one per layer). fp4spd's original
+        # fix (a `_route` helper calling plain `torch.nn.functional.linear`) only removed the duplicate call; inv
+        # found, separately, that this path never went through the row-count-invariant kernel the FP8 path's
+        # `_route` already uses (`diag_nvfp4_gate_type.py`, after `audit_sm120.py` measured a 5.9% non-bit-exact
+        # residual the Blackwell cuBLAS-workspace fix alone did not close). inv's version is a strict superset of
+        # fp4spd's (same duplicate-call removal, plus row-count invariance), so it is the one kept here; the
+        # standalone `_route` method fp4spd added is dropped as dead code.
         linear = _ROUTER_LINEAR or torch.nn.functional.linear
         logits = linear(x, self.gate.weight)
         weights, ids = fused_topk(x, logits, self.top_k, renormalize=True)[:2]
