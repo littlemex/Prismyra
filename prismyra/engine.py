@@ -442,8 +442,9 @@ class Prismyra:
         self.graphs = graphs
         #: Whether the attention read goes through a page table. Off by default. Its point is not memory -- that was
         #: measured at zero -- but that the read's shape stops depending on the context's length, so one recorded graph
-        #: serves every context instead of one per open context. See `prismyra/paged.py`.
-        self.paged = paged
+        #: serves every context instead of one per open context. See `prismyra/paged.py`. Assigned through the `paged`
+        #: property below (set once self.applied exists, further down this method) rather than here as a plain
+        #: attribute: see that property's own docstring for why.
         if paged:
             from .paged import PagedUnavailable, kernel_supports_pages
 
@@ -569,14 +570,15 @@ class Prismyra:
         #: stored in or handed to the framework's own attention as a strided view. That changes what a branch pass
         #: transiently allocates, so it changes what admission budgets.
         self._borrowed_kernel = self.applied.ok and not self.applied.skipped
-        if paged and on_cuda:
-            try:
-                _enable_batch_invariance()
-            except ImportError as e:
-                self.applied.notes.append(
-                    f"batch-invariant mode not available ({e}); open_batch/Batcher may still move an answer by "
-                    "who else shares the pass -- see diag_layer0_op_divergence.py"
-                )
+        #: Whether *this* engine currently holds a claim on the process-wide batch-invariance registration -- see
+        #: the `paged` property. Must exist before the first assignment to `self.paged` below, which reads it.
+        self._invariance_claimed = False
+        # Through the property, not `self._paged = paged`: construction is one of the two places a caller can turn
+        # paging on (`Prismyra(..., paged=True)`), and the property is what makes that have the same effect as the
+        # other one (`engine.paged = True` after construction, which `tests/test_gpu.py::engine_paged` and any other
+        # caller flipping the flag between contexts does, by this file's own module docstring, "rather than loading
+        # a second copy"). See the `paged` property for why both have to run `_enable_batch_invariance()`.
+        self.paged = paged
         self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
         # measured question rather than an obvious one -- `evals/run.py` compares the two.
@@ -716,6 +718,70 @@ class Prismyra:
         """
         rows = min(self.group, questions) if questions else self.group
         return self._observed_row_constant is not None and rows <= self._observed_at_rows
+
+    @property
+    def paged(self) -> bool:
+        """Whether the attention read goes through a page table. See `__init__`'s own comment on the attribute."""
+        return self._paged
+
+    @paged.setter
+    def paged(self, value: bool) -> None:
+        """Turning paging on is also the one condition `_enable_batch_invariance()` is gated on (`__init__`'s
+        comment on `self.applied`), and a caller can turn it on two ways: at construction (`Prismyra(...,
+        paged=True)`) or afterward, by assigning this attribute directly -- which this file's own module
+        docstring recommends ("flipping the flag between contexts rather than loading a second copy") and which
+        `tests/test_gpu.py::engine_paged` does, to share one set of weights between a joined-storage test and a
+        paged one. Before this property existed, only the first path ran the invariance setup: `self.paged =
+        paged` was a plain attribute, so `engine.paged = True` after construction left `open_batch`/`Batcher`
+        running with no protection at all against the row-count-chosen-GEMM-algorithm effect
+        `_enable_batch_invariance` exists for, silently, since nothing about assigning a bool raises or warns.
+
+        Found on the real checkpoint (inv2, round 4), while chasing `tests/test_gpu.py`'s own documented
+        0.008346 residual on `test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length`: a
+        synthetic, kernel-level reproduction of every op that test touches came back bit-identical across row
+        counts in isolation (`probe_attn_rowcount.py`, `probe_gdn_rowcount.py`, `probe_fused_moe_rowcount.py`,
+        `probe_dense_fp8_rowcount.py` -- all `torch.equal` across row counts 1-33, with
+        `_enable_batch_invariance()`'s dispatcher registered by hand first), which did not fit "a second,
+        separate, deeper cause" (round 3's own description of this residual). Reproducing `engine_paged`'s exact
+        two lines instead -- `Prismyra(MODEL)` then `engine.paged = True` -- showed `_BATCH_INVARIANT_DISPATCH_LIB`
+        stayed `None` (`check_invariance_fixture_gap.py`): the fixture's "flip the flag" path never ran the
+        dispatcher registration at all, in an engine constructed exactly as every `engine_paged`-based test in
+        this file constructs one. Fixing this property closed the residual on the real checkpoint to exactly
+        0.0 (`measure_residual_after_fix.py`, both the short and the long companion); reverting to the plain
+        attribute on the same weights, same process, same run reproduced a non-zero residual again (max
+        7.657e-05 here, a different run than round 3's own 0.008346 but the same sign and the same cause),
+        which is the before/after pair that makes this the actual cause rather than a correlate of it.
+
+        Reference-counted (`_enable_batch_invariance`/`_disable_batch_invariance`, both in this module), not a
+        one-shot: the first version of this fix left the dispatcher registered for the rest of the process once
+        any engine turned paging on, which (inv2, round 4) broke two *other*, unrelated tests on this same test
+        module's plain `engine` fixture (`test_a_short_question_replays_exactly_as_it_reads_eagerly` and
+        `test_a_headed_question_replays_exactly_as_it_reads_eagerly`) -- `onepass.py`'s one-pass CUDA graph
+        recording, left running under a dispatcher it was never recorded or verified against, once an earlier
+        `engine_paged` test flipped this attribute and never flipped it back off in the sense of undoing the
+        registration (`engine_paged`'s own `finally: engine.paged = was` restored this attribute but, before
+        this fix, nothing noticed and nothing reversed the dispatcher). Production code cannot hit that
+        collision -- `ask()`'s one-pass shortcut explicitly requires `not self.paged`, so one call never takes
+        both paths -- but this test module's shared-weights fixture does, by design (its own docstring: "the
+        same weights with the paged storage, by flipping the flag between contexts rather than loading a second
+        copy"). This setter now claims and releases one count per *instance* (`self._invariance_claimed`), so
+        turning paging back off on the engine that turned it on actually undoes the registration (confirmed by
+        hand that dropping a `torch.library.Library`'s last reference and `gc.collect()`-ing restores the
+        original op) once nothing else still needs it, instead of leaving it on for the rest of the process.
+        """
+        self._paged = value
+        if value and self.torch_device.type == "cuda" and not self._invariance_claimed:
+            try:
+                _enable_batch_invariance()
+                self._invariance_claimed = True
+            except ImportError as e:
+                self.applied.notes.append(
+                    f"batch-invariant mode not available ({e}); open_batch/Batcher may still move an answer by "
+                    "who else shares the pass -- see diag_layer0_op_divergence.py"
+                )
+        elif not value and self._invariance_claimed:
+            _disable_batch_invariance()
+            self._invariance_claimed = False
 
     def open_context(self, context: str, *, images: list | None = None, videos: list | None = None) -> Context:
         """Read a context and keep it open. The expensive half happens here, once.
@@ -1291,6 +1357,19 @@ class Prismyra:
             )
         if any(count == 0 for count in counts):
             raise PrismyraError("every document in a batch needs at least one question; drop it from the batch instead")
+        # 2026-10-07 (inv, round 3): the real check is on the *padded* total, not this one -- `_branch_across` now
+        # pads each document to its own bucket before summing (see there), which can need more rows than the real
+        # total alone would. Checked here too, before any tokenising, so a batch that cannot fit fails with one
+        # clear reason instead of a confusing one from deeper in the pass.
+        padded_total = sum(_round_rows(c, self.group) for c in counts)
+        if padded_total > self.group:
+            raise PrismyraError(
+                f"{sum(counts)} questions across {len(asked)} documents round up to {padded_total} rows once each "
+                f"document is padded to its own bucket independently of its companions, and a group of {self.group} "
+                f"cannot hold that many. Ask fewer documents or questions together, or build the engine with a "
+                f"larger group; the independent-padding rule is what makes two documents answered together give "
+                f"the same reduction order each one would alone (see `_round_rows`)."
+            )
 
         flat = [q for questions in asked for q in questions]
         plans = [plan(q, self.tokenizer) for q in flat]
@@ -1355,35 +1434,63 @@ class Prismyra:
         would take -- a few lines -- once the other half, `graphs.Recording` accepting a remainder bucket instead of an
         exact context length, makes a recording survive the batch's documents changing between passes.
         """
-        rows = sum(counts)
         # Batch-invariant: see `_round_rows`. The row count is the only thing that otherwise differs between "two
         # documents answered together" and "either one answered alone", once the width is matched (`_round_pack_align`)
         # -- and that alone moved an answer by up to 0.29 and flipped decisions. Padding every pass sharing documents
         # to the same row count a solo document would be padded to removes the difference entirely: `pad` extra rows
         # repeat the first document, discarded at the end exactly as `build_suffixes` already discards padded columns.
-        padded_rows = _round_rows(rows, self.group)
-        pad = padded_rows - rows
-        ids, read_at, _ = build_suffixes(texts, self.tokenizer, self.device, padded_rows, width)
+        #
+        # 2026-10-07 (inv, round 3): that single `padded_rows = _round_rows(rows, self.group)` rounded the
+        # *combined* total, which closes the context-length axis (`diag_openbatch_vs_ask_modes.py`'s 80-document
+        # benchmark) but not the question-count one: the same two real questions about the same document land in
+        # a 2-row pass alone and a 4-row pass once a one-question companion is added, even though neither document's
+        # own rows changed -- `tests/test_gpu.py`'s documented 0.0128/0.024 residual, confirmed on sm_120 too
+        # (`audit_sm120.py`, RUN-inv.md round 2). Padding *each document to its own bucket* first, then laying the
+        # padded blocks end to end, makes a document's own width a function of its own row count alone -- the
+        # property SYNTHESIS.md's round 3 asks for by name ("同席者に左右されない"). `restore_and_fork_many` already
+        # takes an arbitrary per-document row count in `parts` (it was only ever used with padding on the last
+        # document because that is all `_branch_across` built), so nothing downstream of this needed to change to
+        # accept it.
+        padded_counts = [_round_rows(c, self.group) for c in counts]
+        padded_rows = sum(padded_counts)
+
+        # `texts` is flat and real-only, in document order (`_answer_batch`'s `flat`). Insert each document's own
+        # pad entries right after its own real ones -- repeating that document's own first real text, the same
+        # convention `build_suffixes` already uses for the single-document case, just scoped per document instead
+        # of globally so a different document's padding can never be mistaken for this one's.
+        padded_texts: list[str] = []
+        real_row_at: list[int] = []  # index into `padded_texts`/the eventual padded rows for each real, flat row
+        at = 0
+        for count, padded in zip(counts, padded_counts):
+            block = texts[at : at + count]
+            real_row_at.extend(range(len(padded_texts), len(padded_texts) + count))
+            padded_texts.extend(block)
+            if padded > count:
+                padded_texts.extend([block[0]] * (padded - count))
+            at += count
+        ids, read_at, _ = build_suffixes(padded_texts, self.tokenizer, self.device, padded_rows, width)
+
+        # One start position per *padded* row: every row of a document, real or padding, starts at that document's
+        # own context end -- there is one such position per document, not per question, so repeating it for a
+        # document's pad rows is the same arithmetic as for its real ones, not a special case.
         starts = [
-            prefills[at].position_from or prefills[at].tokens for at, count in enumerate(counts) for _ in range(count)
+            prefills[at].position_from or prefills[at].tokens
+            for at, padded in enumerate(padded_counts)
+            for _ in range(padded)
         ]
-        # Padding extends the *last* document's own block, never a new one at the tail: `rows_for`'s rows are laid
-        # out contiguously per document (`paged.PagedForkLayer.begin_branches` rebuilds its row assignment from each
-        # document's *total* count in `rows_for`, not from the row positions themselves, so it assumes every row
-        # naming one document is contiguous). Padding with the first document while a different one is last split
-        # that document's rows across the gap and answered every row from the wrong table -- found by this file's
-        # own open-loop comparison moving a probability by 0.93 instead of removing the smaller 0.29 it was meant to.
-        if pad:
-            starts += [starts[-1]] * pad
         offsets = torch.tensor(starts, device=self.device).unsqueeze(1)
         positions = offsets + torch.arange(ids.shape[1], device=self.device).unsqueeze(0)
         cache = prefills[0].cache
 
-        parts = [(prefills[at].snapshot, count) for at, count in enumerate(counts)]
-        rows_for_padded = rows_for
-        if pad:
-            parts = [*parts[:-1], (parts[-1][0], parts[-1][1] + pad)]
-            rows_for_padded = [*rows_for, *([rows_for[-1]] * pad)]
+        # Each document gets its own padded count directly -- no more "extend the last document's block", because
+        # every document now carries its own padding rather than borrowing room at the tail.
+        parts = [(prefills[at].snapshot, padded_counts[at]) for at in range(len(counts))]
+        rows_for_padded: list[int] = []
+        at = 0
+        for count, padded in zip(counts, padded_counts):
+            name = rows_for[at]  # every real row of one document already names the same document
+            rows_for_padded.extend([name] * padded)
+            at += count
 
         def fork() -> None:
             restore_and_fork_many(cache, parts, width=self.group, rows_for=rows_for_padded, lane=lane)
@@ -1400,7 +1507,10 @@ class Prismyra:
         hidden = self._run_recorded(
             cache, fork, run, ids, positions, padded_rows, width, homogeneous=homogeneous, lane=lane
         )
-        return hidden[torch.arange(padded_rows, device=self.device), read_at][: len(texts)]
+        # Gather the real rows back out in the caller's original flat order -- they are no longer a contiguous
+        # prefix now that each document's own padding sits right after its own real rows instead of at the tail.
+        real_idx = torch.tensor(real_row_at, device=self.device)
+        return hidden[torch.arange(padded_rows, device=self.device), read_at][real_idx]
 
     def _answer(self, prefill: Prefill, questions: list[Question], tokens: int, context_ms: float) -> Result:
         # Already validated: both public entry points call `validate` before the context is read, and repeating it
@@ -1949,7 +2059,19 @@ def _round_rows(rows: int, cap: int) -> int:
     run at 8, with the extra rows a harmless repeat of an existing row (discarded the same way `build_suffixes`
     already discards padded columns). Two documents or one document asked twice then see the identical kernel
     dispatch their row count would get alone, which is what makes answering together stop moving an answer.
+
+    2026-10-07 (inv, round 2): the power-of-two bucketing above closes most of the row-count effect but not all of
+    it, because it rounds the *pass's total* row count, not each document's own -- a target alone and the same
+    target plus a one-question companion can combine to totals either side of a power-of-two boundary even though
+    the target's own row count never changed (the documented residual: `tests/test_gpu.py`'s `COMPANION_MOVEMENT /
+    20`, measured 0.0128 on L40S; `audit_sm120.py` found the matching case on sm_120 at 0.057, i.e. this is not a
+    different bug per card, it is the same one at a different magnitude). `PRISMYRA_ROUND_ROWS_TO_GROUP=1` rounds
+    every pass straight to `cap` instead -- the simplest version of "every pass runs at the same width", so a
+    document's own padding can no longer depend on who shares the pass -- at the cost of always paying for a
+    full-width pass; see RUN-inv.md for the measured speed cost before deciding whether this becomes the default.
     """
+    if os.environ.get("PRISMYRA_ROUND_ROWS_TO_GROUP") == "1":
+        return cap
     if rows >= cap:
         return cap
     return min(cap, 1 << (max(rows, 1) - 1).bit_length())
@@ -2057,6 +2179,36 @@ def _enable_batch_invariance() -> None:
 
     Kept only when the borrowed kernels this engine's batching depends on are actually in use (`paged` on CUDA): a
     joined-storage engine never shares a pass across documents, so it has nothing this buys.
+    2026-10-07 (inv, SYNTHESIS 0-2/0-3): the early return below used to leave sm_120 (RTX PRO 4500, the only card
+    `nvfp4-36l` serves on) with *no* process-wide protection at all -- not even vLLM's own fallback for
+    non-SM80 CUDA. Reading `vllm.model_executor.layers.batch_invariant.enable_batch_invariant_mode` (the function
+    this one was written to narrow, not to replace) shows it has an explicit branch for exactly this case: "Hopper
+    (SM90) and Blackwell (SM100): the only source of batch variance is split-k, which we disable via the cuBLAS
+    workspace config" (`CUBLAS_WORKSPACE_CONFIG`/`CUBLASLT_WORKSPACE_SIZE`). This function's own `else: return`
+    dropped that branch by omission, not by measurement -- there is no comment or diag log claiming it was tried
+    and found insufficient on sm_120, only the comment that it "was not measured here". `audit_sm120.py` (this
+    branch) is the first time it has been.
+
+    2026-10-07 (inv2, round 4): reference-counted (`_BATCH_INVARIANT_REFCOUNT`), where it used to be a one-shot
+    guarded only by `_BATCH_INVARIANT_DISPATCH_LIB is None`. Needed once `prismyra/engine.py`'s `paged` property
+    started calling this on *every* `engine.paged = True`, not only at construction (see that property's own
+    docstring for why): `tests/test_gpu.py` shares one engine object between `engine_paged` tests, which flip
+    `paged` on and restore it to `False` in a `finally`, and a *second*, unrelated feature on the very same
+    shared object -- `onepass.py`'s one-pass CUDA graph recording, which production code never combines with a
+    paged engine (`Prismyra.ask`'s own `not self.paged` guard on the one-pass shortcut) but this test module's
+    shared-weights fixture does. With the dispatcher registration left permanently on after the first
+    `engine_paged` test, `test_a_short_question_replays_exactly_as_it_reads_eagerly` and
+    `test_a_headed_question_replays_exactly_as_it_reads_eagerly` (both on the plain, non-paged `engine` fixture)
+    started failing: a graph recorded and replayed consistently under the persistent-tile Triton matmul this
+    function installs is not bit-identical to the one it was eager-compared against before this round -- a real,
+    separate incompatibility between the two features, not an ordering artifact (confirmed by registering the
+    dispatcher from the very first line of the `engine` fixture instead of from a later `engine_paged` test: the
+    same two tests failed with the identical values either way). Production code structurally cannot hit this
+    (paged and one-pass are mutually exclusive on one `ask()` call), so the correct fix is for the dispatcher
+    registration to go away again once nothing paged still needs it, which is what the refcount buys: `paged`
+    going back to `False` calls `_disable_batch_invariance()`, which drops the count and, at zero, drops the
+    `torch.library.Library` and lets it be garbage-collected -- confirmed by hand that `del lib; gc.collect()`
+    actually restores the original dispatch (`torch.library.Library`'s own documented behaviour, not assumed).
     """
     import os
 
@@ -2069,30 +2221,102 @@ def _enable_batch_invariance() -> None:
     )
     from vllm.platforms import current_platform
 
+    global _BATCH_INVARIANT_REFCOUNT
+    _BATCH_INVARIANT_REFCOUNT += 1
+
     # fused_moe.py's own guard (`get_default_config`): picks a fixed MoE tiling config instead of one keyed by the
-    # pass's row count M, independent of anything registered on the dispatcher below.
+    # pass's row count M, independent of anything registered on the dispatcher below. Reset on every call (cheap,
+    # idempotent) rather than only on the first, so a caller that disabled and re-enabled sees it reapplied too.
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
-    if not current_platform.is_cuda() or not current_platform.is_device_capability_family(80):
-        # The SM80-family (Ampere/Ada/Hopper-adjacent) Triton persistent matmul is what this was measured against
-        # (L40S, SM89). A different family's registration (vLLM's own `enable_batch_invariant_mode` has an SM90/
-        # Blackwell branch that only pins the cuBLAS workspace config) was not measured here; fall back to the
-        # router+tiling fix alone rather than assume it carries over.
+    if _BATCH_INVARIANT_REFCOUNT > 1:
+        return  # already registered by an earlier claim; nothing left to do
+
+    if not current_platform.is_cuda():
         return
 
+    # 2026-10-07 (inv, round 2): the Triton persistent matmul this registers (`mm_batch_invariant` et al.) is not
+    # itself gated to SM80 anywhere in its own implementation -- `linear_batch_invariant` just calls
+    # `matmul_persistent`, a plain Triton kernel, unconditionally. `_ROUTER_LINEAR` (`kernels/qwen3_moe.py`) was
+    # already calling it directly on sm_120 (RTX PRO 4500, Blackwell) for the FP8 router with no crash and no
+    # family check at all, which is the evidence that it runs there -- "vLLM's Triton version on sm_120" was a
+    # question `audit_sm120.py`'s own code answers by example, not something that needed a separate try. The
+    # round-1 version of this function treated SM80 and "everything else" as needing *different* fixes (dispatcher
+    # vs. cuBLAS workspace config only); registering the dispatcher everywhere closes a residual the cuBLAS-only
+    # fix left (measured: `audit_sm120.py` non-exact 258/4392 -> see RUN-inv.md for the after-this-change number).
     lib = torch.library.Library("aten", "IMPL")
     key = current_platform.dispatch_key
     lib.impl("aten::mm", mm_batch_invariant, key)
     lib.impl("aten::addmm", addmm_batch_invariant, key)
     lib.impl("aten::matmul", matmul_batch_invariant, key)
     lib.impl("aten::linear", linear_batch_invariant, key)
-    # Kept alive for the process's lifetime (matching `enable_batch_invariant_mode`'s own module-level singleton):
-    # letting it be garbage-collected would un-register the dispatcher entries it just installed.
+    # Kept alive while the refcount is above zero (matching `enable_batch_invariant_mode`'s own module-level
+    # singleton while it is wanted at all): letting it be garbage-collected is now how `_disable_batch_invariance`
+    # un-registers these four, deliberately, rather than something to avoid happening by accident.
     global _BATCH_INVARIANT_DISPATCH_LIB
     _BATCH_INVARIANT_DISPATCH_LIB = lib
 
+    if not current_platform.is_device_capability_family(80):
+        # Belt and suspenders on every other family (Hopper/Blackwell, including sm_120): vLLM's own fallback for
+        # these cards disables cuBLAS split-K the same way, for anything that reaches cuBLAS directly rather than
+        # through one of the four aten ops above (e.g. a custom op that calls `at::cuda::blas::gemm` itself).
+        # Original values saved on the module (`_BATCH_INVARIANT_SAVED_BACKENDS`) so `_disable_batch_invariance`
+        # can put them back rather than guessing torch's defaults.
+        global _BATCH_INVARIANT_SAVED_BACKENDS
+        _BATCH_INVARIANT_SAVED_BACKENDS = (
+            os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            os.environ.get("CUBLASLT_WORKSPACE_SIZE"),
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        )
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+        os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.backends.cuda.preferred_blas_library(backend="cublaslt")
+
+
+def _disable_batch_invariance() -> None:
+    """The other half of the refcount `_enable_batch_invariance` keeps (inv2, round 4): drops this caller's claim
+    and, only once nothing else still holds one, actually reverses the registration -- un-registering the
+    dispatcher override by dropping the last reference to its `torch.library.Library` (confirmed by hand that
+    `del lib; gc.collect()` restores the original op, which is what makes doing this safe at all) and restoring
+    the cuBLAS/TF32 backend flags `_enable_batch_invariance` saved before overwriting them. Does not touch
+    `VLLM_BATCH_INVARIANT`: unlike the dispatcher registration, nothing has shown that env var alone breaks
+    anything un-paged, and leaving a stray env var set is a smaller risk than mis-timing when fused_moe.py reads
+    it.
+    """
+    global _BATCH_INVARIANT_REFCOUNT, _BATCH_INVARIANT_DISPATCH_LIB, _BATCH_INVARIANT_SAVED_BACKENDS
+    if _BATCH_INVARIANT_REFCOUNT == 0:
+        return
+    _BATCH_INVARIANT_REFCOUNT -= 1
+    if _BATCH_INVARIANT_REFCOUNT > 0:
+        return
+    if _BATCH_INVARIANT_DISPATCH_LIB is None:
+        return  # never actually registered (e.g. this process is not on CUDA) -- nothing to undo
+    import gc
+    import os
+
+    import torch
+
+    _BATCH_INVARIANT_DISPATCH_LIB = None
+    gc.collect()
+    if _BATCH_INVARIANT_SAVED_BACKENDS is not None:
+        cublas_cfg, cublaslt_size, fp16_rpr, bf16_rpr = _BATCH_INVARIANT_SAVED_BACKENDS
+        for name, value in (("CUBLAS_WORKSPACE_CONFIG", cublas_cfg), ("CUBLASLT_WORKSPACE_SIZE", cublaslt_size)):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = fp16_rpr
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = bf16_rpr
+        torch.backends.cuda.preferred_blas_library(backend="default")
+        _BATCH_INVARIANT_SAVED_BACKENDS = None
+
 
 _BATCH_INVARIANT_DISPATCH_LIB = None
+_BATCH_INVARIANT_REFCOUNT = 0
+_BATCH_INVARIANT_SAVED_BACKENDS = None
 
 
 def _now(device: torch.device) -> float:
