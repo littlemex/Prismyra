@@ -548,29 +548,64 @@ class FlashAttention(nn.Module):
                 # length -- an upper bound is what that argument is for, and reading the real one would mean a
                 # device-to-host copy on the request path.
                 pool_keys, pool_values, table, seqused, capacity = layer.paged_read(rows)
-                # inv3, task 1 (SYNTHESIS 0): tried `num_splits=1` here to pin the KV-reduction split count the same
-                # way the fixed-tile matmul kernel pins its tile size (`diag_qn1_residual_round5.py` traced
-                # `audit_sm120.py`'s remaining 72/4392, question-count=1-only residual to this call). Measured and
-                # rejected, immediately: with `block_table`/`seqused_k` (the paged branch-read path, the only one
-                # that matters here), `num_splits=1` does not merely change the reduction order -- it corrupts the
-                # output outright (differences of 0.08-1.56 on hidden states that are normally within a few percent,
-                # cascading into every downstream layer), so this combination of arguments is not just row-count
-                # dependent, it is not supported at all. Left at the kernel's own default (`num_splits=0`, "let it
-                # choose") pending a fix that does not touch this argument -- see RUN-inv.md (inv3) for the
-                # before/after numbers that caught this before it reached any committed verification.
-                out = flash_attn_varlen_func(
-                    q,
-                    pool_keys,
-                    pool_values,
+                # inv3 (round 5) tried `num_splits=1` here to pin FA2's KV-reduction split count the same way the
+                # fixed-tile matmul kernel pins its tile size (`diag_qn1_residual_round5.py` traced `audit_sm120.py`'s
+                # question-count=1-only residual, 72/4,392, to this call). Rejected: with `block_table`/`seqused_k`,
+                # `num_splits=1` corrupts the output outright, and `diag_num_splits_sweep.py` (inv4, round 5) found
+                # this FA2 build rejects any `num_splits>1` at all (`NotImplementedError: FA2 does not support
+                # num_splits > 1`) -- so pinning FA2's own split count is not an available fix on this build.
+                #
+                # inv4 (round 6, chair's "fix it, don't accept the residual"): switched this call to vLLM's own
+                # `unified_attention` (`vllm.v1.attention.ops.triton_unified_attention`) instead of FA2's
+                # `flash_attn_varlen_func`. This is the exact kernel `TritonAttentionBackend` dispatches to under
+                # `VLLM_BATCH_INVARIANT=1` (`v1/attention/backends/triton_attn.py`), and reading its source shows why
+                # it does not have FA2's problem: when the "3D" segmented-softmax path's buffers are not supplied
+                # (`seq_threshold_3D=None` etc., below), `use_3d` is forced `False` and every row is tiled over KV
+                # length with a fixed `TILE_SIZE_PREFILL`/`TILE_SIZE_DECODE` -- a schedule that depends only on this
+                # row's own sequence length, never on how many other rows share the launch. That is the opposite of
+                # FA2's `num_splits=0` ("let the kernel choose based on the whole launch's occupancy"), which is the
+                # mechanism `diag_qn1_residual_round5.py` traced the residual to in the first place. The paged page
+                # pool's own layout (`PagedForkLayer._allocate`, `prismyra/paged.py`) already stores keys/values as
+                # `[num_pages, BLOCK, heads, head_dim]` with an int32 `block_table`/`seqused` -- vLLM's own paged KV
+                # cache layout -- so no reshape or copy is needed to hand them to this kernel.
+                try:
+                    from vllm.v1.attention.ops.triton_unified_attention import (
+                        unified_attention,
+                    )
+                except ImportError:
+                    out = flash_attn_varlen_func(
+                        q,
+                        pool_keys,
+                        pool_values,
+                        cu_seqlens_q=cu_q,
+                        max_seqlen_q=q_len,
+                        max_seqlen_k=capacity,
+                        softmax_scale=a.scaling,
+                        causal=True,
+                        block_table=table,
+                        seqused_k=seqused,
+                    )
+                    return self._finish(out[0] if isinstance(out, tuple) else out, gate, shape)
+                out = torch.empty_like(q)
+                unified_attention(
+                    q=q,
+                    k=pool_keys,
+                    v=pool_values,
+                    out=out,
                     cu_seqlens_q=cu_q,
                     max_seqlen_q=q_len,
+                    seqused_k=seqused,
                     max_seqlen_k=capacity,
                     softmax_scale=a.scaling,
                     causal=True,
+                    window_size=(-1, -1),
                     block_table=table,
-                    seqused_k=seqused,
+                    softcap=0.0,
+                    q_descale=None,
+                    k_descale=None,
+                    v_descale=None,
                 )
-                return self._finish(out[0] if isinstance(out, tuple) else out, gate, shape)
+                return self._finish(out, gate, shape)
 
             k_len = key.shape[-2]
             k = key.transpose(1, 2).reshape(rows * k_len, -1, a.head_dim)
@@ -934,8 +969,44 @@ def _install_conv() -> bool:
         # the original, which is the implementation those cases were written for.
         if not _measured_conv(weight):
             return original(x, weight, bias, activation=activation, **kwargs)
-        if bias is not None or x.dim() != 3 or x.shape[0] != 1 or not x.is_cuda:
+        if bias is not None or x.dim() != 3 or not x.is_cuda:
             return original(x, weight, bias, activation=activation, **kwargs)
+        if x.shape[0] != 1:
+            # inv5 (round 7): a branch pass answering about several documents at once calls this with one row per
+            # document (`x.shape == (companions, channels, width)`, `width` = this branch's own token count plus
+            # the carried-over convolution state, identical per row) -- which used to fall through to the line
+            # below, the framework's own fallback. That silently ran a *different implementation* than the B=1
+            # case above (not the same kernel with a different schedule), which is why `audit_sm120.py`/
+            # `diag_round6_matrix.py`'s question-count=1 residual traced here: the branch is answered through
+            # this fast path when it is one document and through the framework's path when it is several, and
+            # the two do not agree bit-for-bit.
+            #
+            # Each row's own `width` tokens are already self-contained (the caller baked its own carried-over
+            # state into the leading positions, same as the B=1 case's `extra` prefix), so flattening the batch
+            # into one token-major run and marking each row's own span with `seq_starts` is exactly the existing
+            # multi-document mechanism below, just with the boundaries declared by this call's own shape instead
+            # of by `varlen.current()` -- nothing bleeds across a row boundary because `causal_depthwise_conv1d`
+            # already refuses to read before `seq_start` for every output position.
+            batch, channels, width = x.shape
+            flat = x.transpose(1, 2).reshape(batch * width, channels)
+            if not flat.is_contiguous():
+                flat = flat.contiguous()
+            # Every row has the same `width`, known in Python rather than discovered from a device tensor, so this
+            # builds the per-token start array directly instead of going through `starts_from_boundaries` (which
+            # derives its `repeats` from `cu_seqlens` as a *tensor*, forcing `repeat_interleave` onto the
+            # dynamic-output-size path -- a device-to-host size resolution that is not capturable inside a CUDA
+            # graph). `repeats=width` here is a plain Python int, so `repeat_interleave`'s output size is static
+            # and known at trace time, which is what let a graph-recording test capture this path at all: without
+            # this, a (4, 24)-shaped branch recording failed with "operation failed due to a previous error during
+            # capture" (inv5, round 7 -- the first version of this fix broke `test_a_paged_recording_answers_a_
+            # later_document_of_a_different_length` and two neighbouring recording tests on both cards).
+            row_starts = torch.arange(
+                0, batch * width, width, device=x.device, dtype=torch.int32
+            ).repeat_interleave(width)
+            out = causal_depthwise_conv1d(
+                flat, weight, seq_starts=row_starts, activation=activation if activation is not None else "silu"
+            )
+            return out.reshape(batch, width, channels).transpose(1, 2)
         tokens_major = x.squeeze(0).t()
         if not tokens_major.is_contiguous():
             tokens_major = tokens_major.contiguous()
