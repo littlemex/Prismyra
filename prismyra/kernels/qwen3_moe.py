@@ -131,6 +131,18 @@ class FusedExperts(nn.Module):
         linear = _ROUTER_LINEAR or torch.nn.functional.linear
         return linear(x, self.gate.weight)
 
+    def _gate(self, x: torch.Tensor) -> torch.Tensor:
+        """`shared_expert_gate`'s own plain bf16 projection, called directly rather than through the module -- the
+        same reason and the same fix as `_route`, above. `diag_dispatch_inventory.py` flagged this call site (not
+        the shared expert's own `F.linear`, which round 1's measurement already found bit-identical without
+        protection) as one of exactly three places where a plain `F.linear` sees a shape that moves with the pass's
+        companion -- a necessary, not sufficient, condition the narrow-scope experiment in `engine.py`
+        (`PRISMYRA_INVARIANCE_SCOPE=narrow`) needs value-level confirmation of (`audit_sm120.py`/`tests/test_gpu.py`
+        with the scope env var set), not merely shape-level, before this stops needing the process-wide registration
+        as a safety net too."""
+        linear = _ROUTER_LINEAR or torch.nn.functional.linear
+        return linear(x, self.shared_expert_gate.weight)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
 
@@ -145,7 +157,7 @@ class FusedExperts(nn.Module):
         logits = rows_exact(self._route, x)
         weights, ids = fused_topk(x, logits, self.top_k, renormalize=True)[:2]
         routed = fused_experts(x, self.w1, self.w2, weights, ids, quant_config=self.quant)
-        shared = torch.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+        shared = torch.sigmoid(self._gate(x)) * self.shared_expert(x)
         return (routed + shared).reshape(shape)
 
 
@@ -536,6 +548,16 @@ class FlashAttention(nn.Module):
                 # length -- an upper bound is what that argument is for, and reading the real one would mean a
                 # device-to-host copy on the request path.
                 pool_keys, pool_values, table, seqused, capacity = layer.paged_read(rows)
+                # inv3, task 1 (SYNTHESIS 0): tried `num_splits=1` here to pin the KV-reduction split count the same
+                # way the fixed-tile matmul kernel pins its tile size (`diag_qn1_residual_round5.py` traced
+                # `audit_sm120.py`'s remaining 72/4392, question-count=1-only residual to this call). Measured and
+                # rejected, immediately: with `block_table`/`seqused_k` (the paged branch-read path, the only one
+                # that matters here), `num_splits=1` does not merely change the reduction order -- it corrupts the
+                # output outright (differences of 0.08-1.56 on hidden states that are normally within a few percent,
+                # cascading into every downstream layer), so this combination of arguments is not just row-count
+                # dependent, it is not supported at all. Left at the kernel's own default (`num_splits=0`, "let it
+                # choose") pending a fix that does not touch this argument -- see RUN-inv.md (inv3) for the
+                # before/after numbers that caught this before it reached any committed verification.
                 out = flash_attn_varlen_func(
                     q,
                     pool_keys,
@@ -818,6 +840,44 @@ MEASURED_MARK = "_prismyra_measured"
 MEASURED_POINTERS: set[int] = set()
 
 
+class _InvariantGate(nn.Module):
+    """A drop-in replacement for one of `Qwen3_5MoeGatedDeltaNet`'s `in_proj_a`/`in_proj_b` (plain bf16, bias-free,
+    `nn.Linear(hidden_size, num_v_heads)`), computing the identical projection through `_ROUTER_LINEAR` directly
+    instead of through `F.linear` -- the same narrow fix as `FusedExperts._route`/`_gate`, applied at the two other
+    call sites `diag_dispatch_inventory.py` flagged (`modeling_qwen3_5_moe.py:449`/`:450`, S2 step 2) as plain
+    `F.linear` calls whose shape moves with a pass's companion. Kept as a module (not a bound-method monkeypatch) so
+    `named_parameters()`/`state_dict()` keep seeing a weight at the same name after `kernels.apply()` has already
+    run and the checkpoint is already loaded -- nothing after this reads these two attributes except this layer's
+    own `forward`."""
+
+    def __init__(self, original: nn.Linear):
+        super().__init__()
+        self.weight = original.weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        linear = _ROUTER_LINEAR or torch.nn.functional.linear
+        return linear(x, self.weight)
+
+
+def _patch_gdn_gates(model: nn.Module) -> int:
+    """Replace `in_proj_a`/`in_proj_b` on every recurrent layer with `_InvariantGate`. Two per layer, found by type
+    rather than by walking `expected_counts`'s per-layer accounting: this is a narrowing of what `engine.py`'s
+    process-wide dispatcher registration already protects, not a new guarantee, so it has no count of its own in
+    `Applied.swaps` -- `stats()`'s existing `gated_delta_rule`/`convolution` entries already say how many recurrent
+    layers this checkpoint has."""
+    patched = 0
+    for module in model.modules():
+        if type(module).__name__ != "Qwen3_5MoeGatedDeltaNet":
+            continue
+        for name in ("in_proj_a", "in_proj_b"):
+            current = getattr(module, name)
+            if isinstance(current, _InvariantGate):
+                continue
+            setattr(module, name, _InvariantGate(current))
+            patched += 1
+    return patched
+
+
 def _measured_conv(weight: torch.Tensor) -> bool:
     """Whether this tensor is, or is a view of, a convolution weight this adapter measured."""
     if getattr(weight, MEASURED_MARK, False):
@@ -1035,6 +1095,16 @@ class Qwen3MoeAdapter:
                 "the convolution kernel covers the context pass; a branch pass arrives as many rows and keeps the "
                 "framework's path"
             )
+        # inv3, S2 step 2: narrows two of the three plain-`F.linear` call sites `diag_dispatch_inventory.py` found
+        # (the router, `_route`, was already narrow -- round 1). Independent of `PRISMYRA_INVARIANCE_SCOPE`
+        # (`engine.py`): installed unconditionally as a safety net under the default "global" scope too, and is
+        # what makes "narrow" worth measuring at all once that scope stops also registering the process-wide
+        # dispatcher. See `engine._enable_batch_invariance`'s own docstring for why "global" stays the shipped
+        # default until a full torch.equal sweep says otherwise on both cards.
+        gates = _patch_gdn_gates(text)
+        if gates:
+            applied.notes.append(f"{gates} GatedDeltaNet gate projections (in_proj_a/in_proj_b) narrowed to the "
+                                  "batch-invariant kernel directly, independent of the process-wide registration")
         return applied
 
 

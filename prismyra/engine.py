@@ -2421,6 +2421,29 @@ def _enable_batch_invariance() -> None:
     if not current_platform.is_cuda():
         return
 
+    # 2026-10-07 (inv3/inv4, S2 step 1/2): "global" (the default, unchanged) registers the four aten ops below for
+    # every plain bf16 matmul in the whole model -- `diag_invariance_cost_profile.py` measured this at +14.5ms
+    # (6.8%) on a solo `ask()` and +18.9ms (1.8%) on a 32-document `open_batch`, on an L40S, almost all of it in
+    # `matmul_kernel_persistent` calls that `diag_dispatch_inventory.py` (same round) shows are not at one of the
+    # three call sites that are actually row-count dependent: the router (`_route`, narrowed since round 1) and the
+    # two `GatedDeltaNet` gate projections (`in_proj_a`/`in_proj_b`, narrowed by `_patch_gdn_gates` this round,
+    # unconditionally -- see `qwen3_moe.Qwen3MoeAdapter.replace`). "narrow" skips this registration (and the
+    # Hopper/Blackwell cuBLAS workspace change below) and relies on those two narrow fixes plus the
+    # `VLLM_BATCH_INVARIANT` env var above instead.
+    #
+    # inv4: the sibling draft of this comment once claimed "narrow" was measured safe on `audit_sm120.py`'s own
+    # companion matrix. It was not, by the time the measurement actually ran (`narrow_report_sm120.json`,
+    # /Users/akazawt/tmp/smr/inv-wt-logs/inv3/): on sm_120, "narrow" leaves 150/4,392 probability checks non-exact
+    # against "global"'s 72/4,392, and -- more to the point than the raw count -- it breaks question-counts
+    # {2, 3, 31, 32} that "global" does not touch at all (`global`'s 72 are 100% question-count=1, a different,
+    # already-tracked residual; see `diag_qn1_residual_round5.py`). That means at least one more plain `F.linear`/
+    # `torch.mm` call this project has not yet narrowed is still row-count dependent on sm_120, and the global
+    # dispatcher registration is the only thing currently catching it. "narrow" stays an opt-in diagnostic switch
+    # for exactly this reason -- it is not a candidate default until whatever call site the 2→150 jump comes from
+    # is found and narrowed too. See RUN-inv.md (inv3/inv4, round 5) for the numbers.
+    if os.environ.get("PRISMYRA_INVARIANCE_SCOPE", "global") == "narrow":
+        return
+
     # 2026-10-07 (inv, round 2): the Triton persistent matmul this registers (`mm_batch_invariant` et al.) is not
     # itself gated to SM80 anywhere in its own implementation -- `linear_batch_invariant` just calls
     # `matmul_persistent`, a plain Triton kernel, unconditionally. `_ROUTER_LINEAR` (`kernels/qwen3_moe.py`) was
