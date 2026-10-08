@@ -1,7 +1,15 @@
 """[sj_train_qat.py: SearchJev-cheap-filter candidates on top of train_qat.py, the exact script that trained
 a6b/a7/a8 (see /Users/akazawt/tmp/smr/redesign/IDEAS-CEILING.md 6.4.11, 6.4.16).
 
-This file is train_qat.py (/work/next/scripts/train_qat.py) UNCHANGED except for three additive, off-by-default
+CORRECTION (2026-10-08, coordinator review): this file was first written from a STALE local mirror of
+train_qat.py (/Users/akazawt/tmp/smr/next/tokyo/scripts/train_qat.py) that was missing one guard the live EFS
+file (/work/next/scripts/train_qat.py) already has, for rows whose teacher_pt entry carries only the option-prob
+signal "p" (no "h"/"ti"/"tv"). The first sj1/sj2 launch crashed on this (KeyError 'h'); the fix added below
+(search "sj CORRECTION") was independently derived and turned out to compute the EXACT SAME formula as the
+live file's own `if "h" in T_: ... else: cos = kv = torch.zeros(...)` guard once the arithmetic is worked
+through (w_h*0 + w_v*0 = 0). Full writeup, including why a8 itself almost certainly trained against these same
+partial rows without crashing: RUN-sj.md, "a8 reproduction check" section. Net: this file is train_qat.py
+EQUIVALENT (not merely "unchanged") on every row-handling path, plus three additive, off-by-default
 flags, each implementing one of the two SearchJev mechanisms the learning-free sieve (RUN-tok.md experiment 4)
 found "worth trying" (c=4.36% for (a), reversed-order argmax flip, above the 2% stand-down line; 80.9% agreement
 for (b), below the 95% stand-down line):
@@ -325,16 +333,22 @@ for ep in range(a.epochs):
             ce_w = ex.get("_ce_w", 1.0)
             loss = ce_w * F.cross_entropy(logits[None], torch.tensor([gold], device=DEV))
             if "T" in ex:
-                # sj FIX (2026-10-08, found before any training step completed on the first sj1/sj2 launch):
-                # teacher_2x.pt on EFS today has full signal (p/h/ti/tv) for 30,200 of its 43,729 entries and
-                # ONLY "p" for the remaining 13,529 -- confirmed with torch.load on next2, not an artefact of
-                # this script's own edits (train_qat.py's unmodified code at /work/next/scripts/train_qat.py
-                # reads T_["h"] unconditionally too, so it would hit the same KeyError against the file in its
-                # CURRENT state; a8's own completed run therefore must have trained against teacher_2x.pt
-                # before whatever later touched it dropped h/ti/tv on these rows -- a dossier-worthy pitfall
-                # for whoever next reads this file, reported in RUN-sj.md section 2, orthogonal to the (a)/(b)
-                # SearchJev flags this file otherwise tests). Falling back to CE+KD(p) only for a p-only row
-                # keeps every row trainable without inventing a hidden-state/vocab target that was never saved.
+                # sj CORRECTION (2026-10-08, after the coordinator's review): the comment this replaces claimed
+                # the unmodified /work/next/scripts/train_qat.py reads T_["h"] unconditionally and would crash
+                # on these rows too -- that was wrong, from diffing against a STALE local mirror
+                # (/Users/akazawt/tmp/smr/next/tokyo/scripts/train_qat.py) instead of the live EFS file. The live
+                # file already guards this exact case: `if "h" in T_: cos, kv = ... else: cos = kv =
+                # torch.zeros((), device=DEV)`, with its own comment ("rows whose teacher read a different
+                # context (B2, 12.1) carry option probabilities only"). That reduces to EXACTLY `a.w_ce*loss +
+                # a.w_kd*kl` when h/ti/tv are absent (w_h*0 + w_v*0 = 0) -- the same formula the branch below
+                # computes. train_L1.json's 13,529 p-only rows (all index < 31,418, none among a8's 22,367 new
+                # rows) are not file corruption; they match RUN-acc.md's documented teacher_R4.pt coverage
+                # (21,362/31,418 = 68.0%: 7,833 full + 13,529 partial) from well before a8 was trained, and
+                # a8_train.log finished at 2026-10-05 01:09:40 with "skipped 0" against a teacher_2x.pt whose
+                # mtime (2026-10-04 17:51:11) sits ~8 minutes before that run's own start -- consistent with a8
+                # training against this exact file. Full investigation: RUN-sj.md, "a8 reproduction check"
+                # section. Net effect: this branch was independently reinvented to match a8's real formula; it
+                # is not a divergence from a8, and no sj0 control run was needed on this account.
                 T_ = ex["T"]; tp = T_["p"].to(DEV).float().clamp_min(1e-8)
                 kl = (tp * (tp.log() - F.log_softmax(logits, -1))).sum()
                 if "h" in T_ and "ti" in T_ and "tv" in T_:
