@@ -497,7 +497,11 @@ class FlashAttention(nn.Module):
         attn = out.reshape(*shape, -1).contiguous() * torch.sigmoid(gate)
         return a.o_proj(attn), None
 
-    def forward(self, hidden_states, position_embeddings, attention_mask=None, past_key_values=None, **kwargs):
+    def forward(  # noqa: PLR0911 - one early return per attention shape this layer can be called with (context,
+        # branch over a page pool, branch over a dense join -- the one this change adds -- and packed/fallback);
+        # folding them into one return would hide which shape is which, which is what each early return documents
+        self, hidden_states, position_embeddings, attention_mask=None, past_key_values=None, **kwargs
+    ):
         try:
             from vllm.vllm_flash_attn import flash_attn_varlen_func
         except ImportError:
@@ -606,6 +610,85 @@ class FlashAttention(nn.Module):
                 return self._finish(out, gate, shape)
 
             k_len = key.shape[-2]
+            if layer.writing_branches:
+                # The joined (non-paged) storage's own branch read. Historically this ran the same
+                # `flash_attn_varlen_func` call the plain `cu_seqlens` branch below uses -- a dense, per-row
+                # copy of context+branch read with FA2's own split-KV heuristic, which reduces in a
+                # different order than the paged branch read below (`unified_attention`, tiled by this row's
+                # own `seqused_k` alone). `pg2`'s own measurement (`RUN-pg2.md`) found that difference is the
+                # single largest remaining source of a joined-vs-paged answer moving at question count >= 2
+                # -- up to 0.126938 on the L40S, 34/816 decision flips in `tools/audit_sm120.py`'s own sweep.
+                #
+                # This builds the *same* page-table call `prismyra/paged.py`'s `PagedForkLayer.paged_read`
+                # feeds `unified_attention`, over the join's own dense per-row keys/values instead of a shared
+                # pool: one page per row, `prismyra.paged.BLOCK` (16) tokens wide, padded with zeros past this
+                # row's real `k_len` (never read -- `seqused_k` caps every row at `k_len`, same as a paged
+                # pool's own partial last page). `block_size = v.shape[1]` is what the kernel picks its own
+                # `TILE_SIZE_PREFILL`/`TILE_SIZE_DECODE` from (`vllm...triton_unified_attention.unified_
+                # attention`, `TILE_SIZE_PREFILL = min(TILE_SIZE_PREFILL, block_size)`); a page view of a
+                # different width than the paged pool's own (e.g. one page covering a whole row) picks a
+                # different tile and does **not** reduce in the same order -- `BLOCK` is used here rather than
+                # any other width for exactly that reason, not for memory layout.
+                try:
+                    from vllm.v1.attention.ops.triton_unified_attention import (
+                        unified_attention,
+                    )
+
+                    from ..paged import BLOCK as page_block
+                except ImportError:
+                    # Same fallback the paged branch below takes on the same ImportError: the installed
+                    # kernel does not have this, so the join's own dense FA2 call (unchanged, below) is what
+                    # every release before this one shipped -- not a canonical match, but not a crash either.
+                    unified_attention = None
+                if unified_attention is not None:
+                    pages_per_row = -(-k_len // page_block)
+                    k_len_padded = pages_per_row * page_block
+                    pad = k_len_padded - k_len
+
+                    # Built one tensor (keys) at a time and the join's own transient dropped (`del key`) before
+                    # the next (values) starts, rather than padding both up front: a padded copy is briefly a
+                    # second, same-size allocation beside the join's own -- at `rows=64` and a long context this
+                    # doubled the branch pass's keys-and-values peak and OOM'd where the unpadded join fit
+                    # (measured directly, `RUN-pg2.md`). Doing one tensor fully (pad, reshape into pages, and
+                    # drop the pre-pad reference) before touching the other keeps the peak at one extra
+                    # same-size allocation rather than two.
+                    k_dense = key.transpose(1, 2).contiguous()
+                    del key
+                    if pad:
+                        k_dense = torch.nn.functional.pad(k_dense, (0, 0, 0, 0, 0, pad))
+                    pool_keys = k_dense.reshape(rows * pages_per_row, page_block, *k_dense.shape[-2:])
+                    del k_dense
+
+                    v_dense = value.transpose(1, 2).contiguous()
+                    del value
+                    if pad:
+                        v_dense = torch.nn.functional.pad(v_dense, (0, 0, 0, 0, 0, pad))
+                    pool_values = v_dense.reshape(rows * pages_per_row, page_block, *v_dense.shape[-2:])
+                    del v_dense
+                    block_table = torch.arange(
+                        rows * pages_per_row, device=q.device, dtype=torch.int32
+                    ).reshape(rows, pages_per_row)
+                    seqused = torch.full((rows,), k_len, device=q.device, dtype=torch.int32)
+                    out = torch.empty_like(q)
+                    unified_attention(
+                        q=q,
+                        k=pool_keys,
+                        v=pool_values,
+                        out=out,
+                        cu_seqlens_q=cu_q,
+                        max_seqlen_q=q_len,
+                        seqused_k=seqused,
+                        max_seqlen_k=k_len_padded,
+                        softmax_scale=a.scaling,
+                        causal=True,
+                        window_size=(-1, -1),
+                        block_table=block_table,
+                        softcap=0.0,
+                        q_descale=None,
+                        k_descale=None,
+                        v_descale=None,
+                    )
+                    return self._finish(out, gate, shape)
             k = key.transpose(1, 2).reshape(rows * k_len, -1, a.head_dim)
             v = value.transpose(1, 2).reshape(rows * k_len, -1, a.head_dim)
             cu_k = torch.arange(0, rows * k_len + 1, k_len, device=q.device, dtype=torch.int32)
