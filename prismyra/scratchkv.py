@@ -310,3 +310,123 @@ def random_token_control_readout(engine, context: str, question: Question, steps
         final = hidden[0, -1:]
     (p,) = score(final, unembed, [planned.token_ids])
     return SoftThinkingResult(probabilities=p.float().tolist(), options=list(question.options), steps=steps)
+
+
+# -------------------------------------------------------------------- ws3: placement fix (RUN-ws3.md section 0)
+#
+# `soft_thinking_readout` and `random_token_control_readout` (above) both build `ids` from `_branch_ids_tensor`,
+# which is the *whole* rendered question -- already ending in the literal tail `readout.plan` builds its
+# read-out position around ("Answer:"/"Answer: ") -- and then append their `steps` extra positions *after*
+# that whole string, reading out at the new last position (one of the appended positions, not the tail).
+# ws2's own stage 5 measured the cost: Soft Thinking lost 24-29 points to the undisturbed baseline, far more
+# than a "no measurable gain" result would predict. `RUN-ws3.md` section 0 diagnoses this the same way ws1's
+# stage A diagnosed `scratch.scratch_loop`: the tail is where this checkpoint's read-out was built to be read,
+# and moving the read-out past it breaks that, independent of whether the content in between is useful.
+#
+# The three functions below keep each mechanism's own update rule unchanged and change only where the extra
+# positions go: *before* the tail, not after it. The tail is appended last and the read-out stays at its own
+# last token -- the same position `plan` already computes, this time left undisturbed because nothing was
+# ever placed after it.
+
+
+def _split_body_tail(engine, planned):
+    """`readout.plan`'s own split: tokenize the full rendered text once, then slice off the literal tail
+    rather than re-tokenizing the body alone, so a tokenizer merge across the body/tail boundary (if the
+    tokenizer ever made one) would show up as a mismatch here instead of a silently wrong split."""
+    from .fork import branch_ids
+
+    full_ids = branch_ids(planned.text, engine.tokenizer)
+    tail_text = "Answer: " if planned.trailing_space else "Answer:"
+    tail_ids = engine.tokenizer(tail_text, add_special_tokens=False)["input_ids"]
+    if full_ids[-len(tail_ids) :] != tail_ids:
+        raise RuntimeError(
+            f"tail {tail_text!r} does not tokenize the same at the end of the full rendered text as it does "
+            f"alone ({full_ids[-len(tail_ids):]!r} != {tail_ids!r})"
+        )
+    return full_ids[: -len(tail_ids)], tail_ids
+
+
+def _tailfixed_body_and_tail(engine, context: str, question: Question):
+    """`(body_ids, tail_ids, planned)`: `body_ids` is the context plus the question's own rendered text up to
+    but not including the literal tail; `tail_ids` is just the tail. Both are `(1, L)` tensors on the engine's
+    device, ready to `embed()` and concatenate around the extra positions."""
+    from .media import encode
+
+    planned = plan(question, engine.tokenizer)
+    encoded = encode(context, None, None, engine.processor, engine.tokenizer, engine.device)
+    body_ids, tail_ids = _split_body_tail(engine, planned)
+    body_t = torch.cat([encoded.input_ids, torch.tensor([body_ids], device=engine.device)], dim=1)
+    tail_t = torch.tensor([tail_ids], device=engine.device)
+    return body_t, tail_t, planned
+
+
+def soft_thinking_readout_tailfixed(engine, context: str, question: Question, steps: int) -> SoftThinkingResult:
+    """`soft_thinking_readout`, with the placement fixed: the `steps` concept-token positions are generated
+    and appended *before* the literal tail, and the tail is appended afterwards so the read-out stays at the
+    tail's own last token (the position `plan`/`readout.score` already assume), not at the last concept token.
+    """
+    body_ids, tail_ids, planned = _tailfixed_body_and_tail(engine, context, question)
+    embed = engine.backbone.get_input_embeddings()
+    unembed = engine.unembedding
+    with engine._lock, torch.inference_mode():
+        embeds = embed(body_ids)  # (1, Lbody, H)
+        for _ in range(steps):
+            out = engine.backbone(inputs_embeds=embeds, use_cache=False)
+            hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+            last = hidden[0, -1]  # (H,)
+            logits = last.float() @ unembed.float().t()
+            p = torch.softmax(logits, dim=-1)
+            soft = (p.unsqueeze(0) @ embed.weight.float()).to(embeds.dtype)  # (1, H)
+            embeds = torch.cat([embeds, soft.unsqueeze(1)], dim=1)
+        tail_embeds = embed(tail_ids).to(embeds.dtype)
+        embeds = torch.cat([embeds, tail_embeds], dim=1)
+        out = engine.backbone(inputs_embeds=embeds, use_cache=False)
+        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        final = hidden[0, -1:]
+    (p,) = score(final, unembed, [planned.token_ids])
+    return SoftThinkingResult(probabilities=p.float().tolist(), options=list(question.options), steps=steps)
+
+
+def random_token_control_readout_tailfixed(
+    engine, context: str, question: Question, steps: int, rng
+) -> SoftThinkingResult:
+    """`random_token_control_readout`, placement-fixed the same way as `soft_thinking_readout_tailfixed`:
+    `steps` random discrete tokens from the context, inserted before the tail instead of after it."""
+    body_ids, tail_ids, planned = _tailfixed_body_and_tail(engine, context, question)
+    embed = engine.backbone.get_input_embeddings()
+    unembed = engine.unembedding
+    ctx_tokens = body_ids[0].tolist()
+    picks = [ctx_tokens[rng.randrange(len(ctx_tokens))] for _ in range(steps)]
+    extra = torch.tensor([picks], device=body_ids.device)
+    with engine._lock, torch.inference_mode():
+        body_embeds = embed(body_ids)
+        extra_embeds = embed(extra).to(body_embeds.dtype)
+        tail_embeds = embed(tail_ids).to(body_embeds.dtype)
+        embeds = torch.cat([body_embeds, extra_embeds, tail_embeds], dim=1)
+        out = engine.backbone(inputs_embeds=embeds, use_cache=False)
+        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        final = hidden[0, -1:]
+    (p,) = score(final, unembed, [planned.token_ids])
+    return SoftThinkingResult(probabilities=p.float().tolist(), options=list(question.options), steps=steps)
+
+
+def filler_control_readout_tailfixed(engine, context: str, question: Question, steps: int) -> SoftThinkingResult:
+    """Content-free control for the placement fix itself (RUN-ws3.md section 2): `steps` *identical* copies
+    of the question's own mean embedding, inserted before the tail -- no probability mixture, no per-step
+    update, no random discreteness, just the same vector repeated. If this alone recovers most of the gap to
+    the undisturbed baseline, the fix is doing the work and the content of Soft Thinking's mixture is not;
+    if it does not, the gap was the placement and the mixture's own content still matters on top of that."""
+    body_ids, tail_ids, planned = _tailfixed_body_and_tail(engine, context, question)
+    embed = engine.backbone.get_input_embeddings()
+    unembed = engine.unembedding
+    with engine._lock, torch.inference_mode():
+        body_embeds = embed(body_ids)
+        q_repr = body_embeds[0].float().mean(dim=0)
+        filler = q_repr.unsqueeze(0).expand(steps, -1).unsqueeze(0).to(body_embeds.dtype)
+        tail_embeds = embed(tail_ids).to(body_embeds.dtype)
+        embeds = torch.cat([body_embeds, filler, tail_embeds], dim=1)
+        out = engine.backbone(inputs_embeds=embeds, use_cache=False)
+        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        final = hidden[0, -1:]
+    (p,) = score(final, unembed, [planned.token_ids])
+    return SoftThinkingResult(probabilities=p.float().tolist(), options=list(question.options), steps=steps)
