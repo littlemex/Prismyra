@@ -1,11 +1,10 @@
-"""S4c: layer-interleaved fork (SYNTHESIS.md P5, out/p1_speed_opus.md P5, RUN-fp8spd.md).
+"""Layer-interleaved fork.
 
 The two-pass design reads a context through all 36 layers (`engine._read`), then answers through all 36 layers
 again (`engine._branch`) -- which re-streams every layer's dense and routed-expert weights for a branch pass that
-may carry as few as one row. A microbenchmark on a real `FusedExperts` module with its own weights (RUN-fp8spd.md,
-"P4(a) 射影結合の効果を単体カーネルで実測") found that restreaming costs 51.3% of a 16-row pass's time against one
-call that already held the row count the context pass used; a second microbenchmark on the same module
-(RUN-fp8spd.md, "S4c: 4層試作、実モデルの重みで検証") found concatenating a context's 5,000 rows with a branch's
+may carry as few as one row. A microbenchmark on a real `FusedExperts` module with its own weights found that
+restreaming costs 51.3% of a 16-row pass's time against one call that already held the row count the context
+pass used; a second microbenchmark on the same module found concatenating a context's 5,000 rows with a branch's
 16 or 64 rows into one call, instead of two, saved 29-30% of that layer's time and both halves of the combined
 output were `torch.equal` to running them alone -- the expert computation does not depend on which other rows
 share the call. Scaled from a 4-layer measurement to this model's 36, that is about 39 ms at both 16 and 64
@@ -13,8 +12,8 @@ questions, which is the saving this module exists to realise end to end rather t
 
 **What is fused and what is not.** Only the dense projections and the routed/shared-expert block (`decoder_layer.
 mlp`, called on the context's and the branch's rows concatenated) are shared across one call per layer -- these
-are the ops a microbenchmark showed to be free of any dependence on which rows share them (`torch.equal`,
-RUN-fp8spd.md). The gated-delta-net recurrence and the attention read are the two things that genuinely cannot
+are the ops a microbenchmark showed to be free of any dependence on which rows share them (`torch.equal`-verified).
+The gated-delta-net recurrence and the attention read are the two things that genuinely cannot
 share a call, because each carries state the other side must not see or must see *only* for one layer:
 
 * the GDN layer's recurrent and convolution state is **this layer's own**, nothing a 36-layer snapshot would
@@ -33,8 +32,7 @@ installed (`engine._borrowed_kernel`), the joined (non-paged) cache. A request n
 questions still gets one: `read_and_branch` returns a `Prefill` whose `snapshot` is the pure context state,
 assembled one layer at a time as the loop goes rather than taken in a separate pass -- so `engine._branch` and
 `fork.restore_and_fork`, both unmodified, serve every group after the first exactly as they do today. Extending
-this to several documents at once (`open_batch`, `Shelf`) and to CUDA graphs is out of scope for this cut; see
-RUN-fp8spd.md's design note for why and what each would need.
+this to several documents at once (`open_batch`, `Shelf`) and to CUDA graphs is out of scope for this cut.
 """
 
 from __future__ import annotations
@@ -54,7 +52,7 @@ def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, p
     `_round_rows`'s own docstring is why a mismatch there would move an answer rather than raise.
 
     Returns `(hidden, prefill)`. `hidden` is `(len(texts), hidden_size)`, read at each row's own last real token
-    -- the same shape and, `torch.equal`-gated (RUN-fp8spd.md), the same values `engine._branch` gives for this
+    -- the same shape and, `torch.equal`-gated, the same values `engine._branch` gives for this
     one group. `prefill` is this document's usual `Prefill`, snapshot included, built one layer at a time as the
     loop below runs rather than by a separate `fork.snapshot(cache)` call afterwards.
     """
@@ -121,7 +119,7 @@ def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, p
 
         # The one call this module exists for: the dense projections inside `mlp` (the shared expert) and the
         # routed experts, on the context's and the branch's rows concatenated -- one weight stream instead of
-        # two. `torch.equal`-verified against running the two halves separately (RUN-fp8spd.md).
+        # two. `torch.equal`-verified against running the two halves separately.
         residual_ctx, residual_branch = hidden_ctx, hidden_branch
         normed2_ctx = decoder_layer.post_attention_layernorm(hidden_ctx)
         normed2_branch = decoder_layer.post_attention_layernorm(hidden_branch)
@@ -153,7 +151,7 @@ def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, p
 
 
 def read_and_branch_shelf(engine, shelf, context: str, texts: list[str], width: int, padded_rows: int):
-    """`read_and_branch`'s counterpart for `Shelf`/`Batcher` (round 5): fuse one *fresh* document's read into the
+    """`read_and_branch`'s counterpart for `Shelf`/`Batcher`: fuse one *fresh* document's read into the
     shelf with its first (and, in `Batcher`, only -- a request's own questions already fit one group,
     `schedule.Limits.questions`) branch group, through the same per-layer loop.
 
@@ -260,7 +258,7 @@ def read_and_branch_shelf(engine, shelf, context: str, texts: list[str], width: 
             # boundaries active for the branch call too (entering once for the whole function, as
             # `read_and_branch`'s single-document version has no reason to distinguish) made the branch's
             # `padded_rows` rows look like a mismatched *document* count to the framework ("expected 2 initial
-            # states... rather than 1") -- found running this on real hardware (RUN-fp8spd.md round 5).
+            # states... rather than 1").
             if has_pad:
                 with varlen.reading(lengths, device) as boundaries:
                     out_ctx = decoder_layer.linear_attn(normed_ctx, cache_params=cache, attention_mask=None)
@@ -362,10 +360,9 @@ def read_and_branch_shelf(engine, shelf, context: str, texts: list[str], width: 
 def read_and_branch_shelf_many(
     engine, shelf, contexts: list[str], texts_per_doc: list[list[str]], width: int, padded_rows_per_doc: list[int]
 ):
-    """`read_and_branch_shelf`'s own job for several *fresh* documents at once (round 7, "本題" --
-    RUN-fp8spd.md): fuse `N` documents' reads into the shelf with each one's own (first, and in `Batcher`,
-    only -- see that function's own docstring) branch group, through one per-layer loop that carries every
-    document's rows at once instead of one.
+    """`read_and_branch_shelf`'s own job for several *fresh* documents at once: fuse `N` documents' reads into
+    the shelf with each one's own (first, and in `Batcher`, only -- see that function's own docstring) branch
+    group, through one per-layer loop that carries every document's rows at once instead of one.
 
     **Scope.** `N >= 2` documents, every one read for the first time this call -- a pass naming an already
     resident document, or exactly one fresh document, still goes through `Shelf.put_many`/`Shelf.ask` or
@@ -374,15 +371,15 @@ def read_and_branch_shelf_many(
 
     **Why each document's own branch rows are rounded independently.** `_branch_across` (the existing,
     non-interleaved multi-document branch pass) rounds the *combined* row count once and pads only the last
-    document -- which is exactly the design RUN-inv.md round 3 traced a residual to: a document's own answer
+    document -- which is exactly the design that creates a residual: a document's own answer
     moving when a companion's question count changes the bucket the *pair* rounds to, not the bucket either
-    one would round to alone. This function was written after that finding, not before it, so it rounds each
+    one would round to alone. This function rounds each
     document's `padded_rows_per_doc[i]` on its own count alone (the caller already did this, in
     `schedule.Batcher._answer`'s own `_round_rows` call per job) and never recombines it with anyone else's --
-    nothing here depends on how many rows a companion asked for, which is this project's own invariance
-    contract (BRIEF rule 2) by construction rather than by a later patch.
+    nothing here depends on how many rows a companion asked for, which is this module's own invariance
+    guarantee by construction rather than by a later patch.
 
-    **The one new primitive this needed.** `fork.widen_for_branch_many` (first written, unwired, by fp8spd5):
+    **The one new primitive this needed.** `fork.widen_for_branch_many`:
     `widen_for_branch`'s one-document broadcast, generalised to broadcast document `i`'s own just-written row
     to its own `padded_rows_per_doc[i]` branch rows and nobody else's, for every document in one call -- the
     same guarantee `widen_for_branch` gives a single document, extended rather than approximated.
@@ -390,7 +387,7 @@ def read_and_branch_shelf_many(
     **Everything else is `open_batch`'s own admission (`begin_documents`, one shared padding segment sized by
     the *combined* total exactly as `Prismyra._pad_context_lengths` already does for any batched read) plus
     `read_and_branch_shelf`'s own per-layer narrowing of the framework's end-of-run convolution tail and
-    its one-document-per-row recurrent state** (RUN-fp8spd.md round 5's own docstring explains both), run in
+    its one-document-per-row recurrent state** (see that function's own docstring, which explains both), run in
     a loop over `N` documents instead of written out for one.
 
     Returns `(hidden, handles, shelved)`: `hidden` is every document's own answer rows concatenated in the

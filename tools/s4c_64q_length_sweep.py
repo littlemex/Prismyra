@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""fp8spd4: round5 found group=64 full fusion wins at ~5,016 tok (-9.6%) and loses at ~20,064 tok (+6.0%)
--- round robin, same engine, interchanging configs each round (first 3 rounds discarded as warmup, >=5 kept).
-This sweep finds where the sign flips so `ask()` can pick the faster path by `encoded.tokens` instead of always
-taking the (sometimes slower) fused path (RUN-fp8spd.md round5 "次の担当は... 閾値を実測して決める").
+"""group=64 full fusion wins at ~5,016 tok (-9.6%) and loses at ~20,064 tok (+6.0%) -- round robin,
+same engine, interchanging configs each round (first 3 rounds discarded as warmup, >=5 kept). This
+sweep finds where the sign flips so `ask()` can pick the faster path by `encoded.tokens` instead of
+always taking the (sometimes slower) fused path.
 
 Usage: python3 s4c_64q_length_sweep.py
 """
 import json
+import os
 import statistics
 import sys
 import time
 
-sys.path.insert(0, "/work/fp8spd/fp8spd4-src")
+sys.path.insert(0, os.environ.get("PRISMYRA_SRC", "."))
 import torch
 from prismyra import Prismyra, Boolean
 
-MODEL = "littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l"
+MODEL = os.environ.get("PRISMYRA_MODEL", "littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l")
 CONFIGS = ("two_pass", "interleaved_g64")
 LENGTHS = [3000, 5000, 7000, 9000, 11000, 13000, 16000, 20000]
 ROUNDS = 9
@@ -45,7 +46,7 @@ def run(engine, cfg, context, qs):
         return engine.ask(context, qs)
     if cfg == "interleaved_g64":
         engine.interleaved_fork = True
-        return engine.ask(context, qs)  # ask() itself widens group->64 at exactly 64 questions (round5)
+        return engine.ask(context, qs)  # ask() itself widens group->64 at exactly 64 questions
     raise ValueError(cfg)
 
 
@@ -92,7 +93,7 @@ def main():
         all_reports[str(ntok)] = report
 
     print(json.dumps(all_reports, indent=2))
-    with open("/work/fp8spd/runs/fp8spd4_64q_length_sweep.json", "w") as f:
+    with open(os.environ.get("S4C_64Q_OUT", "/tmp/s4c_64q_length_sweep.json"), "w") as f:
         json.dump(all_reports, f, indent=2)
 
 

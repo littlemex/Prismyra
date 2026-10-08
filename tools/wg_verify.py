@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""wg: does the wide_group (S4a, 33-64 questions widened to one group=64 pass) mismatch found by
-fp8spd3 (RUN-fp8spd.md "33問だけ不一致") still reproduce on today's integrated branch (integ/v0.4.0,
-a6b0087+)? Since that finding, three things landed that could have changed the picture:
-  - per-document (not combined) `_round_rows` rounding (inv, round 2)
-  - the branch-pass convolution batch fix (inv5, dadb996/32b93c3)
-  - every CUDA engine unconditionally claims batch-invariance at construction (recon, ad7bafe)
+"""Does the wide_group (33-64 questions widened to one group=64 pass) mismatch found earlier -- a disagreement
+at exactly 33 questions -- still reproduce on the engine as of v0.4.0 (a6b0087+)? Since that finding, three things
+landed that could have changed the picture:
+  - per-document (not combined) `_round_rows` rounding
+  - the branch-pass convolution batch fix (dadb996/32b93c3)
+  - every CUDA engine unconditionally claims batch-invariance at construction (ad7bafe)
 This gate re-measures from scratch rather than trusting the old report.
 
 Ground truth: `wide_group=False` (today's default), two passes (e.g. 33 -> 32+1). Compared against
 `wide_group=True`, one pass widened to `WIDE_GROUP` (64) via `_group_for`. Both through plain `ask()`
-(`paged=False`, `interleaved_fork=False`) -- the joined-cache path S4a's own gate used, independent of
+(`paged=False`, `interleaved_fork=False`) -- the joined-cache path this setting uses, independent of
 `interleaved_fork`'s separate 64-exact mechanism in `_ask_interleaved`.
 
 Asserts `engine._invariance_base_claimed` is True before measuring anything -- a diagnostic that ran
-without this would not be testing the branch this task cares about.
+without this check would not be testing the construction path this file means to measure.
 
 Set WG_REVERT_FIX=1 to run a negative control: monkeypatch `_enable_batch_invariance` to a no-op before
-construction (reproducing the pre-recon-fix world) to check whether the fix now unconditionally claimed
-is actually *why* the old mismatch is gone, or whether something else changed independently.
+construction (reproducing the pre-fix world) to check whether the unconditional claim now in place is
+actually *why* the old mismatch is gone, or whether something else changed independently.
 """
 import os
 import sys
@@ -67,7 +67,7 @@ def main():
     print(f"REVERT_FIX={REVERT_FIX} invariance_base_claimed={base_claimed}", flush=True)
     if not REVERT_FIX:
         assert base_claimed is True, (
-            "engine was built without the unconditional batch-invariance claim (recon's ad7bafe) -- "
+            "engine was built without the unconditional batch-invariance claim (ad7bafe) -- "
             "this gate must not run against a world where that fix is absent."
         )
     tokenizer = engine.tokenizer

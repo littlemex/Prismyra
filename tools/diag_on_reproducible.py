@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""recon: does re-recording the one-pass graphs TWICE under the SAME "on" (batch-invariant) state give
+"""Does re-recording the one-pass graphs TWICE under the SAME "on" (batch-invariant) state give
 the identical answer, in contrast to the "off" (default cuBLAS) state's own re-record noise measured in
-recon_diag_onepass_capture.py (off vs off-re-recorded maxdiff 0.0081)? If "on" is perfectly reproducible
+`diag_onepass_capture.py` (off vs off-re-recorded maxdiff 0.0081)? If "on" is perfectly reproducible
 across re-records while "off" is not, that confirms the noise source is cuBLAS/cuBLASLt's own
 heuristic, timing-based algorithm selection for the un-pinned default matmul path -- not autotuner
-racing (already ruled out: recon_diag_autotune_gap.py showed every Triton Autotuner pinned to
+racing (already ruled out: `diag_autotune_gap.py` showed every Triton Autotuner pinned to
 configs=1, cache_entries=0 after full construction)."""
 import os
 import sys
@@ -31,7 +31,7 @@ def build_context(pad_to_tokens, tokenizer):
 
 
 def ask_q1(engine, context, qid="q0"):
-    qs = [Boolean(id=qid, prompt="条項は返金を認めているか。")]
+    qs = [Boolean(id=qid, prompt="Does the clause permit a refund?")]
     result = engine.ask(context, qs)
     return result.answers[qid].probabilities
 

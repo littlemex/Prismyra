@@ -105,7 +105,7 @@ def apply(model: nn.Module, config, required: bool = False) -> Applied:
     """
     from . import fp8_tuning
 
-    fp8_tuning.install()  # this card's dense-FP8 matmul tiling, if this pod does not already have it (fp8_tuning.py)
+    fp8_tuning.install()  # this card's dense-FP8 matmul tiling, if this machine does not already have it
     adapter = find(config)
     if adapter is None:
         arch = getattr(config, "architectures", None)

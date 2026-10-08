@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""recon: pin down WHERE in construction the interleaved_fork=True / wide_group=True config changes the
-n=1 (_ask_in_one_pass) answer, given that _ask_in_one_pass itself never branches on either flag
-(RUN-integ.md 12.3's puzzle). Hypothesis, from reading prismyra/engine.py:673-679 and
-prismyra/onepass.py:350 (`record_all`): `Prismyra.__init__` calls `onepass.record_all(...)` -- which
-does real `torch.cuda.graph` capture, baking in whichever matmul kernels are dispatched *at that exact
-moment* -- strictly *after* the `interleaved_fork`-triggered `_enable_batch_invariance()` call
-(engine.py:647-650). So an engine built with interleaved_fork=True captures its one-pass graphs under
-vLLM's batch-invariant Triton kernel; the default engine captures them under the plain/default kernel.
-Later `ask()` calls for n=1 just *replay* whichever graph was captured, which is why the result depends
-on construction flags despite `_ask_in_one_pass` having no branch on them.
+"""Pins down WHERE in construction the interleaved_fork=True / wide_group=True config changes the
+n=1 (_ask_in_one_pass) answer, given that _ask_in_one_pass itself never branches on either flag.
+Hypothesis, from reading prismyra/engine.py:673-679 and prismyra/onepass.py:350 (`record_all`):
+`Prismyra.__init__` calls `onepass.record_all(...)` -- which does real `torch.cuda.graph` capture,
+baking in whichever matmul kernels are dispatched *at that exact moment* -- strictly *after* the
+`interleaved_fork`-triggered `_enable_batch_invariance()` call (engine.py:647-650). So an engine built
+with interleaved_fork=True captures its one-pass graphs under vLLM's batch-invariant Triton kernel; the
+default engine captures them under the plain/default kernel. Later `ask()` calls for n=1 just *replay*
+whichever graph was captured, which is why the result depends on construction flags despite
+`_ask_in_one_pass` having no branch on them.
 
 This script verifies that *re-recording* the one-pass graphs under a different batch-invariance state,
 on the SAME engine / SAME weights (no second model load -- avoids OOM on a single 46GB card), changes
-the n=1 replay by the same order of magnitude integ measured (RUN-integ.md 12.3: up to 0.208 on L40S),
-and that toggling back round-trips to the original value exactly.
+the n=1 replay by the same order of magnitude previously measured (up to 0.208 on L40S), and that
+toggling back round-trips to the original value exactly.
 """
 import os
 import sys
@@ -40,7 +40,7 @@ def build_context(pad_to_tokens, tokenizer):
 
 
 def ask_q1(engine, context, qid="q0"):
-    qs = [Boolean(id=qid, prompt="条項は返金を認めているか。")]
+    qs = [Boolean(id=qid, prompt="Does the clause permit a refund?")]
     result = engine.ask(context, qs)
     return result.answers[qid].probabilities
 

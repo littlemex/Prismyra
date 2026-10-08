@@ -67,16 +67,16 @@ SHELF_MEMORY_MARGIN = 2 * 1024**3
 #: The same question `MAX_KEPT_RECORDINGS` asks for recordings, asked here for shelf residents: the margin above
 #: only ever fires when *admitting a new document* finds the device short, which never happens while the token
 #: budget and the memory margin both still have room to spare -- a shelf can and does sit on dozens of short
-#: residents without ever being asked to drop one. Measured (THROUGHPUT.md 2026-10-05, the lane=2 go/no-go
-#: harness's own rate=10/n=80 burst, `mem_breakdown_candidates.py`/`diag_shelf_resident_cap.py`): with no cap,
+#: residents without ever being asked to drop one. Measured on a two-lane burst at rate=10/n=80: with no cap,
 #: resident count came out at 33-37 across repeated runs of the identical scenario (seeded, but real wall-clock
 #: Poisson arrivals make the exact eviction moment timing-sensitive) and *dominated* the free-memory variance --
 #: capping residents at 24/16/8 measured free-after-`empty_cache()` of 3.132/3.966/5.079 GiB against the no-cap
 #: run's 3.288 GiB, with no measured questions/second cost (34.7-35.3 q/s across all four, inside noise). The full
-#: multi-rate open-loop benchmark's own natural steady state (THROUGHPUT.md "常駐文書数は到着率ごとに1〜8") never
-#: approaches this cap, so it only ever fires on the kind of short, bursty accumulation the margin alone missed --
-#: the same shape of gap `MAX_KEPT_RECORDINGS` closed for recordings. 16, a 2x safety factor over that observed
-#: natural ceiling of 8, so it does not bind the ordinary case and only catches the transient this was added for.
+#: multi-rate open-loop benchmark's own natural steady state (resident document counts of roughly 1-8 depending
+#: on arrival rate) never approaches this cap, so it only ever fires on the kind of short, bursty accumulation
+#: the margin alone missed -- the same shape of gap `MAX_KEPT_RECORDINGS` closed for recordings. 16, a 2x safety
+#: factor over that observed natural ceiling of 8, so it does not bind the ordinary case and only catches the
+#: transient this was added for.
 SHELF_MAX_RESIDENTS = 16
 
 #: Same constant and same reasoning as `engine.RECLAIM_COOLDOWN_S` -- see there. Kept separate (not imported) so
@@ -176,19 +176,19 @@ class Batcher:
         lane_room: int | None = None,
         _lane_id: int = 0,
     ):
-        """`lanes>1` (THROUGHPUT.md 2026-10-05, "本当に効く経路"): the single-worker-thread bottleneck a rate=10
-        open-loop run exposed is not a tuning question, it is that one `Worker` thread runs one pass fully before
-        starting the next. `lanes` builds that many fully independent (`Shelf`/`Pool`/`Worker`) stacks under one
-        router, so two passes can be in flight on the device at once -- each lane is otherwise identical to the
-        `lanes=1` object this already was, which is what keeps this safe to add: a lane's `Shelf` is never shared
-        with another lane's, so the only new sharing between lanes is the model's weights (read-only) and, for the
-        engine's own forking machinery, a lane-tagged `fork.OWNED` buffer (`Prismyra._owned`'s `lane` argument) --
-        see `prismyra.engine.Prismyra.open_shelf`'s docstring for why a lane's `Shelf` is its own `Pool`/cache and
+        """`lanes>1`: the single-worker-thread bottleneck a rate=10 open-loop run exposes is not a tuning
+        question, it is that one `Worker` thread runs one pass fully before starting the next. `lanes` builds
+        that many fully independent (`Shelf`/`Pool`/`Worker`) stacks under one router, so two passes can be in
+        flight on the device at once -- each lane is otherwise identical to the `lanes=1` object this already
+        was, which is what keeps this safe to add: a lane's `Shelf` is never shared with another lane's, so the
+        only new sharing between lanes is the model's weights (read-only) and, for the engine's own forking
+        machinery, a lane-tagged `fork.OWNED` buffer (`Prismyra._owned`'s `lane` argument) -- see
+        `prismyra.engine.Prismyra.open_shelf`'s docstring for why a lane's `Shelf` is its own `Pool`/cache and
         not a bigger one shared out.
 
         `lane_room` is the token budget each lane's own shelf is opened with (default's reasoning: `open_shelf`'s
         own default, sized for being the *only* shelf, double-costs when there are two -- measured infeasible for
-        the full-size default, see `diag_two_shelves_memory.py`). A document is routed to a lane by a hash of its
+        the full-size default). A document is routed to a lane by a hash of its
         digest, so repeat questions about the same document always land on the same lane and keep the shelf-hit
         benefit `Batcher` exists for.
 
@@ -218,7 +218,7 @@ class Batcher:
         self._lane_room = lane_room
         self.engine = engine
         self.limits = Limits.of(engine) if linger_ms is None else Limits.of(engine, linger_ms=linger_ms)
-        # fp8spd6 (round 8): `Limits.of`'s own `questions=engine.group` is what `submit` checks a single
+        # `Limits.of`'s own `questions=engine.group` is what `submit` checks a single
         # request against (`"one request carries N questions and a pass has M rows"`) -- unchanged, that
         # refuses a 33-64-question request outright on an engine built with `wide_group=True`, before
         # `_shelf_ask_interleaved`'s own widen decision ever runs. Raised to `WIDE_GROUP` here, the one place
@@ -255,31 +255,30 @@ class Batcher:
         #: Monotonic deadline before `_make_room` tries `empty_cache()` again, once an attempt has already left
         #: free memory at or below `SHELF_MEMORY_MARGIN`. See `RECLAIM_COOLDOWN_S`.
         self._reclaim_cooldown_until = 0.0
-        #: fp8spd (S5 / SYNTHESIS.md): measurement only, see `engine.Prismyra._empty_cache_calls`.
-        #: fp8spd3 (round 5): how many passes took the fused single-fresh-document path, out of how many passes
+        #: Measurement only, see `engine.Prismyra._empty_cache_calls`.
+        #: How many passes took the fused single-fresh-document path, out of how many passes
         #: total -- so a q/s measurement that shows little effect can be told apart from one where the path
-        #: rarely engages at all. See `RUN-fp8spd.md` round 5.
+        #: rarely engages at all.
         self._fused_single_passes = 0
-        #: fp8spd6 (round 7): how many passes took the generalised fused path -- every document in the pass
-        #: fresh, two or more of them -- out of the same `_total_passes` denominator above. See
-        #: `RUN-fp8spd.md` round 7, "本題": this is what raises the single-document path's own 10.4% fusion
-        #: rate under congestion, where a pass's companions are themselves almost always fresh documents too.
+        #: How many passes took the generalised fused path -- every document in the pass
+        #: fresh, two or more of them -- out of the same `_total_passes` denominator above. This is what raises
+        #: the single-document path's own 10.4% fusion rate under congestion, where a pass's companions are
+        #: themselves almost always fresh documents too.
         self._fused_many_passes = 0
-        #: fp8spd6 (round 8): why a pass of two or more documents did *not* take the fused-many path above,
-        #: counted on real hardware rather than guessed at (RUN-fp8spd.md round 8). `not_all_fresh` is a pass
+        #: Why a pass of two or more documents did *not* take the fused-many path above,
+        #: counted on real hardware rather than guessed at. `not_all_fresh` is a pass
         #: naming a resident document or two jobs for the same still-fresh document (`len(fresh) !=
         #: len(formed.jobs)`); `capacity` is every document fresh but their independently-rounded row counts
         #: summing past `self.engine.group` in one fused call. At rate=40, capacity was 40 of 48 passes against
-        #: 1 for not-all-fresh -- overwhelmingly the majority cause, which is why round 8's own two attempts to
-        #: fix it (making `form()` admit by padded count, and splitting a pass into several smaller fused
-        #: calls that each fit) both targeted it. Both measured *worse* net throughput than leaving this gate
-        #: as it is (RUN-fp8spd.md round 8's own economic finding: a `form()`-assembled pass's two-step
-        #: baseline is always exactly 2 passes -- one combined read, one combined branch -- however many
-        #: documents it carries; splitting a fused pass into `B` smaller fused calls instead costs `B`
-        #: separate reads, which no longer amortise across all of a pass's documents the way one `put_many`
-        #: call does, so `B >= 2` is a loss `B == 1`'s own saving cannot make up). Kept as a counter, not
-        #: turned into a fix, for that reason -- it still answers "how often would raising the cap matter"
-        #: for whoever revisits this with a different fused-call design.
+        #: 1 for not-all-fresh -- overwhelmingly the majority cause. Two alternative fixes (making `form()`
+        #: admit by padded count, and splitting a pass into several smaller fused calls that each fit) both
+        #: targeted it and both measured *worse* net throughput than leaving this gate as it is: a
+        #: `form()`-assembled pass's two-step baseline is always exactly 2 passes -- one combined read, one
+        #: combined branch -- however many documents it carries; splitting a fused pass into `B` smaller fused
+        #: calls instead costs `B` separate reads, which no longer amortise across all of a pass's documents
+        #: the way one `put_many` call does, so `B >= 2` is a loss `B == 1`'s own saving cannot make up. Kept
+        #: as a counter, not turned into a fix, for that reason -- it still answers "how often would raising
+        #: the cap matter" for whoever revisits this with a different fused-call design.
         self._blocked_not_all_fresh = 0
         self._blocked_capacity = 0
         self._total_passes = 0
@@ -358,7 +357,7 @@ class Batcher:
         That bound is a ceiling, not a bet, and the bet is what `backlogged` adds. `first` was already taken off the
         queue before this runs, so `self._worker.depth` here is the number of *other* jobs already waiting at this
         instant -- not a guess, a fact observed one line ago. Zero of them is not weak evidence that a companion is
-        imminent; over an open-loop run against real documents (`THROUGHPUT.md`, "到着率10の負けの切り分け"), lingering
+        imminent; over an open-loop run against real documents, lingering
         on that non-evidence raised the median end-to-end latency at a sparse arrival rate (10 documents/s) from
         386.8ms to 436.9ms and dropped the deadline-hit rate from 0.875 to 0.713 -- waiting for a companion that
         usually was not coming, at everyone's expense once in a while when the wait ran long. One or more already
@@ -428,12 +427,12 @@ class Batcher:
             if job.payload.digest not in self._resident:
                 fresh.setdefault(job.payload.digest, job)
 
-        # fp8spd3 (round 5): the common low-concurrency case -- a formed pass naming exactly one document, and
+        # The common low-concurrency case -- a formed pass naming exactly one document, and
         # that document fresh -- can skip `Shelf.put_many` and the later `Shelf.ask` entirely: one layer-
         # interleaved pass over `interleave.read_and_branch_shelf` does the read and this one request's own
         # (single, by `Limits.questions`) branch group together. A pass naming more than one document, or a
         # document already resident, still goes through the two-step path below unchanged. See
-        # `Prismyra._shelf_ask_interleaved` and RUN-fp8spd.md round 5 for the gate this went through.
+        # `Prismyra._shelf_ask_interleaved` for the gate this goes through.
         self._total_passes += 1
         if self.engine.interleaved_fork and len(fresh) == 1 and len(formed.jobs) == 1:
             self._fused_single_passes += 1
@@ -449,30 +448,31 @@ class Batcher:
             self.reads.append(1)
             return [result]
 
-        # fp8spd6 (round 7): the generalised case -- every document this pass names is fresh, two or more of
+        # The generalised case -- every document this pass names is fresh, two or more of
         # them, none already resident -- fuses the same way, through `interleave.read_and_branch_shelf_many`
         # instead of one document at a time. `len(fresh) == len(formed.jobs)` is what the single-document
         # branch above's own `len(fresh) == 1 and len(formed.jobs) == 1` generalises to: `fresh` already
         # de-duplicates by digest, so this many fresh digests for this many jobs means no two jobs name the
         # same document and none is resident -- a pass naming a resident document, or two jobs for the same
-        # still-fresh document, falls through to the two-step path below unchanged, same as before. See
-        # `RUN-fp8spd.md` round 7, "本題", for why this -- not loosening the single-document condition's own
-        # exact-match -- is what the round-6 10.4%-fusion-rate finding under congestion needed.
+        # still-fresh document, falls through to the two-step path below unchanged, same as before. This
+        # generalisation, not a loosened exact-match on the single-document condition, is what raises the
+        # single-document path's own 10.4% fusion rate under congestion, where a pass's companions are
+        # themselves almost always fresh documents too.
         #
         # `padded_total <= self.engine.group`, checked **before** taking this path: `form()`'s own admission
         # (`Formed.questions`) bounds the *raw* question count a pass carries to `self.limits.questions`, not
         # the *padded* one -- and `interleave.read_and_branch_shelf_many` rounds each document's own branch
         # rows independently (this function's own docstring says why: rounding the combined total once, the
-        # way the non-interleaved `_branch_across` does, is the exact design RUN-inv.md round 3 traced a
-        # cross-document residual to). Independent rounding means the *sum* of several documents' own rounded
+        # way the non-interleaved `_branch_across` does, creates exactly the cross-document residual this
+        # avoids). Independent rounding means the *sum* of several documents' own rounded
         # counts is no longer bounded by `cap` the way one document's own `_round_rows(count, cap) <= cap`
-        # always is -- found on real hardware (RUN-fp8spd.md round 7): three fresh documents in one pass with
+        # always is -- on real hardware, three fresh documents in one pass with
         # a combined raw count of 32 rounded, independently, to a combined 44 and crashed the pool
         # ("44 rows asked for and this pool holds 32") rather than disagreeing on an answer. A pass whose
         # padded total does not fit falls through to the two-step path below, unchanged -- not a smaller
-        # version of this one, the same safe path every pass took before this round.
+        # version of this one, the same safe path every pass always took.
         #
-        # fp8spd6 (round 8): `cap` is `WIDE_GROUP` rather than `self.engine.group` when `self.engine.wide_group`
+        # `cap` is `WIDE_GROUP` rather than `self.engine.group` when `self.engine.wide_group`
         # -- the shelf's own paged pool was opened with that much room (`_on_shelf`) precisely so a bin
         # containing a 33-64-question document can actually use it. For every document asking `self.group` or
         # fewer questions this changes nothing (`_round_rows(n, cap)` only differs once `n` would round past
@@ -503,7 +503,7 @@ class Batcher:
             self.reads.append(len(jobs))
             return results
 
-        # fp8spd6 (round 8): counted, not just reasoned about -- a pass of exactly one document that reaches
+        # Counted, not just reasoned about -- a pass of exactly one document that reaches
         # here is the single document being resident already (nothing to fuse, not a miss), so only passes of
         # two or more are attributed to one of the two causes the fused-many path's own condition can fail on.
         if self.engine.interleaved_fork and len(formed.jobs) >= 2:
@@ -537,7 +537,7 @@ class Batcher:
     def _on_shelf(self):
         """The shelf, opened on the first pass rather than at construction, because opening it allocates.
 
-        `group=WIDE_GROUP` (fp8spd6, round 8) when `self.engine.wide_group`: the shelf's own paged pool is
+        `group=WIDE_GROUP` when `self.engine.wide_group`: the shelf's own paged pool is
         sized once, here, not per call -- see `Prismyra.open_shelf`'s own docstring for why a document later
         asked up to `WIDE_GROUP` questions needs that room to already exist.
         """
@@ -584,39 +584,36 @@ class Batcher:
             if self.engine.torch_device.type == "cuda":
                 free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
                 fits_memory = free - incoming_snapshot > SHELF_MEMORY_MARGIN
-                # 2026-10-05 (THROUGHPUT.md item 2, same measurement and reasoning as
-                # `engine._run_recorded`'s GRAPH_MEMORY_MARGIN check): a `mem_get_info` free number below the
-                # margin is often PyTorch's caching allocator holding cached-but-unallocated blocks, not memory
-                # any resident document actually needs -- `empty_cache()` reclaimed 7.6 of a measured 7.9 GiB gap
-                # in one call. Tried once per `_make_room` call (not once per loop iteration: a resident document
-                # evicted a moment ago may have made room on its own, which this re-checks first) before this
-                # loop evicts a document that fits-memory alone would not have required dropping.
-                # 2026-10-05 (coordinator's item 2 follow-up): across *calls*, not just within one -- the reclaim
-                # itself costs 2-4% of questions/second under load (THROUGHPUT.md, isolated from the dispatcher-
-                # narrowing change by comparing both independently). `RECLAIM_COOLDOWN_S` skips the call while a
-                # previous attempt from a recent pass is still within its cooldown; `fits_memory` stays `False` on
-                # the stale number either way, so skipping the call never admits past a margin that is still tight.
+                # Same measurement and reasoning as `engine._run_recorded`'s GRAPH_MEMORY_MARGIN check: a
+                # `mem_get_info` free number below the margin is often PyTorch's caching allocator holding
+                # cached-but-unallocated blocks, not memory any resident document actually needs --
+                # `empty_cache()` reclaimed 7.6 of a measured 7.9 GiB gap in one call. Tried once per
+                # `_make_room` call (not once per loop iteration: a resident document evicted a moment ago may
+                # have made room on its own, which this re-checks first) before this loop evicts a document
+                # that fits-memory alone would not have required dropping.
+                # Across *calls*, not just within one -- the reclaim itself costs 2-4% of questions/second
+                # under load (isolated from the dispatcher-narrowing change by comparing both independently).
+                # `RECLAIM_COOLDOWN_S` skips the call while a previous attempt from a recent pass is still
+                # within its cooldown; `fits_memory` stays `False` on the stale number either way, so skipping
+                # the call never admits past a margin that is still tight.
                 now = time.perf_counter()
                 if not fits_memory and not tried_reclaim and now >= self._reclaim_cooldown_until:
                     tried_reclaim = True
-                    # fp8spd4 (correcting fp8spd3's S5 / SYNTHESIS.md): the previous version of this check
-                    # *predicted* that `empty_cache()` would raise `mem_get_info`'s free number by
-                    # `reserved - allocated` and set `fits_memory = True` on that prediction alone, without
-                    # calling `empty_cache()` or re-reading `mem_get_info` to confirm it. integ's bisection
-                    # (RUN-integ.md 2.5) found this broke `test_a_shelf_evicts_on_memory_pressure_even_with_
-                    # tokens_to_spare`: that test monkeypatches `mem_get_info` to report a free number pinned
-                    # below the margin regardless of what this process's allocator does, which is exactly the
-                    # case the module docstring's own history (`SHELF_MAX_RESIDENTS`'s "97 documents... exhausted
-                    # a 44 GiB card") this check exists to catch -- an externally (OS/driver) reported shortage
-                    # that this process's own `reserved - allocated` slack does not explain and could not fix.
+                    # An earlier version of this check *predicted* that `empty_cache()` would raise
+                    # `mem_get_info`'s free number by `reserved - allocated` and set `fits_memory = True` on
+                    # that prediction alone, without calling `empty_cache()` or re-reading `mem_get_info` to
+                    # confirm it. That broke `test_a_shelf_evicts_on_memory_pressure_even_with_tokens_to_spare`:
+                    # that test monkeypatches `mem_get_info` to report a free number pinned below the margin
+                    # regardless of what this process's allocator does, which is exactly the case the module
+                    # docstring's own history (`SHELF_MAX_RESIDENTS`'s "97 documents... exhausted a 44 GiB
+                    # card") this check exists to catch -- an externally (OS/driver) reported shortage that
+                    # this process's own `reserved - allocated` slack does not explain and could not fix.
                     # The fix keeps the one case the prediction is *never* wrong about -- `cached_slack == 0`,
                     # nothing cached-but-unused to give back, so the call could not possibly help and skipping
                     # it is a true no-op -- and calls `empty_cache()` and re-reads the real `mem_get_info` for
-                    # every other case, the same as before S5 existed. DOSSIER.md's own recorded decision
-                    # ("`empty_cache()`の呼び出しはmargin checkの正しさに必要で、そのコストは意図して受け入れた")
-                    # is what this restores; S5's round1/round5 own measurements never established the skip's
-                    # real-world savings against a baseline (RUN-fp8spd.md), so there is nothing demonstrated to
-                    # trade the correctness back for.
+                    # every other case. Calling `empty_cache()` is necessary for the margin check's own
+                    # correctness, and its cost is accepted deliberately: no measurement has established that
+                    # skipping it saves enough in practice to trade that correctness back for.
                     allocated = torch.cuda.memory_allocated(self.engine.torch_device)
                     reserved = torch.cuda.memory_reserved(self.engine.torch_device)
                     cached_slack = max(0, reserved - allocated)

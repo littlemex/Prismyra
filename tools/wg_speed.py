@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""wg: alternating speed measurement for wide_group (two_pass vs widened-to-WIDE_GROUP), on the
-current integ/v0.4.0 branch where 33-64 questions are confirmed torch.equal (RUN-wg.md section 3).
-Interleaves wide_group on/off every round, round-robin across the given question counts, same
-engine/same weight load, so the comparison is never confounded by a second construction (recon's
-own finding about why "two separately-constructed engines" measurements disagreed, RUN-recon.md
-section 3.3).
+"""Alternating speed measurement for wide_group (two_pass vs widened-to-WIDE_GROUP), on the v0.4.0
+branch where 33-64 questions are confirmed torch.equal. Interleaves wide_group on/off every round,
+round-robin across the given question counts, same engine/same weight load, so the comparison is
+never confounded by a second construction -- two separately-constructed engines give measurements
+that disagree with each other for reasons unrelated to wide_group itself.
 """
 import os
 import statistics

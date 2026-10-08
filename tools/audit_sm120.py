@@ -1,8 +1,8 @@
-"""inv task item 1: SYNTHESIS Section 0's unmeasured claim -- does nvfp4-36l's companion-invariance guarantee hold
-on the RTX PRO 4500 (sm_120, Blackwell)? Dossier 0-2/0-3 say the dispatcher registration that makes the FP8/L40S
-checkpoint invariant is skipped on sm_120 (`is_device_capability_family(80)` in `engine._enable_batch_invariance`)
-and nothing has replaced it there; 0-4 adds the NVFP4 MoE kernel's own per-M tactic bucketing as a second, separate
-candidate cause. This script is the first real measurement of either on this card.
+"""Does nvfp4-36l's companion-invariance guarantee hold on the RTX PRO 4500 (sm_120, Blackwell)? This script is the
+real measurement, meant to be run against two engine states: before `engine._enable_batch_invariance` extended its
+dispatcher registration past the SM80 family (`is_device_capability_family(80)` used to gate it to that one family
+alone, leaving sm_120 with nothing in its place) and after. The NVFP4 MoE kernel's own per-M tactic bucketing is a
+second, separate candidate cause, measured by the same comparison.
 
 Ground truth: `engine.ask(context, questions)` alone, once per document (never shares a pass with anything else).
 Compared against: `open_batch` with companion counts in {1, 2, 3, 8} documents and question counts in
@@ -11,8 +11,9 @@ full probability tensor per question, not just the argmax decision -- the standi
 merely same-answer.
 
 Usage: PRISMYRA_MODE={raw,fix} python3 audit_sm120.py
-  raw -- shipped v0.3.1 code, unmodified (what ships today).
-  fix -- this branch's sm_120 fix applied (see engine.py/nvfp4.py diffs); only meaningful once that code exists.
+  raw -- the engine state before `_enable_batch_invariance` covered sm_120; only meaningful checked out against that
+  code.
+  fix -- the engine state after, which is what every release ships today.
 """
 
 import json
@@ -83,10 +84,10 @@ total_exact = 0
 skipped_capacity = []
 for group_size in GROUP_SIZES:
     # `_answer_batch` refuses a batch whose *padded* question count across every document in the pass exceeds
-    # `self.group` (64 here) -- a real constraint, not a test artefact, and since round 3 (per-document padding,
-    # not combined-total padding) it is computed per document and summed, which rejects a few combinations the
-    # combined-total version used to accept (predicted here with the same `_round_rows`, not discovered by
-    # exception, so a genuine regression in the admission check itself still shows up as an unexpected raise below).
+    # `self.group` (64 here) -- a real constraint, not a test artefact. Padding is computed per document and
+    # summed (not from a combined-total padding), which rejects a few combinations a combined-total version
+    # would accept (predicted here with the same `_round_rows`, not discovered by exception, so a genuine
+    # regression in the admission check itself still shows up as an unexpected raise below).
     qcounts_here = [n for n in QCOUNTS if group_size * _round_rows(n, engine.group) <= engine.group]
     for qn in qcounts_here:
         for start in range(0, len(items) - group_size + 1, group_size):

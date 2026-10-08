@@ -61,7 +61,7 @@ class Prefill:
     snapshot: dict | None = field(default=None, repr=False)
     #: The branch-row capacity this document's own fork buffers were allocated at. `None` means "whatever the
     #: engine's own `self.group` was when this was read" -- the historical, single behaviour every call site before
-    #: this field existed. Set explicitly (fp8spd, S4a / SYNTHESIS.md) when a document is read for a request already
+    #: this field existed. Set explicitly when a document is read for a request already
     #: known to need more than one `group`-worth of rows, so its *own* fork buffers are sized for that from the read
     #: onward instead of being capped at the engine's construction-time default and silently truncating a wider
     #: branch pass. Per-document (the buffers it names live on this document's own cache's layers, see `_owned`), so
@@ -72,7 +72,7 @@ class Prefill:
 def snapshot_layer(layer) -> dict:
     """One layer's own slice of `snapshot()` -- what that function would put at this layer's index.
 
-    Factored out for S4c (layer-interleaved fork, RUN-fp8spd.md): the interleaved path takes this snapshot one
+    Factored out for the layer-interleaved fork: the interleaved path takes this snapshot one
     layer at a time, immediately after that layer's own context forward and before that layer's branch forward
     runs -- rather than waiting for the whole 36-layer stack to finish, which is what `snapshot()` requires and
     is exactly the extra pass this path exists to remove. Calling this once per layer as the interleaved loop
@@ -106,7 +106,7 @@ def snapshot(cache) -> dict:
 @contextmanager
 def widen_for_branch(layer, rows: int, width: int, lane: int = 0):
     """Give one recurrent layer's just-written context state to `rows` branch rows, for exactly the call this
-    wraps -- S4c (layer-interleaved fork, RUN-fp8spd.md). The per-layer analogue of `restore_and_fork`'s own
+    wraps -- the layer-interleaved fork. The per-layer analogue of `restore_and_fork`'s own
     widening, with one difference: there is no snapshot here. What is widened is whatever this layer holds
     *right now* -- called immediately after this layer's own context forward and before this layer's branch
     forward, that is this context forward's own final recurrent and convolution state, not a clone taken
@@ -149,8 +149,8 @@ def widen_for_branch(layer, rows: int, width: int, lane: int = 0):
 
 @contextmanager
 def widen_for_branch_many(layer, parts: list[tuple[int, int]], lane: int = 0):
-    """`widen_for_branch`'s own job for several documents' context rows at once (S4c, multi-document fusion,
-    RUN-fp8spd.md round7 "本題"): the layer holds `N` real documents' just-written context state (one row each,
+    """`widen_for_branch`'s own job for several documents' context rows at once, for multi-document fusion:
+    the layer holds `N` real documents' just-written context state (one row each,
     in row order) rather than one, and each document `d` gets its own `rows` branch rows, broadcast from its own
     row and nobody else's.
 
@@ -251,8 +251,8 @@ def _owned(layer, attr: str, key, like: torch.Tensor, width: int, rows: int, lan
     `like` is the snapshot's one-row tensor, which gives the shape of everything but the batch. Allocated on first use
     and never again: a caller may hold the view, and a recorded pass holds the address.
 
-    `lane` names a second (or further) independent store on the same layer object, for lane=2 concurrency
-    (THROUGHPUT.md 2026-10-05): two passes racing to fork the *same* layer's `OWNED` buffer is exactly the hazard
+    `lane` names a second (or further) independent store on the same layer object, for lane=2 concurrency:
+    two passes racing to fork the *same* layer's `OWNED` buffer is exactly the hazard
     `self._lock` existed to prevent, and two lanes sharing one buffer would still have it even if everything else
     about them is kept apart. `lane=0` keeps today's attribute name (`OWNED`) so every existing caller and
     recording is unaffected; `lane>0` costs a second full-width buffer (~1 GiB, measured) rather than sharing one.

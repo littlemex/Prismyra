@@ -134,17 +134,17 @@ class FusedExpertsFp4(nn.Module):
 
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
-        # 2026-10-07 (fp4spd + inv, merged by integ): this used to be `logits, _, _ = self.gate(x)` -- calling the
+        # This used to be `logits, _, _ = self.gate(x)` -- calling the
         # router module's own `forward` whole, which is `F.linear(hidden_states, self.weight)` followed by a
         # softmax/top-k this function immediately recomputes with `fused_topk` and discards (the identical "called
         # it twice, threw one away" pattern `kernels.qwen3_moe.FusedExperts._route`, the FP8 path's router, already
-        # comments on; measured by fp4spd: 36 calls, ~4.13ms on a 36-layer read, one per layer). fp4spd's original
-        # fix (a `_route` helper calling plain `torch.nn.functional.linear`) only removed the duplicate call; inv
-        # found, separately, that this path never went through the row-count-invariant kernel the FP8 path's
-        # `_route` already uses (`diag_nvfp4_gate_type.py`, after `audit_sm120.py` measured a 5.9% non-bit-exact
-        # residual the Blackwell cuBLAS-workspace fix alone did not close). inv's version is a strict superset of
-        # fp4spd's (same duplicate-call removal, plus row-count invariance), so it is the one kept here; the
-        # standalone `_route` method fp4spd added is dropped as dead code.
+        # comments on; measured: 36 calls, ~4.13ms on a 36-layer read, one per layer). An earlier
+        # fix (a `_route` helper calling plain `torch.nn.functional.linear`) only removed the duplicate call; this
+        # path separately never went through the row-count-invariant kernel the FP8 path's
+        # `_route` already uses (`audit_sm120.py` measured a 5.9% non-bit-exact
+        # residual the Blackwell cuBLAS-workspace fix alone did not close). The current version is a strict
+        # superset of that earlier fix (same duplicate-call removal, plus row-count invariance), so it is the
+        # one kept here; the standalone `_route` method the earlier fix added is dropped as dead code.
         linear = _ROUTER_LINEAR or torch.nn.functional.linear
         logits = linear(x, self.gate.weight)
         weights, ids = fused_topk(x, logits, self.top_k, renormalize=True)[:2]
@@ -159,7 +159,7 @@ class FusedExpertsFp4(nn.Module):
         """One scratch buffer per calling thread for every MoE layer (they share shapes), grown to the largest
         token count that thread has seen, instead of the kernel allocating and freeing its scratch on each call.
 
-        inv5 (round 8): keyed by `threading.get_ident()` as well as device and `fused_finalize`, not just the
+        Keyed by `threading.get_ident()` as well as device and `fused_finalize`, not just the
         latter two. `Batcher(lanes=N)` runs `N` fully independent worker threads, each driving its own CUDA
         stream, and every one of the 36 MoE layers shared this one class-level buffer across all of them -- two
         lanes could genuinely call this at the same instant (`test_lanes_two_decisions_under_a_burst_do_not_
@@ -167,7 +167,7 @@ class FusedExpertsFp4(nn.Module):
         could see a cache miss, both allocate their own buffer, and whichever one loses the race to the shared
         dict slot has its own buffer dropped out from under a CUDA kernel that is still writing into it on its
         own stream -- a used-after-dropped scratch buffer, which reads as the illegal-memory-access crash and
-        the NaN probabilities this round was asked to fix (RUN-fp8spd.md: FlashInfer's own autotuner warning
+        the NaN probabilities this fix addresses (FlashInfer's own autotuner warning
         for an unseen shape appears immediately before the NaN, which is the same first-use race one layer up).
         Even with the race on the dict closed, one physical buffer still cannot be *used* by two lanes at once
         -- the CUTLASS kernel treats it as private scratch for the one call it was handed to -- so the fix is
@@ -286,16 +286,16 @@ def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
     choice serves all of them; FlashInfer keeps the choice for the rest of the process. Inputs are random: the timing
     depends on the shapes and the routing spread, not on the values.
 
-    2026-10-07 (inv, SYNTHESIS 0-4/S2): one bucket, not the powers-of-two ladder this used to profile. The previous
+    One bucket, not the powers-of-two ladder this used to profile. The previous
     version picked a *different* tactic per power-of-two bucket (`round_up=False`, so a size between two buckets ran
     the lower one's choice) -- which is exactly the row-count-dependent-algorithm shape of bug this project calls the
     companion effect everywhere else: two passes carrying the identical real row at a different *total* M could cross
     a bucket boundary (e.g. 32 companion questions -> 33) and get a different tactic, hence a different GEMM
     reduction order, hence a non-bit-identical answer for that unchanged row. This was never caught because no
-    device test exercises an NVFP4 pass across a bucket boundary (`audit_sm120.py`, this branch, is the first to).
+    device test exercises an NVFP4 pass across a bucket boundary before `audit_sm120.py`.
     One bucket at `max_tokens` with `round_up=True` makes every real M (small questions-only pass or a full
     `open_batch`) map to the *same* profiled tactic, by construction -- determinism first, matching this project's
-    standing rule; the speed cost of using the large-M tactic at small M is measured in RUN-inv.md rather than assumed.
+    standing rule; the speed cost of using the large-M tactic at small M is measured directly rather than assumed.
 
     The choice is made by timing, so two processes can pick differently if FlashInfer finds two tactics near-equal at
     this one bucket; `PRISMYRA_NVFP4_TACTICS` names a JSON file: loaded if it exists, written if not, so every

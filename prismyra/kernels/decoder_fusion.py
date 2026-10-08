@@ -16,8 +16,8 @@ each time, fusing every add this model does with the norm that reads its result:
 norm with the attention output's add, its *next* layer's pre-attention norm with the MLP output's add, and the
 model's own final norm with the last layer's MLP output's add. Deliberately not counted as a `Swap` the way other
 replacements are: there is no module to compare a count against (`forward` is overridden, not swapped for another
-module), so correctness here rests entirely on the end-to-end probability check in `tests/test_gpu.py` and in
-`RUN-fp4spd.md`, not on a swap count.
+module), so correctness here rests entirely on the end-to-end probability check in `tests/test_gpu.py`,
+not on a swap count.
 
 Must run after `kernels.qwen3_moe`'s own norm replacement (`_swap_and_verify(..., "norm", "Qwen3_5MoeRMSNorm", ...)`):
 this reuses that pass's already-verified `FastRMSNorm` instances (and the `weight+1` vs `weight` choice it measured)

@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""fp8spd4: does the long-context regression found at 64Q (group=64 WIDE_GROUP widening) also happen at 16Q
+"""Does the long-context regression found at 64Q (group=64 WIDE_GROUP widening) also happen at 16Q
 (the ordinary, non-widened interleaved_fork path, group stays at the engine's default 32)? If yes, the
 context-length threshold belongs on `ask()`'s general `self.interleaved_fork` branch, not just the
 `len(questions) == WIDE_GROUP` special case. If no, it is specific to widening the GDN state buffers to 64
-rows (round5's own hypothesis) and the threshold only needs to guard that one branch.
+rows and the threshold only needs to guard that one branch.
 
 Usage: python3 s4c_16q_length_check.py
 """
 import json
+import os
 import statistics
 import sys
 import time
 
-sys.path.insert(0, "/work/fp8spd/fp8spd4-src")
+sys.path.insert(0, os.environ.get("PRISMYRA_SRC", "."))
 import torch
 from prismyra import Prismyra, Boolean
 
-MODEL = "littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l"
+MODEL = os.environ.get("PRISMYRA_MODEL", "littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l")
 CONFIGS = ("two_pass", "interleaved")
 LENGTHS = [5016, 9044, 20064]
 ROUNDS = 9
@@ -78,7 +79,7 @@ def main():
         all_reports[str(ntok)] = report
 
     print(json.dumps(all_reports, indent=2))
-    with open("/work/fp8spd/runs/fp8spd4_16q_length_check.json", "w") as f:
+    with open(os.environ.get("S4C_16Q_OUT", "/tmp/s4c_16q_length_check.json"), "w") as f:
         json.dump(all_reports, f, indent=2)
 
 

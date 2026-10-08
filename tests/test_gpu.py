@@ -98,55 +98,55 @@ def questions(n: int) -> list[Boolean]:
 #: much tighter bounds (`COMPANION_MOVEMENT_PAGED_ROWS`, `COMPANION_MOVEMENT_ROW_COUNT`) instead of this one.
 COMPANION_MOVEMENT = 0.3
 
-#: 2026-10-07 (inv, round 3). How far a probability may move on a *paged* engine (the one `_enable_batch_invariance`
+#: How far a probability may move on a *paged* engine (the one `_enable_batch_invariance`
 #: protects) between a question asked alone and the same question asked alongside a companion, once `_round_rows`
-#: pads each document to its own bucket independently (round 3's fix) rather than to the pair's combined total.
+#: pads each document to its own bucket independently rather than to the pair's combined total.
 #: Measured directly on this file's own fixtures, not assumed: `test_one_pass_answers_about_two_documents_...`
 #: and `test_a_document_on_a_shelf_answers_as_one_read_fresh` both moved by 0.023866 (the "replaced" question);
 #: `test_graphs_never_corrupt_a_batch_naming_more_than_one_document` moved by 0.023888 (the "faulty" question),
-#: both before and after round 3 (confirmed by re-running against origin/main unmodified and getting the identical
-#: bit pattern, RUN-inv.md round 2) -- evidence that this was not a `_round_rows` bucket-mismatch effect at all,
-#: since these three fixtures' two documents ask the *same* number of questions as each other.
+#: both before and after independent-bucket rounding was introduced (confirmed by re-running against the
+#: unmodified baseline and getting the identical bit pattern) -- evidence that this was not a `_round_rows`
+#: bucket-mismatch effect at all, since these three fixtures' two documents ask the *same* number of questions
+#: as each other.
 #:
-#: round 4 (RUN-inv.md round 4, `prismyra/engine.py`'s `paged` property fix) found and closed the actual cause:
-#: `_enable_batch_invariance()` was never being called at all for an engine built with `paged=True` and then
-#: flipped on after construction (`engine_paged`'s own fixture, and any other construct-then-flip caller) -- this
-#: file's `paged` engine ran with *no* batch-invariance protection the whole time the 0.023866/0.023888 numbers
-#: above were measured. With the registration actually active (inv4, round 5, re-measured directly on sm_120 after
-#: round 4's fix): `test_one_pass_answers_about_two_documents_...` and `test_a_document_on_a_shelf_answers_as_one_
-#: read_fresh` are now bit-exact (0.000000e+00). `<=`, not `<`, is deliberate so an exact 0.0 move still passes a
-#: 0.0 bound. L40S re-confirmation is pending (see RUN-inv.md round 5).
+#: The actual cause was that `_enable_batch_invariance()` was never being called at all for an engine built with
+#: `paged=True` and then flipped on after construction (`engine_paged`'s own fixture, and any other
+#: construct-then-flip caller) -- this file's `paged` engine ran with *no* batch-invariance protection the whole
+#: time the 0.023866/0.023888 numbers above were measured. With the registration actually active (re-measured
+#: directly on sm_120 after the `paged` property fix): `test_one_pass_answers_about_two_documents_...` and
+#: `test_a_document_on_a_shelf_answers_as_one_read_fresh` are now bit-exact (0.000000e+00). `<=`, not `<`, is
+#: deliberate so an exact 0.0 move still passes a 0.0 bound. L40S re-confirmation is pending.
 #:
-#: `test_graphs_never_corrupt_a_batch_naming_more_than_one_document` moved off this constant entirely (inv4, round
-#: 5) -- see `COMPANION_MOVEMENT_QN1_ATTENTION`, below, for why: it is not the same residual as the other two.
+#: `test_graphs_never_corrupt_a_batch_naming_more_than_one_document` moved off this constant entirely -- see
+#: `COMPANION_MOVEMENT_QN1_ATTENTION`, below, for why: it is not the same residual as the other two.
 COMPANION_MOVEMENT_PAGED_ROWS = 0.0
 
-#: 2026-10-07 (inv4, round 5). `test_graphs_never_corrupt_a_batch_naming_more_than_one_document` asks exactly *one*
+#: `test_graphs_never_corrupt_a_batch_naming_more_than_one_document` asks exactly *one*
 #: question per document (`about_returns`/`about_cards` are each a single `Boolean`) -- unlike its two siblings
-#: above, which ask two. A fresh re-measurement after round 4's `paged` property fix found this fixture is not
+#: above, which ask two. A re-measurement after the `paged` property fix found this fixture is not
 #: bit-exact: a probability moved by 0.000719 at the third repeat of the same two-document batch, under `<=
 #: COMPANION_MOVEMENT_PAGED_ROWS` (0.0) failing first at a much smaller 1.1859e-06 on an earlier repeat -- i.e. the
 #: gap kept growing across repeats rather than being one fixed value, which first looked like this test's own
 #: "homogeneous" graph-replay bug recurring. It is not: `audit_sm120.py`'s full companion matrix
-#: (`diag_qn1_residual_round5.py`'s own investigation, RUN-inv.md round 5 §10.1) already found and attributed a
-#: non-invariance residual to exactly this shape of input -- a single-question document read alongside companions
-#: -- down to the operation (`flash_attn_varlen_func`'s paged branch-read, a FlashAttention-2 split-KV heuristic
-#: that depends on how many other rows share the launch, and which this build's FA2 cannot be pinned away from:
-#: `num_splits=1` corrupts the paged branch-read outright, and FA2 rejects any `num_splits>1`). That audit's own
-#: group_size=2 subset (this fixture's own shape: exactly two documents, one question each) measured a maximum of
-#: 0.057285 across 24 real documents, with zero decision flips. This constant is half again over that number, not
-#: over the smaller value this fixture's own first few repeats happened to show -- the two measurements are the
-#: same underlying cause, and nothing says this fixture's own worst repeat is the global worst case.
+#: already found and attributed a non-invariance residual to exactly this shape of input -- a single-question
+#: document read alongside companions -- down to the operation (`flash_attn_varlen_func`'s paged branch-read, a
+#: FlashAttention-2 split-KV heuristic that depends on how many other rows share the launch, and which this
+#: build's FA2 cannot be pinned away from: `num_splits=1` corrupts the paged branch-read outright, and FA2
+#: rejects any `num_splits>1`). That audit's own group_size=2 subset (this fixture's own shape: exactly two
+#: documents, one question each) measured a maximum of 0.057285 across 24 real documents, with zero decision
+#: flips. This constant is half again over that number, not over the smaller value this fixture's own first few
+#: repeats happened to show -- the two measurements are the same underlying cause, and nothing says this
+#: fixture's own worst repeat is the global worst case.
 COMPANION_MOVEMENT_QN1_ATTENTION = 0.086
 
-#: 2026-10-07 (inv, round 3). The narrower residual left in `test_open_batch_matches_ask_bit_for_bit_whatever_the_
-#: companions_total_length` once round 3 removed the specific `_round_rows` bucket-mismatch component that test's
-#: own docstring used to attribute its whole 0.0128 bound to: measured there, directly, at 0.008346 (the "faulty"
-#: question, "no" option, short companion) after the fix -- down from 0.0128 before it, not to zero. This is
-#: `COMPANION_MOVEMENT_PAGED_ROWS`'s same underlying cause (the pass's total row count still changes between
-#: "alone" and "with a companion"), measured smaller here only because this test's specific questions and context
-#: happen to be less sensitive to it than `COMPANION_MOVEMENT_PAGED_ROWS`'s own fixtures, not because the cause
-#: is different. Set half again over 0.008346.
+#: The narrower residual left in `test_open_batch_matches_ask_bit_for_bit_whatever_the_
+#: companions_total_length` once independent-bucket rounding removed the specific `_round_rows` bucket-mismatch
+#: component that test's own docstring used to attribute its whole 0.0128 bound to: measured there, directly, at
+#: 0.008346 (the "faulty" question, "no" option, short companion) after the fix -- down from 0.0128 before it,
+#: not to zero. This is `COMPANION_MOVEMENT_PAGED_ROWS`'s same underlying cause (the pass's total row count still
+#: changes between "alone" and "with a companion"), measured smaller here only because this test's specific
+#: questions and context happen to be less sensitive to it than `COMPANION_MOVEMENT_PAGED_ROWS`'s own fixtures,
+#: not because the cause is different. Set half again over 0.008346.
 COMPANION_MOVEMENT_ROW_COUNT = 0.0125
 
 #: The smallest answer to "how many seconds" that still shows the clip's timing reached the model. Five, not six.
@@ -320,10 +320,9 @@ def test_the_counted_kernels_match_what_the_config_implies(engine):
     assert got == {k: v for k, v in want.items() if k in got}
 
     verified = {s.name for s in engine.applied.swaps if s.verified}
-    # 2026-10-07 (integ, merging fp4spd): fp4spd's dense-projection fusion (`_fuse_pair`,
-    # prismyra/kernels/qwen3_moe.py) is found and verified by structure, the same way `norm`/`dense_matmul`/
-    # `gated_norm` already are -- this set was not updated when that swap was added (reproduced on fp4spd's own
-    # branch standalone, before any merge, so it is that branch's own gap, not something the merge introduced).
+    # The dense-projection fusion (`_fuse_pair`, prismyra/kernels/qwen3_moe.py) is found and verified by
+    # structure, the same way `norm`/`dense_matmul`/`gated_norm` already are -- this set was not updated when
+    # that swap was added.
     assert verified == {"norm", "dense_matmul", "gated_norm", "dense_fusion"}, engine.applied.as_dict()
 
 
@@ -1019,37 +1018,37 @@ def test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length
     *context read*'s total row count, the same row-count-chosen-algorithm effect `onepass.py`'s islands already
     guard against during a *recording* but nothing guarded against during an ordinary read or branch pass.
 
-    Found decisively (`diag_layer0_op_divergence.py`): the same document, companioned by two documents of
+    Found decisively: the same document, companioned by two documents of
     completely different content but the identical total length, was bit-identical through every layer-0
     operation. Companioned instead by documents of *different* total length, the first and only divergent
     operation was the router's logits -- not the chunked recurrence, not the convolution, not either RMSNorm.
     `Prismyra._enable_batch_invariance` (vLLM's `enable_batch_invariant_mode` plus `VLLM_BATCH_INVARIANT=1` for
     `fused_moe.py`'s own row-count-keyed config, on by default for a paged engine on CUDA since this was found)
-    is the fix for that axis, and the full RACE validation set (80 documents, 11 batches,
-    `diag_openbatch_vs_ask.py`) now answers `open_batch` bit-identical to `ask()` -- zero mismatches, where there
-    were three before this and the context-length padding together.
+    is the fix for that axis, and the full RACE validation set (80 documents, 11 batches) now answers
+    `open_batch` bit-identical to `ask()` -- zero mismatches, where there were three before this and the
+    context-length padding together.
 
-    2026-10-07 (inv, round 3): the 0.0128 bound this test used to carry came from one specific cause -- the
-    pre-round-3 `_round_rows` rounded the *combined* total of target and companion rows together, so a
+    The 0.0128 bound this test used to carry came from one specific cause -- the
+    previous `_round_rows` rounded the *combined* total of target and companion rows together, so a
     two-question target and a one-question companion were forced onto the 4-row bucket even though the target
     alone only ever needed 2. `_branch_across` now pads each document to its own bucket *before* laying the
     padded blocks end to end (`_round_rows` applied per document, not to the sum), which removes that specific
     width-mismatch component -- measured here, on this test's own fixtures, as a reduction from 0.0128 to 0.0083
-    (short companion) rather than to zero. Round 3 narrowed the remainder to a second, separate cause but did
-    not close it: even with the width-mismatch gone, a document's own rows still sat in a pass whose *total* row
-    count differs between "alone" (2) and "with this companion" (3).
+    (short companion) rather than to zero. That change narrowed the remainder to a second, separate cause but
+    did not close it: even with the width-mismatch gone, a document's own rows still sat in a pass whose
+    *total* row count differs between "alone" (2) and "with this companion" (3).
 
-    2026-10-07 (inv2, round 4): that second cause was `engine.paged = True` (the only way this fixture turns
+    That second cause was `engine.paged = True` (the only way this fixture turns
     paging on) never having run `_enable_batch_invariance()` at all -- see `prismyra/engine.py`'s `paged`
     property for the full finding. Fixed, this test is bit-exact: `tools/measure_residual_after_fix.py`, this
     exact fixture, measured 0.0 for every option on both the short and the long companion, and reverting the
     property to a plain attribute on the same weights, same process, same run reproduced a non-zero residual
     again -- the before/after pair that makes the property fix the actual cause. `COMPANION_MOVEMENT_ROW_COUNT`
     is retired for this test in favour of exact equality; it stays defined, and the module docstring still
-    describes what it bounded, as a record of the two things that closed it (round 3's width fix, round 4's
-    `paged` property fix) and because `COMPANION_MOVEMENT_PAGED_ROWS`'s own three tests, a different set of
+    describes what it bounded, as a record of the two fixes that closed it (the width fix, the `paged` property
+    fix) and because `COMPANION_MOVEMENT_PAGED_ROWS`'s own three tests, a different set of
     fixtures sharing the same underlying cause, have not individually been re-measured at this bit-exact level
-    this round and still carry the measured, not-yet-zero, bound.
+    and still carry the measured, not-yet-zero, bound.
     """
     long_companion = SECOND_CONTEXT * 6  # several times CONTEXT's own length: the context-read axis this closes.
     asked = [
@@ -1073,7 +1072,7 @@ def test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length
         for q in asked:
             assert mixed[q.id].option == want[q.id].option, f"{label}: {q.id} changed its answer"
             for option, p in want[q.id].probabilities.items():
-                # Bit-exact since inv2, round 4 (see the docstring above): not pytest.approx(..., abs=...) any
+                # Bit-exact (see the docstring above): not pytest.approx(..., abs=...) any
                 # more, now that both causes of this test's old 0.0083 residual are closed.
                 assert mixed[q.id].probabilities[option] == p, (label, q.id, option)
 
@@ -1118,9 +1117,9 @@ def test_a_shelf_evicts_on_memory_pressure_even_with_tokens_to_spare(engine_page
 
 
 def test_shelf_resident_count_stays_at_the_cap_with_room_to_spare(engine_paged):
-    """`SHELF_MAX_RESIDENTS` (THROUGHPUT.md 2026-10-05, task item 1): the margin check above only ever fires when
+    """`SHELF_MAX_RESIDENTS`: the margin check above only ever fires when
     the device is already short, which never happens while many *short* documents are each well under the token
-    budget -- measured, the lane=2 go/no-go harness's own rate=10 burst piled up 33-37 residents with gigabytes of
+    budget -- measured, a two-lane rate=10 burst piled up 33-37 residents with gigabytes of
     free memory still unspent. Reproduced here with plenty of real free memory (no monkeypatch): more than the cap
     worth of distinct, short documents are shelved one at a time, and resident count must never exceed the cap even
     though neither the token budget nor the memory margin would ever have asked for an eviction on their own.
@@ -1145,10 +1144,10 @@ def test_shelf_resident_count_stays_at_the_cap_with_room_to_spare(engine_paged):
 
 
 def test_lanes_two_answers_match_ask_bit_for_bit_when_isolated(engine_paged):
-    """`Batcher(lanes=2)` (THROUGHPUT.md 2026-10-05, "本当に効く経路"): two lanes, each its own `Shelf`/`Pool`,
+    """`Batcher(lanes=2)`: two lanes, each its own `Shelf`/`Pool`,
     sharing only the model's weights (read-only) and a lane-tagged `fork.OWNED` scratch buffer (`fork._owned`'s
-    `lane` argument) and a thread-local `varlen._current` (fixed in this same session -- a plain module global
-    there raised "a batched read is already in progress" the first time two lanes' reads genuinely overlapped,
+    `lane` argument) and a thread-local `varlen._current` (a plain module global
+    there raises "a batched read is already in progress" the first time two lanes' reads genuinely overlap,
     which is the correct failure for ambient state shared by two threads, not a bug to tolerate).
 
     One document at a time, waited for before the next is submitted, so no pass ever carries more than this one
@@ -1197,16 +1196,16 @@ def test_lanes_two_decisions_under_a_burst_do_not_move(engine_paged):
 
     `test_an_answer_does_not_depend_on_its_companions` already states this file's standard for a companion
     effect: "the decision is asserted exactly and the distribution behind it within a measured tolerance ...
-    only [the decision] is a promise". The first version of this test used synthetic, near-50/50 documents and
-    found decisions moving under *both* `lanes=1` and `lanes=2` on the same burst (`diag_lanes_control.py`:
-    identical flips, matching probabilities to the sixth decimal place, so not a lanes=2 regression) -- a
+    only [the decision] is a promise". An earlier version of this test used synthetic, near-50/50 documents and
+    found decisions moving under *both* `lanes=1` and `lanes=2` on the same burst (identical flips,
+    matching probabilities to the sixth decimal place, so not a lanes=2 regression) -- a
     pre-existing sensitivity of borderline questions to which companions share a pass, consistent with how
     `NEARLY_SIX` elsewhere in this file documents the same thing happening to a *single* document's result when
     the recurrence kernel changed. That is real but orthogonal to what lane=2 adds, and testing it with
     borderline documents conflates the two. This test uses the decisive, already-established `CONTEXT` and
     `faulty` question instead (confidently "yes" -- `test_an_answer_does_not_depend_on_its_companions` already
     relies on this), with twenty distinguishing suffixes only so each document's digest routes differently and
-    the full 368-document open-loop benchmark (THROUGHPUT.md 2026-10-05) measured zero decisions changed across
+    the full 368-document open-loop benchmark measured zero decisions changed across
     every arrival rate with the production (`lanes=1`) `Batcher`, which is the bar lanes=2 is held to here.
     """
     from prismyra.schedule import Batcher
@@ -1402,13 +1401,13 @@ def test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did(engin
 def test_wide_group_widening_answers_as_the_two_pass_path_did(engine):
     """`wide_group` widens a document's own branch-row capacity past `self.group` once it is asked more than
     `WIDE_GROUP_FROM` questions (`ask`'s own `_group_for`), turning the common 33-64 question case into one
-    pass instead of two. fp8spd3's own gate first measured this as **not** bit-identical at 33 and 40
-    questions (RUN-fp8spd.md, "33問だけ不一致") -- the GDN layer's causal convolution fell back to a different
+    pass instead of two. This gate first measured this as **not** bit-identical at 33 and 40
+    questions -- the GDN layer's causal convolution fell back to a different
     implementation whenever a branch pass's row count was not exactly 1, which the leftover group from an
-    uneven split always was and a full 32- or 64-row group never was. inv5's branch-pass convolution batch fix
+    uneven split always was and a full 32- or 64-row group never was. The branch-pass convolution batch fix
     (`prismyra/kernels/qwen3_moe.py`'s `_install_conv`) closed that for every row count, independently of this
-    flag; wg re-verified the whole 33-64 range bit-identical on both supported cards and two context lengths
-    an order of magnitude apart (RUN-wg.md) -- this is the permanent version of that gate, the same bar
+    flag; a re-verification of the whole 33-64 range confirmed it bit-identical on both supported cards and two
+    context lengths an order of magnitude apart -- this is the permanent version of that gate, the same bar
     `test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did` holds `interleaved_fork` to.
 
     Covers the narrow end (33 = 32+1, the width the old mismatch was sharpest at), the wide end (63 = 32+31,
@@ -1463,21 +1462,21 @@ def test_a_short_question_replays_exactly_as_it_reads_eagerly(engine):
         choices=["A", "B", "C"],
     )
     original = engine._one_pass
-    # inv3, task 3: re-recorded here, fresh, rather than trusting the recording `engine` took once at construction
+    # Re-recorded here, fresh, rather than trusting the recording `engine` took once at construction
     # (module scope, before any `engine_paged`-based test in this file ever ran). This test and
     # `test_a_headed_question_replays_exactly_as_it_reads_eagerly` are the only two on the plain, non-paged `engine`
-    # fixture that compare a *replay* against an *eager* read -- and both started failing (round 4) once
+    # fixture that compare a *replay* against an *eager* read -- and both started failing once
     # `engine_paged`'s dispatcher registration became something a test could claim and release mid-session instead
-    # of never happening at all. Round 4 confirmed the registration itself is released correctly (refcounted,
-    # verified by hand) and still found a residual, meaning *something else* process-wide is left different by an
-    # `engine_paged` test having run -- round 4's own write-up names the Triton/vLLM autotune caches as the leading
-    # unconfirmed suspect, keyed by shape rather than by whether the dispatcher is currently registered, so a config
+    # of never happening at all. The registration itself releases correctly (refcounted,
+    # verified by hand) and still leaves a residual, meaning *something else* process-wide is left different by an
+    # `engine_paged` test having run -- the leading unconfirmed suspect is the Triton/vLLM autotune caches,
+    # keyed by shape rather than by whether the dispatcher is currently registered, so a config
     # exercised once under the batch-invariant kernel can still be the one a later unprotected call reuses. Rather
     # than chase that cache by name, this closes the actual gap the test is checking: a replay must match an eager
     # read taken *now*, under whatever the process's current state happens to be -- not one taken at construction,
     # under a state the rest of the session no longer promises to hold. Recording and comparing both fresh, in the
     # same few lines, makes the comparison self-consistent regardless of what ran earlier in the module and
-    # regardless of whether round 4's suspected cache (or anything else undiscovered) is the real mechanism.
+    # regardless of whether the suspected cache (or anything else undiscovered) is the real mechanism.
     held = engine._one_pass = onepass.record_all(engine, engine._pad_id(), engine._read_one_pass)
     try:
         for copies in (1, 2, 5, 9):
@@ -1586,8 +1585,8 @@ def test_recorded_hidden_states_are_the_ones_the_read_out_scores(engine):
         p = torch.softmax(h @ engine.unembedding[ids].float().cpu().t(), dim=-1).tolist()
         # abs=1e-5 rather than 1e-6: a paged engine now runs the router's projection (and every other plain bf16
         # `F.linear`) through vLLM's batch-invariant Triton matmul (`engine._enable_batch_invariant`), which does
-        # not pick its reduction by row count -- the fix for a real companion-dependent mismatch
-        # (`diag_layer0_op_divergence.py`), at the cost of a reduction order that differs from this test's own CPU
+        # not pick its reduction by row count -- the fix for a real companion-dependent mismatch,
+        # at the cost of a reduction order that differs from this test's own CPU
         # float32 softmax by a hair more than the old tolerance allowed (measured: 1.3e-6, not 1.3e-5).
         assert p == pytest.approx([answered.probabilities[o] for o in HEADED.options], abs=1e-5)
 
@@ -1616,7 +1615,7 @@ def test_a_headed_question_replays_exactly_as_it_reads_eagerly(engine, tmp_path)
         json.dumps([{"name": "who-pays", "options": HEAD_OPTIONS, "form": "mlp", "weights": "pays.safetensors"}])
     )
     saved, original = engine.heads, engine._one_pass
-    # inv3, task 3: re-recorded fresh here too -- see the sibling test's own comment
+    # Re-recorded fresh here too -- see the sibling test's own comment
     # (`test_a_short_question_replays_exactly_as_it_reads_eagerly`) for why a recording taken at `engine`'s
     # construction is no longer guaranteed to match an eager read taken after an `engine_paged`-based test has run
     # earlier in this module.

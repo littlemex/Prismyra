@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""recon: check whether any Triton autotuner relevant to the one-pass path is still open to timing-based
+"""Checks whether any Triton autotuner relevant to the one-pass path is still open to timing-based
 racing (len(tuner.configs) > 1) *after* construction finishes -- i.e. after both `pin_autotunes()`
 (engine.py:664) and `onepass.record_all()` (engine.py:679) have run. If `pin_autotunes()` ran too early
 (before record_all() created/exercised some autotuner), that autotuner would still show >1 live
 candidate here, which is the mechanism hypothesised for the re-record noise seen in
-recon_diag_onepass_capture.py (off vs off-re-recorded maxdiff 0.0081, same order as off vs on 0.0063)."""
+`diag_onepass_capture.py` (off vs off-re-recorded maxdiff 0.0081, same order as off vs on 0.0063)."""
 import os
 import sys
 
