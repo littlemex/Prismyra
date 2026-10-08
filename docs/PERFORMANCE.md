@@ -486,18 +486,37 @@ closed:
   audit_sm120.py`'s `paged_vs_joined` section measures this directly, flipping only the `paged` property on one
   engine rather than constructing two: on 8 real RACE documents, a single question moved by at most 0.026176 on the
   L40S and 0.001839 on the RTX PRO 4500, zero decision flips on either card -- bounded by `tests/test_gpu.py`'s
-  `PAGED_VS_JOINED_MOVEMENT` (0.04). **Question counts above 1 are measurably worse and not bounded by anything
-  today**: once there is more than one question, `ask()` no longer reaches `_ask_in_one_pass` at all, and a second
-  mechanism (`interleaved_fork`'s fused context-and-first-branch-group pass against the page-pool branch read)
-  joins the one-pass-specific gap above. The same 8-document sweep moved by up to 0.126938 on the L40S with 34 of
-  816 checks flipping the decision (0 of 816 flipped on the RTX PRO 4500, worst move 0.169903 there). Two fixes were
-  considered and rejected: routing a solo `paged=True` question through `_ask_in_one_pass` would make `ask()`'s own
-  question-count-1 answer disagree with `open_batch`'s, which is exactly the companion/question-count matrix above
-  already measures bit-exact (4,392/4,392) -- trading that closed guarantee for this one; aligning the branch
-  read's attention kernel to FlashAttention-2 is faster (2.3-2.9% at the L40S, measured 1/16/64 questions, same
-  engine, 15 alternating rounds) but reopens the companion-count residual `unified_attention` was adopted to close,
-  and on the RTX PRO 4500 it does not meaningfully narrow this gap at all (0.002609 to 0.002478 for a single
-  question). This is tracked as an open gap, not a tolerance this project has decided is acceptable.
+  `PAGED_VS_JOINED_MOVEMENT` (0.04). Question count 1 stays this way: `_ask_in_one_pass` is a structurally
+  different computation (one FA2 call over context-and-question together, with no fork at all) than the forked
+  path, and routing a solo `paged=True` question through it would make `ask()`'s own question-count-1 answer
+  disagree with `open_batch`'s -- exactly the companion/question-count matrix above already measures bit-exact
+  (4,392/4,392) -- trading that closed guarantee for this one. Not pursued.
+* **Question counts above 1: now closed too.** Once there was more than one question, `ask()` no longer reached
+  `_ask_in_one_pass` at all, and a second mechanism (`interleaved_fork`'s fused context-and-first-branch-group pass,
+  and any later group through plain `_branch`) joined the one-pass-specific gap above with a much larger one: the
+  same 8-document sweep moved by up to 0.126938 on the L40S with 34 of 816 checks flipping the decision (0 of 816
+  flipped on the RTX PRO 4500, worst move 0.169903 there). The cause was the branch read's own attention kernel --
+  the joined (non-paged) storage ran a dense, per-row `flash_attn_varlen_func` call over its own copy of
+  context-and-branch, while the paged storage ran `unified_attention` against a shared page pool, tiled by this
+  row's own `seqused_k` alone (adopted for the companion-count axis above). The two kernels reduce in a different
+  order over the same values. The fix routes the joined branch read through the *same* page-table call the paged
+  one already uses -- one page per row, `prismyra.paged.BLOCK` (16) tokens wide and zero-padded past this row's
+  real length, never shared across rows (unlike the paged pool), but tiled identically because `unified_attention`
+  picks its own tile width from the page width it is handed (`prismyra/kernels/qwen3_moe.py`'s `FlashAttention.
+  forward`, the `layer.writing_branches` branch). Re-measured on the same 8-document sweep, both cards: **808 of
+  816 checks bit-exact, 0 decision flips, the remaining 8 non-exact checks are exactly the question-count-1 ones
+  already described above** (`tools/audit_sm120.py`'s own report). Aligning the branch read's kernel the other way
+  (paged to FlashAttention-2 instead of joined to `unified_attention`) was considered and rejected before this fix,
+  for the reason already on record: it is faster (2.3-2.9% at the L40S) but reopens the companion-count residual
+  `unified_attention` was adopted to close, and on the RTX PRO 4500 it does not meaningfully narrow the gap at all
+  (0.002609 to 0.002478 for a single question) -- a kernel choice that cannot satisfy both axes at once. Padding a
+  page's own width costs a transient same-size copy of the branch's keys and values; built one at a time (`del
+  key`/`del value` before the other starts) rather than both at once, which is what let a 64-question pass OOM
+  where the unpadded join fit. The remaining cost: 1/16/64 questions, 15 alternating rounds, same engine --
+  L40S +0.0%/+3.3%/+2.6%, RTX PRO 4500 +0.1%/+3.1%/+2.8% (`paged=False`, default `interleaved_fork=True`). The
+  16-question point is a touch over this project's 3% rule of thumb on both cards; it is the same cost
+  `unified_attention` already charges the paged path for the same reason, paid a second time now that the joined
+  path takes it too, not a new kind of cost.
 
 This is a process-wide setting, not a per-request one: it registers a fixed-tile kernel on `aten::mm`, `addmm`,
 `matmul` and `linear` for the whole process, including any unrelated torch code sharing it, and that registration is

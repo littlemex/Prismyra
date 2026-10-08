@@ -1424,6 +1424,37 @@ def test_paged_and_joined_agree_within_measured_bound_for_one_question(engine_pa
         assert paged[q.id].probabilities[option] == pytest.approx(p, abs=PAGED_VS_JOINED_MOVEMENT)
 
 
+def test_paged_and_joined_agree_bit_for_bit_once_there_is_more_than_one_question(engine_paged):
+    """Two or more questions about one document must answer *bit-for-bit* the same whether `paged` is `True` or
+    `False`, flipping only the property on the same engine as the test above does for question count 1.
+
+    Question count 1 is the one case this project does not claim bit-exactness for -- see
+    `PAGED_VS_JOINED_MOVEMENT` and the test above, both scoped to it on purpose, because `paged=False` reaches
+    `_ask_in_one_pass` there and nothing routes that one-pass read through a page table. From two questions on,
+    `ask()` no longer reaches `_ask_in_one_pass` at all (`interleaved_fork`'s fused pass, or plain `_branch`, for
+    `paged=False`), and the joined branch read now goes through the same `BLOCK`-wide page-table call to
+    `unified_attention` the paged branch read already used, in `FlashAttention.forward`'s `layer.writing_branches`
+    branch -- so there is no longer a structurally different kernel on either side of this flag for this question
+    count, and `tools/audit_sm120.py`'s own 8-document, both-card sweep found zero non-exact checks at every
+    question count in `{2, 3, 31, 32, 33}` once this was wired in. `torch.equal`, not `pytest.approx`: this is the
+    bit-exact claim, not a bounded one.
+    """
+    qs = [
+        Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?"),
+        Boolean(id="window", prompt="Is the return window thirty days?"),
+    ]
+    engine_paged.paged = False
+    joined = engine_paged.ask(CONTEXT, qs)
+    engine_paged.paged = True
+    paged = engine_paged.ask(CONTEXT, qs)
+    for q in qs:
+        keys = sorted(joined[q.id].probabilities)
+        j = torch.tensor([joined[q.id].probabilities[k] for k in keys])
+        p = torch.tensor([paged[q.id].probabilities[k] for k in keys])
+        assert torch.equal(j, p)
+        assert joined[q.id].option == paged[q.id].option
+
+
 def test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did(engine):
     """`interleaved_fork` fuses the context's read and the first branch group into one layer-interleaved pass
     instead of two full passes (`ask`'s own docstring on `self.interleaved_fork`); this is the project's own
