@@ -1,8 +1,8 @@
-"""Does nvfp4-36l's companion-invariance guarantee hold on the RTX PRO 4500 (sm_120, Blackwell)? The dispatcher
-registration that makes the FP8/L40S checkpoint invariant is skipped on sm_120
-(`is_device_capability_family(80)` in `engine._enable_batch_invariance`) and nothing replaces it there; the
-NVFP4 MoE kernel's own per-M tactic bucketing is a second, separate candidate cause. This script is the real
-measurement of either on this card.
+"""Does nvfp4-36l's companion-invariance guarantee hold on the RTX PRO 4500 (sm_120, Blackwell)? This script is the
+real measurement, meant to be run against two engine states: before `engine._enable_batch_invariance` extended its
+dispatcher registration past the SM80 family (`is_device_capability_family(80)` used to gate it to that one family
+alone, leaving sm_120 with nothing in its place) and after. The NVFP4 MoE kernel's own per-M tactic bucketing is a
+second, separate candidate cause, measured by the same comparison.
 
 Ground truth: `engine.ask(context, questions)` alone, once per document (never shares a pass with anything else).
 Compared against: `open_batch` with companion counts in {1, 2, 3, 8} documents and question counts in
@@ -11,8 +11,9 @@ full probability tensor per question, not just the argmax decision -- the standi
 merely same-answer.
 
 Usage: PRISMYRA_MODE={raw,fix} python3 audit_sm120.py
-  raw -- shipped v0.3.1 code, unmodified (what ships today).
-  fix -- this branch's sm_120 fix applied (see engine.py/nvfp4.py diffs); only meaningful once that code exists.
+  raw -- the engine state before `_enable_batch_invariance` covered sm_120; only meaningful checked out against that
+  code.
+  fix -- the engine state after, which is what every release ships today.
 """
 
 import json

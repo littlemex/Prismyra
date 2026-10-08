@@ -24,9 +24,9 @@ ROUNDS = 9
 WARMUP_ROUNDS = 3
 
 PARAGRAPH = (
-    "Returns are accepted only within thirty days of delivery. Unopened items qualify for a full refund, "
-    "but opened items are exchanged rather than refunded unless a manufacturing fault is confirmed. "
-    "Return shipping is paid by the seller when the item is faulty and by the buyer for any other reason."
+    "返品は商品到着後三十日以内に限り受け付けます。未開封の商品は全額返金の対象となりますが、"
+    "開封済みの商品については、初期不良が確認された場合を除き、返金ではなく交換のみの対応となります。"
+    "返送にかかる送料は、初期不良の場合は当社が負担し、それ以外の理由による返品ではお客様のご負担となります。"
 )
 
 
@@ -38,7 +38,7 @@ def build_context(pad_to_tokens, tokenizer):
 
 
 def build_questions(n):
-    return [Boolean(id=f"q{i}", prompt=f"Does clause {i} permit a refund?") for i in range(n)]
+    return [Boolean(id=f"q{i}", prompt=f"条項 {i} は返金を認めているか。") for i in range(n)]
 
 
 def run(engine, cfg, context, qs):

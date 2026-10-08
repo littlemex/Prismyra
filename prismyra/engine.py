@@ -452,9 +452,9 @@ class Prismyra:
         # convolution batch fix (`prismyra/kernels/qwen3_moe.py`'s `_install_conv`) closed that fallback for every
         # row count, not only one: all 32 widths, both context lengths tested, both supported cards, come back
         # `torch.equal` now, including with the batch-invariance claim below monkeypatched off (so that claim was
-        # never what fixed this). The mismatch this flag was switched off for is gone; it is kept off here anyway
-        # pending this project's own sign-off on flipping the default, the same
-        # process `interleaved_fork` went through below before its default flipped.
+        # never what fixed this). The mismatch this flag was switched off for is gone, but it stays off anyway: the
+        # widened pass measures slower than the two-pass path it replaces at every width and document length
+        # measured, on at least one supported card, so the default stays off for speed rather than correctness.
         self.wide_group = wide_group
         # **On by default as of this release**: `ask()`
         # with more than one question goes through `interleave.read_and_branch` instead of
@@ -472,7 +472,7 @@ class Prismyra:
         # by default -- it widens a different range (33-63 questions in the *un-fused* path), which this flag
         # does not touch. That range's own `torch.equal` mismatch has since been
         # closed too (see `self.wide_group`'s own comment above), independently of this flag; its
-        # default is a separate decision, still pending this project's sign-off.
+        # default stays off for the same speed reason, a separate decision from this flag's.
         # Requires the borrowed kernels (`self._borrowed_kernel`, decided below, after the kernels are applied)
         # -- see `ask`'s guard.
         self.interleaved_fork = interleaved_fork
@@ -703,7 +703,7 @@ class Prismyra:
             except ImportError as e:
                 self.applied.notes.append(
                     f"batch-invariant mode not available ({e}); open_batch/Batcher/read_and_branch may still "
-                    "move an answer by who else shares the pass -- see diag_layer0_op_divergence.py"
+                    "move an answer by who else shares the pass"
                 )
         self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
@@ -865,12 +865,11 @@ class Prismyra:
         This explains a 0.008346 residual on
         `test_open_batch_matches_ask_bit_for_bit_whatever_the_companions_total_length` (`tests/test_gpu.py`): a
         synthetic, kernel-level reproduction of every op that test touches came back bit-identical across row
-        counts in isolation (`probe_attn_rowcount.py`, `probe_gdn_rowcount.py`, `probe_fused_moe_rowcount.py`,
-        `probe_dense_fp8_rowcount.py` -- all `torch.equal` across row counts 1-33, with
-        `_enable_batch_invariance()`'s dispatcher registered by hand first), ruling out a second, separate,
-        deeper cause for the residual. Reproducing `engine_paged`'s exact
+        counts in isolation, with `_enable_batch_invariance()`'s dispatcher registered by hand first -- evidence
+        against a second, separate, deeper cause for the residual, not conclusive on its own. Reproducing
+        `engine_paged`'s exact
         two lines instead -- `Prismyra(MODEL)` then `engine.paged = True` -- showed `_BATCH_INVARIANT_DISPATCH_LIB`
-        stayed `None` (`check_invariance_fixture_gap.py`): the fixture's "flip the flag" path never ran the
+        stayed `None`: the fixture's "flip the flag" path never ran the
         dispatcher registration at all, in an engine constructed exactly as every `engine_paged`-based test in
         this file constructs one. Fixing this property closed the residual on the real checkpoint to exactly
         0.0 (`measure_residual_after_fix.py`, both the short and the long companion); reverting to the plain
@@ -903,7 +902,7 @@ class Prismyra:
             except ImportError as e:
                 self.applied.notes.append(
                     f"batch-invariant mode not available ({e}); open_batch/Batcher may still move an answer by "
-                    "who else shares the pass -- see diag_layer0_op_divergence.py"
+                    "who else shares the pass"
                 )
         elif not value and self._invariance_claimed:
             _disable_batch_invariance()
@@ -1449,8 +1448,8 @@ class Prismyra:
     def _read(self, encoded, group: int | None = None) -> Prefill:
         # A solo read and `open_batch`'s joint read of several documents go through the *same* borrowed chunked
         # recurrent kernel, and that kernel's own configuration is chosen by the *total* length of the varlen run
-        # it is given -- not by any one document's content in it (measured decisively,
-        # `diag_total_length_hypothesis.py`: two companions of the identical length but different content left a
+        # it is given -- not by any one document's content in it (measured decisively:
+        # two companions of the identical length but different content left a
         # target's extracted state bit-identical; the same target alone, at a different total length, did not).
         # So a document read alone and the same document read alongside others can legitimately end up at two
         # different total lengths, and therefore two different -- but each internally consistent -- recurrent
@@ -1500,7 +1499,7 @@ class Prismyra:
         """Round a varlen read's total length up to the bucket `_round_rows` would pick, as one more segment appended
         after the real documents, and the padding ids to fill it -- a harmless repeat of the last document's own
         tokens, because the measurement behind this is that a chunked recurrent kernel's config is chosen by *total*
-        length and does not care what the padding is (`diag_total_length_hypothesis.py`).
+        length and does not care what the padding is.
 
         Returns the padding ids (shape `(1, 0)`, not `(1, pad)` carrying nothing, when the total is already at a
         bucket) and `lengths` with the pad segment appended only when there is one -- `varlen.reading` refuses a
@@ -1586,7 +1585,7 @@ class Prismyra:
         `lane` is which engine lane this shelf's own passes run under (see `Shelf.lane`). Each call builds a brand
         new cache (`_claim_cache` has no pool to reuse from yet), so two shelves -- one per lane -- never share a
         `Pool`/page table; the only thing two lanes still share is the model weights (read-only) and, if `lane`
-        differs, nothing else at all. Measured (`diag_two_shelves_memory.py`): a second
+        differs, nothing else at all. Measured directly: a second
         shelf is not free -- opening one at `room=4096` plus 5 documents on each cost about 2.1 GiB total from a
         freshly loaded model's 8.6 GiB of free device memory -- so a second lane's `room` should be set with that
         in mind rather than left at the default (which is sized for *one* shelf being the only one).
@@ -1855,7 +1854,7 @@ class Prismyra:
         # repeat the first document, discarded at the end exactly as `build_suffixes` already discards padded columns.
         #
         # An earlier version of this: a single `padded_rows = _round_rows(rows, self.group)` rounded the
-        # *combined* total, which closes the context-length axis (`diag_openbatch_vs_ask_modes.py`'s 80-document
+        # *combined* total, which closes the context-length axis (an 80-document
         # benchmark) but not the question-count one: the same two real questions about the same document land in
         # a 2-row pass alone and a 4-row pass once a one-question companion is added, even though neither document's
         # own rows changed -- `tests/test_gpu.py`'s documented 0.0128/0.024 residual, confirmed on sm_120 too
@@ -2412,7 +2411,7 @@ class Prismyra:
         free, _ = (
             torch.cuda.mem_get_info(self.torch_device) if self.torch_device.type == "cuda" else (1 << 62, 1 << 62)
         )
-        # Measured the gap directly (`diag_memory_breakdown_single.py`) --
+        # Measured the gap directly --
         # after a rate=10 burst, `mem_get_info`'s free number was 2.16 GiB (below this margin) while PyTorch's own
         # `reserved - allocated` gap was 7.6 GiB of cached-but-unallocated blocks the caching allocator was simply
         # not returning to the driver, not memory any live tensor (recording, shelf snapshot, or anything else)
@@ -2599,7 +2598,7 @@ def _load_processor(model: str):
 def _enable_batch_invariance() -> None:
     """Make the operations that actually move with a pass's row count row-independent -- no more of them.
 
-    Found decisively (`diag_layer0_op_divergence.py`): a document read alongside two companions of identical
+    Found decisively: a document read alongside two companions of identical
     length but entirely different content was bit-identical through every layer-0 operation except one -- the
     router's own `F.linear(x, self.gate.weight)` inside `kernels.qwen3_moe.FusedExperts._route`. That one op's
     result for a real row moved with the pass's total row count, the row-count-chosen-GEMM-algorithm effect
@@ -2609,15 +2608,14 @@ def _enable_batch_invariance() -> None:
     so its tile-size choice stops keying on `M` too (`fused_moe.py`'s own guard, independent of any dispatcher
     override). An attempt that stopped at the router alone found 2/80 real-document mismatches
     left (largest move 0.189) -- not from attention or shared-expert projections as first suspected (that
-    diagnosis was from a single synthetic two-document companion pair, which `diag_full_inventory_op_divergence.py`
-    and `diag_all_layers_real_mismatch_padded.py` later showed does not generalise), but from the borrowed
+    diagnosis was from a single synthetic two-document companion pair, which a fuller, real-document sweep
+    across every layer later showed does not generalise), but from the borrowed
     chunked gated-delta-rule kernel (`vllm.third_party.flash_linear_attention`) itself: on the real mismatching
     batch (RACE validation, batch 4 of the 80-document benchmark), layer 0's `linear_attn` block alone moved by
     0.0039 between a solo read and the real 8-document batch with router+tiling already fixed -- before the
     router, before any MoE op, inside the recurrence this engine depends on for its batching to be fast at all.
 
-    Two candidates were measured head-to-head at full scale (`diag_isolate_invariance_lever_combined.py` for the
-    single-layer signal, `diag_openbatch_vs_ask_modes.py` for the decisive 80-document/11-batch count):
+    Two candidates were measured head-to-head at full scale (a single-layer signal, and separately the decisive 80-document/11-batch count):
     disabling TF32 and bf16/fp16 reduced-precision matmul reduction closed layer 0's gap (0.0039 -> 0.0) but
     *reopened* it at layer 4 once checked across all 40 layers on the real batch -- a precision change shrinks the
     chunk-boundary reduction-order effect enough to round to zero at shallow layers, not remove it, so it does not
@@ -2631,7 +2629,7 @@ def _enable_batch_invariance() -> None:
     registration, so this function registers only the dispatcher override plus the MoE tiling env var, rather
     than calling `enable_batch_invariant_mode()`/`init_batch_invariance()` wholesale.
 
-    Measured cost against the full five-lever version (`docs/PERFORMANCE.md`-style sweep, `diag_solo_document_cost.py`
+    Measured cost against the full five-lever version (`docs/PERFORMANCE.md`-style sweep, a solo-document measurement
     and the `open_batch` documents=8/16/32, group=64 sweep): unchanged within measurement noise -- the dispatcher
     registration this keeps was already the expensive part (every plain bf16/fp32 matmul in the decoder funnelled
     through a slower fixed-tile Triton kernel instead of cuBLAS), and `torch.bmm`/TF32/`cublaslt` were measured to
@@ -2700,9 +2698,9 @@ def _enable_batch_invariance() -> None:
         return
 
     # "global" (the default, unchanged) registers the four aten ops below for
-    # every plain bf16 matmul in the whole model -- `diag_invariance_cost_profile.py` measured this at +14.5ms
+    # every plain bf16 matmul in the whole model -- measured at +14.5ms
     # (6.8%) on a solo `ask()` and +18.9ms (1.8%) on a 32-document `open_batch`, on an L40S, almost all of it in
-    # `matmul_kernel_persistent` calls that `diag_dispatch_inventory.py` shows are not at one of the
+    # `matmul_kernel_persistent` calls that are not at one of the
     # three call sites that are actually row-count dependent: the router (`_route`, now narrowed) and the
     # two `GatedDeltaNet` gate projections (`in_proj_a`/`in_proj_b`, narrowed by `_patch_gdn_gates`,
     # unconditionally -- see `qwen3_moe.Qwen3MoeAdapter.replace`). "narrow" skips this registration (and the
@@ -2710,11 +2708,11 @@ def _enable_batch_invariance() -> None:
     # `VLLM_BATCH_INVARIANT` env var above instead.
     #
     # An earlier claim that "narrow" was measured safe on `audit_sm120.py`'s own
-    # companion matrix did not hold up once the measurement actually ran (`narrow_report_sm120.json`, the
-    # sm_120 narrow-mode comparison log): on sm_120, "narrow" leaves 150/4,392 probability checks non-exact
+    # companion matrix did not hold up once the measurement actually ran: on sm_120, "narrow" leaves 150/4,392
+    # probability checks non-exact
     # against "global"'s 72/4,392, and -- more to the point than the raw count -- it breaks question-counts
     # {2, 3, 31, 32} that "global" does not touch at all (`global`'s 72 are 100% question-count=1, a different,
-    # already-tracked residual; see `diag_qn1_residual.py`). That means at least one more plain `F.linear`/
+    # already-tracked residual). That means at least one more plain `F.linear`/
     # `torch.mm` call this project has not yet narrowed is still row-count dependent on sm_120, and the global
     # dispatcher registration is the only thing currently catching it. "narrow" stays an opt-in diagnostic switch
     # for exactly this reason -- it is not a candidate default until whatever call site the 2→150 jump comes from

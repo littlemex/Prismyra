@@ -292,7 +292,7 @@ def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
     companion effect everywhere else: two passes carrying the identical real row at a different *total* M could cross
     a bucket boundary (e.g. 32 companion questions -> 33) and get a different tactic, hence a different GEMM
     reduction order, hence a non-bit-identical answer for that unchanged row. This was never caught because no
-    device test exercises an NVFP4 pass across a bucket boundary (`audit_sm120.py`, this branch, is the first to).
+    device test exercises an NVFP4 pass across a bucket boundary before `audit_sm120.py`.
     One bucket at `max_tokens` with `round_up=True` makes every real M (small questions-only pass or a full
     `open_batch`) map to the *same* profiled tactic, by construction -- determinism first, matching this project's
     standing rule; the speed cost of using the large-M tactic at small M is measured directly rather than assumed.

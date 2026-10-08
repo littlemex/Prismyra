@@ -27,8 +27,8 @@ from prismyra import onepass
 
 MODEL = os.environ.get("PRISMYRA_MODEL", "littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l")
 PARAGRAPH = (
-    "Returns are accepted only within thirty days of delivery. Unopened items qualify for a full refund, "
-    "but opened items are exchanged rather than refunded unless a manufacturing fault is confirmed."
+    "返品は商品到着後三十日以内に限り受け付けます。未開封の商品は全額返金の対象となりますが、"
+    "開封済みの商品については、初期不良が確認された場合を除き、返金ではなく交換のみの対応となります。"
 )
 
 

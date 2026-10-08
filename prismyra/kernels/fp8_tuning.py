@@ -1,26 +1,26 @@
-"""Carry this card's dense-FP8 matmul tuning with the package, instead of leaving it to evaporate with the pod.
+"""Carry this card's dense-FP8 matmul tuning with the package, instead of leaving it to evaporate with the machine it was tuned on.
 
 Why this exists. vLLM's block-FP8 Triton matmul (`w8a8_triton_block_scaled_mm`, used by `Fp8Linear` and by every FP8
 dense projection in both the FP8-only and the NVFP4-experts checkpoints) is not itself a `triton.autotune` kernel --
 it is a plain `@triton.jit` kernel whose tile size vLLM looks up from a static table, keyed by shape and this card's
 name, in `get_w8a8_block_fp8_configs()`. That table is a JSON file vLLM reads from *inside its own installed package*
 (`vllm/model_executor/layers/quantization/utils/configs/`). Nothing ships it there: the project's own tuner
-(`tune_fp8.py`) writes the file straight into that pip-installed path, on whichever pod happened to run it. A fresh
-pod -- the normal state after this project's own resource-cleanup discipline deletes one -- starts with none of
+writes the file straight into that pip-installed path, on whichever machine happened to run it. A freshly built
+machine -- the normal state once a short-lived GPU machine is torn down and rebuilt -- starts with none of
 those files, vLLM logs "Using default W8A8 Block FP8 kernel config... Performance might be sub-optimal!" for every
 shape, and every dense FP8 matmul runs vLLM's one hard-coded fallback tile (`BLOCK_SIZE_M=64, N=128, K=128,
 GROUP_SIZE_M=32, num_warps=4, num_stages=2`) at every row count, including the branch passes (M~16-128) where the
 fallback is measured at roughly 2x slower than the tuned tile (`BLOCK_SIZE_M=16, num_stages=4` wins there) and the
 long prefill passes (M~thousands) where it is roughly 10-20% slower. The project's own measured "+10-20% per matmul"
-figure for this tuning was never at risk of being wrong -- it was at risk of being present only on the one pod that
-happened to run the tuner in the same session, and silently absent on every pod built since.
+figure for this tuning was never at risk of being wrong -- it was at risk of being present only on the one machine that
+happened to run the tuner, and silently absent on every machine built since.
 
 What this does. Ships the already-tuned tables for the generations this project measures (one JSON file per
-(N, K, device name) cell, same format `tune_fp8.py` writes, same `BLOCK_SIZE_K=128` as the untuned fallback so the
+(N, K, device name) cell, same format the project's own tuner writes, same `BLOCK_SIZE_K=128` as the untuned fallback so the
 inner reduction loop sums the same K-blocks in the same order -- `torch.equal` against the fallback was checked for
 every cell this project's checkpoints use before any file here was kept) under `pinned/fp8_block_configs/`, and
 copies the ones that match this process's device into vLLM's own configs directory before the first dense FP8 matmul
-runs, if vLLM does not already have a file there. It never overwrites a file vLLM already has: a pod someone tuned
+runs, if vLLM does not already have a file there. It never overwrites a file vLLM already has: a machine someone tuned
 by hand, or a newer measurement placed there in this same session, is left alone.
 """
 
@@ -71,7 +71,7 @@ def install() -> list[str]:
             continue
         dest = dest_dir / src.name
         if dest.exists():
-            continue  # never clobber a table already on this pod, hand-placed or freshly re-tuned
+            continue  # never clobber a table already on this machine, hand-placed or freshly re-tuned
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest)

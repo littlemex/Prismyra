@@ -17,9 +17,9 @@ from prismyra import Boolean, Prismyra
 
 MODEL = os.environ.get("PRISMYRA_MODEL", "littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l")
 PARAGRAPH = (
-    "Returns are accepted only within thirty days of delivery. Unopened items qualify for a full refund, "
-    "but opened items are exchanged rather than refunded unless a manufacturing fault is confirmed. "
-    "Orders ship within two business days of confirmation; remote areas may take an extra day or two."
+    "返品は商品到着後三十日以内に限り受け付けます。未開封の商品は全額返金の対象となりますが、"
+    "開封済みの商品については、初期不良が確認された場合を除き、返金ではなく交換のみの対応となります。"
+    "配送は注文確定から二営業日以内に発送します。離島・一部地域では追加で二日ほどかかる場合があります。"
 )
 QCOUNTS = [int(x) for x in os.environ.get("WG_SPEED_QCOUNTS", "33,48,63,64").split(",")]
 PAD = int(os.environ.get("WG_SPEED_PAD", "5016"))
@@ -35,7 +35,7 @@ def build_context(pad_to_tokens, tokenizer):
 
 
 def make_questions(n):
-    return [Boolean(id=f"q{i}", prompt=f"Does clause {i} address this document's subject?") for i in range(n)]
+    return [Boolean(id=f"q{i}", prompt=f"条項 {i} はこの文書の主題について述べているか。") for i in range(n)]
 
 
 def roundrobin(engine, context, qcounts, rounds, drop):
