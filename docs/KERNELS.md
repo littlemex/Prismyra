@@ -233,8 +233,8 @@ per-thread scratch buffer `FusedExpertsFp4._workspace()` reuses across calls was
 so its first-allocation content was whatever this process's own CUDA allocator history happened to leave there,
 and that leaked into the answer -- unrelated to which tactic ran. Confirmed by toggling `PRISMYRA_NVFP4_WORKSPACE`
 (the kernel's own per-call scratch does not show the effect) and closed the same way padding is handled everywhere
-else in this project: `torch.zeros` instead of `torch.empty`, paid once per process at first allocation, not per
-request.
+else in this project: `torch.zeros` instead of `torch.empty`, paid at each buffer's first allocation (one buffer
+per device, fusion mode, and thread, so normally once per process) rather than on every request.
 
 See [docs/PERFORMANCE.md's settings table](PERFORMANCE.md#four-speed-settings-one-that-risks-the-answer) for
 `interleaved_fork` and `wide_group`, the two flags that change how a multi-question request reaches these kernels.

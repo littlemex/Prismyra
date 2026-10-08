@@ -202,7 +202,8 @@ class FusedExpertsFp4(nn.Module):
             FusedExpertsFp4._ws[key] = None
             # Zero-initialized at allocation: this buffer is reused across calls (keyed by device, fusion mode,
             # and thread), so an uninitialized first allocation would leak this process's own CUDA allocator
-            # history -- not the kernel's own output -- into the answer. Paid once per process, at first use.
+            # history -- not the kernel's own output -- into the answer. Paid at each key's first allocation
+            # (normally once per process), not on every request.
             buf = FusedExpertsFp4._ws[key] = torch.zeros(size, dtype=torch.uint8, device=self.w1.device)
         return buf
 
