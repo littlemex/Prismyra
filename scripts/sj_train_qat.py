@@ -243,6 +243,26 @@ if a.teacher:
         r = json.loads(l); data[r["i"]]["teacher"] = r["p"]
 if a.n: data = data[: a.n]
 
+# --- sj (b) MUST run before sj (a): per-row CE weight for Kimi-overwritten labels (gold != pool_gold).
+# Computed from the ORIGINAL (pre-shuffle) gold/pool_gold pair that build_kd2x.py/build_kdpool.py wrote, and
+# stashed in `_ce_w` so it survives the option reorder below, the max_chars/max_tokens filters, and the rank
+# sharding untouched (it travels with the row dict). BUG FIXED 2026-10-08 (caught before any training step
+# ran, from the sj2 launch log): doing this AFTER --shuffle_opts would compare the POST-shuffle `gold` (an
+# index into the newly permuted option list) against the PRE-shuffle `pool_gold` (an index into the original
+# order) -- two indices into different orderings that are almost never equal by construction, which is why
+# the first (killed) run reported 28,191/53,785 rows "down-weighted" instead of the true 1,548 (RUN-sj.md
+# section 0, confirmed against train_L1_2x.json directly). Order matters here and only here because (a)
+# mutates `gold`; it does not matter for anything else in this file.
+n_kimi_down = 0
+if a.kimi_weight != 1.0:
+    for ex in data:
+        pg = ex.get("pool_gold")
+        ex["_ce_w"] = a.kimi_weight if (pg is not None and ex["gold"] != pg) else 1.0
+        if ex["_ce_w"] != 1.0: n_kimi_down += 1
+    if RANK == 0:
+        print(f"--kimi_weight {a.kimi_weight}: down-weighted {n_kimi_down} of {len(data)} rows "
+              f"(gold overwritten relative to pool_gold, computed BEFORE --shuffle_opts)", flush=True)
+
 # --- sj (a): option-order augmentation, applied once at load time, BEFORE any filtering/sharding, with an
 # RNG stream (`shuf_rng`) completely separate from the `random` module's global state used for epoch
 # shuffling and (if --teacher is used instead of --teacher_pt) nothing else here reads `random` before this
@@ -267,19 +287,6 @@ if a.shuffle_opts:
     if RANK == 0:
         print(f"--shuffle_opts: permuted {n_shuffled} choice rows, skipped {n_skipped_scale} ordered-scale rows "
               f"(of {len(data)} total)", flush=True)
-
-# --- sj (b): per-row CE weight for Kimi-overwritten labels (gold != pool_gold). Computed here, once, from the
-# fields build_kd2x.py/build_kdpool.py already write, so it survives the max_chars/max_tokens filters and the
-# rank sharding below untouched (it travels with the row dict).
-n_kimi_down = 0
-if a.kimi_weight != 1.0:
-    for ex in data:
-        pg = ex.get("pool_gold")
-        ex["_ce_w"] = a.kimi_weight if (pg is not None and ex["gold"] != pg) else 1.0
-        if ex["_ce_w"] != 1.0: n_kimi_down += 1
-    if RANK == 0:
-        print(f"--kimi_weight {a.kimi_weight}: down-weighted {n_kimi_down} of {len(data)} rows "
-              f"(gold overwritten relative to pool_gold)", flush=True)
 
 if a.max_chars:
     before = len(data)
