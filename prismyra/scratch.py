@@ -311,3 +311,148 @@ def scratch_loop_clear_readout(
     finally:
         hooks.close()
         extra_handle.remove()
+
+
+# -------------------------------------------------------------------- ws3: placement fix (RUN-ws3.md section 0)
+#
+# `scratch_loop` (above) appends its `K` scratch positions *after* the whole rendered question, which already
+# ends in the literal tail `readout.plan` and `loop.py`'s read-out position are built around: "Answer:" or
+# "Answer: ". That put the read-out position -- redefined here to be the scratchpad's own last slot -- one or
+# more positions downstream of the place every other read-out in this codebase reads. ws1's stage A measured the
+# cost of that move on its own, before any loop: -17 to -27 points at r=0, far past the ~0.16-point path noise
+# `loop.py` documents. `RUN-ws3.md` section 0 diagnoses this as a placement confound, not a property of the
+# scratchpad or the loop.
+#
+# The functions below keep the mechanism identical -- same hook class, same slot_init, same per-pass replace --
+# and change exactly one thing: the `K` positions are spliced in *before* the tail, not after it. The read-out
+# position is therefore still the tail's own last token, exactly where `plan`/`loop.py` already put it; the
+# scratchpad becomes extra context the tail causally attends to; the tail is still the last thing in the
+# sequence, so `out.last_hidden_state[0, -1:]` reads the same kind of position it always did.
+
+
+def tail_text_for(planned) -> str:
+    """The literal suffix every rendered question ends in -- the thing `loop.py`'s read-out position already is."""
+    return "Answer: " if planned.trailing_space else "Answer:"
+
+
+def split_body_tail(engine, planned) -> tuple[list[int], list[int]]:
+    """Split `planned.text`'s own tokenization into `(body_ids, tail_ids)` at the literal tail.
+
+    Tokenizes the full text exactly as `plan` already implies (via `branch_ids`), then slices off the tail
+    rather than re-tokenizing the body on its own -- re-tokenizing separately would be wrong if the tokenizer
+    merges a token across the body/tail boundary differently than it does inside the one full string. The tail
+    is tokenized alone only to know how many trailing ids to slice off, and the slice is then checked against
+    that tail tokenization so a merge there (if the tokenizer ever did one) raises instead of silently reading
+    at the wrong offset.
+    """
+    full_ids = branch_ids(planned.text, engine.tokenizer)
+    tail_text = tail_text_for(planned)
+    tail_ids = engine.tokenizer(tail_text, add_special_tokens=False)["input_ids"]
+    if full_ids[-len(tail_ids) :] != tail_ids:
+        raise RuntimeError(
+            f"tail {tail_text!r} does not tokenize the same at the end of the full rendered text as it does "
+            f"alone ({full_ids[-len(tail_ids):]!r} != {tail_ids!r}); splicing scratch positions in front of it "
+            f"is not safe for this question without re-deriving the split"
+        )
+    return full_ids[: -len(tail_ids)], tail_ids
+
+
+def scratch_loop_tailfixed(
+    engine,
+    context: str,
+    question: Question,
+    layer_k: int,
+    k_positions: int,
+    r: int,
+    alpha: float = 1.0,
+    filler: bool = False,
+) -> ScratchResult:
+    """`scratch_loop`, with the placement fixed: `k_positions` scratch slots go *before* the tail
+    ("Answer:"/"Answer: "), not after it. The read-out position is unchanged from the no-scratchpad baseline --
+    the tail's own last token, which is still the last position in the sequence.
+
+    `filler=True` replaces the scratch slots' real content (the question's mean embedding plus a per-slot
+    sinusoidal identifier, `scratch_loop`'s own init) with `k_positions` *identical* copies of the question's
+    mean embedding alone -- no per-slot variation, no loopable structure. This is the "same embedding repeated"
+    control RUN-ws3.md's section 2 calls for: it isolates "any extra positions in the corrected place help"
+    from "position-coded, loopable scratch content helps". A filler run is always called with `r=0` by the
+    caller; the loop machinery below still works on it (nothing stops a filler slot from being looped), it is
+    just not part of the pre-registered filler comparison.
+    """
+    decoder = getattr(engine.config, "text_config", engine.config)
+    layers, norm = decoder_parts(engine.backbone, decoder.num_hidden_layers)
+    layer_types = list(getattr(decoder, "layer_types", []) or [])
+    if layer_types and layer_types[layer_k - 1] != "full_attention":
+        raise ValueError(f"layer {layer_k} is {layer_types[layer_k - 1]!r}, not full_attention")
+
+    planned = plan(question, engine.tokenizer)
+    body_ids, tail_ids = split_body_tail(engine, planned)
+    device = engine.torch_device
+    width = decoder.hidden_size
+
+    def read(hidden_normed) -> list[float]:
+        (p,) = engine.heads.apply(
+            hidden_normed, [question.options], score(hidden_normed, engine.unembedding, [planned.token_ids], None)
+        )
+        return p.float().tolist()
+
+    hooks = _ScratchHooks(layers, norm, layer_k)
+    try:
+        with engine._lock, torch.inference_mode():
+            encoded = encode(context, None, None, engine.processor, engine.tokenizer, engine.device)
+            embed_layer = engine.backbone.get_input_embeddings()
+            body_t = torch.tensor([body_ids], device=engine.device)
+            tail_t = torch.tensor([tail_ids], device=engine.device)
+            body_embeds = embed_layer(torch.cat([encoded.input_ids, body_t], dim=1)).to(engine.dtype)
+            tail_embeds = embed_layer(tail_t).to(engine.dtype)
+            # q_repr spans body+tail together, matching `scratch_loop`'s own definition (the mean of the
+            # question's own rendered-text tokens) -- only *where* the scratchpad sits changes, not what seeds it.
+            q_repr = embed_layer(torch.cat([body_t, tail_t], dim=1)).to(torch.float32)[0].mean(dim=0)
+
+            if filler:
+                s0 = q_repr.unsqueeze(0).expand(k_positions, -1).to(engine.dtype)
+            else:
+                slots = slot_init(k_positions, width, device, torch.float32)
+                text_norm = body_embeds[0].float().norm(dim=-1).mean()
+                slot_norm = slots.norm(dim=-1).mean().clamp_min(1e-6)
+                s0 = (q_repr.unsqueeze(0) + slots * (text_norm / slot_norm)).to(engine.dtype)
+
+            full_embeds = torch.cat([body_embeds, s0.unsqueeze(0), tail_embeds], dim=1)
+            total_len = full_embeds.shape[1]
+            hooks.start = body_embeds.shape[1]  # scratch slots sit right after body, right before the tail
+            hooks.count = k_positions
+            hooks.active = True
+
+            def forward_once():
+                cache = build_cache(
+                    engine.config, engine.room_for(total_len) + WIDTHS[-1], 1, engine.dtype, engine.device, WIDTHS[-1]
+                )
+                _sync(device)
+                t = time.perf_counter()
+                out = engine.backbone(inputs_embeds=full_embeds, use_cache=True, past_key_values=cache)
+                # The tail is still the sequence's last thing, so this is still the tail's own last token --
+                # exactly the position `plan`/`loop.py` already read, unlike `scratch_loop`'s last scratch slot.
+                hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
+                _sync(device)
+                ms = (time.perf_counter() - t) * 1000
+                del out, cache
+                return hidden, ms
+
+            hidden, base_ms = forward_once()
+            result = ScratchResult(options=list(question.options), base=read(hidden), base_ms=base_ms)
+            if r == 0:
+                return result
+            first_in = hooks.input_at_k.clone()
+            h_final = hooks.final.clone()
+            for n in range(1, r + 1):
+                hooks.replace = first_in + alpha * (h_final - first_in)
+                hidden, ms = forward_once()
+                hooks.replace = None
+                key = (layer_k, k_positions, n)
+                result.passes[key] = read(hidden)
+                result.pass_ms[key] = ms
+                result.scratch_final[key] = hooks.final.clone()
+                h_final = hooks.final.clone()
+    finally:
+        hooks.close()
+    return result
