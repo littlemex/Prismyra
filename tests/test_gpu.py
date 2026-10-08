@@ -1229,6 +1229,83 @@ def test_lanes_two_decisions_under_a_burst_do_not_move(engine_paged):
         batcher.stop()
 
 
+def test_batcher_fusion_answers_as_the_unfused_batcher_did_under_a_real_arrival_burst(engine_paged):
+    """tok, SYNTHESIS-v2.md experiment 10: `Batcher._answer` fuses a pass naming one fresh document
+    (`schedule.py:438`, `_fused_single_passes`) or several fresh documents at once (`schedule.py:483`,
+    `_fused_many_passes`) into one layer-interleaved pass when `engine.interleaved_fork` is on (the
+    default since v0.4.0) -- `test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did`
+    already covers the engine-level mechanism on one document at a time; this is its Batcher-level
+    counterpart, under genuine companions arriving together, which is the shape that mechanism is for.
+
+    Found decisive on real hardware before this test existed: a 368-document RACE open-loop replay
+    (rate=40/s, 8s injection, the scale `RUN-fp8spd.md`'s own S5 harness uses) at full scale ran this
+    46 GiB L40S (`tput`) out of device memory over the course of 100+ real passes -- not from any single
+    wide pass or from many sequential narrow ones (both measured stable in isolation, `RUN-tok.md`), so a
+    scaled-down burst is what this permanent test replays: enough fresh, simultaneously-submitted
+    documents to force `_fused_many_passes` (not just `_fused_single_passes`), without needing the full
+    open-loop scale. Measured bit-exact (`torch.equal`-equivalent: `==`, not `pytest.approx`) over 24
+    documents and 98 questions that a real 75-request open-loop burst happened to answer in both an
+    `interleaved_fork=True` and an `interleaved_fork=False` run of the *same* fixed arrival trace
+    (`scripts/exp10_batcher_fusion_torch_equal.py`) -- zero probability mismatches, only timing-driven
+    differences in *which* requests each run happened to answer (expected: the two engines run at
+    different real speeds, so the same wall-clock trace does not form identical pass shapes in both --
+    see that script's own module docstring). This test fixes the trace to an instantaneous burst instead
+    of wall-clock timing, so it is deterministic and does not depend on real-time scheduling: every
+    document is submitted before any of them are waited on, which is what made `_fused_many_passes` fire
+    in the real run too (`len(fresh) == len(formed.jobs) >= 2`, `schedule.py:483`).
+
+    `engine_paged` is a function-scoped fixture (unlike `engine`, module-scoped), so flipping
+    `interleaved_fork` here does not need a `finally` restore the way the module-scoped tests above do --
+    confirmed against this file's own fixture, not assumed.
+    """
+    from prismyra.schedule import Batcher
+
+    docs = [
+        (
+            f"Document {i}: a short, self-contained shipping policy note with its own number and nothing "
+            f"shared with its neighbours, so a fused pass mixing this row with another document's rows "
+            f"would show up as this document answering a question about a different one.",
+            [
+                Boolean(id="mentions", prompt=f"Does this note mention the number {i}?"),
+                Boolean(id="shipping", prompt="Is this note about a shipping policy?"),
+            ],
+        )
+        for i in range(8)
+    ]
+    truth = {i: engine_paged.ask(context, qs) for i, (context, qs) in enumerate(docs)}
+
+    results = {}
+    for interleaved_fork in (True, False):
+        engine_paged.interleaved_fork = interleaved_fork
+        batcher = Batcher(engine_paged, lane_room=4096, linger_ms=50.0).start()
+        try:
+            jobs = [batcher.submit(context, qs) for context, qs in docs]  # burst: none waited on yet
+            got = {}
+            for i, job in enumerate(jobs):
+                assert job.done.wait(timeout=30), f"document {i} never answered (interleaved_fork={interleaved_fork})"
+                assert job.error is None, (i, interleaved_fork, job.error)
+                got[i] = job.result
+            stats = batcher.stats()
+            assert stats["fused_many_passes"] >= 1 or not interleaved_fork, (
+                "this burst was meant to force at least one multi-document fused pass; it did not -- the "
+                f"test's own documents/questions no longer fit `Limits`, so it is not exercising what it "
+                f"claims to: {stats}"
+            )
+            results[interleaved_fork] = got
+        finally:
+            batcher.stop()
+
+    for i, (context, qs) in enumerate(docs):
+        want = truth[i]
+        fused = results[True][i]
+        unfused = results[False][i]
+        for q in qs:
+            assert fused[q.id].option == want[q.id].option == unfused[q.id].option, (i, q.id)
+            for option, p in want[q.id].probabilities.items():
+                assert fused[q.id].probabilities[option] == p, ("fused vs ask()", i, q.id, option)
+                assert unfused[q.id].probabilities[option] == p, ("unfused vs ask()", i, q.id, option)
+
+
 def test_asking_twice_about_a_shelved_document_does_not_read_it_twice(engine_paged):
     """What the shelf is for. The second question pays a branch pass and no read."""
     asked = [Boolean(id="faulty", prompt="Does the seller pay on a faulty item?")]
