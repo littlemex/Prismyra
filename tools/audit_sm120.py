@@ -10,6 +10,16 @@ Compared against: `open_batch` with companion counts in {1, 2, 3, 8} documents a
 full probability tensor per question, not just the argmax decision -- the standing rule is bit-identical, not
 merely same-answer.
 
+A second, independent matrix (below the first, its own report section `"paged_vs_joined"`) answers a different
+question that this file did not used to ask at all: does the *constructor flag* `paged` move a solo, companion-free
+single question's answer, on top of (not instead of) the companion/question-count matrix above? `ask()`'s own
+docstring already says the one-pass path (`paged=False`, question count 1, `_ask_in_one_pass`) and the forked path
+(`paged=True`, any question count, a branch pass through the page pool) "agree to the bound batching already
+allows" -- this section is what measures that bound on both supported cards, rather than leaving it asserted but
+unmeasured. See `tests/test_gpu.py`'s `PAGED_VS_JOINED_MOVEMENT` for the regression test this feeds and
+`docs/PERFORMANCE.md`'s "Which engine construction built the answer" section for why `paged` is scoped out of that
+section's "closed" claim on the strength of this measurement.
+
 Usage: PRISMYRA_MODE={raw,fix} python3 audit_sm120.py
   raw -- the engine state before `_enable_batch_invariance` covered sm_120; only meaningful checked out against that
   code.
@@ -146,6 +156,71 @@ for s in skipped_capacity[:5]:
     print(f"  group_size={s['group_size']} qn={s['qn']}: {s['error'][:120]}")
 
 report["skipped_capacity"] = skipped_capacity
+
+# ---- second matrix: does `paged` itself (a constructor flag, not a companion/question-count axis) move a solo,
+# companion-free answer? Flips the *same* engine's `paged` property rather than constructing a second one, so this
+# never holds two copies of the checkpoint at once (a second `Prismyra(...)` of either supported checkpoint does not
+# fit beside the first on either card this project ships for -- see RUN-srv.md section 3's "same engine" fix for the
+# same OOM). `engine.paged = False` / `= True` round-trips bit-identically on its own (closed by
+# `_invariance_base_claimed`, `prismyra/engine.py`'s `__init__`) -- what this measures is *not* that round trip, it
+# is the one-pass path (`_ask_in_one_pass`, reached only when `paged` is `False` and the question count is 1)
+# against the forked path (`_answer`'s branch pass through the page pool, reached at every question count when
+# `paged` is `True`) on the *same* document and question.
+print("\n--- paged vs joined (same engine, same weights, paged flipped) ---", flush=True)
+was_paged = engine.paged
+engine.paged = False
+joined_truth = {}
+for item in items:
+    for n in QCOUNTS:
+        qs = questions_at(item, n)
+        joined_truth[(id(item), n)] = engine.ask(item.context, qs)
+engine.paged = was_paged
+print("joined (paged=False) truth done", flush=True)
+
+pvj_checks = 0
+pvj_exact = 0
+pvj_mismatches = []
+for item in items:
+    for n in QCOUNTS:
+        qs = questions_at(item, n)
+        joined = joined_truth[(id(item), n)]
+        paged = truth[(id(item), n)]
+        for q in qs:
+            pvj_checks += 1
+            g = joined[q.id].probabilities
+            w = paged[q.id].probabilities
+            g_t = torch.tensor([g[o] for o in sorted(g)])
+            w_t = torch.tensor([w[o] for o in sorted(w)])
+            exact = torch.equal(g_t, w_t)
+            if exact:
+                pvj_exact += 1
+            else:
+                move = (g_t - w_t).abs().max().item()
+                decision_flip = joined[q.id].option != paged[q.id].option
+                pvj_mismatches.append(
+                    {"qn": n, "doc": item.context[:50], "qid": q.id, "move": move, "decision_flip": decision_flip}
+                )
+
+pvj_worst = max((m["move"] for m in pvj_mismatches), default=0.0)
+pvj_flips = sum(1 for m in pvj_mismatches if m["decision_flip"])
+pvj_by_qn = {}
+for m in pvj_mismatches:
+    pvj_by_qn.setdefault(m["qn"], []).append(m["move"])
+print(
+    f"paged vs joined: {pvj_checks} checks, {pvj_exact} bit-exact, {pvj_checks - pvj_exact} non-exact, "
+    f"{pvj_flips} decision flips, worst move {pvj_worst:.6f}"
+)
+for qn, moves in sorted(pvj_by_qn.items()):
+    print(f"  qn={qn}: {len(moves)} non-exact, worst {max(moves):.6f}, median {sorted(moves)[len(moves) // 2]:.6f}")
+
+report["paged_vs_joined"] = {
+    "checks": pvj_checks,
+    "exact": pvj_exact,
+    "decision_flips": pvj_flips,
+    "worst_move": pvj_worst,
+    "mismatches": pvj_mismatches,
+}
+
 out_path = Path(os.environ.get("PRISMYRA_REPORT", "/tmp/audit_sm120_report.json"))
 out_path.write_text(json.dumps(report, indent=2))
 print(f"\nfull report written to {out_path}")

@@ -465,14 +465,39 @@ closed:
   small nonzero tolerances left over from before this matrix closed; they have not been retightened to match, so
   treat them as not yet re-measured rather than as evidence either axis is still open. The non-default `narrow`
   scope (below) does **not** close this matrix on the RTX PRO 4500, the only card it has been run against.
-* **Which engine construction built the answer: closed, independent of the axis above.** Building two engines with
-  different constructor flags (`interleaved_fork`, `wide_group`, `paged`) used to answer a single, companion-free
-  question differently, by up to 0.208 on the same card and document -- not from anything either flag computes, but
-  because only one of them happened to be the sole opt-in to a dispatcher registration that an un-pinned
-  cuBLAS/cuBLASLt heuristic needed to stay reproducible from one construction to the next. Every CUDA engine now
-  claims that registration unconditionally, regardless of which flags built it, which closes both the cross-flag gap
-  and the weaker version of it a plain restart used to show: three independent cold starts, each a fresh process with
-  an empty Triton cache, answer the same document and question bit-identically (`tests/test_gpu_cold_start.py`).
+* **Which engine construction built the answer: closed for `interleaved_fork` and `wide_group`, independent of the
+  axis above -- `paged` is a separate, open gap, below.** Building two engines with different constructor flags
+  (`interleaved_fork`, `wide_group`) used to answer a single, companion-free question differently, by up to 0.208 on
+  the same card and document -- not from anything either flag computes, but because only one of them happened to be
+  the sole opt-in to a dispatcher registration that an un-pinned cuBLAS/cuBLASLt heuristic needed to stay
+  reproducible from one construction to the next. Every CUDA engine now claims that registration unconditionally,
+  regardless of which flags built it, which closes both the cross-flag gap and the weaker version of it a plain
+  restart used to show: three independent cold starts, each a fresh process with an empty Triton cache, answer the
+  same document and question bit-identically (`tests/test_gpu_cold_start.py`).
+* **`paged` as a constructor flag: not closed, and not the same gap as the one above.** An earlier version of this
+  section listed `paged` alongside `interleaved_fork` and `wide_group` here. That was wrong: the registration fix
+  above closes a *process-wide, cuBLAS/cuBLASLt-heuristic* non-determinism that construction order used to expose,
+  and `paged` was never on that axis -- flipping `paged` moves a question onto a structurally different computation
+  (`ask()`'s own docstring already says as much: "the paged storage... keeps the forked path", and that the two
+  paths "agree to the bound batching already allows"). `paged=False`'s single-question path (`_ask_in_one_pass`)
+  reads the context and the question together in one FlashAttention-2 call; `paged=True` always forks, reading the
+  context first and then the question in a *separate* call against the page pool, through `unified_attention`
+  rather than FlashAttention-2 (adopted for the companion-count axis above, not for this one). `tools/
+  audit_sm120.py`'s `paged_vs_joined` section measures this directly, flipping only the `paged` property on one
+  engine rather than constructing two: on 8 real RACE documents, a single question moved by at most 0.026176 on the
+  L40S and 0.001839 on the RTX PRO 4500, zero decision flips on either card -- bounded by `tests/test_gpu.py`'s
+  `PAGED_VS_JOINED_MOVEMENT` (0.04). **Question counts above 1 are measurably worse and not bounded by anything
+  today**: once there is more than one question, `ask()` no longer reaches `_ask_in_one_pass` at all, and a second
+  mechanism (`interleaved_fork`'s fused context-and-first-branch-group pass against the page-pool branch read)
+  joins the one-pass-specific gap above. The same 8-document sweep moved by up to 0.126938 on the L40S with 34 of
+  816 checks flipping the decision (0 of 816 flipped on the RTX PRO 4500, worst move 0.169903 there). Two fixes were
+  considered and rejected: routing a solo `paged=True` question through `_ask_in_one_pass` would make `ask()`'s own
+  question-count-1 answer disagree with `open_batch`'s, which is exactly the companion/question-count matrix above
+  already measures bit-exact (4,392/4,392) -- trading that closed guarantee for this one; aligning the branch
+  read's attention kernel to FlashAttention-2 is faster (2.3-2.9% at the L40S, measured 1/16/64 questions, same
+  engine, 15 alternating rounds) but reopens the companion-count residual `unified_attention` was adopted to close,
+  and on the RTX PRO 4500 it does not meaningfully narrow this gap at all (0.002609 to 0.002478 for a single
+  question). This is tracked as an open gap, not a tolerance this project has decided is acceptable.
 
 This is a process-wide setting, not a per-request one: it registers a fixed-tile kernel on `aten::mm`, `addmm`,
 `matmul` and `linear` for the whole process, including any unrelated torch code sharing it, and that registration is
