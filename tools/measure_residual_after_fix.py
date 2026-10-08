@@ -1,5 +1,5 @@
-"""inv2 round4: reproduce `tests/test_gpu.py::engine_paged`'s exact two-line fixture pattern (`Prismyra(MODEL)`
-then `engine.paged = True`, not `Prismyra(MODEL, paged=True)`) and measure the real, bit-level movement between
+"""Reproduces `tests/test_gpu.py::engine_paged`'s exact two-line fixture pattern (`Prismyra(MODEL)`
+then `engine.paged = True`, not `Prismyra(MODEL, paged=True)`) and measures the real, bit-level movement between
 "this document answered alone" and "the same document answered alongside a companion" -- the thing
 `COMPANION_MOVEMENT_ROW_COUNT` bounds in that test file. Used to prove the `paged` property fix in
 `prismyra/engine.py` (see that property's own docstring) closes the residual to exactly 0.0 on the real

@@ -116,15 +116,14 @@ class Boundaries:
 
 #: The boundaries the pass in progress covers, or None when a pass covers one document. Ambient because the kernels
 #: are reached through the framework's own module-level names and there is no argument to thread down to them --
-#: see the module docstring. Thread-local rather than a single module global (2026-10-05, THROUGHPUT.md "本当に
-#:効く経路" lane=2): the engine's own fork, `fork.OWNED`, and now this are all ambient state reached by a thread
-#: calling into the model rather than by an argument, and lane=2 (`prismyra.schedule.Batcher(lanes=2)`) runs one
-#: pass per lane *concurrently*, each synchronously on its own worker thread -- `current()`'s four callers
-#: (`paged.py`, `kernels/qwen3_moe.py`) are all reached from inside the same `backbone(...)` call `reading()`
-#: wraps, on the same thread that opened it, so a thread-local gives each lane's pass its own boundaries without
-#: needing to invent an argument this module exists because there wasn't one for. A plain global, as this was
-#: until lane=2, raised "these do not nest" the first time two lanes' reads genuinely overlapped -- correctly: a
-#: shared global would have let one lane's boundaries leak into another's kernels, silently.
+#: see the module docstring. Thread-local rather than a single module global: the engine's own fork, `fork.OWNED`,
+#: and now this are all ambient state reached by a thread calling into the model rather than by an argument, and
+#: `prismyra.schedule.Batcher(lanes=2)` runs one pass per lane *concurrently*, each synchronously on its own worker
+#: thread -- `current()`'s four callers (`paged.py`, `kernels/qwen3_moe.py`) are all reached from inside the same
+#: `backbone(...)` call `reading()` wraps, on the same thread that opened it, so a thread-local gives each lane's
+#: pass its own boundaries without needing to invent an argument this module exists because there wasn't one for.
+#: A plain module global raises "these do not nest" the moment two lanes' reads genuinely overlap -- correctly: a
+#: shared global would let one lane's boundaries leak into another's kernels, silently.
 _local = threading.local()
 
 
@@ -134,7 +133,7 @@ def current() -> Boundaries | None:
 
 
 def in_branch() -> bool:
-    """Whether the pass in progress on *this thread* is a branch pass (fp8spd, S4b / SYNTHESIS.md P4).
+    """Whether the pass in progress on *this thread* is a branch pass.
 
     A branch ends at the answer token: nothing downstream of it ever reads the recurrent or convolution state it
     leaves the gated-delta-net layers in, because the next thing that touches this document's cache is always

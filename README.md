@@ -104,14 +104,14 @@ help and one figure this project published and then withdrew.
 **There is no release on PyPI**, so it installs from the repository, pinned to a tag:
 
 ```bash
-pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.4.0"                  # runs, and leaves every borrowed kernel on its fallback
-pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.4.0"             # the kernels: needs vLLM and Triton, so Linux and CUDA
+pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.4.1"                  # runs, and leaves every borrowed kernel on its fallback
+pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.4.1"             # the kernels: needs vLLM and Triton, so Linux and CUDA
 ```
 
 A clone works the same way, checked out at the same tag:
 
 ```bash
-git clone --branch v0.4.0 https://github.com/littlemex/Prismyra
+git clone --branch v0.4.1 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e .                  # runs, and leaves every borrowed kernel on its fallback
 pip install -e ".[fast]"          # the kernels: needs vLLM and Triton, so Linux and CUDA
@@ -403,7 +403,7 @@ that depends on how the work was arranged, so `0.999492` and `0.99974` are the s
 differs from one below, that is worth reporting.
 
 ```bash
-git clone --branch v0.4.0 https://github.com/littlemex/Prismyra
+git clone --branch v0.4.1 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e ".[server,fast]"
 prismyra-serve --host 127.0.0.1 --port 8000

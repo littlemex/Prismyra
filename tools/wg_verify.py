@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""wg: does the wide_group (S4a, 33-64 questions widened to one group=64 pass) mismatch found by
-fp8spd3 (RUN-fp8spd.md "33問だけ不一致") still reproduce on today's integrated branch (integ/v0.4.0,
-a6b0087+)? Since that finding, three things landed that could have changed the picture:
-  - per-document (not combined) `_round_rows` rounding (inv, round 2)
-  - the branch-pass convolution batch fix (inv5, dadb996/32b93c3)
-  - every CUDA engine unconditionally claims batch-invariance at construction (recon, ad7bafe)
+"""Does the wide_group (33-64 questions widened to one group=64 pass) mismatch found earlier -- a disagreement
+at exactly 33 questions -- still reproduce on this branch (v0.4.0, a6b0087+)? Since that finding, three things
+landed that could have changed the picture:
+  - per-document (not combined) `_round_rows` rounding
+  - the branch-pass convolution batch fix (dadb996/32b93c3)
+  - every CUDA engine unconditionally claims batch-invariance at construction (ad7bafe)
 This gate re-measures from scratch rather than trusting the old report.
 
 Ground truth: `wide_group=False` (today's default), two passes (e.g. 33 -> 32+1). Compared against
 `wide_group=True`, one pass widened to `WIDE_GROUP` (64) via `_group_for`. Both through plain `ask()`
-(`paged=False`, `interleaved_fork=False`) -- the joined-cache path S4a's own gate used, independent of
+(`paged=False`, `interleaved_fork=False`) -- the joined-cache path this setting uses, independent of
 `interleaved_fork`'s separate 64-exact mechanism in `_ask_interleaved`.
 
 Asserts `engine._invariance_base_claimed` is True before measuring anything -- a diagnostic that ran
 without this would not be testing the branch this task cares about.
 
 Set WG_REVERT_FIX=1 to run a negative control: monkeypatch `_enable_batch_invariance` to a no-op before
-construction (reproducing the pre-recon-fix world) to check whether the fix now unconditionally claimed
-is actually *why* the old mismatch is gone, or whether something else changed independently.
+construction (reproducing the pre-fix world) to check whether the unconditional claim now in place is
+actually *why* the old mismatch is gone, or whether something else changed independently.
 """
 import os
 import sys
@@ -29,9 +29,9 @@ from prismyra import Boolean, Prismyra
 
 MODEL = os.environ.get("PRISMYRA_MODEL", "littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l")
 PARAGRAPH = (
-    "返品は商品到着後三十日以内に限り受け付けます。未開封の商品は全額返金の対象となりますが、"
-    "開封済みの商品については、初期不良が確認された場合を除き、返金ではなく交換のみの対応となります。"
-    "配送は注文確定から二営業日以内に発送します。離島・一部地域では追加で二日ほどかかる場合があります。"
+    "Returns are accepted only within thirty days of delivery. Unopened items qualify for a full refund, "
+    "but opened items are exchanged rather than refunded unless a manufacturing fault is confirmed. "
+    "Orders ship within two business days of confirmation; remote areas may take an extra day or two."
 )
 QCOUNTS = [int(x) for x in os.environ.get("WG_QCOUNTS", "33,40,48,63,64").split(",")]
 PADS = [int(x) for x in os.environ.get("WG_PADS", "5016").split(",")]
@@ -46,7 +46,7 @@ def build_context(pad_to_tokens, tokenizer):
 
 
 def questions_for(n):
-    return [Boolean(id=f"q{i}", prompt=f"条項 {i} はこの文書の主題について述べているか。") for i in range(n)]
+    return [Boolean(id=f"q{i}", prompt=f"Does clause {i} address this document's subject?") for i in range(n)]
 
 
 def probs_of(result):
@@ -67,7 +67,7 @@ def main():
     print(f"REVERT_FIX={REVERT_FIX} invariance_base_claimed={base_claimed}", flush=True)
     if not REVERT_FIX:
         assert base_claimed is True, (
-            "engine was built without the unconditional batch-invariance claim (recon's ad7bafe) -- "
+            "engine was built without the unconditional batch-invariance claim (ad7bafe) -- "
             "this gate must not run against a world where that fix is absent."
         )
     tokenizer = engine.tokenizer

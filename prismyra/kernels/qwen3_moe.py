@@ -29,7 +29,7 @@ BLOCK = (128, 128)
 #: falls back to its own separate `Fp8Linear` call. Both sides are bit-identical to the pre-fusion separate calls
 #: (`_fuse_pair` checks the fused side against them), so switching on M changes nothing a caller reads back -- only
 #: which kernel calls computed it. The split exists because the fused matmul measurably loses to the separate
-#: calls at context width for one group (GDN's in_proj_qkv+in_proj_z, -9.4% at M=5309, RUN-fp4spd2.md section 2.4):
+#: calls at context width for one group (GDN's in_proj_qkv+in_proj_z, -9.4% at M=5309):
 #: a different N there picks a different tile than either separate call would. `WIDTHS[-1]` is the widest a branch
 #: pass ever is (`prismyra/fork.py`), so this keeps every branch call fused and every context-sized call (always
 #: wider) separate, for all three fused groups alike rather than special-casing just the one that measured worse.
@@ -39,10 +39,9 @@ FUSION_MAX_ROWS = WIDTHS[-1]
 #: `aten::linear` override `engine._enable_batch_invariance` used to be the only way to reach it. vLLM's own fixed-tile
 #: Triton kernel (not the dispatch-level registration -- a plain function, callable directly) picks its tile sizes from
 #: the operands' shapes alone, never from how many other rows happened to share the call, which is exactly what this one
-#: call site needs and the rest of the model's `F.linear` calls do not: THROUGHPUT.md's "ルーターのみの
-#: batch-invariant" measurement found the router is the only plain bf16 projection whose reduction order moved with a
-#: pass's total row count (`diag_layer0_op_divergence.py` -- every other layer-0 operation, including the shared
-#: expert's own `F.linear`, was already bit-identical). `None` when the installed vLLM is too old to have it: `_route`
+#: call site needs and the rest of the model's `F.linear` calls do not: the router is the only plain bf16 projection
+#: whose reduction order moves with a pass's total row count -- every other layer-0 operation, including the shared
+#: expert's own `F.linear`, is already bit-identical. `None` when the installed vLLM is too old to have it: `_route`
 #: then falls back to the ordinary row-dependent `F.linear`, exactly as it did before this existed.
 try:
     from vllm.model_executor.layers.batch_invariant import (
@@ -133,13 +132,12 @@ class FusedExperts(nn.Module):
 
     def _gate(self, x: torch.Tensor) -> torch.Tensor:
         """`shared_expert_gate`'s own plain bf16 projection, called directly rather than through the module -- the
-        same reason and the same fix as `_route`, above. `diag_dispatch_inventory.py` flagged this call site (not
-        the shared expert's own `F.linear`, which round 1's measurement already found bit-identical without
-        protection) as one of exactly three places where a plain `F.linear` sees a shape that moves with the pass's
-        companion -- a necessary, not sufficient, condition the narrow-scope experiment in `engine.py`
-        (`PRISMYRA_INVARIANCE_SCOPE=narrow`) needs value-level confirmation of (`audit_sm120.py`/`tests/test_gpu.py`
-        with the scope env var set), not merely shape-level, before this stops needing the process-wide registration
-        as a safety net too."""
+        same reason and the same fix as `_route`, above. This call site is one of exactly three places where a
+        plain `F.linear` sees a shape that moves with the pass's companion (not the shared expert's own `F.linear`,
+        which measurement already found bit-identical without protection) -- a necessary, not sufficient, condition
+        the narrow-scope experiment in `engine.py` (`PRISMYRA_INVARIANCE_SCOPE=narrow`) needs value-level
+        confirmation of (`audit_sm120.py`/`tests/test_gpu.py` with the scope env var set), not merely shape-level,
+        before this stops needing the process-wide registration as a safety net too."""
         linear = _ROUTER_LINEAR or torch.nn.functional.linear
         return linear(x, self.shared_expert_gate.weight)
 
@@ -162,9 +160,9 @@ class FusedExperts(nn.Module):
 
 
 # --------------------------------------------------------------------------- dense projections
-#: fp8spd (S3 / SYNTHESIS.md P4b), round 3: an earlier version of this file carried its own duplicate-and-override
+#: An earlier version of this file carried its own duplicate-and-override
 #: wrapper around `w8a8_triton_block_scaled_mm` to use per-M-bucket configs. Removed in favour of
-#: `kernels.fp8_tuning` (adopted from fp4spd's `feat/fp4spd-nvfp4-speed`, RUN-fp8spd.md round 3): that module ships
+#: `kernels.fp8_tuning`: that module ships
 #: the tuned per-row-count tables as JSON files in vLLM's *own* format and installs them into vLLM's *own* configs
 #: directory, so `w8a8_triton_block_scaled_mm` picks them up through its existing, unmodified lookup
 #: (`get_w8a8_block_fp8_configs`) -- no duplicated kernel-call code to keep in sync with vLLM's own, and every other
@@ -199,7 +197,7 @@ class _FusedDenseProjection(nn.Module):
     Concatenating weight and scale along the output dimension does not change the per-row reduction order over the
     input dimension -- `BLOCK[0]` (128) divides every sibling's own output width in this configuration, so no FP8
     block straddles the seam between two of them, and `w8a8_triton_block_scaled_mm` fixes `BLOCK_SIZE_K` rather than
-    deriving it from the output width (measured for the dense matmul's own M-bucketed config search, RUN-fp4spd.md).
+    deriving it from the output width (measured for the dense matmul's own M-bucketed config search).
     The input is quantised once here rather than once per sibling, which is the actual saving: three or four small
     matmuls sharing one input become one matmul of their combined width.
     """
@@ -548,14 +546,14 @@ class FlashAttention(nn.Module):
                 # length -- an upper bound is what that argument is for, and reading the real one would mean a
                 # device-to-host copy on the request path.
                 pool_keys, pool_values, table, seqused, capacity = layer.paged_read(rows)
-                # inv3 (round 5) tried `num_splits=1` here to pin FA2's KV-reduction split count the same way the
-                # fixed-tile matmul kernel pins its tile size (`diag_qn1_residual_round5.py` traced `audit_sm120.py`'s
+                # `num_splits=1` was tried here to pin FA2's KV-reduction split count the same way the
+                # fixed-tile matmul kernel pins its tile size (traced `audit_sm120.py`'s
                 # question-count=1-only residual, 72/4,392, to this call). Rejected: with `block_table`/`seqused_k`,
-                # `num_splits=1` corrupts the output outright, and `diag_num_splits_sweep.py` (inv4, round 5) found
-                # this FA2 build rejects any `num_splits>1` at all (`NotImplementedError: FA2 does not support
-                # num_splits > 1`) -- so pinning FA2's own split count is not an available fix on this build.
+                # `num_splits=1` corrupts the output outright, and this FA2 build rejects any `num_splits>1` at all
+                # (`NotImplementedError: FA2 does not support num_splits > 1`) -- so pinning FA2's own split count
+                # is not an available fix on this build.
                 #
-                # inv4 (round 6, chair's "fix it, don't accept the residual"): switched this call to vLLM's own
+                # This call was switched to vLLM's own
                 # `unified_attention` (`vllm.v1.attention.ops.triton_unified_attention`) instead of FA2's
                 # `flash_attn_varlen_func`. This is the exact kernel `TritonAttentionBackend` dispatches to under
                 # `VLLM_BATCH_INVARIANT=1` (`v1/attention/backends/triton_attn.py`), and reading its source shows why
@@ -564,7 +562,7 @@ class FlashAttention(nn.Module):
                 # length with a fixed `TILE_SIZE_PREFILL`/`TILE_SIZE_DECODE` -- a schedule that depends only on this
                 # row's own sequence length, never on how many other rows share the launch. That is the opposite of
                 # FA2's `num_splits=0` ("let the kernel choose based on the whole launch's occupancy"), which is the
-                # mechanism `diag_qn1_residual_round5.py` traced the residual to in the first place. The paged page
+                # mechanism the residual traces to in the first place. The paged page
                 # pool's own layout (`PagedForkLayer._allocate`, `prismyra/paged.py`) already stores keys/values as
                 # `[num_pages, BLOCK, heads, head_dim]` with an int32 `block_table`/`seqused` -- vLLM's own paged KV
                 # cache layout -- so no reshape or copy is needed to hand them to this kernel.
@@ -700,7 +698,7 @@ def _delta_wrapper(kernel, original):
             # state per document**, which is exactly the per-document state a fork needs -- so the thing that makes a
             # batched read possible and the thing that makes it useful are the same argument.
             passed["cu_seqlens"] = boundaries.offsets
-        # fp8spd (S4b / SYNTHESIS.md P4): a branch pass ends at the answer token, so no one ever reads the final
+        # A branch pass ends at the answer token, so no one ever reads the final
         # state it would leave in `cache_params` -- `varlen.in_branch()`'s own docstring says why the next thing to
         # touch this document's cache always overwrites it first (another `fork()`, which restores from
         # `Prefill.snapshot`). `output_final_state=False` makes the borrowed kernel skip computing and returning
@@ -799,7 +797,7 @@ def _install_gated_delta_rule(decoder, device, verify: bool = True) -> tuple[int
 
 
 def _install_recurrent_state_none_guard() -> None:
-    """Let a branch pass skip the GDN final-state write it never reads back (fp8spd, S4b / SYNTHESIS.md P4).
+    """Let a branch pass skip the GDN final-state write it never reads back.
 
     `_delta_wrapper.call` tells the borrowed kernel `output_final_state=False` for a branch pass (`varlen.in_branch()`),
     which makes the kernel return `None` for the state. Nothing in this module's own patches is downstream of that
@@ -830,7 +828,7 @@ def _install_recurrent_state_none_guard() -> None:
     except ImportError:
         return
     layer_cls = getattr(cache_utils, "LinearAttentionLayer", None)
-    if layer_cls is None or getattr(layer_cls.update_recurrent_state, "_fp8spd_none_guard", False):
+    if layer_cls is None or getattr(layer_cls.update_recurrent_state, "_branch_none_guard_installed", False):
         return
     original = layer_cls.update_recurrent_state
 
@@ -839,7 +837,7 @@ def _install_recurrent_state_none_guard() -> None:
             return self.recurrent_states[state_idx]
         return original(self, recurrent_states, state_idx, **kwargs)
 
-    guarded._fp8spd_none_guard = True
+    guarded._branch_none_guard_installed = True
     layer_cls.update_recurrent_state = guarded
 
 
@@ -879,7 +877,7 @@ class _InvariantGate(nn.Module):
     """A drop-in replacement for one of `Qwen3_5MoeGatedDeltaNet`'s `in_proj_a`/`in_proj_b` (plain bf16, bias-free,
     `nn.Linear(hidden_size, num_v_heads)`), computing the identical projection through `_ROUTER_LINEAR` directly
     instead of through `F.linear` -- the same narrow fix as `FusedExperts._route`/`_gate`, applied at the two other
-    call sites `diag_dispatch_inventory.py` flagged (`modeling_qwen3_5_moe.py:449`/`:450`, S2 step 2) as plain
+    call sites (`modeling_qwen3_5_moe.py:449`/`:450`) found to be plain
     `F.linear` calls whose shape moves with a pass's companion. Kept as a module (not a bound-method monkeypatch) so
     `named_parameters()`/`state_dict()` keep seeing a weight at the same name after `kernels.apply()` has already
     run and the checkpoint is already loaded -- nothing after this reads these two attributes except this layer's
@@ -972,12 +970,12 @@ def _install_conv() -> bool:
         if bias is not None or x.dim() != 3 or not x.is_cuda:
             return original(x, weight, bias, activation=activation, **kwargs)
         if x.shape[0] != 1:
-            # inv5 (round 7): a branch pass answering about several documents at once calls this with one row per
+            # A branch pass answering about several documents at once calls this with one row per
             # document (`x.shape == (companions, channels, width)`, `width` = this branch's own token count plus
             # the carried-over convolution state, identical per row) -- which used to fall through to the line
             # below, the framework's own fallback. That silently ran a *different implementation* than the B=1
-            # case above (not the same kernel with a different schedule), which is why `audit_sm120.py`/
-            # `diag_round6_matrix.py`'s question-count=1 residual traced here: the branch is answered through
+            # case above (not the same kernel with a different schedule), which is why `audit_sm120.py`'s
+            # question-count=1 residual traces here: the branch is answered through
             # this fast path when it is one document and through the framework's path when it is several, and
             # the two do not agree bit-for-bit.
             #
@@ -998,7 +996,7 @@ def _install_conv() -> bool:
             # graph). `repeats=width` here is a plain Python int, so `repeat_interleave`'s output size is static
             # and known at trace time, which is what let a graph-recording test capture this path at all: without
             # this, a (4, 24)-shaped branch recording failed with "operation failed due to a previous error during
-            # capture" (inv5, round 7 -- the first version of this fix broke `test_a_paged_recording_answers_a_
+            # capture" (the first version of this fix broke `test_a_paged_recording_answers_a_
             # later_document_of_a_different_length` and two neighbouring recording tests on both cards).
             row_starts = torch.arange(
                 0, batch * width, width, device=x.device, dtype=torch.int32
@@ -1120,7 +1118,7 @@ class Qwen3MoeAdapter:
                 _fuse_dense_projections(applied, text)
             # Experimental (PRISMYRA_DECODER_FUSION=1), off by default: fuses every residual add with the RMSNorm
             # that reads it, including across the decoder-layer boundary. See decoder_fusion.py for why this one
-            # needs the layer loop's cooperation rather than a module swap, and RUN-fp4spd.md for the end-to-end
+            # needs the layer loop's cooperation rather than a module swap, and for the end-to-end
             # torch.equal check this has (or has not) passed.
             if os.environ.get("PRISMYRA_DECODER_FUSION") == "1":
                 from . import decoder_fusion
@@ -1166,8 +1164,8 @@ class Qwen3MoeAdapter:
                 "the convolution kernel covers the context pass; a branch pass arrives as many rows and keeps the "
                 "framework's path"
             )
-        # inv3, S2 step 2: narrows two of the three plain-`F.linear` call sites `diag_dispatch_inventory.py` found
-        # (the router, `_route`, was already narrow -- round 1). Independent of `PRISMYRA_INVARIANCE_SCOPE`
+        # Narrows two of the three plain-`F.linear` call sites found to need it
+        # (the router, `_route`, was already narrow). Independent of `PRISMYRA_INVARIANCE_SCOPE`
         # (`engine.py`): installed unconditionally as a safety net under the default "global" scope too, and is
         # what makes "narrow" worth measuring at all once that scope stops also registering the process-wide
         # dispatcher. See `engine._enable_batch_invariance`'s own docstring for why "global" stays the shipped

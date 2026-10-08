@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
-"""fp8spd4: does the long-context regression found at 64Q (group=64 WIDE_GROUP widening) also happen at 16Q
+"""Does the long-context regression found at 64Q (group=64 WIDE_GROUP widening) also happen at 16Q
 (the ordinary, non-widened interleaved_fork path, group stays at the engine's default 32)? If yes, the
 context-length threshold belongs on `ask()`'s general `self.interleaved_fork` branch, not just the
 `len(questions) == WIDE_GROUP` special case. If no, it is specific to widening the GDN state buffers to 64
-rows (round5's own hypothesis) and the threshold only needs to guard that one branch.
+rows and the threshold only needs to guard that one branch.
 
 Usage: python3 s4c_16q_length_check.py
 """
 import json
+import os
 import statistics
 import sys
 import time
 
-sys.path.insert(0, "/work/fp8spd/fp8spd4-src")
+sys.path.insert(0, os.environ.get("PRISMYRA_SRC", "."))
 import torch
 from prismyra import Prismyra, Boolean
 
-MODEL = "littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l"
+MODEL = os.environ.get("PRISMYRA_MODEL", "littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l")
 CONFIGS = ("two_pass", "interleaved")
 LENGTHS = [5016, 9044, 20064]
 ROUNDS = 9
 WARMUP_ROUNDS = 3
 
 PARAGRAPH = (
-    "返品は商品到着後三十日以内に限り受け付けます。未開封の商品は全額返金の対象となりますが、"
-    "開封済みの商品については、初期不良が確認された場合を除き、返金ではなく交換のみの対応となります。"
-    "返送にかかる送料は、初期不良の場合は当社が負担し、それ以外の理由による返品ではお客様のご負担となります。"
+    "Returns are accepted only within thirty days of delivery. Unopened items qualify for a full refund, "
+    "but opened items are exchanged rather than refunded unless a manufacturing fault is confirmed. "
+    "Return shipping is paid by the seller when the item is faulty and by the buyer for any other reason."
 )
 
 
@@ -37,7 +38,7 @@ def build_context(pad_to_tokens, tokenizer):
 
 
 def build_questions(n):
-    return [Boolean(id=f"q{i}", prompt=f"条項 {i} は返金を認めているか。") for i in range(n)]
+    return [Boolean(id=f"q{i}", prompt=f"Does clause {i} permit a refund?") for i in range(n)]
 
 
 def run(engine, cfg, context, qs):
@@ -78,7 +79,7 @@ def main():
         all_reports[str(ntok)] = report
 
     print(json.dumps(all_reports, indent=2))
-    with open("/work/fp8spd/runs/fp8spd4_16q_length_check.json", "w") as f:
+    with open(os.environ.get("S4C_16Q_OUT", "/tmp/s4c_16q_length_check.json"), "w") as f:
         json.dump(all_reports, f, indent=2)
 
 
