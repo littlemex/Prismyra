@@ -968,8 +968,15 @@ class Prismyra:
         separate branch pass it would cost is a whole traversal of the model (docs/PERFORMANCE.md). Only when nothing
         needs the fork: media (whose positions are worked out during the read), calibration (whose priors are measured
         through branch passes) and the paged storage (whose pages belong to a pool this path does not draw from) keep
-        the forked path. The two paths read the same tokens, and their answers agree to the bound batching already
-        allows (`COMPANION_MOVEMENT` in the device tests): `open_context(...).ask(...)` with one question still forks.
+        the forked path. The two paths read the same tokens, but not through the same kernels -- the paged fork's
+        branch read goes through `unified_attention` against the page pool rather than the one-pass read's single
+        FlashAttention-2 call over context and question together (`prismyra/kernels/qwen3_moe.py`'s
+        `FlashAttention.forward`) -- so their answers agree only to a measured bound, not bit-for-bit:
+        `PAGED_VS_JOINED_MOVEMENT` in the device tests, for this one-question case specifically (`tools/
+        audit_sm120.py`'s `paged_vs_joined` section measures it directly, both supported cards). `open_context(...)
+        .ask(...)` with one question still forks, and so does `ask()` itself once `self.paged` is `True` or there is
+        more than one question -- that second case is measurably worse (`docs/PERFORMANCE.md`) and not bounded by
+        the constant above.
         """
         self.validate(questions)
         if len(questions) == 1 and not images and not videos and self.calibration is None and not self.paged:

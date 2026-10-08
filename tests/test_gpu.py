@@ -149,6 +149,39 @@ COMPANION_MOVEMENT_QN1_ATTENTION = 0.086
 #: not because the cause is different. Set half again over 0.008346.
 COMPANION_MOVEMENT_ROW_COUNT = 0.0125
 
+#: How far a single, companion-free question's probability may move between the one-pass path (`paged=False`,
+#: `_ask_in_one_pass`, a recorded replay of context-and-question read together) and the forked path (`paged=True`,
+#: `_answer`'s branch pass through the page pool) on the *same* engine, same weights, same card, same document and
+#: question -- flipping only the `paged` property, not constructing a second engine.
+#:
+#: This is a different axis from every other constant in this file: those bound how much a *companion* or an extra
+#: *question* may move an answer within one storage mode (`paged=True` throughout); this one bounds how much the
+#: storage mode itself may move an answer with nothing else held constant. `docs/PERFORMANCE.md`'s "Which engine
+#: construction built the answer" section used to list `paged` alongside `interleaved_fork`/`wide_group` as a third
+#: constructor flag whose single-question cross-construction gap the `_invariance_base_claimed` fix (`engine.py`'s
+#: `__init__`) closed -- it does not: that fix closes a *process-wide, cuBLAS/cuBLASLt-heuristic* non-determinism
+#: that construction order used to expose; it does nothing about `paged` routing a single question through a
+#: structurally different computation (one FA2 call over context+question together, vs. a context-only FA2 prefill
+#: followed by a *separate* branch call that reads the page pool through `unified_attention` -- `prismyra/kernels/
+#: qwen3_moe.py`'s `FlashAttention.forward`, `key is None` branch). `tools/audit_sm120.py`'s `paged_vs_joined`
+#: section is the real measurement: on 8 real RACE documents, question count 1 (this constant's own scope) moved by
+#: at most 0.026176 on the L40S and 0.001839 on the RTX PRO 4500, zero decision flips on either card. Set half again
+#: over the larger of the two (0.026176 * 1.5 = 0.039264, rounded up). **Question counts above 1 are measurably
+#: worse** (`ask()` no longer reaches
+#: `_ask_in_one_pass` at all once there is more than one question, so a second mechanism -- `interleaved_fork`'s
+#: fused context-and-first-branch-group pass vs. the page-pool branch read -- joins the one-pass-specific gap this
+#: constant covers) -- up to 0.126938 on the L40S with 34/816 decision flips in that same 8-document sweep, not
+#: bounded by this constant and not claimed closed anywhere; see `docs/PERFORMANCE.md` for why `paged` was removed
+#: from the "closed" list rather than given a second, looser bound here. Routing a solo `paged=True` question
+#: through `_ask_in_one_pass` was considered and rejected: it would make `ask()`'s own question-count=1 case
+#: disagree with `open_batch`'s, which is exactly the companion/question-count matrix `audit_sm120.py` already
+#: measures bit-exact (4,392/4,392) -- trading a closed guarantee for this one, not adding to it. Aligning the
+#: branch read's attention kernel to FA2 (dropping `unified_attention`) was also considered: faster by 2.3-2.9% on
+#: the L40S, but it reopens the companion-count residual (FA2's `num_splits` heuristic, "72/4,392" in the v0.4.0
+#: release notes) `unified_attention` was adopted to close, and on the RTX PRO 4500 it barely moves this gap at all
+#: (0.002609 to 0.002478) -- the cause is not attention-kernel choice alone on that card.
+PAGED_VS_JOINED_MOVEMENT = 0.04
+
 #: The smallest answer to "how many seconds" that still shows the clip's timing reached the model. Five, not six.
 #:
 #: Not a loosened assertion. What these two tests exist to catch is timing **withheld**: a six second clip handed over
@@ -1364,6 +1397,31 @@ def test_one_question_in_one_pass_answers_as_the_fork_does(engine):
         for option, p in forked[q.id].probabilities.items():
             assert once[q.id].probabilities[option] == pytest.approx(p, abs=COMPANION_MOVEMENT)
         assert once.timing.readout_ms == 0.0
+
+
+def test_paged_and_joined_agree_within_measured_bound_for_one_question(engine_paged):
+    """A single, companion-free question's answer must not move by more than `PAGED_VS_JOINED_MOVEMENT` between
+    `paged=False` (`_ask_in_one_pass`) and `paged=True` (`_answer`'s branch pass through the page pool), flipping
+    only the `paged` property on the *same* engine rather than constructing a second one.
+
+    This is not the same claim `test_one_question_in_one_pass_answers_as_the_fork_does` already makes: that test
+    compares the one-pass path against the forked path on a *non*-paged engine (`open_context(...).ask(...)` there
+    still runs through the joined, contiguous cache). This test is the `paged` axis specifically -- see
+    `PAGED_VS_JOINED_MOVEMENT`'s own docstring for the mechanism (a structurally different branch-read kernel, not a
+    construction-order non-determinism) and for why question counts above 1 are deliberately out of this test's
+    scope.
+
+    `engine_paged` already flipped `paged` to `True` and will restore whatever it was before; this test flips it
+    back to `False` for the joined half of the comparison, then forward to `True` again, leaving the fixture's own
+    teardown to put it back to its original value.
+    """
+    q = Boolean(id="faulty", prompt="Does the seller pay return shipping on a faulty item?")
+    engine_paged.paged = False
+    joined = engine_paged.ask(CONTEXT, [q])
+    engine_paged.paged = True
+    paged = engine_paged.ask(CONTEXT, [q])
+    for option, p in joined[q.id].probabilities.items():
+        assert paged[q.id].probabilities[option] == pytest.approx(p, abs=PAGED_VS_JOINED_MOVEMENT)
 
 
 def test_the_layer_interleaved_fused_path_answers_as_the_two_pass_path_did(engine):
