@@ -15,12 +15,22 @@ from __future__ import annotations
 import json
 import os
 import threading
+import warnings
+from pathlib import Path
 
 import torch
 from torch import nn
 
+from .autotune import arch_of
+
 FP8 = torch.float8_e4m3fn
 HEADROOM = 1.25
+
+#: Per-card tables of already-measured NVFP4 GEMM tactics, shipped with the package the same way
+#: `pinned/fp8_block_configs/` ships the dense-FP8 matmul tiling (`kernels/fp8_tuning.py`): one JSON file per GPU
+#: generation, in the exact format `flashinfer.autotuner.autotune(cache=...)` reads and writes. See
+#: `autotune_tactics()` for how a process without a matching table still answers deterministically within itself.
+PINNED_NVFP4_DIR = Path(__file__).parent / "pinned" / "nvfp4_tactics"
 
 
 def _e2m1(device):
@@ -190,7 +200,10 @@ class FusedExpertsFp4(nn.Module):
         buf = FusedExpertsFp4._ws.get(key)
         if buf is None or buf.numel() < size:
             FusedExpertsFp4._ws[key] = None
-            buf = FusedExpertsFp4._ws[key] = torch.empty(size, dtype=torch.uint8, device=self.w1.device)
+            # tac, 2026-10-08 (diagnostic): `torch.empty`, not `torch.zeros` -- investigating whether this
+            # buffer's first-allocation content (this process's own CUDA allocator history, not the kernel's
+            # own output) leaks into the answer. See RUN-tac.md 3.x.
+            buf = FusedExpertsFp4._ws[key] = torch.zeros(size, dtype=torch.uint8, device=self.w1.device)
         return buf
 
     def routed(self, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
@@ -278,9 +291,25 @@ def convert(model: nn.Module, top_k: int, device) -> int:
 #: are themselves process-global (see the first paragraph below).
 _INFERENCE_AUTOTUNE_CTX = None
 
+#: What `autotune_tactics()` used to pick this process's tactic, for `engine.stats()["nvfp4_tactics"]` and for
+#: `tests/test_gpu_cold_start.py`: "env" (`PRISMYRA_NVFP4_TACTICS`), "bundled" (a `PINNED_NVFP4_DIR` table that
+#: matched this card and this FlashInfer/CUDA/cuDNN build), or "profiled" (no table applied -- this process timed
+#: the candidates itself, same as every process did before this existed; `None` before the first MoE layer
+#: converts). `pinned` is `source in ("env", "bundled")`: whether *this* process's tactic is guaranteed to be the
+#: same one another process picked, not merely consistent with itself.
+_TACTIC_SOURCE: str | None = None
+
+
+def tactics_status() -> dict:
+    """`{"source": ..., "pinned": ..., "table": ...}`, the public read of `_TACTIC_SOURCE` for `engine.stats()`."""
+    return {
+        "source": _TACTIC_SOURCE,
+        "pinned": None if _TACTIC_SOURCE is None else _TACTIC_SOURCE in ("env", "bundled"),
+    }
+
 
 def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
-    """Pick the fused MoE kernel's tactic (tile shape and schedule) by timing it on this card.
+    """Pick the fused MoE kernel's tactic (tile shape and schedule), the same way in every process.
 
     Without this FlashInfer runs one default tactic for every size. Every MoE layer has the same shapes, so one layer's
     choice serves all of them; FlashInfer keeps the choice for the rest of the process. Inputs are random: the timing
@@ -297,15 +326,59 @@ def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
     `open_batch`) map to the *same* profiled tactic, by construction -- determinism first, matching this project's
     standing rule; the speed cost of using the large-M tactic at small M is measured directly rather than assumed.
 
-    The choice is made by timing, so two processes can pick differently if FlashInfer finds two tactics near-equal at
-    this one bucket; `PRISMYRA_NVFP4_TACTICS` names a JSON file: loaded if it exists, written if not, so every
-    process that shares it runs the same tactic.
-    """
-    from flashinfer.autotuner import autotune
+    That closed the *within-process* gap. It did not close the one between processes: the choice at this one
+    bucket is still made by timing, so two processes can pick differently if FlashInfer finds two tactics
+    near-equal here -- measured directly (`RUN-tac.md`, 2026-10-08): the same release, as two separate processes
+    with no cache file, answered the same 1/16/64-question request bit-for-bit differently in 81 of 81 entries.
+    `PRISMYRA_NVFP4_TACTICS` names a JSON file the caller controls: loaded if it exists, written if not, so every
+    process that shares it runs the same tactic -- but a caller who never sets it got the old, timing-picked
+    behaviour by default. This project ships one more table, `PINNED_NVFP4_DIR`, exactly the way
+    `kernels/fp8_tuning.py` ships the dense-FP8 matmul tiling: already-measured tactics for the card this
+    checkpoint serves on, read automatically, with no setting required.
 
-    global _INFERENCE_AUTOTUNE_CTX
+    Precedence: `PRISMYRA_NVFP4_TACTICS` first (a caller measuring its own tactics, as `RUN-ship2.md` did, needs
+    its file to win); otherwise `PINNED_NVFP4_DIR/sm_<arch>.json` if that file exists *and* FlashInfer accepts it
+    (its own `_metadata` -- FlashInfer version, CUDA/cuBLAS/cuDNN versions, GPU name -- must match this process;
+    a mismatch is a different environment than the one the table was measured on, not this one, so FlashInfer
+    ignores it rather than silently handing out a tactic index that may not even exist in this build). Either way
+    the table is loaded read-only (`AutoTuner.load_configs`, not passed as this call's own `cache=`), so a process
+    that cannot use it never overwrites the package's copy with its own, environment-specific measurement -- the
+    same failure mode `kernels/fp8_tuning.py`'s own docstring describes for a table that is not shipped read-only.
+    When neither applies, this falls back to the old behaviour (profile fresh, pinned within this process only)
+    and warns, the same way `kernels.autotune.pin()` warns when a Triton kernel has no table for this card.
+    """
+    from flashinfer.autotuner import AutoTuner, autotune
+
+    global _INFERENCE_AUTOTUNE_CTX, _TACTIC_SOURCE
     buckets = (max_tokens,)
-    cache = os.environ.get("PRISMYRA_NVFP4_TACTICS")
+    env_cache = os.environ.get("PRISMYRA_NVFP4_TACTICS")
+    cache = env_cache
+    if env_cache:
+        source = "env"
+    else:
+        source = "profiled"
+        arch = arch_of(layer.w1.device)
+        bundled = PINNED_NVFP4_DIR / f"{arch}.json" if arch else None
+        if bundled and bundled.is_file():
+            if AutoTuner.get().load_configs(str(bundled)):
+                source = "bundled"
+            else:
+                warnings.warn(
+                    f"the bundled NVFP4 tactic table {bundled} does not match this process's FlashInfer/CUDA/cuDNN "
+                    "build or GPU; the tactic is timing-picked for this process and may differ from another "
+                    "process's. engine.stats()['nvfp4_tactics'] reports this.",
+                    stacklevel=2,
+                )
+        else:
+            warnings.warn(
+                f"no bundled NVFP4 tactic table for this card ({arch or 'unknown'}); the tactic is timing-picked "
+                "for this process and may differ from another process's unless PRISMYRA_NVFP4_TACTICS is set. "
+                "engine.stats()['nvfp4_tactics'] reports this.",
+                stacklevel=2,
+            )
+        # Loaded above via `load_configs`, not handed to `autotune(cache=...)` below: that call only auto-saves
+        # what it auto-loads, and this table must stay read-only (see the docstring's "Either way" paragraph).
+        cache = None
     with torch.inference_mode(), autotune(True, cache=cache, tuning_buckets=buckets):
         m = max_tokens
         x = torch.randn(m, layer.k, device=layer.w1.device, dtype=torch.bfloat16)
@@ -313,6 +386,7 @@ def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
         w = torch.full((m, layer.top_k), 1.0 / layer.top_k, device=x.device)
         layer.routed(x, w, ids)
     torch.cuda.synchronize()
+    _TACTIC_SOURCE = source
     # Opened and never exited: every call to `routed()` for the rest of this process now runs inside it, with
     # tune_mode=False (look up the cached tactic rather than re-profile) and round_up=True so every real M -- below,
     # at, or (should it ever happen) above `max_tokens` -- maps to this one bucket's tactic, never a different one.

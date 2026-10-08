@@ -220,6 +220,22 @@ the same profiled tactic by construction, closing the gap rather than bounding i
 now runs the tactic chosen for the largest one rather than its own dedicated choice; this project's own measurements
 of that cost are recorded against the row-count-invariance fix itself, not assumed.
 
+That closed the gap *within* one process. It did not close the one *between* processes: the one bucket's tactic
+is still chosen by timing on first use, so two processes with no shared cache file could pick differently if
+FlashInfer found two tactics near-equal there -- measured directly: the same release, as two separate processes
+with no `PRISMYRA_NVFP4_TACTICS`, answered the same request bit-for-bit differently in 81 of 81 entries (max
+move 0.334). This release ships one more table the same way `kernels/fp8_tuning.py` ships the dense-FP8 matmul
+tiling: already-measured tactics for the card this checkpoint serves on (`kernels/pinned/nvfp4_tactics/`), read
+automatically and read-only (a process whose FlashInfer/CUDA/cuDNN build does not match the table's falls back to
+timing for itself, warns, and never overwrites the package's copy). `engine.stats()["nvfp4_tactics"]` reports
+which of the two happened. A second, independent source of the same symptom was found verifying this: the
+per-thread scratch buffer `FusedExpertsFp4._workspace()` reuses across calls was allocated with `torch.empty`,
+so its first-allocation content was whatever this process's own CUDA allocator history happened to leave there,
+and that leaked into the answer -- unrelated to which tactic ran. Confirmed by toggling `PRISMYRA_NVFP4_WORKSPACE`
+(the kernel's own per-call scratch does not show the effect) and closed the same way padding is handled everywhere
+else in this project: `torch.zeros` instead of `torch.empty`, paid once per process at first allocation, not per
+request.
+
 See [docs/PERFORMANCE.md's settings table](PERFORMANCE.md#four-speed-settings-one-that-risks-the-answer) for
 `interleaved_fork` and `wide_group`, the two flags that change how a multi-question request reaches these kernels.
 
