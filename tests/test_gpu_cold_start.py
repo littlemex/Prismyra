@@ -6,12 +6,12 @@ because each start loads the weights and they must not be held by another test a
     pytest -m gpu tests/test_gpu_cold_start.py
 
 The test above only ever loaded `MODEL` -- `PRISMYRA_TEST_MODEL`, defaulting to the FP8 checkpoint -- so a run on
-the RTX PRO 4500 pod that never set that override exercised the FP8 code path there too, never the NVFP4 one, and
+an RTX PRO 4500 host that never set that override exercised the FP8 code path there too, never the NVFP4 one, and
 its `raced` check only enumerates `triton.runtime.autotuner.Autotuner` instances (`kernels.autotune.autotuners()`):
 NVFP4's own GEMM tactic is chosen by a *different* autotuner, FlashInfer's `flashinfer.autotuner.AutoTuner`, which
-that enumeration cannot see at all. Both gaps let a real defect through two verification rounds (`RUN-ship2.md`,
-`RUN-recon.md`) before a third round (`RUN-tac.md`) measured it directly: the same release, as two separate
-processes with no `PRISMYRA_NVFP4_TACTICS`, answered the same request bit-for-bit differently in 81 of 81 entries.
+that enumeration cannot see at all. Both gaps let a real defect through two earlier verification rounds before a
+direct measurement caught it: the same release, as two separate processes with no `PRISMYRA_NVFP4_TACTICS`,
+answered the same request bit-for-bit differently in 81 of 81 entries.
 `test_cold_starts_pin_the_nvfp4_tactic_too` below closes both gaps -- it loads the real NVFP4 checkpoint, and it
 asserts on `engine.stats()["nvfp4_tactics"]` (the mechanism: did this process load a pinned tactic, or time its
 own) rather than only on whether two or three samples happened to disagree. That distinction matters: pinning the

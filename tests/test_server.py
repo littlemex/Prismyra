@@ -157,7 +157,7 @@ def test_the_served_version_is_the_package_version():
     prismyra.Prismyra = lambda *a, **k: StubEngine()
     try:
         app = create_app("stub/model")
-        assert app.version == prismyra.__version__ == "0.4.1"
+        assert app.version == prismyra.__version__ == "0.4.2"
         client = TestClient(app)
         assert client.get("/openapi.json").json()["info"]["version"] == prismyra.__version__
     finally:

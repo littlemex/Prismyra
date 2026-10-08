@@ -200,9 +200,9 @@ class FusedExpertsFp4(nn.Module):
         buf = FusedExpertsFp4._ws.get(key)
         if buf is None or buf.numel() < size:
             FusedExpertsFp4._ws[key] = None
-            # tac, 2026-10-08 (diagnostic): `torch.empty`, not `torch.zeros` -- investigating whether this
-            # buffer's first-allocation content (this process's own CUDA allocator history, not the kernel's
-            # own output) leaks into the answer. See RUN-tac.md 3.x.
+            # Zero-initialized at allocation: this buffer is reused across calls (keyed by device, fusion mode,
+            # and thread), so an uninitialized first allocation would leak this process's own CUDA allocator
+            # history -- not the kernel's own output -- into the answer. Paid once per process, at first use.
             buf = FusedExpertsFp4._ws[key] = torch.zeros(size, dtype=torch.uint8, device=self.w1.device)
         return buf
 
@@ -328,7 +328,7 @@ def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
 
     That closed the *within-process* gap. It did not close the one between processes: the choice at this one
     bucket is still made by timing, so two processes can pick differently if FlashInfer finds two tactics
-    near-equal here -- measured directly (`RUN-tac.md`, 2026-10-08): the same release, as two separate processes
+    near-equal here -- measured directly: the same release, as two separate processes
     with no cache file, answered the same 1/16/64-question request bit-for-bit differently in 81 of 81 entries.
     `PRISMYRA_NVFP4_TACTICS` names a JSON file the caller controls: loaded if it exists, written if not, so every
     process that shares it runs the same tactic -- but a caller who never sets it got the old, timing-picked
@@ -336,8 +336,8 @@ def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
     `kernels/fp8_tuning.py` ships the dense-FP8 matmul tiling: already-measured tactics for the card this
     checkpoint serves on, read automatically, with no setting required.
 
-    Precedence: `PRISMYRA_NVFP4_TACTICS` first (a caller measuring its own tactics, as `RUN-ship2.md` did, needs
-    its file to win); otherwise `PINNED_NVFP4_DIR/sm_<arch>.json` if that file exists *and* FlashInfer accepts it
+    Precedence: `PRISMYRA_NVFP4_TACTICS` first (a caller measuring its own tactics needs its file to
+    win); otherwise `PINNED_NVFP4_DIR/sm_<arch>.json` if that file exists *and* FlashInfer accepts it
     (its own `_metadata` -- FlashInfer version, CUDA/cuBLAS/cuDNN versions, GPU name -- must match this process;
     a mismatch is a different environment than the one the table was measured on, not this one, so FlashInfer
     ignores it rather than silently handing out a tactic index that may not even exist in this build). Either way
