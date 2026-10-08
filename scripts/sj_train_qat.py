@@ -307,6 +307,7 @@ data = data[:usable]
 data = data[RANK::WORLD]
 opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.0)
 steps_total = a.epochs * len(data) // a.accum; step = 0; t0 = time.time(); run_loss = []; skipped = 0
+n_partial_signal = [0]  # rows seen so far whose "T" entry had only "p" (see fix note at the T_ branch below)
 sched = lambda s: min(1.0, s / 20) * max(0.1, 1 - s / max(1, steps_total))
 lm.train()
 for ep in range(a.epochs):
@@ -324,13 +325,27 @@ for ep in range(a.epochs):
             ce_w = ex.get("_ce_w", 1.0)
             loss = ce_w * F.cross_entropy(logits[None], torch.tensor([gold], device=DEV))
             if "T" in ex:
+                # sj FIX (2026-10-08, found before any training step completed on the first sj1/sj2 launch):
+                # teacher_2x.pt on EFS today has full signal (p/h/ti/tv) for 30,200 of its 43,729 entries and
+                # ONLY "p" for the remaining 13,529 -- confirmed with torch.load on next2, not an artefact of
+                # this script's own edits (train_qat.py's unmodified code at /work/next/scripts/train_qat.py
+                # reads T_["h"] unconditionally too, so it would hit the same KeyError against the file in its
+                # CURRENT state; a8's own completed run therefore must have trained against teacher_2x.pt
+                # before whatever later touched it dropped h/ti/tv on these rows -- a dossier-worthy pitfall
+                # for whoever next reads this file, reported in RUN-sj.md section 2, orthogonal to the (a)/(b)
+                # SearchJev flags this file otherwise tests). Falling back to CE+KD(p) only for a p-only row
+                # keeps every row trainable without inventing a hidden-state/vocab target that was never saved.
                 T_ = ex["T"]; tp = T_["p"].to(DEV).float().clamp_min(1e-8)
                 kl = (tp * (tp.log() - F.log_softmax(logits, -1))).sum()
-                cos = 1 - F.cosine_similarity(h.float(), T_["h"].to(DEV).float(), 0)
-                vi = T_["ti"].to(DEV).long(); vt = torch.softmax(T_["tv"].to(DEV).float(), -1)
-                vs = F.log_softmax(h.float() @ U[vi].float().t(), -1)
-                kv = (vt * (vt.log() - vs)).sum()
-                loss = a.w_ce * loss + a.w_kd * kl + a.w_h * cos + a.w_v * kv
+                if "h" in T_ and "ti" in T_ and "tv" in T_:
+                    cos = 1 - F.cosine_similarity(h.float(), T_["h"].to(DEV).float(), 0)
+                    vi = T_["ti"].to(DEV).long(); vt = torch.softmax(T_["tv"].to(DEV).float(), -1)
+                    vs = F.log_softmax(h.float() @ U[vi].float().t(), -1)
+                    kv = (vt * (vt.log() - vs)).sum()
+                    loss = a.w_ce * loss + a.w_kd * kl + a.w_h * cos + a.w_v * kv
+                else:
+                    n_partial_signal[0] += 1
+                    loss = a.w_ce * loss + a.w_kd * kl
             elif "teacher" in ex:
                 tp = torch.tensor(ex["teacher"], device=DEV).clamp_min(1e-8)
                 kl = (tp * (tp.log() - F.log_softmax(logits, -1))).sum()
@@ -350,7 +365,8 @@ for ep in range(a.epochs):
             if step % a.log_every == 0 and RANK == 0:
                 el = time.time() - t0
                 print(f"step {step}/{steps_total} loss {sum(run_loss[-a.accum*a.log_every:])/len(run_loss[-a.accum*a.log_every:]):.4f} "
-                      f"ex/s {(i+1+ep*len(data))/el:.2f} mem {torch.cuda.max_memory_allocated()/2**30:.1f}GiB skipped {skipped}", flush=True)
+                      f"ex/s {(i+1+ep*len(data))/el:.2f} mem {torch.cuda.max_memory_allocated()/2**30:.1f}GiB skipped {skipped} "
+                      f"partial_signal_rows {n_partial_signal[0]}", flush=True)
             if step % 100 == 0 and RANK == 0:
                 torch.save({n: p.detach().cpu() for n, p in lm.named_parameters() if n.endswith(".A") or n.endswith(".B")}, a.out + ".partial")
 if WORLD > 1:
