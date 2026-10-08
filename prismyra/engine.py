@@ -37,6 +37,7 @@ from .fork import (
 from .graphs import keeping_pays, pays_from, record
 from .heads import Heads
 from .kernels.autotune import pin as pin_autotunes
+from .kernels.nvfp4 import tactics_status as _nvfp4_tactics_status
 from .media import Encoded, encode, position_offset
 from .readout import load_unembedding, plan, score
 from .schema import (
@@ -1354,6 +1355,11 @@ class Prismyra:
             "group": self.group,
             "kernels": self.applied.as_dict(),
             "autotune": self.autotune.as_dict(),
+            # `{"source": None, "pinned": None}` when this process never converted an NVFP4 MoE layer (the usual
+            # case on fp8-36l); otherwise which of PRISMYRA_NVFP4_TACTICS/the bundled per-card table/a fresh,
+            # this-process-only timing search chose this process's GEMM tactic. See `kernels/nvfp4.py`'s
+            # `autotune_tactics()`.
+            "nvfp4_tactics": _nvfp4_tactics_status(),
             "scoring": self.calibration.mode if self.calibration else "raw",
             "storage": "paged" if self.paged else "joined",
             # Counted by the layers themselves rather than taken from the flag. A previous version of the paged path

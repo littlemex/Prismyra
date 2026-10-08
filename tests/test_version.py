@@ -25,6 +25,6 @@ def test_the_version_comes_from_installed_metadata_not_a_second_hardcoded_string
     assert prismyra.__version__ == installed_version("prismyra") == _pyproject_version()
 
 
-def test_the_current_release_is_0_4_1():
+def test_the_current_release_is_0_4_2():
     """The number this release shipped, checked directly rather than only through agreement with itself."""
-    assert prismyra.__version__ == "0.4.1"
+    assert prismyra.__version__ == "0.4.2"

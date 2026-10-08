@@ -1,0 +1,18 @@
+{
+  "_metadata": {
+    "flashinfer_version": "0.6.16.post3",
+    "cuda_version": "13.0",
+    "cublas_version": "13.1.1",
+    "cudnn_version": "92000",
+    "cudnn_frontend_version": "1.27.0",
+    "gpu": "NVIDIA RTX PRO 4500 Blackwell Server Edition"
+  },
+  "('trtllm::fused_moe::gemm1', 'MoERunner', ((16384, 1024), (256, 1024, 128), (0,), (256, 2048, 32), (0,)), ())": [
+    "MoERunner",
+    12
+  ],
+  "('trtllm::fused_moe::gemm2', 'MoERunner', ((16384, 1024), (256, 1024, 128), (0,), (256, 2048, 32), (0,)), ())": [
+    "MoERunner",
+    32
+  ]
+}
