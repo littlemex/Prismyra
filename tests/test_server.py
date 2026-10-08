@@ -320,3 +320,250 @@ def test_a_generated_answer_is_read_without_crediting_or_robbing_the_model():
     assert parse("yes, because the policy says so", yes_no)[0] is True
     assert parse("no.", yes_no)[0] is False
     assert parse("I am not sure", yes_no)[0] is None
+
+
+# --------------------------------------------------------------------------- --batcher: routing, without a device
+#
+# `Batcher` (prismyra/schedule.py) is its own, device-free-testable object -- see tests/test_schedule.py's
+# `FakeEngine`/`FakeShelf`. What is new here, and not covered there, is `/ask`'s own choice of which path a request
+# takes: `StubBatchableEngine` is that same shape of stand-in, extended with `ask()` so a request this endpoint
+# cannot send through `Batcher` (media, or more questions than one pass holds) still has somewhere to go, and the
+# two paths leave different traces (`direct_asks` against `shelf_asks`) so a test can tell which one a request
+# actually travelled through without reading any probability.
+
+
+class _StubShelf:
+    """Enough of `prismyra.engine.Shelf` for `Batcher._answer`'s non-fused path (`StubBatchableEngine.interleaved_fork`
+    stays `False`, same as `tests/test_schedule.py`'s `FakeEngine`, so the fused paths are never reached here)."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.documents: dict[int, object] = {}
+        self._next = 0
+
+    def put_many(self, contexts):
+        handles = []
+        for context in contexts:
+            self.documents[self._next] = type("Shelved", (), {"tokens": len(context.split()), "snapshot_bytes": 0})()
+            handles.append(self._next)
+            self._next += 1
+        return handles
+
+    def ask(self, asked: dict, lane: int = 0) -> dict:
+        out = {}
+        for handle, questions in asked.items():
+            self.engine.shelf_asks.append((handle, len(questions)))
+            out[handle] = _stub_result(questions)
+        return out
+
+    def drop(self, handle):
+        self.documents.pop(handle, None)
+
+    def close(self):
+        self.documents.clear()
+
+
+def _stub_result(questions):
+    answers = {
+        q.id: Answer(
+            id=q.id,
+            kind=q.kind,
+            value=q.value_of(q.options[0]),
+            option=q.options[0],
+            probabilities=dict.fromkeys(q.options, 1.0 / len(q.options)),
+        )
+        for q in questions
+    }
+    return Result(answers=answers, timing=Timing(context_ms=1.0, readout_ms=1.0), model="stub")
+
+
+class StubBatchableEngine:
+    """`paged = True` and the shelf methods are what let `Batcher` build against this at all; `ask()` is what the
+    plain queue (`Worker`) calls for everything `Batcher` cannot take. `interleaved_fork = False`, same reason as
+    `tests/test_schedule.py`'s `FakeEngine`: this file's own job is which path `/ask` picks, not the fused path's
+    own device-only correctness (covered on real hardware by `tests/test_gpu.py::test_a_shelf_matches_ask_bit_for_bit`
+    and `tools/audit_sm120.py`).
+    """
+
+    model_name = "stub"
+    paged = True
+    wide_group = False
+    interleaved_fork = False
+
+    def __init__(self, group: int = 8):
+        self.group = group
+        self.longest_context = 4096
+        self.fastest_read_ms = 1.0
+        self.torch_device = type("Device", (), {"type": "cpu"})()
+        self.direct_asks: list[tuple] = []
+        self.shelf_asks: list[tuple] = []
+        self.tokenizer = staticmethod(lambda text, **_: {"input_ids": text.split()})
+
+    def cache_bytes(self, tokens):
+        return tokens * 1024
+
+    def stats(self):
+        return {"model": "stub"}
+
+    def validate(self, questions):
+        return None
+
+    def encode_context(self, text: str):
+        return type("Encoded", (), {"text": text, "tokens": len(text.split())})()
+
+    def open_shelf(self, room=None, lane: int = 0, group=None) -> _StubShelf:
+        return _StubShelf(self)
+
+    def ask(self, context, questions, images=None, videos=None):
+        self.direct_asks.append((context, len(questions), images, videos))
+        return _stub_result(questions)
+
+
+def _client_with(engine, **app_kwargs):
+    """A `TestClient` wired to `engine` the same way `test_the_endpoint_accepts_a_request_body_over_real_http`
+    wires a `StubEngine`: `prismyra.Prismyra` is replaced for the one call that builds the app."""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    import prismyra
+    from prismyra.server import create_app
+
+    real = prismyra.Prismyra
+    prismyra.Prismyra = lambda *a, **k: engine
+    try:
+        app = create_app("stub/model", **app_kwargs)
+    finally:
+        prismyra.Prismyra = real
+    return TestClient(app)
+
+
+def _ask(client, questions, **body):
+    return client.post("/ask", json={"context": "a short document", "questions": questions, **body})
+
+
+def test_batcher_off_by_default_behaves_exactly_as_before():
+    """The default (`batcher=False`) must be the plain queue, unchanged: no `Batcher` is built, `/stats` carries
+    no `batcher` key, and every request answers through `ask()`."""
+    engine = StubBatchableEngine()
+    client = _client_with(engine)
+    assert client.app.state.batcher is None
+
+    response = _ask(client, [{"id": "q0", "prompt": "Ships today?"}])
+    assert response.status_code == 200, response.text
+    assert engine.direct_asks and not engine.shelf_asks
+    assert "batcher" not in client.get("/stats").json()
+
+
+def test_batcher_on_routes_a_plain_text_request_through_the_scheduler():
+    """A text-only request that fits in one pass (2 questions against a group of 8) takes the batched path, and
+    `/stats` now reports it."""
+    engine = StubBatchableEngine(group=8)
+    client = _client_with(engine, batcher=True)
+    assert client.app.state.batcher is not None
+
+    response = _ask(client, [{"id": "q0", "prompt": "Ships today?"}, {"id": "q1", "prompt": "Returnable?"}])
+    assert response.status_code == 200, response.text
+    assert engine.shelf_asks and not engine.direct_asks
+    assert response.json()["answers"]["q0"]["kind"] == "boolean"
+    assert "passes" in client.get("/stats").json()["batcher"]
+
+
+def test_batcher_on_still_sends_media_through_the_plain_queue():
+    """`Batcher` is text-only (`schedule.py`'s own docstring, same restriction as `open_batch`); a request with an
+    image must still answer, through `ask()`, exactly as it would with `batcher` off."""
+    import base64
+    import io
+
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+
+    engine = StubBatchableEngine(group=8)
+    client = _client_with(engine, batcher=True)
+    response = _ask(client, [{"id": "q0", "prompt": "Is it blue?"}], images=[encoded])
+    assert response.status_code == 200, response.text
+    assert engine.direct_asks and not engine.shelf_asks
+
+
+def test_batcher_on_still_sends_an_over_wide_request_through_the_plain_queue():
+    """A request asking more questions than one pass holds (`_batcher_capacity`) is not something `Batcher.submit`
+    will take -- `engine.ask()` answers it in several branch passes on its own, so it still goes to the plain
+    queue rather than being refused."""
+    engine = StubBatchableEngine(group=2)
+    client = _client_with(engine, batcher=True)
+    questions = [{"id": f"q{i}", "prompt": f"Clause {i}?"} for i in range(3)]
+    response = _ask(client, questions)
+    assert response.status_code == 200, response.text
+    assert engine.direct_asks and not engine.shelf_asks
+
+
+def test_namespaced_ids_never_collide_across_two_requests_sharing_a_document():
+    """`/ask` promises a request is stateless and carries its own context; a caller reasonably reads that as "my
+    ids only have to be unique within my own request body". `Batcher` does not keep that promise on its own:
+    `schedule.py`'s own `_answer` docstring says two callers asking about the *same* document in one pass are
+    "merged instead -- one document, both callers' questions, one set of rows", and the merge is a plain
+    `list.extend`, not a disjoint union -- two callers who both call their question `"ok"` collide. Found on real
+    hardware (`measure_packed.py`'s open-loop HTTP run against a 64-document pool at a sustained arrival rate):
+    several requests got a 422 for "duplicate question ids" naming an id their own request never sent, because a
+    *different* concurrent caller's identically-named question about the same document landed in the same pass.
+
+    This is the pure, device-free half of the fix: two different requests about the same document, using the
+    exact same caller-chosen id, must still namespace to two different ids (so a real `Batcher`'s merge cannot
+    collide them), and restoring must hand each caller back only its own.
+    """
+    from prismyra import Boolean
+    from prismyra.schema import Answer, Result, Timing
+    from prismyra.server import _namespaced, _restore_ids
+
+    request_a = [Boolean(id="ok", prompt="Ships today?")]
+    request_b = [Boolean(id="ok", prompt="Returnable within 30 days?")]  # same id, different question, same doc
+
+    namespaced_a, map_a = _namespaced(request_a)
+    namespaced_b, map_b = _namespaced(request_b)
+
+    assert namespaced_a[0].id != namespaced_b[0].id, "two requests' namespaced ids must never collide"
+    assert namespaced_a[0].prompt == "Ships today?"  # renaming touches only the id, nothing the model reads
+
+    def stub_result(renamed_id: str, value: bool) -> Result:
+        answer = Answer(id=renamed_id, kind="boolean", value=value, option="yes" if value else "no", probabilities={})
+        return Result(answers={renamed_id: answer}, timing=Timing(), model="stub")
+
+    restored_a = _restore_ids(stub_result(namespaced_a[0].id, True), map_a)
+    restored_b = _restore_ids(stub_result(namespaced_b[0].id, False), map_b)
+
+    assert set(restored_a.answers) == {"ok"}
+    assert set(restored_b.answers) == {"ok"}
+    assert restored_a["ok"].value is True
+    assert restored_b["ok"].value is False  # not swapped with request_a's answer
+
+
+def test_restore_ids_drops_a_companions_answers_from_the_shared_merged_result():
+    """The deeper half of the same finding. `_answer`'s own merge does not give each job a *slice* of the
+    document's answers -- it gives every job sharing a handle the *same* `Result` object, whatever every
+    companion in that pass also asked about that document (`return [answers[self._resident[job.payload.digest]]
+    for job in formed.jobs]`: one shared value, read once per job). Found on real hardware exactly this way: once
+    namespacing alone stopped the id collision, a *different* failure appeared at a higher arrival rate --
+    `KeyError` on a companion's own namespaced id, raised by the first draft of `_restore_ids`, which assumed
+    every key in `result.answers` was this request's own and tried to restore all of them.
+
+    `id_map` is this request's own and only this request's own, so filtering by it (`if k in id_map`) is what
+    turns the companion's leaked answer into something silently dropped rather than a `KeyError` -- or worse,
+    something returned to a caller that never asked for it.
+    """
+    from prismyra.schema import Answer, Result, Timing
+    from prismyra.server import _restore_ids
+
+    # One document, two callers who both asked about it in the same pass: this request's own answer, plus a
+    # companion's -- under a namespaced id this request's own `id_map` was never given.
+    mine = Answer(id="mine:q0", kind="boolean", value=True, option="yes", probabilities={})
+    companions = Answer(id="companion:q0", kind="boolean", value=False, option="no", probabilities={})
+    merged = Result(answers={"mine:q0": mine, "companion:q0": companions}, timing=Timing(), model="stub")
+
+    restored = _restore_ids(merged, {"mine:q0": "q0"})
+
+    assert set(restored.answers) == {"q0"}, "a companion's answer must not leak into this request's response"
+    assert restored["q0"].value is True
