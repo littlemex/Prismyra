@@ -26,6 +26,7 @@ half-built version of them away. In-process callers that want follow-ups use `Pr
 import argparse
 import base64
 import dataclasses
+import uuid
 from typing import Any, Literal
 
 from .media import MAX_DECODED_FRAMES, decode_image, decode_video
@@ -95,6 +96,78 @@ def with_queue_time(result: Result, queue_ms: float) -> Result:
     return dataclasses.replace(result, timing=dataclasses.replace(result.timing, queue_ms=queue_ms))
 
 
+def _batcher_capacity(engine) -> int:
+    """The widest single request `Batcher.submit` will accept, mirroring `schedule.Limits.of` without needing a
+    built `Batcher` to ask: a `lanes>1` router keeps no `Limits` of its own (every lane does, and they agree), so
+    this is computed from the engine instead of read off either shape.
+
+    A document's row budget is `engine.group`, widened to `WIDE_GROUP` exactly when `Batcher.__init__` would widen
+    its own -- `engine.wide_group` set and `engine.group` still short of it. `/ask` uses this once, at construction,
+    to decide which requests the batched path can take at all; a request wider than this still has somewhere to
+    go, because `engine.ask()` itself answers an arbitrarily wide request in several branch passes, which is why
+    an over-wide request falls back to the plain queue rather than being refused.
+    """
+    from .engine import WIDE_GROUP
+
+    return WIDE_GROUP if getattr(engine, "wide_group", False) and engine.group < WIDE_GROUP else engine.group
+
+
+def _ask_via_batcher(batcher, context: str, questions: list[Question], timeout: float):
+    """`Batcher.submit` only enqueues; this adds the wait, so `/ask` can treat the result exactly like
+    `Worker.submit`'s: the same three exceptions (`QueueFull`, `PrismyraError`, `TimeoutError`) and, on success, a
+    `Job` whose `.result` and `.queue_ms` the response is built from.
+    """
+    job = batcher.submit(context, questions)  # may raise QueueFull or PrismyraError before anything is queued
+    if not job.done.wait(timeout):
+        job.cancelled = True
+        raise TimeoutError(f"no answer within {timeout}s")
+    if job.error is not None:
+        raise job.error
+    return job
+
+
+def _namespaced(questions: list[Question]) -> tuple[list[Question], dict[str, str]]:
+    """Give every question in this one request a batcher-wide-unique id, and the map back to what the caller sent.
+
+    `/ask`'s own docstring promises a request is stateless and carries its own context -- which a caller reasonably
+    reads as "my ids only have to be unique within my own request body", the same promise `build_questions` already
+    enforces one request at a time. `Batcher` does not keep that promise on its own: `schedule.py`'s `_answer`
+    docstring says two callers asking about the *same* document in one pass are "merged instead -- one document,
+    both callers' questions, one set of rows", and the merge is `dict.setdefault(handle, []).extend(...)` -- a
+    union, not a disjoint union. Two different callers who happen to both call their question `"ok"` about a
+    document they both already had open get one one of their two rows silently answering for both ids once merged
+    (reproduced here: a 64-document pool at a sustained arrival rate puts the same document in more than one
+    forming pass's company, and every repeat used the same caller-chosen ids by construction, costing several
+    requests a 422 for "duplicate question ids" that named a *different* caller's question, not this request's
+    own). Renaming here, before `submit`, and renaming back in `_restore_ids` after the answer comes back, is
+    local to the HTTP front end and changes nothing the model sees: `question.id` is read only for error text and
+    for keying the answer dict (`engine.py`'s `q.id: _answer_for(...)` sites), never for row order or any
+    computation, so this cannot move an answer.
+    """
+    prefix = uuid.uuid4().hex[:12]
+    renamed = [dataclasses.replace(q, id=f"{prefix}:{q.id}") for q in questions]
+    return renamed, {renamed_q.id: original.id for renamed_q, original in zip(renamed, questions, strict=True)}
+
+
+def _restore_ids(result: Result, id_map: dict[str, str]) -> Result:
+    """Undo `_namespaced`, keeping only *this* request's own answers.
+
+    The namespacing alone is not the whole fix. `Batcher`'s merge for two callers sharing a document (same
+    `_answer`'s `asked.setdefault(handle, []).extend(...)`) hands the *same* merged `Result` -- every companion's
+    answers included, keyed by their own namespaced ids -- back to every job that named that document, not a
+    per-job slice of it (`_answer`'s own `return [answers[self._resident[job.payload.digest]] for job in
+    formed.jobs]`: one shared `Result` object, read once per job sharing the handle). Filtering by `k in id_map`
+    is what turns "the whole document's answers" back into "the answers to the questions this request asked" --
+    without it, two concurrent callers who happen to send the identical context text see each other's answers
+    (and, before ids were namespaced at all, could see a `KeyError` here instead: a companion's own namespaced id
+    is not a key this request's `id_map` ever had).
+    """
+    return dataclasses.replace(
+        result,
+        answers={id_map[k]: dataclasses.replace(a, id=id_map[k]) for k, a in result.answers.items() if k in id_map},
+    )
+
+
 #: Hard limits on one request. An endpoint with none lets a single caller hold the device for as long as it likes, and
 #: the failure arrives as everyone else's latency rather than as that caller's error. The context limit is in tokens,
 #: not characters, because that is what both costs are a function of -- and a character count is a proxy that varies
@@ -120,12 +193,28 @@ def create_app(
     max_questions: int = MAX_QUESTIONS,
     max_media_bytes: int = MAX_MEDIA_BYTES,
     max_video_frames: int = MAX_DECODED_FRAMES,
+    batcher: bool = False,
+    linger_ms: float | None = None,
+    lanes: int = 1,
     **engine_kwargs,
 ):
     """A FastAPI application with the engine and its worker already running.
 
     The model loads at construction, not at the first request. A first request that pays for loading would report a
     latency no later request can reproduce, and a health check would pass before the server could answer anything.
+
+    **`batcher`** routes a text-only `/ask` request through `prismyra.schedule.Batcher` instead of answering it alone:
+    several callers' documents and questions share passes, the way `docs/PERFORMANCE.md`'s "The scheduler" section
+    measures. Off by default -- a caller who wants the plain one-request-at-a-time queue this always was still gets
+    exactly that, unchanged, and nothing below changes shape for them. On, a request still goes to the plain queue
+    when the batched path cannot take it: it carries media (`Batcher` is text-only, like `open_batch`) or it asks more
+    questions than one pass holds (`_batcher_capacity`) -- `engine.ask()` answers that in several branch passes on its
+    own, which `Batcher.submit` does not attempt. Either way the wire contract is the same request in, the same
+    response shape out; which internal path answered it is not part of what a caller can observe.
+
+    `batcher` requires the paged storage (`Batcher.__init__` refuses without it), so it is set to `True` here when
+    the caller has not already said otherwise -- there is no CLI flag for `paged` on its own, and a caller passing
+    `batcher=True` plainly wants the one precondition it has.
     """
     from contextlib import asynccontextmanager
 
@@ -134,16 +223,28 @@ def create_app(
 
     from . import Prismyra, __version__
 
+    if batcher:
+        engine_kwargs.setdefault("paged", True)
     engine = Prismyra(model, **engine_kwargs)
     worker = Worker(
         lambda payload: engine.ask(payload[0], payload[1], images=payload[2] or None, videos=payload[3] or None),
         max_queue=max_queue,
     ).start()
 
+    text_batcher = None
+    batcher_capacity = 0
+    if batcher:
+        from .schedule import Batcher
+
+        text_batcher = Batcher(engine, max_queue=max_queue, linger_ms=linger_ms, lanes=lanes).start()
+        batcher_capacity = _batcher_capacity(engine)
+
     @asynccontextmanager
     async def lifespan(_):
         yield
         worker.stop()
+        if text_batcher is not None:
+            text_batcher.stop()
 
     class QuestionIn(BaseModel):
         id: str | None = None
@@ -210,8 +311,16 @@ def create_app(
             questions = build_questions([q.model_dump() for q in body.questions])
         except QuestionError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
+        id_map = None
         try:
-            job = worker.submit((body.context, questions, images, videos), timeout=request_timeout)
+            # The batched path only when it can actually take the request: no media (`Batcher` is text-only) and
+            # not more questions than one pass holds. Everything else -- including every request when `batcher` is
+            # off -- takes the queue this endpoint always had, unchanged.
+            if text_batcher is not None and not images and not videos and len(questions) <= batcher_capacity:
+                namespaced, id_map = _namespaced(questions)
+                job = _ask_via_batcher(text_batcher, body.context, namespaced, request_timeout)
+            else:
+                job = worker.submit((body.context, questions, images, videos), timeout=request_timeout)
         except QueueFull as e:
             # The work was never started, so 503 with Retry-After is the honest answer. Its own exception type matters
             # here: the engine raises `RuntimeError` too, and reporting that as an overloaded server would send the
@@ -222,7 +331,8 @@ def create_app(
             raise HTTPException(status_code=504, detail=str(e), headers={"Retry-After": "5"}) from e
         except PrismyraError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
-        return as_json(with_queue_time(job.result, job.queue_ms))
+        result = _restore_ids(job.result, id_map) if id_map is not None else job.result
+        return as_json(with_queue_time(result, job.queue_ms))
 
     @app.get("/health")
     def health() -> dict:
@@ -230,10 +340,14 @@ def create_app(
 
     @app.get("/stats")
     def stats() -> dict:
-        return {"engine": engine.stats(), "queue": worker.stats()}
+        out = {"engine": engine.stats(), "queue": worker.stats()}
+        if text_batcher is not None:
+            out["batcher"] = text_batcher.stats()
+        return out
 
     app.state.engine = engine
     app.state.worker = worker
+    app.state.batcher = text_batcher
     return app
 
 
@@ -273,6 +387,28 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="a JSON spec of option-set heads (see prismyra.heads); questions whose options match none are unaffected",
     )
+    parser.add_argument(
+        "--batcher",
+        action="store_true",
+        help="answer a text-only /ask alongside whatever else is already waiting, through prismyra.schedule.Batcher, "
+        "instead of alone; off by default. Implies --paged (there is no separate flag for it: Batcher refuses "
+        "without the paged storage). A request with media, or more questions than one pass holds, still answers "
+        "through the plain queue this flag leaves otherwise unchanged.",
+    )
+    parser.add_argument(
+        "--linger-ms",
+        type=float,
+        default=None,
+        help="with --batcher, how long a forming pass waits with nothing new arriving before it runs (default: the "
+        "scheduler's own, 2 ms, bounded by what the engine has measured a pass to cost -- see schedule.Limits)",
+    )
+    parser.add_argument(
+        "--lanes",
+        type=int,
+        default=1,
+        help="with --batcher, how many independent pass pipelines run under one Batcher; more than one lets a "
+        "second pass start while the first is still running, at the cost of a second shelf's own device memory",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -291,6 +427,9 @@ def main(argv: list[str] | None = None) -> int:
         require_kernels=args.require_kernels,
         **({"short_graphs": False} if args.no_short_graphs else {}),
         heads=args.heads,
+        batcher=args.batcher,
+        linger_ms=args.linger_ms,
+        lanes=args.lanes,
     )
     uvicorn.run(app, host=args.host, port=args.port)
     return 0

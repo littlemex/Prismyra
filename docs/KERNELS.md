@@ -89,6 +89,92 @@ at context width, same checkpoint, three rounds each alternating against `origin
 project's noise bar) -- with the per-shape tuning table now ruled out as the explanation on both cards, since both
 have one.
 
+## The same answer in every process, part two: swap self-checks are seeded too
+
+The pinning above covers kernels whose *configuration* a timing race can pick differently. A second, independent
+gap had the same symptom -- `tests/test_gpu_cold_start.py::test_cold_starts_pin_the_nvfp4_tactic_too` failing on
+`nvfp4-36l`, on the RTX PRO 4500, with the NVFP4 tactic itself confirmed pinned in every failing run -- but a
+different cause: whether a kernel *replacement runs at all*.
+
+`_compare` (used by `_swap_and_verify` for the "dense_matmul" and "norm" swaps) and `_swap_gated_norm` each decide
+whether to install a replacement by running both the framework's own implementation and the replacement on one
+random probe and requiring they agree within a tolerance (5e-2 for "dense_matmul", `2 * BF16_ULP` for "norm" and
+"gated_norm"). The probe used to be unseeded -- drawn fresh from the process-global RNG state on every construction.
+Measured directly on `nvfp4-36l`'s own weights: four independent, unseeded draws of "dense_matmul"'s probe measured
+2.912e-02, 3.893e-02, 3.968e-02, and 5.018e-02 against that 5e-2 tolerance -- the fourth is *over* it. A process whose
+draw lands under the line installs `Fp8Linear` (and, downstream, the three `dense_fusion` groups that depend on it
+being installed) for every dense FP8 projection in the model; a process whose draw lands over the line keeps the
+framework's own implementation instead, which rounds at a different point (`_swap_and_verify`'s own docstring has
+the detail) -- a difference compounded across every dense projection in all 36 layers, large enough to flip which
+of two probabilities a question's answer reports.
+
+The fix seeds both probes from a value derived from the module being checked (the same pattern `onepass.prove`
+already uses for its own bucket proof, and `_delta_inputs` for the `gated_delta_rule` swap's), and widens
+`_compare`'s probe from 4 rows to 64 (matching `_swap_gated_norm`'s own row count) to shrink the measurement's own
+spread. Re-measured five independent times after the fix: all five gave the identical 2.820e-02 for "dense_matmul"
+on `nvfp4-36l`. `test_cold_starts_pin_the_nvfp4_tactic_too` passed on seven independent cold starts after the fix
+(it had failed within five before it, and within seven after fixing a narrower, unrelated cause two releases
+earlier -- see this file's own autotune-pinning section and `kernels/nvfp4.py`'s tactic table for that one).
+
+Checked and ruled out directly, not assumed, before landing on this: the NVFP4 GEMM tactic itself
+(`engine.stats()["nvfp4_tactics"]` reported `pinned: True` in every failing run); its workspace buffer (sized once
+for the largest profiled bucket and confirmed, by direct computation of `cutlass_fused_moe_workspace_size`, never to
+need re-growing at the token counts this test uses); every Triton autotuner `pin_autotunes()` is supposed to cover
+(`engine.stats()["autotune"]` showed every expected kernel name pinned-from-table or deterministically fallen-back
+in three independent constructions); the GDN fused-norm kernel itself in isolation (called directly, no model, no
+engine, fixed seeded input: identical across five independent processes); and `onepass.install_islands()`'s
+module-forward monkey-patch (an early, false lead from a too-small sample -- ruled out once a larger sample showed
+the same split with and without it).
+
+Why `fp8-36l` never showed this: the same two checks measured 5.747e-03 ("dense_matmul") and 5.208e-03 ("norm")
+against the same tolerances on that checkpoint's own weights -- comfortably clear of the "dense_matmul" line
+(11% of the budget), closer than that on "norm" (67%). `engine.applied.notes` now says so whenever a passing
+measurement uses more than half its tolerance (`MARGIN_WARN_FRACTION`, `kernels/qwen3_moe.py`), on either
+checkpoint, so a future checkpoint drifting toward either line is visible before it crosses one rather than
+after. The two checks that already demand bit-identical agreement rather than a tolerance (`_fuse_pair`'s
+fused-vs-separate check, `_probe_head_duplication`'s before-vs-after check) are not at this risk: a probe's specific
+values cannot move an exact-equality decision the way they can move one measured against 5e-2 or `2 * BF16_ULP`.
+
+## The same answer in every process, part three: a self-check's own exception must not pick an answer
+
+Seeding the probes (the section above) closed the gap where *which numeric draw* a self-check happened to get
+decided which kernel path answered. A narrower but structurally identical gap remained one level down: before
+this fix, `_compare`, `_swap_gated_norm`, `_delta_disagreement`, and `_probe_head_duplication` each treated *every*
+exception from running the original or the replacement as a decline (`except Exception: return None`, or the
+string-returning equivalent) -- the right call for a replacement that is simply the wrong shape for this
+checkpoint, and the comment at each site said so. It is the wrong call for an exception that means the probe could
+not run at all right now: a `torch.OutOfMemoryError`, or a Triton kernel's static shared-memory requirement for the
+probe's shape exceeding the card's limit (`triton.errors.OutOfResources`, not a numeric disagreement). Measured
+directly: running `fp8-36l`'s own `test_require_kernels_starts_with_nothing_skipped` (`tests/test_gpu_require_kernels.py`)
+*after* `test_gpu.py`'s module-scoped engine had already run real inference at several row counts, in the same
+pytest process, made `_compare`'s "dense_matmul" probe raise `OutOfResources(106496, 101376, "shared memory")` --
+the identical probe, run as the first construction in a fresh process, measured a clean 5.747e-03 and installed the
+swap. The two constructions differ only in what else had already run in the same process; which kernel path this
+checkpoint answers from should not.
+
+`_reraise_if_resource_exhausted` (`kernels/qwen3_moe.py`) is called from all four sites before each one's own
+decline logic: a `torch.OutOfMemoryError` or `triton.errors.TritonError` (the base class `OutOfResources` and
+every other Triton compiler/runtime resource error derive from) is re-raised as `AdapterError` -- the same
+exception `kernels.apply()` already raises for a `require_kernels` checkpoint it cannot complete -- so a resource
+shortage fails construction loudly, independent of `require_kernels`, rather than silently keeping whichever
+kernel path happened to fit. This is unconditional: `require_kernels=False` (the default `Prismyra(...)` constructor
+value) does not reintroduce the silent path -- a resource exception during a self-check now always raises, because
+the danger (which kernel answers depends on resource pressure the caller never asked about) exists whether or not
+anyone asked for `require_kernels`. Only a genuine structural mismatch -- the replacement, or the original on this
+checkpoint's own shapes, raising for a reason that has nothing to do with a resource limit -- still declines
+quietly, exactly as before. Covered by device-free tests in `tests/test_kernels_registry.py` using modules whose
+`forward` raises the exception directly, not an actual OOM or a real Triton compile: both must raise `AdapterError`
+through `_compare`, and a plain structural `RuntimeError` must still decline the way it always has.
+
+`tests/test_gpu_require_kernels.py`'s own construction now runs in a subprocess rather than in the shared pytest
+process, for the reason the measurement above found: a fresh process has no Triton autotuner cache entries from an
+earlier shape to inherit, which is what actually changed between the clean construction and the one that raised --
+not the free-VRAM headroom `gpu_room.no_room_reason` already checked (that check guards a different resource, a
+second copy of the weights, and still runs first). A subprocess failure naming a resource (this fix's own
+`AdapterError` message) is reported as a skip with that message, not asserted on as if it had produced the normal
+JSON; checked on both of this project's checkpoints after the fix (fp8-36l on the L40S, nvfp4-36l on the RTX PRO
+4500) and neither raises it when run this way.
+
 ## What each replacement is worth
 
 Measured on one context of about 5,000 tokens. Each row is its own paired run -- the same process with and without that

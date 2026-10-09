@@ -369,6 +369,14 @@ class Batcher:
         """
         formed = Formed(jobs=[first])
         tokens = self._tokens(first)
+        # Rounded independently per document, the same rule `_round_rows` enforces everywhere else a pass's row
+        # budget is checked (`_answer`'s own fused-path `padded_total`, and `engine._answer_batch` underneath the
+        # non-fused path this admits into) -- *not* the raw question count `Formed.questions` reports. Two
+        # documents of, say, 2 and 14 questions round to 4 and 16 rows each (not a combined 16), and admitting by
+        # the raw sum let a pass form here that `_answer_batch` then refused by name, failing every job already
+        # in it rather than the one that did not fit. Measured concretely: a 256-document mixed 1/2/3-question
+        # Batcher run (the shape `measure_packed.py` uses) hit this on the very first non-trivial pass.
+        padded = _round_rows(len(first.payload.questions), self.limits.questions)
         backlogged = self._worker.depth > 0
         # Bounded by what the engine has measured as well as by the setting. A linger longer than a pass's fixed cost
         # cannot pay, and before anything has been read there is no evidence for any wait at all -- the same reason
@@ -394,8 +402,12 @@ class Batcher:
                 return formed
             questions = len(nxt.payload.questions)
             more = self._tokens(nxt)
-            if formed.questions + questions > self.limits.questions:
-                formed.reason = f"the next request's {questions} questions would pass {self.limits.questions} rows"
+            more_padded = _round_rows(questions, self.limits.questions)
+            if padded + more_padded > self.limits.questions:
+                formed.reason = (
+                    f"the next request's {questions} questions pad to {more_padded} rows of its own and would "
+                    f"pass {self.limits.questions} rows"
+                )
                 return formed
             if tokens + more > self.limits.tokens:
                 formed.reason = f"the next document's {more} tokens would pass {self.limits.tokens} in the pool"
@@ -406,6 +418,7 @@ class Batcher:
                 return formed
             formed.jobs.append(taken)
             tokens += more
+            padded += more_padded
             # The wait refreshes when a request joins. A burst is defined by requests still arriving rather than by a
             # duration, so a quiet stretch ends the wait and a busy one extends it -- up to the ceiling, which does not
             # move.

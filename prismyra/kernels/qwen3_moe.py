@@ -19,11 +19,50 @@ from torch import nn
 from .. import varlen
 from ..fork import WIDTHS
 from ..onepass import rows_exact
-from . import Applied, Swap, register
+from . import AdapterError, Applied, Swap, register
 from .conv import available as triton_available
 from .conv import causal_depthwise_conv1d, starts_from_boundaries
 
 BLOCK = (128, 128)
+
+
+def _reraise_if_resource_exhausted(e: Exception, context: str) -> None:
+    """A kernel-replacement self-check's own forward call ran out of a hardware resource -- GPU memory, or a
+    Triton kernel's static shared-memory requirement for the shapes at hand -- rather than disagreeing with the
+    original on the numbers. That is not evidence the replacement is wrong; it is evidence this process could not
+    run the probe at all right now. The callers of this function used to treat every exception here the same way
+    (`except Exception: decline`, this file's own comment: "a replacement that cannot run on this model is a
+    replacement to put back"), which is the right call for a replacement that is structurally the wrong shape for
+    this checkpoint -- but it also silently declined on a transient resource shortage, which means how much free
+    GPU memory happened to exist at *construction* time chose which kernel path answers every request for the
+    rest of the process's life (the FP8 fast path or the framework's slower one, the duplicated-head fallback or
+    the borrowed recurrence), changing the answer the exact way an unseeded random probe did before this file's
+    own seeding fix (`_compare`'s docstring) -- construction-time resource pressure standing in for a
+    construction-time coin flip. Measured: `_compare`'s own 64-row probe (widened from 4, both to shrink the
+    measured spread and to match `_swap_gated_norm`'s probe) can raise `triton.errors.TritonError` (seen in
+    practice as `OutOfResources` on a shared-memory limit, not `want`/`got` disagreeing) when a module-scoped
+    engine elsewhere in the same process still holds another checkpoint's weights.
+
+    Re-raised as `AdapterError` -- the same exception `kernels.apply()` already raises for a `require_kernels`
+    checkpoint it cannot complete -- so a transient resource shortage fails construction loudly, independent of
+    `require_kernels`, rather than picking a fallback kernel path no caller asked for.
+    """
+    if isinstance(e, torch.OutOfMemoryError):
+        raise AdapterError(
+            f"{context}: ran out of GPU memory while self-checking a kernel replacement ({type(e).__name__}: {e}) "
+            f"-- retry with more free memory on this device (for example, without another engine's weights still "
+            f"resident), rather than silently answering from whichever kernel path happened to fit"
+        ) from e
+    try:
+        from triton.errors import TritonError
+    except ImportError:  # pragma: no cover - the adapter already checks for triton before any of this runs
+        return
+    if isinstance(e, TritonError):
+        raise AdapterError(
+            f"{context}: hit a Triton compiler/runtime resource limit while self-checking a kernel replacement "
+            f"({type(e).__name__}: {e}) -- this is a hardware limit for the shapes involved, not a disagreement "
+            f"between the two sides, and is not expected to be fixed by retrying alone"
+        ) from e
 
 #: Rows at or below this width take a fused group's one combined matmul (`_ProjectionSlot`); above it, each slot
 #: falls back to its own separate `Fp8Linear` call. Both sides are bit-identical to the pre-fusion separate calls
@@ -425,7 +464,12 @@ except ImportError:  # pragma: no cover - the adapter checks for triton before i
 
 
 def _swap_gated_norm(applied, root: nn.Module) -> None:
-    """Replace every gated normalisation, after checking one against the module it replaces on two inputs."""
+    """Replace every gated normalisation, after checking one against the module it replaces on two inputs.
+
+    The two inputs come from a generator seeded by the weight's own width, not the process-global RNG state --
+    `_compare`'s own docstring has the measured reason an unseeded probe this close to its tolerance is not safe to
+    draw fresh every process.
+    """
     targets = _find_children(root, lambda m: type(m).__name__ == "Qwen3_5MoeRMSNormGated")
     if not targets:
         applied.skipped.append("gated_norm: nothing matched")
@@ -438,14 +482,16 @@ def _swap_gated_norm(applied, root: nn.Module) -> None:
     if p.dtype != torch.bfloat16:
         applied.skipped.append(f"gated_norm: the weight is {p.dtype}, and the kernel's rounding order assumes bfloat16")
         return
-    x = torch.randn(64, 32, p.shape[0], device=p.device, dtype=torch.bfloat16)
-    g = torch.randn(64, 32, p.shape[0], device=p.device, dtype=torch.bfloat16)
+    generator = torch.Generator(device="cpu").manual_seed(p.shape[0])
+    x = torch.randn(64, 32, p.shape[0], generator=generator).to(device=p.device, dtype=torch.bfloat16)
+    g = torch.randn(64, 32, p.shape[0], generator=generator).to(device=p.device, dtype=torch.bfloat16)
     try:
         with torch.inference_mode():
             want = original(x, g)
             got = FusedGatedRMSNorm(original)(x, g)
         moved = ((want.float() - got.float()).abs().max() / want.float().abs().max().clamp(min=1e-6)).item()
     except Exception as e:  # noqa: BLE001 - a replacement that cannot run here is not installed
+        _reraise_if_resource_exhausted(e, "gated_norm")
         applied.skipped.append(f"gated_norm left alone: {type(e).__name__}: {e}")
         return
     if moved > 2 * BF16_ULP:
@@ -456,6 +502,7 @@ def _swap_gated_norm(applied, root: nn.Module) -> None:
     applied.swaps.append(
         Swap("gated_norm", len(targets), None, verified=f"{len(targets)} modules, agreed to {moved:.3e}")
     )
+    _warn_if_close_to_tolerance(applied, "gated_norm", moved, 2 * BF16_ULP)
 
 
 # --------------------------------------------------------------------------- attention
@@ -497,7 +544,11 @@ class FlashAttention(nn.Module):
         attn = out.reshape(*shape, -1).contiguous() * torch.sigmoid(gate)
         return a.o_proj(attn), None
 
-    def forward(self, hidden_states, position_embeddings, attention_mask=None, past_key_values=None, **kwargs):
+    def forward(  # noqa: PLR0911 - one early return per attention shape this layer can be called with (context,
+        # branch over a page pool, branch over a dense join -- the one this change adds -- and packed/fallback);
+        # folding them into one return would hide which shape is which, which is what each early return documents
+        self, hidden_states, position_embeddings, attention_mask=None, past_key_values=None, **kwargs
+    ):
         try:
             from vllm.vllm_flash_attn import flash_attn_varlen_func
         except ImportError:
@@ -606,6 +657,85 @@ class FlashAttention(nn.Module):
                 return self._finish(out, gate, shape)
 
             k_len = key.shape[-2]
+            if layer.writing_branches:
+                # The joined (non-paged) storage's own branch read. Historically this ran the same
+                # `flash_attn_varlen_func` call the plain `cu_seqlens` branch below uses -- a dense, per-row
+                # copy of context+branch read with FA2's own split-KV heuristic, which reduces in a
+                # different order than the paged branch read below (`unified_attention`, tiled by this row's
+                # own `seqused_k` alone). `pg2`'s own measurement (`RUN-pg2.md`) found that difference is the
+                # single largest remaining source of a joined-vs-paged answer moving at question count >= 2
+                # -- up to 0.126938 on the L40S, 34/816 decision flips in `tools/audit_sm120.py`'s own sweep.
+                #
+                # This builds the *same* page-table call `prismyra/paged.py`'s `PagedForkLayer.paged_read`
+                # feeds `unified_attention`, over the join's own dense per-row keys/values instead of a shared
+                # pool: one page per row, `prismyra.paged.BLOCK` (16) tokens wide, padded with zeros past this
+                # row's real `k_len` (never read -- `seqused_k` caps every row at `k_len`, same as a paged
+                # pool's own partial last page). `block_size = v.shape[1]` is what the kernel picks its own
+                # `TILE_SIZE_PREFILL`/`TILE_SIZE_DECODE` from (`vllm...triton_unified_attention.unified_
+                # attention`, `TILE_SIZE_PREFILL = min(TILE_SIZE_PREFILL, block_size)`); a page view of a
+                # different width than the paged pool's own (e.g. one page covering a whole row) picks a
+                # different tile and does **not** reduce in the same order -- `BLOCK` is used here rather than
+                # any other width for exactly that reason, not for memory layout.
+                try:
+                    from vllm.v1.attention.ops.triton_unified_attention import (
+                        unified_attention,
+                    )
+
+                    from ..paged import BLOCK as page_block
+                except ImportError:
+                    # Same fallback the paged branch below takes on the same ImportError: the installed
+                    # kernel does not have this, so the join's own dense FA2 call (unchanged, below) is what
+                    # every release before this one shipped -- not a canonical match, but not a crash either.
+                    unified_attention = None
+                if unified_attention is not None:
+                    pages_per_row = -(-k_len // page_block)
+                    k_len_padded = pages_per_row * page_block
+                    pad = k_len_padded - k_len
+
+                    # Built one tensor (keys) at a time and the join's own transient dropped (`del key`) before
+                    # the next (values) starts, rather than padding both up front: a padded copy is briefly a
+                    # second, same-size allocation beside the join's own -- at `rows=64` and a long context this
+                    # doubled the branch pass's keys-and-values peak and OOM'd where the unpadded join fit
+                    # (measured directly, `RUN-pg2.md`). Doing one tensor fully (pad, reshape into pages, and
+                    # drop the pre-pad reference) before touching the other keeps the peak at one extra
+                    # same-size allocation rather than two.
+                    k_dense = key.transpose(1, 2).contiguous()
+                    del key
+                    if pad:
+                        k_dense = torch.nn.functional.pad(k_dense, (0, 0, 0, 0, 0, pad))
+                    pool_keys = k_dense.reshape(rows * pages_per_row, page_block, *k_dense.shape[-2:])
+                    del k_dense
+
+                    v_dense = value.transpose(1, 2).contiguous()
+                    del value
+                    if pad:
+                        v_dense = torch.nn.functional.pad(v_dense, (0, 0, 0, 0, 0, pad))
+                    pool_values = v_dense.reshape(rows * pages_per_row, page_block, *v_dense.shape[-2:])
+                    del v_dense
+                    block_table = torch.arange(
+                        rows * pages_per_row, device=q.device, dtype=torch.int32
+                    ).reshape(rows, pages_per_row)
+                    seqused = torch.full((rows,), k_len, device=q.device, dtype=torch.int32)
+                    out = torch.empty_like(q)
+                    unified_attention(
+                        q=q,
+                        k=pool_keys,
+                        v=pool_values,
+                        out=out,
+                        cu_seqlens_q=cu_q,
+                        max_seqlen_q=q_len,
+                        seqused_k=seqused,
+                        max_seqlen_k=k_len_padded,
+                        softmax_scale=a.scaling,
+                        causal=True,
+                        window_size=(-1, -1),
+                        block_table=block_table,
+                        softcap=0.0,
+                        q_descale=None,
+                        k_descale=None,
+                        v_descale=None,
+                    )
+                    return self._finish(out, gate, shape)
             k = key.transpose(1, 2).reshape(rows * k_len, -1, a.head_dim)
             v = value.transpose(1, 2).reshape(rows * k_len, -1, a.head_dim)
             cu_k = torch.arange(0, rows * k_len + 1, k_len, device=q.device, dtype=torch.int32)
@@ -850,7 +980,8 @@ def _delta_disagreement(original, wrapper, decoder, device) -> float | None:
         with torch.inference_mode():
             want, _ = original(**inputs, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=True)
             got, _ = wrapper(**inputs, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=True)
-    except Exception:  # noqa: BLE001 - either side may refuse these shapes, and that is a decline rather than a fault
+    except Exception as e:  # noqa: BLE001 - either side may refuse these shapes, and that is a decline rather than a fault
+        _reraise_if_resource_exhausted(e, "gated_delta_rule")
         return None
     scale = want.float().abs().amax().clamp(min=1e-6)
     return float((got.float() - want.float()).abs().amax() / scale)
@@ -1206,7 +1337,7 @@ def _swap_and_verify(applied, root: nn.Module, name: str, class_name: str | None
     parent, attribute, original = targets[0]
     tried = []
     for label, make in candidates:
-        moved = _compare(original, make(original))
+        moved = _compare(original, make(original), name)
         tried.append(f"{label} {'raised' if moved is None else format(moved, '.3e')}")
         if moved is not None and moved <= tolerance:
             for p, a, child in targets:
@@ -1214,10 +1345,29 @@ def _swap_and_verify(applied, root: nn.Module, name: str, class_name: str | None
             applied.swaps.append(
                 Swap(name, len(targets), None, verified=f"{label}, {len(targets)} modules, agreed to {moved:.3e}")
             )
+            _warn_if_close_to_tolerance(applied, name, moved, tolerance)
             return
 
     setattr(parent, attribute, original)
     applied.skipped.append(f"{name} left alone, nothing agreed to within {tolerance:.1e} relative: " + "; ".join(tried))
+
+
+#: How much of a `_compare`/`_swap_gated_norm` tolerance a *passing* measurement is allowed to use up before
+#: `engine.applied.notes` says so. Not a second tolerance -- the swap still runs -- just a signal that this
+#: checkpoint's own weights measure close enough to the line that a future checkpoint's could cross it, the way
+#: "dense_matmul" measured 5.018e-02 against this file's own 5.0e-02 on one draw of the probe this seeds today
+#: (`_compare`'s own docstring has the incident). Seeding closed the across-process gap; it does not make a
+#: checkpoint-specific measurement that sits this close to its tolerance any less close.
+MARGIN_WARN_FRACTION = 0.5
+
+
+def _warn_if_close_to_tolerance(applied, name: str, moved: float, tolerance: float) -> None:
+    if moved > tolerance * MARGIN_WARN_FRACTION:
+        applied.notes.append(
+            f"{name}: this checkpoint's own weights measured {moved:.3e}, {moved / tolerance:.0%} of the "
+            f"{tolerance:.1e} tolerance that keeps it installed -- closer to the line than usual; re-run this "
+            f"measurement after any change to this checkpoint's weights or to the kernel it compares against"
+        )
 
 
 #: One step of bfloat16 at a given magnitude, relative. Two of these is the bar for a replacement that should be doing
@@ -1225,20 +1375,32 @@ def _swap_and_verify(applied, root: nn.Module, name: str, class_name: str | None
 BF16_ULP = 2.0**-8
 
 
-def _compare(original: nn.Module, replacement: nn.Module) -> float | None:
-    """The largest disagreement on one random input, relative to the largest output. None if either side raised.
+def _compare(original: nn.Module, replacement: nn.Module, name: str = "dense_matmul") -> float | None:
+    """The largest disagreement on a fixed probe, relative to the largest output. None if either side raised.
 
     Relative, not absolute. An absolute figure says nothing without the magnitude beside it: 6.25e-2 is a rounding
     step where the output reaches 16 and a wrong answer where it reaches 0.1.
+
+    The probe is drawn from a generator seeded by this comparison's own input width, not the process-global RNG state
+    (`onepass.prove`'s own pattern, for the same reason): measured directly on this project's own dense-FP8 weights,
+    the "dense_matmul" swap's measured disagreement sits as close as 5.018e-2 to 2.912e-2 across different unseeded
+    draws against the 5e-2 tolerance below -- an unseeded probe, drawn fresh every process, picks a different side of
+    that tolerance from one process to the next, installing `Fp8Linear` in some and leaving the framework's own
+    (slightly different, see `_swap_and_verify`'s own docstring) implementation in others, which answers every
+    dense projection in the model differently for the rest of that process's life. 64 rows rather than the 4 this
+    used to draw, both to shrink that measured spread and to match the row count `_swap_gated_norm`'s own probe
+    already uses for the same kind of decision.
     """
     p = next(original.parameters())
     width = getattr(original, "in_features", None) or p.shape[-1]
-    x = torch.randn(4, width, device=p.device, dtype=torch.bfloat16) * 0.1
+    generator = torch.Generator(device="cpu").manual_seed(width)
+    x = (torch.randn(64, width, generator=generator) * 0.1).to(device=p.device, dtype=torch.bfloat16)
     try:
         with torch.inference_mode():
             want = original(x)
             got = replacement(x)
-    except Exception:  # noqa: BLE001 - a replacement that cannot run on this model is a replacement to put back
+    except Exception as e:  # noqa: BLE001 - a replacement that cannot run on this model is a replacement to put back
+        _reraise_if_resource_exhausted(e, name)
         return None
     scale = want.float().abs().max().item()
     return (want.float() - got.float()).abs().max().item() / max(scale, 1e-6)
@@ -1334,6 +1496,7 @@ def _probe_head_duplication(probe: nn.Module) -> str | None:
             probe.num_k_heads = probe.num_v_heads
             after = probe(x, cache_params=None)
     except Exception as e:  # noqa: BLE001 - any failure here means the attribute now does more than gate duplication
+        _reraise_if_resource_exhausted(e, "head_duplication")
         return (
             f"the head-duplication probe raised {type(e).__name__}: {e} -- this is the framework's own fallback "
             f"rejecting an un-duplicated query and key, which means the borrowed recurrence kernel that can take "

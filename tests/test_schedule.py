@@ -217,6 +217,31 @@ def test_a_pass_stops_at_the_group_and_says_so():
     assert any("would pass 8 rows" in reason for reason in why), why
 
 
+def test_a_pass_stops_on_padded_rows_even_when_the_raw_sum_fits():
+    """Two documents whose *raw* question counts sum to exactly the group (3 + 5 = 8) but whose independently
+    rounded row counts do not (4 + 8 = 12 > 8, the same `_round_rows` bucketing `_answer`'s own fused-path
+    capacity check and `engine._answer_batch` underneath the non-fused path both enforce): admission has to split
+    them on the padded total, not the raw one.
+
+    Found by `_items/measure_packed.py` (a 256-document run with 1-3 questions per document) against the real
+    engine: `form()` admitted both into one pass on the raw sum, and only `engine._answer_batch` downstream (not
+    reachable from this stub) refused it by name -- after the pass had already committed every other job in it to
+    failing alongside the one that did not fit, rather than being kept out of the pass to begin with.
+    """
+    engine = FakeEngine(group=8)
+    batcher = Batcher(engine)
+    docs = distinct(2)
+    jobs = [batcher.submit(docs[0], asking(3)), batcher.submit(docs[1], asking(5))]
+    batcher.start()
+    try:
+        answered(batcher, jobs)
+    finally:
+        batcher.stop()
+    assert [len(p) for p in engine.passes] == [1, 1], engine.passes
+    why = batcher.stats()["why_passes_stopped"]
+    assert any("pad to 8 rows" in reason for reason in why), why
+
+
 def test_a_pass_stops_when_the_pool_would_overflow():
     """The other limit. Documents of forty words against a pool of a hundred: two fit and the third does not."""
     engine = FakeEngine(group=32, longest_context=100)

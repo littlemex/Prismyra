@@ -968,8 +968,15 @@ class Prismyra:
         separate branch pass it would cost is a whole traversal of the model (docs/PERFORMANCE.md). Only when nothing
         needs the fork: media (whose positions are worked out during the read), calibration (whose priors are measured
         through branch passes) and the paged storage (whose pages belong to a pool this path does not draw from) keep
-        the forked path. The two paths read the same tokens, and their answers agree to the bound batching already
-        allows (`COMPANION_MOVEMENT` in the device tests): `open_context(...).ask(...)` with one question still forks.
+        the forked path. The two paths read the same tokens, but not through the same kernels -- the paged fork's
+        branch read goes through `unified_attention` against the page pool rather than the one-pass read's single
+        FlashAttention-2 call over context and question together (`prismyra/kernels/qwen3_moe.py`'s
+        `FlashAttention.forward`) -- so their answers agree only to a measured bound, not bit-for-bit:
+        `PAGED_VS_JOINED_MOVEMENT` in the device tests, for this one-question case specifically (`tools/
+        audit_sm120.py`'s `paged_vs_joined` section measures it directly, both supported cards). `open_context(...)
+        .ask(...)` with one question still forks, and so does `ask()` itself once `self.paged` is `True` or there is
+        more than one question -- that second case is measurably worse (`docs/PERFORMANCE.md`) and not bounded by
+        the constant above.
         """
         self.validate(questions)
         if len(questions) == 1 and not images and not videos and self.calibration is None and not self.paged:
@@ -1310,7 +1317,9 @@ class Prismyra:
         # One row. The branch room is kept at its usual size rather than zero, because the attention layer sizes its
         # context room as the total minus the branch room; at one row it is a few megabytes.
         cache = build_cache(self.config, self.room_for(tokens) + WIDTHS[-1], 1, self.dtype, self.device, WIDTHS[-1])
-        with torch.inference_mode():
+        from .kernels import onepass_moe_tuning
+
+        with torch.inference_mode(), onepass_moe_tuning.scope():
             out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
             hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
         # Released before returning, inside the caller's lock: the output holds the cache, and the next request must
