@@ -135,6 +135,46 @@ after. The two checks that already demand bit-identical agreement rather than a 
 fused-vs-separate check, `_probe_head_duplication`'s before-vs-after check) are not at this risk: a probe's specific
 values cannot move an exact-equality decision the way they can move one measured against 5e-2 or `2 * BF16_ULP`.
 
+## The same answer in every process, part three: a self-check's own exception must not pick an answer
+
+Seeding the probes (the section above) closed the gap where *which numeric draw* a self-check happened to get
+decided which kernel path answered. A narrower but structurally identical gap remained one level down: before
+this fix, `_compare`, `_swap_gated_norm`, `_delta_disagreement`, and `_probe_head_duplication` each treated *every*
+exception from running the original or the replacement as a decline (`except Exception: return None`, or the
+string-returning equivalent) -- the right call for a replacement that is simply the wrong shape for this
+checkpoint, and the comment at each site said so. It is the wrong call for an exception that means the probe could
+not run at all right now: a `torch.OutOfMemoryError`, or a Triton kernel's static shared-memory requirement for the
+probe's shape exceeding the card's limit (`triton.errors.OutOfResources`, not a numeric disagreement). Measured
+directly: running `fp8-36l`'s own `test_require_kernels_starts_with_nothing_skipped` (`tests/test_gpu_require_kernels.py`)
+*after* `test_gpu.py`'s module-scoped engine had already run real inference at several row counts, in the same
+pytest process, made `_compare`'s "dense_matmul" probe raise `OutOfResources(106496, 101376, "shared memory")` --
+the identical probe, run as the first construction in a fresh process, measured a clean 5.747e-03 and installed the
+swap. The two constructions differ only in what else had already run in the same process; which kernel path this
+checkpoint answers from should not.
+
+`_reraise_if_resource_exhausted` (`kernels/qwen3_moe.py`) is called from all four sites before each one's own
+decline logic: a `torch.OutOfMemoryError` or `triton.errors.TritonError` (the base class `OutOfResources` and
+every other Triton compiler/runtime resource error derive from) is re-raised as `AdapterError` -- the same
+exception `kernels.apply()` already raises for a `require_kernels` checkpoint it cannot complete -- so a resource
+shortage fails construction loudly, independent of `require_kernels`, rather than silently keeping whichever
+kernel path happened to fit. This is unconditional: `require_kernels=False` (the default `Prismyra(...)` constructor
+value) does not reintroduce the silent path -- a resource exception during a self-check now always raises, because
+the danger (which kernel answers depends on resource pressure the caller never asked about) exists whether or not
+anyone asked for `require_kernels`. Only a genuine structural mismatch -- the replacement, or the original on this
+checkpoint's own shapes, raising for a reason that has nothing to do with a resource limit -- still declines
+quietly, exactly as before. Covered by device-free tests in `tests/test_kernels_registry.py` using modules whose
+`forward` raises the exception directly, not an actual OOM or a real Triton compile: both must raise `AdapterError`
+through `_compare`, and a plain structural `RuntimeError` must still decline the way it always has.
+
+`tests/test_gpu_require_kernels.py`'s own construction now runs in a subprocess rather than in the shared pytest
+process, for the reason the measurement above found: a fresh process has no Triton autotuner cache entries from an
+earlier shape to inherit, which is what actually changed between the clean construction and the one that raised --
+not the free-VRAM headroom `gpu_room.no_room_reason` already checked (that check guards a different resource, a
+second copy of the weights, and still runs first). A subprocess failure naming a resource (this fix's own
+`AdapterError` message) is reported as a skip with that message, not asserted on as if it had produced the normal
+JSON; checked on both of this project's checkpoints after the fix (fp8-36l on the L40S, nvfp4-36l on the RTX PRO
+4500) and neither raises it when run this way.
+
 ## What each replacement is worth
 
 Measured on one context of about 5,000 tokens. Each row is its own paired run -- the same process with and without that

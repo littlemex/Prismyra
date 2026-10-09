@@ -19,11 +19,50 @@ from torch import nn
 from .. import varlen
 from ..fork import WIDTHS
 from ..onepass import rows_exact
-from . import Applied, Swap, register
+from . import AdapterError, Applied, Swap, register
 from .conv import available as triton_available
 from .conv import causal_depthwise_conv1d, starts_from_boundaries
 
 BLOCK = (128, 128)
+
+
+def _reraise_if_resource_exhausted(e: Exception, context: str) -> None:
+    """A kernel-replacement self-check's own forward call ran out of a hardware resource -- GPU memory, or a
+    Triton kernel's static shared-memory requirement for the shapes at hand -- rather than disagreeing with the
+    original on the numbers. That is not evidence the replacement is wrong; it is evidence this process could not
+    run the probe at all right now. The callers of this function used to treat every exception here the same way
+    (`except Exception: decline`, this file's own comment: "a replacement that cannot run on this model is a
+    replacement to put back"), which is the right call for a replacement that is structurally the wrong shape for
+    this checkpoint -- but it also silently declined on a transient resource shortage, which means how much free
+    GPU memory happened to exist at *construction* time chose which kernel path answers every request for the
+    rest of the process's life (the FP8 fast path or the framework's slower one, the duplicated-head fallback or
+    the borrowed recurrence), changing the answer the exact way an unseeded random probe did before this file's
+    own seeding fix (`_compare`'s docstring) -- construction-time resource pressure standing in for a
+    construction-time coin flip. Measured: `_compare`'s own 64-row probe (widened from 4, both to shrink the
+    measured spread and to match `_swap_gated_norm`'s probe) can raise `triton.errors.TritonError` (seen in
+    practice as `OutOfResources` on a shared-memory limit, not `want`/`got` disagreeing) when a module-scoped
+    engine elsewhere in the same process still holds another checkpoint's weights.
+
+    Re-raised as `AdapterError` -- the same exception `kernels.apply()` already raises for a `require_kernels`
+    checkpoint it cannot complete -- so a transient resource shortage fails construction loudly, independent of
+    `require_kernels`, rather than picking a fallback kernel path no caller asked for.
+    """
+    if isinstance(e, torch.OutOfMemoryError):
+        raise AdapterError(
+            f"{context}: ran out of GPU memory while self-checking a kernel replacement ({type(e).__name__}: {e}) "
+            f"-- retry with more free memory on this device (for example, without another engine's weights still "
+            f"resident), rather than silently answering from whichever kernel path happened to fit"
+        ) from e
+    try:
+        from triton.errors import TritonError
+    except ImportError:  # pragma: no cover - the adapter already checks for triton before any of this runs
+        return
+    if isinstance(e, TritonError):
+        raise AdapterError(
+            f"{context}: hit a Triton compiler/runtime resource limit while self-checking a kernel replacement "
+            f"({type(e).__name__}: {e}) -- this is a hardware limit for the shapes involved, not a disagreement "
+            f"between the two sides, and is not expected to be fixed by retrying alone"
+        ) from e
 
 #: Rows at or below this width take a fused group's one combined matmul (`_ProjectionSlot`); above it, each slot
 #: falls back to its own separate `Fp8Linear` call. Both sides are bit-identical to the pre-fusion separate calls
@@ -452,6 +491,7 @@ def _swap_gated_norm(applied, root: nn.Module) -> None:
             got = FusedGatedRMSNorm(original)(x, g)
         moved = ((want.float() - got.float()).abs().max() / want.float().abs().max().clamp(min=1e-6)).item()
     except Exception as e:  # noqa: BLE001 - a replacement that cannot run here is not installed
+        _reraise_if_resource_exhausted(e, "gated_norm")
         applied.skipped.append(f"gated_norm left alone: {type(e).__name__}: {e}")
         return
     if moved > 2 * BF16_ULP:
@@ -940,7 +980,8 @@ def _delta_disagreement(original, wrapper, decoder, device) -> float | None:
         with torch.inference_mode():
             want, _ = original(**inputs, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=True)
             got, _ = wrapper(**inputs, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=True)
-    except Exception:  # noqa: BLE001 - either side may refuse these shapes, and that is a decline rather than a fault
+    except Exception as e:  # noqa: BLE001 - either side may refuse these shapes, and that is a decline rather than a fault
+        _reraise_if_resource_exhausted(e, "gated_delta_rule")
         return None
     scale = want.float().abs().amax().clamp(min=1e-6)
     return float((got.float() - want.float()).abs().amax() / scale)
@@ -1296,7 +1337,7 @@ def _swap_and_verify(applied, root: nn.Module, name: str, class_name: str | None
     parent, attribute, original = targets[0]
     tried = []
     for label, make in candidates:
-        moved = _compare(original, make(original))
+        moved = _compare(original, make(original), name)
         tried.append(f"{label} {'raised' if moved is None else format(moved, '.3e')}")
         if moved is not None and moved <= tolerance:
             for p, a, child in targets:
@@ -1334,7 +1375,7 @@ def _warn_if_close_to_tolerance(applied, name: str, moved: float, tolerance: flo
 BF16_ULP = 2.0**-8
 
 
-def _compare(original: nn.Module, replacement: nn.Module) -> float | None:
+def _compare(original: nn.Module, replacement: nn.Module, name: str = "dense_matmul") -> float | None:
     """The largest disagreement on a fixed probe, relative to the largest output. None if either side raised.
 
     Relative, not absolute. An absolute figure says nothing without the magnitude beside it: 6.25e-2 is a rounding
@@ -1358,7 +1399,8 @@ def _compare(original: nn.Module, replacement: nn.Module) -> float | None:
         with torch.inference_mode():
             want = original(x)
             got = replacement(x)
-    except Exception:  # noqa: BLE001 - a replacement that cannot run on this model is a replacement to put back
+    except Exception as e:  # noqa: BLE001 - a replacement that cannot run on this model is a replacement to put back
+        _reraise_if_resource_exhausted(e, name)
         return None
     scale = want.float().abs().max().item()
     return (want.float() - got.float()).abs().max().item() / max(scale, 1e-6)
@@ -1454,6 +1496,7 @@ def _probe_head_duplication(probe: nn.Module) -> str | None:
             probe.num_k_heads = probe.num_v_heads
             after = probe(x, cache_params=None)
     except Exception as e:  # noqa: BLE001 - any failure here means the attribute now does more than gate duplication
+        _reraise_if_resource_exhausted(e, "head_duplication")
         return (
             f"the head-duplication probe raised {type(e).__name__}: {e} -- this is the framework's own fallback "
             f"rejecting an un-duplicated query and key, which means the borrowed recurrence kernel that can take "

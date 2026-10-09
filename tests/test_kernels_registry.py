@@ -128,3 +128,87 @@ def test_applied_reports_degradation_as_data_not_only_as_a_string():
     assert as_dict["applied"] == {"norm": 4}
     assert as_dict["skipped"] == ["no triton"]
     assert as_dict["notes"] == ["context pass only"]
+
+
+def test_a_resource_exhausted_self_check_fails_construction_instead_of_silently_choosing_a_fallback():
+    """A kernel-replacement self-check (`_compare`, and by the same helper `_swap_gated_norm`,
+    `_delta_disagreement`, `_probe_head_duplication`) that runs out of a hardware resource -- GPU memory, or a
+    Triton kernel's static shared-memory requirement for the shapes at hand -- while comparing a replacement
+    against the original is not evidence the two disagree; it is evidence this process could not run the probe at
+    all right now. Treating it the same as a numeric disagreement would let how much free GPU memory happens to
+    exist at construction time choose which kernel path answers every request for the rest of the process's life,
+    moving the answer the same way an unseeded random probe did before this file's own seeding fix -- a
+    construction-time resource shortage standing in for a construction-time coin flip. Found on real hardware: a
+    module-scoped engine elsewhere in the same pytest process still holding another checkpoint's weights made
+    `_compare`'s 64-row probe raise `triton.errors.OutOfResources` on a shared-memory limit for one checkpoint's
+    `dense_matmul` shapes, which the pre-fix code silently treated as "decline" and moved on. No device needed:
+    this is checked with a module whose `forward` raises the exception directly, not an actual OOM."""
+    import torch
+
+    from prismyra.kernels import AdapterError
+    from prismyra.kernels.qwen3_moe import _compare
+
+    class RaisesOOM(nn.Module):
+        in_features = 8
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(1))
+
+        def forward(self, x):
+            raise torch.OutOfMemoryError("simulated: out of memory")
+
+    class MustNotRun(nn.Module):
+        def forward(self, x):
+            raise AssertionError("the replacement must never be called once the original already raised")
+
+    with pytest.raises(AdapterError, match="ran out of GPU memory"):
+        _compare(RaisesOOM(), MustNotRun(), "dense_matmul")
+
+
+def test_a_triton_resource_limit_in_a_self_check_also_fails_construction():
+    """The exact exception seen on real hardware (`triton.errors.OutOfResources`, a `TritonError`) must take the
+    same path as `torch.OutOfMemoryError`: raise, not decline. `pytest.importorskip` rather than `pytest.mark.gpu`
+    because the exception class itself needs no device, only the triton package."""
+    triton_runtime_errors = pytest.importorskip("triton.runtime.errors")
+
+    from prismyra.kernels import AdapterError
+    from prismyra.kernels.qwen3_moe import _compare
+
+    class RaisesTritonResourceError(nn.Module):
+        in_features = 8
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(__import__("torch").zeros(1))
+
+        def forward(self, x):
+            raise triton_runtime_errors.OutOfResources(106496, 101376, "shared memory")
+
+    class MustNotRun(nn.Module):
+        def forward(self, x):
+            raise AssertionError("the replacement must never be called once the original already raised")
+
+    with pytest.raises(AdapterError, match="Triton compiler/runtime resource limit"):
+        _compare(RaisesTritonResourceError(), MustNotRun(), "dense_matmul")
+
+
+def test_a_plain_structural_mismatch_still_declines_quietly():
+    """The opposite case must still work exactly as before this fix: a replacement that is simply the wrong shape
+    or structure for this model's weights is a reason to decline the swap, not to fail construction -- only a
+    resource-exhaustion exception should raise."""
+    import torch
+
+    from prismyra.kernels.qwen3_moe import _compare
+
+    class RaisesShapeError(nn.Module):
+        in_features = 8
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(1))
+
+        def forward(self, x):
+            raise RuntimeError("simulated: shape mismatch, nothing to do with a resource limit")
+
+    assert _compare(RaisesShapeError(), RaisesShapeError(), "dense_matmul") is None
