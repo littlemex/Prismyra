@@ -1317,7 +1317,9 @@ class Prismyra:
         # One row. The branch room is kept at its usual size rather than zero, because the attention layer sizes its
         # context room as the total minus the branch room; at one row it is a few megabytes.
         cache = build_cache(self.config, self.room_for(tokens) + WIDTHS[-1], 1, self.dtype, self.device, WIDTHS[-1])
-        with torch.inference_mode():
+        from .kernels import onepass_moe_tuning
+
+        with torch.inference_mode(), onepass_moe_tuning.scope():
             out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
             hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
         # Released before returning, inside the caller's lock: the output holds the cache, and the next request must

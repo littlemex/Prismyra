@@ -279,7 +279,16 @@ def record_bucket(
     at = torch.zeros(1, dtype=torch.long, device=device)
 
     def run() -> torch.Tensor:
-        out = engine.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
+        # The same pinned MoE tile `engine._read_one_pass` uses for a bucket this recording never reaches
+        # (longer than `BUCKETS`' top): warm-up, capture and the island's own real-row-count re-run all take this
+        # path, so a kept bucket's replay and `_read_one_pass`'s eager fallback never disagree over which tile
+        # the routed-expert GEMM used. See `kernels.onepass_moe_tuning` for why this is safe to bake into a
+        # recording (one fixed tile, proved bit-identical at this bucket's shortest and longest length exactly
+        # like every other kernel this file records).
+        from .kernels import onepass_moe_tuning
+
+        with onepass_moe_tuning.scope():
+            out = engine.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
         last = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
         return last[0].index_select(0, at)
 
