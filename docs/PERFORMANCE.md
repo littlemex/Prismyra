@@ -484,8 +484,8 @@ closed:
   context first and then the question in a *separate* call against the page pool, through `unified_attention`
   rather than FlashAttention-2 (adopted for the companion-count axis above, not for this one). `tools/
   audit_sm120.py`'s `paged_vs_joined` section measures this directly, flipping only the `paged` property on one
-  engine rather than constructing two: on 8 real RACE documents, a single question moved by at most 0.026176 on the
-  L40S and 0.001839 on the RTX PRO 4500, zero decision flips on either card -- bounded by `tests/test_gpu.py`'s
+  engine rather than constructing two: on 8 real RACE documents, a single question moved by at most 0.002091 on the
+  L40S and 0.001769 on the RTX PRO 4500, zero decision flips on either card -- bounded by `tests/test_gpu.py`'s
   `PAGED_VS_JOINED_MOVEMENT` (0.04). Question count 1 stays this way: `_ask_in_one_pass` is a structurally
   different computation (one FA2 call over context-and-question together, with no fork at all) than the forked
   path, and routing a solo `paged=True` question through it would make `ask()`'s own question-count-1 answer
@@ -517,6 +517,30 @@ closed:
   16-question point is a touch over this project's 3% rule of thumb on both cards; it is the same cost
   `unified_attention` already charges the paged path for the same reason, paid a second time now that the joined
   path takes it too, not a new kind of cost.
+* **The solo one-pass path's MoE tile: pinned to a large-M shape, no longer the default small one.** `_ask_in_one_pass`
+  (`paged=False`, question count 1) and the recorded one-pass CUDA graph buckets (`onepass.record_bucket`) are the
+  only two call sites that run a document's whole context through the routed-expert GEMM in a single call, at the
+  row counts a real document's context reaches -- thousands, not the dozens-to-hundreds a branch pass carries. The
+  process-wide batch-invariant registration above forces every expert GEMM to a fixed small tile
+  (`BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, GROUP_SIZE_M=8`) regardless of row count, which is the right shape for a
+  branch pass and the wrong one here: it cost roughly 58% more time than an unwrapped vLLM serving the same
+  checkpoint shape at this row count. `prismyra/kernels/onepass_moe_tuning.py` ships a static, per-card table (one
+  dict, read once at import time, never re-chosen by row count) built by querying vLLM's own
+  `get_default_config` with the batch-invariant env var unset -- the same dict it already returns for every row
+  count at or above 128 -- and applies it only inside those two call sites; every other path (`Batcher`,
+  `open_batch`, the forked branch read) is untouched and keeps paying for, and being protected by, the process-wide
+  registration exactly as before. Measured on `fp8-36l`'s real target checkpoint (confirmed 36 decoder layers,
+  not a different-depth lookalike, before measuring anything), two documents at 3,401 and 5,315 tokens, 15
+  alternating rounds in one process after discarding 4 warm-up rounds: **+16.3% and +14.1%** respectively. A card
+  with no table for its device name (checked by filename, `kernels/pinned/onepass_moe_configs/<device>.json`) is
+  untouched -- the RTX PRO 4500 has none today, so this change does not reach it at all, confirmed by `tools/
+  audit_sm120.py` reporting the same companion/question-count and `paged_vs_joined` figures with and without this
+  change on that card. Checked against the project's 1,893-question development set with the real checkpoint:
+  4 decisions flip (0.21%), 2 in each direction (2 cases where the new tile's answer is right and the old one was
+  wrong, 2 the reverse) -- no measurable accuracy regression. The qn=1 `paged_vs_joined` residual two bullets above
+  reflects this change already applied (`_ask_in_one_pass` is one of its two call sites): it is smaller after this
+  change than before on the L40S (0.002091 against the previous 0.026176), a side effect of the larger tile's
+  reduction landing closer to the paged path's own `unified_attention` answer, not a target this change aimed at.
 
 This is a process-wide setting, not a per-request one: it registers a fixed-tile kernel on `aten::mm`, `addmm`,
 `matmul` and `linear` for the whole process, including any unrelated torch code sharing it, and that registration is
