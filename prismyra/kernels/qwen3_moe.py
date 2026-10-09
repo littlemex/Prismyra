@@ -425,7 +425,12 @@ except ImportError:  # pragma: no cover - the adapter checks for triton before i
 
 
 def _swap_gated_norm(applied, root: nn.Module) -> None:
-    """Replace every gated normalisation, after checking one against the module it replaces on two inputs."""
+    """Replace every gated normalisation, after checking one against the module it replaces on two inputs.
+
+    The two inputs come from a generator seeded by the weight's own width, not the process-global RNG state --
+    `_compare`'s own docstring has the measured reason an unseeded probe this close to its tolerance is not safe to
+    draw fresh every process.
+    """
     targets = _find_children(root, lambda m: type(m).__name__ == "Qwen3_5MoeRMSNormGated")
     if not targets:
         applied.skipped.append("gated_norm: nothing matched")
@@ -438,8 +443,9 @@ def _swap_gated_norm(applied, root: nn.Module) -> None:
     if p.dtype != torch.bfloat16:
         applied.skipped.append(f"gated_norm: the weight is {p.dtype}, and the kernel's rounding order assumes bfloat16")
         return
-    x = torch.randn(64, 32, p.shape[0], device=p.device, dtype=torch.bfloat16)
-    g = torch.randn(64, 32, p.shape[0], device=p.device, dtype=torch.bfloat16)
+    generator = torch.Generator(device="cpu").manual_seed(p.shape[0])
+    x = torch.randn(64, 32, p.shape[0], generator=generator).to(device=p.device, dtype=torch.bfloat16)
+    g = torch.randn(64, 32, p.shape[0], generator=generator).to(device=p.device, dtype=torch.bfloat16)
     try:
         with torch.inference_mode():
             want = original(x, g)
@@ -456,6 +462,7 @@ def _swap_gated_norm(applied, root: nn.Module) -> None:
     applied.swaps.append(
         Swap("gated_norm", len(targets), None, verified=f"{len(targets)} modules, agreed to {moved:.3e}")
     )
+    _warn_if_close_to_tolerance(applied, "gated_norm", moved, 2 * BF16_ULP)
 
 
 # --------------------------------------------------------------------------- attention
@@ -1297,10 +1304,29 @@ def _swap_and_verify(applied, root: nn.Module, name: str, class_name: str | None
             applied.swaps.append(
                 Swap(name, len(targets), None, verified=f"{label}, {len(targets)} modules, agreed to {moved:.3e}")
             )
+            _warn_if_close_to_tolerance(applied, name, moved, tolerance)
             return
 
     setattr(parent, attribute, original)
     applied.skipped.append(f"{name} left alone, nothing agreed to within {tolerance:.1e} relative: " + "; ".join(tried))
+
+
+#: How much of a `_compare`/`_swap_gated_norm` tolerance a *passing* measurement is allowed to use up before
+#: `engine.applied.notes` says so. Not a second tolerance -- the swap still runs -- just a signal that this
+#: checkpoint's own weights measure close enough to the line that a future checkpoint's could cross it, the way
+#: "dense_matmul" measured 5.018e-02 against this file's own 5.0e-02 on one draw of the probe this seeds today
+#: (`_compare`'s own docstring has the incident). Seeding closed the across-process gap; it does not make a
+#: checkpoint-specific measurement that sits this close to its tolerance any less close.
+MARGIN_WARN_FRACTION = 0.5
+
+
+def _warn_if_close_to_tolerance(applied, name: str, moved: float, tolerance: float) -> None:
+    if moved > tolerance * MARGIN_WARN_FRACTION:
+        applied.notes.append(
+            f"{name}: this checkpoint's own weights measured {moved:.3e}, {moved / tolerance:.0%} of the "
+            f"{tolerance:.1e} tolerance that keeps it installed -- closer to the line than usual; re-run this "
+            f"measurement after any change to this checkpoint's weights or to the kernel it compares against"
+        )
 
 
 #: One step of bfloat16 at a given magnitude, relative. Two of these is the bar for a replacement that should be doing
@@ -1309,14 +1335,25 @@ BF16_ULP = 2.0**-8
 
 
 def _compare(original: nn.Module, replacement: nn.Module) -> float | None:
-    """The largest disagreement on one random input, relative to the largest output. None if either side raised.
+    """The largest disagreement on a fixed probe, relative to the largest output. None if either side raised.
 
     Relative, not absolute. An absolute figure says nothing without the magnitude beside it: 6.25e-2 is a rounding
     step where the output reaches 16 and a wrong answer where it reaches 0.1.
+
+    The probe is drawn from a generator seeded by this comparison's own input width, not the process-global RNG state
+    (`onepass.prove`'s own pattern, for the same reason): measured directly on this project's own dense-FP8 weights,
+    the "dense_matmul" swap's measured disagreement sits as close as 5.018e-2 to 2.912e-2 across different unseeded
+    draws against the 5e-2 tolerance below -- an unseeded probe, drawn fresh every process, picks a different side of
+    that tolerance from one process to the next, installing `Fp8Linear` in some and leaving the framework's own
+    (slightly different, see `_swap_and_verify`'s own docstring) implementation in others, which answers every
+    dense projection in the model differently for the rest of that process's life. 64 rows rather than the 4 this
+    used to draw, both to shrink that measured spread and to match the row count `_swap_gated_norm`'s own probe
+    already uses for the same kind of decision.
     """
     p = next(original.parameters())
     width = getattr(original, "in_features", None) or p.shape[-1]
-    x = torch.randn(4, width, device=p.device, dtype=torch.bfloat16) * 0.1
+    generator = torch.Generator(device="cpu").manual_seed(width)
+    x = (torch.randn(64, width, generator=generator) * 0.1).to(device=p.device, dtype=torch.bfloat16)
     try:
         with torch.inference_mode():
             want = original(x)

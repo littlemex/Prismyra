@@ -89,6 +89,52 @@ at context width, same checkpoint, three rounds each alternating against `origin
 project's noise bar) -- with the per-shape tuning table now ruled out as the explanation on both cards, since both
 have one.
 
+## The same answer in every process, part two: swap self-checks are seeded too
+
+The pinning above covers kernels whose *configuration* a timing race can pick differently. A second, independent
+gap had the same symptom -- `tests/test_gpu_cold_start.py::test_cold_starts_pin_the_nvfp4_tactic_too` failing on
+`nvfp4-36l`, on the RTX PRO 4500, with the NVFP4 tactic itself confirmed pinned in every failing run -- but a
+different cause: whether a kernel *replacement runs at all*.
+
+`_compare` (used by `_swap_and_verify` for the "dense_matmul" and "norm" swaps) and `_swap_gated_norm` each decide
+whether to install a replacement by running both the framework's own implementation and the replacement on one
+random probe and requiring they agree within a tolerance (5e-2 for "dense_matmul", `2 * BF16_ULP` for "norm" and
+"gated_norm"). The probe used to be unseeded -- drawn fresh from the process-global RNG state on every construction.
+Measured directly on `nvfp4-36l`'s own weights: four independent, unseeded draws of "dense_matmul"'s probe measured
+2.912e-02, 3.893e-02, 3.968e-02, and 5.018e-02 against that 5e-2 tolerance -- the fourth is *over* it. A process whose
+draw lands under the line installs `Fp8Linear` (and, downstream, the three `dense_fusion` groups that depend on it
+being installed) for every dense FP8 projection in the model; a process whose draw lands over the line keeps the
+framework's own implementation instead, which rounds at a different point (`_swap_and_verify`'s own docstring has
+the detail) -- a difference compounded across every dense projection in all 36 layers, large enough to flip which
+of two probabilities a question's answer reports.
+
+The fix seeds both probes from a value derived from the module being checked (the same pattern `onepass.prove`
+already uses for its own bucket proof, and `_delta_inputs` for the `gated_delta_rule` swap's), and widens
+`_compare`'s probe from 4 rows to 64 (matching `_swap_gated_norm`'s own row count) to shrink the measurement's own
+spread. Re-measured five independent times after the fix: all five gave the identical 2.820e-02 for "dense_matmul"
+on `nvfp4-36l`. `test_cold_starts_pin_the_nvfp4_tactic_too` passed on seven independent cold starts after the fix
+(it had failed within five before it, and within seven after fixing a narrower, unrelated cause two releases
+earlier -- see this file's own autotune-pinning section and `kernels/nvfp4.py`'s tactic table for that one).
+
+Checked and ruled out directly, not assumed, before landing on this: the NVFP4 GEMM tactic itself
+(`engine.stats()["nvfp4_tactics"]` reported `pinned: True` in every failing run); its workspace buffer (sized once
+for the largest profiled bucket and confirmed, by direct computation of `cutlass_fused_moe_workspace_size`, never to
+need re-growing at the token counts this test uses); every Triton autotuner `pin_autotunes()` is supposed to cover
+(`engine.stats()["autotune"]` showed every expected kernel name pinned-from-table or deterministically fallen-back
+in three independent constructions); the GDN fused-norm kernel itself in isolation (called directly, no model, no
+engine, fixed seeded input: identical across five independent processes); and `onepass.install_islands()`'s
+module-forward monkey-patch (an early, false lead from a too-small sample -- ruled out once a larger sample showed
+the same split with and without it).
+
+Why `fp8-36l` never showed this: the same two checks measured 5.747e-03 ("dense_matmul") and 5.208e-03 ("norm")
+against the same tolerances on that checkpoint's own weights -- comfortably clear of the "dense_matmul" line
+(11% of the budget), closer than that on "norm" (67%). `engine.applied.notes` now says so whenever a passing
+measurement uses more than half its tolerance (`MARGIN_WARN_FRACTION`, `kernels/qwen3_moe.py`), on either
+checkpoint, so a future checkpoint drifting toward either line is visible before it crosses one rather than
+after. The two checks that already demand bit-identical agreement rather than a tolerance (`_fuse_pair`'s
+fused-vs-separate check, `_probe_head_duplication`'s before-vs-after check) are not at this risk: a probe's specific
+values cannot move an exact-equality decision the way they can move one measured against 5e-2 or `2 * BF16_ULP`.
+
 ## What each replacement is worth
 
 Measured on one context of about 5,000 tokens. Each row is its own paired run -- the same process with and without that
