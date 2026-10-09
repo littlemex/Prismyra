@@ -7,6 +7,7 @@ the thing it exists to provide.
 
 from __future__ import annotations
 
+import collections
 import os
 import threading
 import time
@@ -103,17 +104,23 @@ REPLAY_CHECKS = 2
 #: number that needed changing was not this one -- see `MAX_KEPT_RECORDINGS`.
 GRAPH_MEMORY_MARGIN = 2 * 1024**3
 
-#: How many distinct shapes one cache may hold a kept recording for at once. A kept recording's pool is never freed,
-#: so unlike everything else admission budgets, this is not something a size-based margin can bound on its own: an
-#: open-loop run against real traffic, with the decline-retry above in place and only a memory margin to stop it,
-#: drove free device memory from several gigabytes to a few megabytes across a handful of distinct shapes each
-#: keeping one recording, and into a tight allocate-fail-retry loop that was not even inside a recording attempt --
-#: it was the ordinary eager pass every call still runs first. A margin only ever asks "is there room for one more";
-#: it does not know how expensive the attempts already granted turned out to be, so raising it cannot bound a count
-#: of unknown-sized things. A small fixed count can. Two, because the recordings measured so far during the paged
-#: branch pass's remainder-bucket work moved a probability by nothing and a replay cost half an eager pass -- worth
-#: having at all -- and this package has not yet measured what one recording actually costs in isolation, which it
-#: would need before this number could be raised with evidence instead of nerve.
+#: How many distinct shapes one cache may hold a kept recording for at once *before the oldest-used one is evicted
+#: to make room for a new one* (`_evict_one_recording`, spd6: a request-spanning cache -- `Batcher`'s shelf, held
+#: open for the engine's whole life rather than one context's -- can see far more than two shapes come and go
+#: over its lifetime, and a hard refuse-forever past this count left every shape after the first two paying full
+#: eager cost on every single pass for the rest of the process). A kept recording's pool used to never be freed at
+#: all: unlike everything else admission budgets, a *count* of unknown-sized things is not something a size-based
+#: margin alone can bound -- an open-loop run against real traffic, with the decline-retry above in place and only
+#: a memory margin to stop it, drove free device memory from several gigabytes to a few megabytes across a
+#: handful of distinct shapes each keeping one recording, and into a tight allocate-fail-retry loop that was not
+#: even inside a recording attempt. A small fixed count bounded that; eviction keeps the same bound while letting
+#: a shape that keeps coming back take a pool from one that has gone cold, instead of the first `N` shapes seen
+#: owning it forever. Two, because the recordings measured so far during the paged branch pass's remainder-bucket
+#: work moved a probability by nothing and a replay cost half an eager pass -- worth having at all -- and this
+#: package has not yet measured what one recording actually costs in isolation, which it would need before this
+#: number could be raised with evidence instead of nerve. `self._branch_recordings_held_bytes` (subtracted in
+#: `_check_fits`, the same way `onepass.OnePassGraphs.held_bytes` already is) is what makes raising it later a
+#: question admission can answer instead of a guess: the real cost is now measured and counted, not assumed.
 MAX_KEPT_RECORDINGS = 2
 
 #: How long `empty_cache()` is skipped after it was tried and *still* left free memory at or below the margin --
@@ -570,6 +577,13 @@ class Prismyra:
         #: Recordings by the identity of the cache they were taken on. Keyed by `id` because a cache is not hashable and
         #: because identity is exactly the right test: a recording is valid for one allocation and no other.
         self._cache_recordings: dict[int, dict] = {}
+        #: How many bytes of device memory every kept branch recording holds, summed across every cache this engine
+        #: has ever recorded on. Each recording's own private CUDA graph pool is measured once, at the moment it is
+        #: kept (`_reserved_growth`, mirroring `onepass.OnePassGraphs.held_bytes`'s own reservation-delta measurement),
+        #: and the figure is added when a recording is kept and subtracted when one is evicted or a cache is released
+        #: -- so this is always "what is actually reserved right now for kept recordings", not an estimate.
+        #: `_check_fits` reads it the same way it already reads `self._one_pass.held_bytes`.
+        self._branch_recordings_held_bytes = 0
         #: The largest per-row transient seen with the context-proportional part taken out -- activations and kernel
         #: workspace for one row -- and the widest pass it was seen at. None until the first pass.
         #:
@@ -1381,6 +1395,10 @@ class Prismyra:
             "graphs_replays": dict(self.replays),
             "graphs_cost": dict(self.replay_cost),
             "graphs_skip_reasons": dict(self._skip_reasons),
+            # What `_check_fits` subtracts for the kept branch recordings across every cache this engine still
+            # holds one on -- `graphs_skip_reasons["lru_eviction"]` is how many times making room for a new shape
+            # meant giving up the least-recently-used one first (`_evict_one_recording`), not refusing it.
+            "graphs_held_bytes": self._branch_recordings_held_bytes,
             # The one-pass recordings: which buckets serve, how often each has, what proving each measured and what
             # they hold. Empty when the one-pass read runs eagerly.
             "short_graphs": self._one_pass.stats() if self._one_pass is not None else {},
@@ -1427,6 +1445,13 @@ class Prismyra:
         # were taken, so it also counts tensors already outside `spare`; refusing a little early is the safe direction.
         if self._one_pass is not None:
             spare -= self._one_pass.held_bytes
+        # Less what the kept branch recordings hold, for the same reason and measured the same way (growth of the
+        # reservation while each was taken, summed as they are kept -- see `_run_recorded`'s `reserved_before`).
+        # Previously left out entirely: a `--graphs` engine's kept recordings grew the reservation exactly as the
+        # one-pass buckets do, but admission only ever subtracted the latter, so a long-lived shelf's recordings
+        # were silently spent out of the margin `_check_fits` was supposed to be guarding instead of out of this
+        # figure.
+        spare -= self._branch_recordings_held_bytes
         free += max(0, spare)
         if wanted >= free:
             phase = "reading it" if reading >= answering else f"answering at group={self.group}"
@@ -2222,12 +2247,47 @@ class Prismyra:
         Attached to the cache rather than to the context because the cache outlives the context now, and a recording is
         only valid for the allocation it was taken on. Identity, not equality: two caches of the same size are different
         allocations and a recording from one must never answer on the other.
+
+        `taken` is an `OrderedDict` in insertion order, and every replay moves its key to the end
+        (`_touch_recording`) -- the order the eviction in `_run_recorded` reads to find the one to drop first:
+        the one that has gone the longest without answering anything, not the one that happened to be recorded
+        first. `bytes` holds what `_run_recorded` measured each kept recording's own private pool at, by the same
+        key, so an eviction knows how much to give back to `self._branch_recordings_held_bytes` without
+        re-measuring anything.
         """
         held = self._cache_recordings.get(id(cache))
         if held is None:
-            held = {"taken": {}, "seen": {}}
+            held = {"taken": collections.OrderedDict(), "seen": {}, "bytes": {}}
             self._cache_recordings[id(cache)] = held
         return held
+
+    def _touch_recording(self, store: dict, key) -> None:
+        """Mark `key` as the most recently used kept recording in `store`, for the LRU eviction order below."""
+        if key in store["taken"]:
+            store["taken"].move_to_end(key)
+
+    def _evict_one_recording(self, store: dict) -> bool:
+        """Drop the least-recently-used kept recording in `store`, freeing its private pool and giving its bytes
+        back to the engine-wide total. `False` if there was nothing to evict.
+
+        A kept recording's `torch.cuda.CUDAGraph` holds its own private memory pool (`graphs.record`'s
+        `torch.cuda.graph(graph)`, no shared `pool=` argument, unlike `onepass.py`'s buckets); dropping the last
+        Python reference to it is how `_run_recorded`'s own comment ("nothing here ever frees one") stops being
+        true -- the allocator reclaims a graph's pool once nothing holds the `CUDAGraph` object, the same way
+        `_disable_batch_invariance`'s docstring confirms for `torch.library.Library`. Evicting the *oldest-used*
+        key (`next(iter(...))` on an `OrderedDict` kept in least-to-most-recently-used order) rather than an
+        arbitrary one is the entire difference between this and the fixed count `MAX_KEPT_RECORDINGS` enforced
+        before: a shape nobody has asked for in a long time gives up its pool to a shape that keeps coming back,
+        instead of every shape past the first `MAX_KEPT_RECORDINGS` being refused forever.
+        """
+        taken = store["taken"]
+        if not taken:
+            return False
+        oldest_key = next(iter(taken))
+        del taken[oldest_key]
+        freed = store["bytes"].pop(oldest_key, 0)
+        self._branch_recordings_held_bytes = max(0, self._branch_recordings_held_bytes - freed)
+        return True
 
     def _claim_cache(self, tokens: int, group: int | None = None):
         """A cache sized for a bucket rather than for this context, reused if one is free.
@@ -2263,14 +2323,25 @@ class Prismyra:
         self._made_caches += 1
         return cache, room
 
+    def _reclaim_recordings_bytes(self, cache) -> None:
+        """Give this cache's kept recordings' bytes back to `self._branch_recordings_held_bytes` before dropping
+        them -- called by both places that discard a cache's recordings outright, so the running total this
+        engine reports never counts a pool that is about to stop existing."""
+        held = self._cache_recordings.get(id(cache))
+        if held is not None:
+            freed = sum(held["bytes"].values())
+            self._branch_recordings_held_bytes = max(0, self._branch_recordings_held_bytes - freed)
+
     def _forget_recordings(self, cache) -> None:
         """Drop the recordings taken on this cache. They hold its addresses, and the cache is about to go."""
+        self._reclaim_recordings_bytes(cache)
         self._cache_recordings.pop(id(cache), None)
 
     def _release_cache(self, prefill) -> None:
         """Where a closed context would hand its cache back for the next one. There is no pool yet; `_claim_cache` says
         what three attempts at one cost and what is still unexplained."""
         if prefill is not None:
+            self._reclaim_recordings_bytes(prefill.cache)
             self._cache_recordings.pop(id(prefill.cache), None)
 
     def fork(self, prefill, rows: int) -> None:
@@ -2378,10 +2449,13 @@ class Prismyra:
             wrong = recorded.usable(cache)
             if wrong is None:
                 self.replays[key] = self.replays.get(key, 0) + 1
+                self._touch_recording(store, key)
                 return recorded.replay(cache, ids, positions)
             # A recording that no longer describes the cache is discarded rather than replayed. The alternative is a
             # plausible answer, and this package treats that as the worst outcome available.
             del store["taken"][key]
+            freed = store["bytes"].pop(key, 0)
+            self._branch_recordings_held_bytes = max(0, self._branch_recordings_held_bytes - freed)
             self.declined_recordings[key] = wrong
             return run(ids, positions)
 
@@ -2466,17 +2540,21 @@ class Prismyra:
                     if free <= GRAPH_MEMORY_MARGIN:
                         self._reclaim_cooldown_until = now + RECLAIM_COOLDOWN_S
         fits_memory_margin = free > GRAPH_MEMORY_MARGIN
-        fits_kept_count = len(store["taken"]) < MAX_KEPT_RECORDINGS
-        room_to_record = fits_memory_margin and fits_kept_count
+        # `MAX_KEPT_RECORDINGS` is no longer a dead end once reached: `_evict_one_recording` (below, right before a
+        # new recording is actually kept) always has somewhere to make room by dropping the least-recently-used
+        # kept recording on this cache, so a cache already holding the cap may still take a new shape -- it gives
+        # up its oldest-used one to do it. The margin check is the one gate eviction cannot help with: it is about
+        # whether there is room on the *device* for the capture to run at all, not about how many kept recordings
+        # this cache already holds.
+        room_to_record = fits_memory_margin
         if expected < pays_from():
             self._skip_reasons["economics_gate"] = self._skip_reasons.get("economics_gate", 0) + 1
         elif key in self.declined_recordings:
             self._skip_reasons["already_declined"] = self._skip_reasons.get("already_declined", 0) + 1
         elif not fits_memory_margin:
             self._skip_reasons["memory_margin"] = self._skip_reasons.get("memory_margin", 0) + 1
-        elif not fits_kept_count:
-            self._skip_reasons["max_kept_recordings"] = self._skip_reasons.get("max_kept_recordings", 0) + 1
         if expected >= pays_from() and key not in self.declined_recordings and room_to_record:
+            reserved_before = torch.cuda.memory_reserved(self.torch_device) if self.torch_device.type == "cuda" else 0
             taken, why = record(run, cache, ids, positions, fork=fork)
             if taken is None:
                 # Remembered so it is attempted once per shape rather than once per group, and reported rather than
@@ -2509,7 +2587,22 @@ class Prismyra:
                         f"a replay moved a hidden state by {moved:.3e}, above {REPLAY_TOLERANCE:.0e}"
                     )
                 else:
+                    while len(store["taken"]) >= MAX_KEPT_RECORDINGS and self._evict_one_recording(store):
+                        self._skip_reasons["lru_eviction"] = self._skip_reasons.get("lru_eviction", 0) + 1
                     store["taken"][key] = taken
+                    # Measured now, not predicted: the capture above may have grown the reservation by more or
+                    # less than any fixed estimate (the private pool's size depends on the shapes this specific
+                    # recording holds), the same reasoning `onepass.OnePassGraphs.held_bytes` already uses for
+                    # the one-pass buckets. Never negative -- a concurrent `empty_cache()` elsewhere could in
+                    # principle shrink the reservation across this window; attributing nothing rather than a
+                    # negative byte count to this recording is the safe direction for an admission figure that
+                    # only ever gets subtracted from `_check_fits`'s spare.
+                    if self.torch_device.type == "cuda":
+                        grown = max(0, torch.cuda.memory_reserved(self.torch_device) - reserved_before)
+                    else:
+                        grown = 0
+                    store["bytes"][key] = grown
+                    self._branch_recordings_held_bytes += grown
                 # The recording ran the pass again while writing itself down, which left the cache where that pass
                 # left it -- not where the eager pass above left it. They are the same state by construction, and
                 # `hidden` was read before any of it, so the answer this call returns is the eager one.

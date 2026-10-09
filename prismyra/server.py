@@ -388,6 +388,18 @@ def main(argv: list[str] | None = None) -> int:
         help="a JSON spec of option-set heads (see prismyra.heads); questions whose options match none are unaffected",
     )
     parser.add_argument(
+        "--graphs",
+        action="store_true",
+        help="record a branch pass's shape (rows, width, and -- paged only -- the context length's remainder) the "
+        "first time it is worth replaying, and keep answering it from the recording instead of running eagerly "
+        "every time. Off by default: only `--batcher` (and `Prismyra.open_shelf`/`open_batch` used directly) hold "
+        "a cache open across more than one request, so this is where a kept recording can actually answer a "
+        "later, different request instead of being discarded with the context that took it -- see "
+        "prismyra.engine.MAX_KEPT_RECORDINGS for the per-cache limit (least-recently-used recordings are evicted "
+        "to make room for a new shape, not refused forever) and docs/PERFORMANCE.md for the memory a kept "
+        "recording's own private pool costs.",
+    )
+    parser.add_argument(
         "--batcher",
         action="store_true",
         help="answer a text-only /ask alongside whatever else is already waiting, through prismyra.schedule.Batcher, "
@@ -426,6 +438,7 @@ def main(argv: list[str] | None = None) -> int:
         max_video_frames=args.max_video_frames,
         require_kernels=args.require_kernels,
         **({"short_graphs": False} if args.no_short_graphs else {}),
+        **({"graphs": True} if args.graphs else {}),
         heads=args.heads,
         batcher=args.batcher,
         linger_ms=args.linger_ms,
