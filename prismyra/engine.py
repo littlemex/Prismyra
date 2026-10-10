@@ -1540,10 +1540,12 @@ class Prismyra:
         answering = self.answering_bytes(context_tokens)
         reading = self.reading_bytes(context_tokens)
         wanted = held + max(answering, reading)
-        free, total = torch.cuda.mem_get_info(self.torch_device)
+        free, total = chunking.visible_free(self.torch_device)
         # The device's free memory is not what is available. The allocator keeps a pool it has already taken from the
         # device and can hand out without asking again, and loading these weights leaves that pool large -- so asking
         # the device alone refused an 18,000-token context that had 9 GiB waiting for it inside the process.
+        # `visible_free` is also where a process capped tighter than the device (real or
+        # `set_per_process_memory_fraction`-simulated) gets corrected for -- see that function's own docstring.
         spare = torch.cuda.memory_reserved(self.torch_device) - torch.cuda.memory_allocated(self.torch_device)
         # Less what the one-pass recordings hold: their private pool is reserved and mostly unallocated between
         # replays, and none of it can be handed to a read. The figure is the whole growth of the reservation while they

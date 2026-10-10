@@ -75,6 +75,37 @@ def chunk_boundary(context_tokens: int) -> int:
     return max(boundary, 0)
 
 
+def visible_free(device: torch.device) -> tuple[int, int]:
+    """`torch.cuda.mem_get_info`, corrected for a process that was given less of the device than the device has.
+
+    `mem_get_info` answers for the device, not for this process. `torch.cuda.set_per_process_memory_fraction` is a
+    soft cap PyTorch's own allocator enforces on top of that -- and the CUDA call behind `mem_get_info` has never
+    heard of it: on a 32 GiB card capped to 22.5 GiB, it keeps reporting the device's own free figure, not this
+    process's much smaller one. Found by measuring both: a 16,000-token context's branch pass admitted and read as
+    one piece under a simulated 22.5 GiB cap reached a peak within a few hundred MiB of the same pass's peak with
+    no cap at all on the same card -- `should_chunk` and `Prismyra._check_fits` had both looked at the device's
+    free figure, seen tens of GiB of it, and never seen the cap at all. Only the allocator itself saw it, and it
+    refused the next byte past it with no warning either of them had the chance to give.
+
+    A real card sized to the limit this is simulating needs none of this -- its own `mem_get_info` already answers
+    correctly, because there `total` *is* what fits -- and a process the fraction was never set on pays nothing for
+    it either: `get_per_process_memory_fraction` defaults to `1.0`, which makes `cap` wider than `total` ever is and
+    the `min` below a no-op. What this corrects is specifically a process capped *tighter* than the device it is
+    on, real or simulated, which `set_per_process_memory_fraction` is the one documented way to be.
+    """
+    free, total = torch.cuda.mem_get_info(device)
+    # `get_per_process_memory_fraction` insists on an index (`cuda`, with none, is not enough -- `mem_get_info`
+    # above is more forgiving and does not), so a device with none names the one CUDA already made current.
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    fraction = torch.cuda.get_per_process_memory_fraction(index)
+    if fraction < 1.0:
+        cap = int(total * fraction)
+        headroom = cap - torch.cuda.memory_reserved(device)
+        free = min(free, max(0, headroom))
+        total = cap
+    return free, total
+
+
 def should_chunk(engine, context_tokens: int) -> bool:
     """Whether this context's own read should go through `chunk_boundary`'s pieces rather than one pass over all
     of it.
@@ -91,7 +122,7 @@ def should_chunk(engine, context_tokens: int) -> bool:
         return False  # chunking trades device memory for Python round trips; there is nothing to trade on the CPU path
     held = engine.cache_bytes(context_tokens)
     one_shot = max(engine.reading_bytes(context_tokens), context_tokens * _READING_BYTES_PER_TOKEN_FLOOR)
-    free, _total = torch.cuda.mem_get_info(engine.torch_device)
+    free, _total = visible_free(engine.torch_device)
     # The same "the allocator's own idle pool is spare too" adjustment `_check_fits` makes, for the same reason:
     # the device's free figure alone undercounts what this process can still use.
     spare = torch.cuda.memory_reserved(engine.torch_device) - torch.cuda.memory_allocated(engine.torch_device)
