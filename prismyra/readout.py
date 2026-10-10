@@ -79,13 +79,25 @@ def option_token_ids(question: Question, tokenizer, trailing_space: bool = False
     return ids
 
 
-def load_unembedding(model_name: str, hidden_size: int, device: str, dtype: torch.dtype) -> torch.Tensor:
+def load_unembedding(
+    model_name: str, hidden_size: int, device: str, dtype: torch.dtype, lazy: bool = False
+) -> torch.Tensor:
     """Fetch the output embedding matrix by name from the shard that holds it.
 
     Instantiating a language-model wrapper to reach its head would materialise a second copy of every parameter to
     keep one matrix, which on a large mixture-of-experts exhausts the device. Matched by suffix because checkpoints in
     the same family prefix the key differently; the output projection is preferred and the input embedding is the
     fallback for a checkpoint that ties them.
+
+    `lazy=True` (`PRISMYRA_LM_HEAD=lazy`) keeps this matrix in host, pinned memory instead of moving the whole
+    thing onto the device. A read-out never needs the whole matrix: `logits_for` already indexes it down to the
+    handful of option-token rows one question declares before it ever touches a GEMM, so the full matrix sitting
+    on the device between requests is held, not used, memory -- measured on a 36-layer checkpoint's vocabulary
+    (248,320 rows x 2,048 columns, bf16) as 0.947 GiB freed, bit-identical to the resident copy at 1/16/64
+    questions (`/Users/akazawt/tmp/smr/air/RUN-q1.md`, 2026-10-10, RTX PRO 4500). `logits_for` moves the gathered
+    rows to the hidden state's device itself, so this is a no-op change in bytes transferred when the matrix is
+    already resident (`device` argument below is then still honoured) and a many-rows-smaller transfer per call
+    when it is not.
     """
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
@@ -148,6 +160,8 @@ def load_unembedding(model_name: str, hidden_size: int, device: str, dtype: torc
                 f"options rather than blurring them -- a wrong answer with nothing to show it."
             )
         matrix = _dequantise(matrix, scale)
+    if lazy:
+        return matrix.to(dtype=dtype).pin_memory()
     return matrix.to(device=device, dtype=dtype)
 
 
@@ -199,10 +213,19 @@ def logits_for(hidden: torch.Tensor, unembedding: torch.Tensor, token_ids: list[
 
     Separated from `score` because a prior has to be subtracted before the softmax, not after: after it, the
     correction is a reweighting of something already normalised and no longer removes a bias.
+
+    `unembedding[ids]` already reads down to the few rows (one per declared option) this call needs before any
+    matmul happens -- the `.to(hidden.device, ...)` below is a no-op in bytes moved when `unembedding` is already
+    resident on that device (the default), and moves only those few rows when `unembedding` is the host-pinned
+    matrix `load_unembedding(..., lazy=True)` returns (`PRISMYRA_LM_HEAD=lazy`). Values are identical either way --
+    this changes where the matrix sits between requests, not what is computed.
     """
     if hidden.shape[0] != len(token_ids):
         raise ValueError(f"{hidden.shape[0]} branch rows against {len(token_ids)} questions")
-    return [(hidden[row : row + 1].float() @ unembedding[ids].float().t())[0] for row, ids in enumerate(token_ids)]
+    return [
+        (hidden[row : row + 1].float() @ unembedding[ids].to(hidden.device).float().t())[0]
+        for row, ids in enumerate(token_ids)
+    ]
 
 
 def score(
