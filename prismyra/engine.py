@@ -648,6 +648,31 @@ class Prismyra:
         if not on_cuda:
             self.backbone.to(self.torch_device)
 
+        # Experimental: keep the input-embedding matrix off the device too, selected with
+        # PRISMYRA_EMBED_TOKENS=lazy. See `embed.make_lazy`'s module docstring; this is the input-side counterpart
+        # to PRISMYRA_LM_HEAD=lazy above and is independent of it (either, both, or neither may be set).
+        #
+        # Measured on real hardware (RTX PRO 4500, `/Users/akazawt/tmp/smr/air/RUN-q2.md`, 2026-10-10): a lazy
+        # input embedding is NOT a drop-in substitute for the resident one the way the output embedding is. The
+        # output embedding is only ever read *after* the one-pass CUDA graph below finishes replaying (it scores
+        # the already-produced hidden state), but the input embedding is the *first op inside the captured
+        # forward* -- `embed_tokens(input_ids)` runs before any decoder layer. A capture that reaches a host-side
+        # gather and a device<->host copy mid-capture is invalid CUDA: it was observed to record an empty graph
+        # (`torch.cuda.graphs: "The CUDA Graph is empty"`) and leave the capturing stream in a state
+        # (`cudaErrorIllegalState`) that crashes the *next* bucket's own unrelated, unguarded setup code,
+        # reproduced on 2 of 2 fresh-process attempts. So `_lazy_embed_tokens` below additionally disables the
+        # one-pass recording (`wanted` further down): it still answers correctly (the eager path this engine
+        # always has as a fallback), it is simply not sped up by a graph replay at short lengths while this flag
+        # is set. Fixing that trade-off (teaching `onepass.record_bucket` to treat the input-embedding lookup as
+        # another eagerly-run "island", like the row-dependent `F.linear` calls already are) is unimplemented --
+        # left for a future round, named here rather than silently accepted.
+        self._lazy_embed_tokens = on_cuda and os.environ.get("PRISMYRA_EMBED_TOKENS") == "lazy"
+        if self._lazy_embed_tokens:
+            from .embed import make_lazy as _make_embedding_lazy
+
+            text_model = self.backbone.language_model if hasattr(self.backbone, "language_model") else self.backbone
+            _make_embedding_lazy(text_model.get_input_embeddings())
+
         decoder = getattr(self.config, "text_config", self.config)
         self.hidden_size = decoder.hidden_size
         self.applied = (
@@ -754,7 +779,11 @@ class Prismyra:
         if wanted:
             if not on_cuda:
                 raise PrismyraError(f"short_graphs records CUDA graphs and this engine is on {self.device}")
-            if not (calibrate or paged):
+            # See the PRISMYRA_EMBED_TOKENS=lazy comment above: recording would try to capture a host-side gather
+            # at the very first op of the forward and crash, not just answer slower, so it is skipped outright
+            # (`self._one_pass` stays None, and `_ask_in_one_pass` already falls back to the eager path whenever
+            # `bucket_for` has nothing to offer -- the same fallback `calibrate`/`paged` already use here).
+            if not (calibrate or paged or self._lazy_embed_tokens):
                 self._one_pass = onepass.record_all(self, self._pad_id(), self._read_one_pass)
         # The one-pass path's own routed-expert tile (`kernels.onepass_moe_tuning`) is a construction-time file
         # load keyed on this process's device name, not a swap `kernels.apply`'s own `Applied` already reports --
@@ -2456,7 +2485,10 @@ class Prismyra:
         # always takes the eager path -- the concurrency this lane exists for is between lanes' eager passes, which
         # does not need graphs at all; the cost given up is lane 0's already-measured graphs economics (judged not
         # worth paying for and so rarely paid for even on lane 0 in practice).
-        if not self.graphs or self.torch_device.type != "cuda" or not homogeneous or lane != 0:
+        # `self._lazy_embed_tokens`: see the PRISMYRA_EMBED_TOKENS=lazy comment in `__init__` -- a branch-pass
+        # recording would capture the same host-side gather at the same first op (`embed_tokens(ids)`) as the
+        # one-pass recording this condition's sibling already excludes it from, for the same reason.
+        if not self.graphs or self.torch_device.type != "cuda" or not homogeneous or lane != 0 or self._lazy_embed_tokens:
             fork()
             return run(ids, positions)
 
