@@ -121,6 +121,10 @@ class FakeShelf:
         self.engine = engine
         self.documents: dict[int, FakeShelved] = {}
         self._next = 0
+        #: Every `token_counts` argument `_make_room` has asked `would_fit` about, in call order -- what
+        #: `test_make_room_previews_the_padding_segment_too` reads to confirm the padding segment this fake has no
+        #: page pool to refuse is still included in the question asked, not silently dropped.
+        self.would_fit_calls: list[list[int]] = []
 
     def put_many(self, contexts: list[str]) -> list[int]:
         self.engine.reads.append(list(contexts))
@@ -140,7 +144,9 @@ class FakeShelf:
         return {handle: FakeResult({q.id: handle for q in questions}) for handle, questions in asked.items()}
 
     def would_fit(self, token_counts: list[int]) -> bool:
-        """The fake has no page pool to fragment; everything always fits."""
+        """The fake has no page pool to fragment; everything always fits. Records what it was asked, so a test can
+        confirm `_make_room` asked about the padding segment too, not only the real documents' own tokens."""
+        self.would_fit_calls.append(list(token_counts))
         return True
 
     def drop(self, handle: int) -> None:
@@ -366,6 +372,41 @@ def test_a_page_pool_refusal_surfaces_as_a_prismyraerror_not_a_bare_runtimeerror
         assert isinstance(job.error, PrismyraError), job.error
         assert not isinstance(job.error, Full), "the pool-internal type must not leak past the scheduler"
         assert "page pool has no room" in str(job.error)
+    finally:
+        batcher.stop()
+
+
+def test_make_room_previews_the_padding_segment_too():
+    """`_make_room`'s own preview of what the write that follows will admit is not only `token_counts`:
+    `interleave.read_and_branch_shelf`(`_many`) and `Shelf.put_many` all pad a fresh read's *combined* length up
+    to a `_round_rows` bucket (`Prismyra._pad_context_lengths`'s own docstring: a chunked recurrent kernel picks
+    its config by the read's *total* length), and write that padding as its own, separate admission, after
+    every real document's own pages. A preview that only asked `would_fit` about the real tokens would believe
+    a write fit once the real documents' own pages did, missing the one case the padding segment's own
+    admission still refuses -- found by review, not by a GPU reproduction: the one real-hardware reproduction
+    `tests/test_gpu.py` carries for this fix used a document sized exactly to a `_round_rows` bucket, which
+    pads to nothing, and so never exercised this second admission at all.
+    """
+    engine = FakeEngine(group=8, longest_context=1000)
+    batcher = Batcher(engine, linger_ms=0.0)
+    batcher.start()
+    try:
+        # `_make_room`'s own eviction loop only runs once something is already resident (nothing to preview
+        # admitting past, on the very first document ever) -- so this needs a second, distinct document before
+        # `would_fit` is ever asked anything at all.
+        first = batcher.submit("a different first document here", asking(1))
+        assert first.done.wait(5), "the first job never completed"
+        assert first.error is None, first.error
+        # Five words -> five tokens (`FakeEngine.tokenizer`'s one-token-per-word rule) -> `_round_rows(5, 1000)`
+        # pads to 8, a padding segment of 3 tokens admitted after the real document's own 5.
+        job = batcher.submit("one two three four five", asking(1))
+        assert job.done.wait(5), "the second job never completed"
+        assert job.error is None, job.error
+        shelf = batcher._shelf
+        assert [5, 3] in shelf.would_fit_calls, (
+            f"would_fit was never asked about the 3-token padding segment alongside the real document's own 5: "
+            f"{shelf.would_fit_calls}"
+        )
     finally:
         batcher.stop()
 

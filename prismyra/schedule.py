@@ -631,19 +631,49 @@ class Batcher:
         a request the plain unbatched queue (no page pool to fragment) answered without complaint. `fits_pages`
         below asks `shelf.would_fit` the same question `admit` is about to ask for real, so this loop keeps evicting
         until that answer is yes -- never changing *how* the document that follows gets read (it still goes through
-        the same paged shelf, the same kernels, the same answer any other admission would give it), only *how much
-        the shelf had already evicted* by the time it does, which is this loop's job either way.
+        the same paged shelf, the same kernels, the same admission path any other write would use), only *how much
+        the shelf had already evicted* by the time it does, which is this loop's job either way. That the kernels and
+        admission path are unchanged is a property of this diff, checked by reading it; that no eviction history can
+        ever move the bits this reads out is a stronger claim this loop does not establish on its own -- see the one
+        fragmentation scenario this release's own real-hardware test actually checked (`tests/test_gpu.py`), and
+        this project's own "Known limitations" for what that one check does and does not generalise to.
+
+        `shelf.would_fit` is asked about `token_counts` *and* the padding segment every one of this method's three
+        callers' own writes also admits (`pages_check`, below): `interleave.read_and_branch_shelf`(`_many`) and
+        `Shelf.put_many` all round a fresh read's *combined* length up to a `_round_rows` bucket
+        (`Prismyra._pad_context_lengths`), and write that padding as its own separate admission, after every real
+        document's own pages -- a write this preview would otherwise believe fits once the real documents' own
+        pages do, missing the one case the padding segment's own admission still refuses.
+
+        This loop can still end with `self._resident` empty and `fits_pages` false -- every resident was in `keep`
+        or already evicted, and the document being formed for genuinely does not fit even an empty shelf. That is
+        not a gap this loop closes: it returns (implicitly, via the `while` exiting) without evicting further, the
+        real `admit` call that follows raises `Full` for real, and the `except Full` conversions already in
+        `engine.py`'s two fused shelf-write paths and in this method's own two-step path below turn that into a
+        `PrismyraError` (422) the same way they always have -- a genuine capacity refusal, not the fragmentation
+        this loop exists to see past.
         """
         shelf = self._on_shelf()
         token_counts = [self._tokens(job) for job in fresh]
         wanted = sum(token_counts)
         incoming_snapshot = len(fresh) * self._slot_bytes
+        # The write this admits is not only `token_counts`: `interleave.read_and_branch_shelf`(_many) and
+        # `Shelf.put_many` all pad a fresh read's combined length up to `_round_rows(total, engine.longest_context)`
+        # (`Prismyra._pad_context_lengths`'s own docstring -- the borrowed chunked recurrent kernel picks its
+        # config by *total* length), and that padding segment is its own, separate `admit` call, written last,
+        # after every real document's own pages. A preview that only asked about `token_counts` believed a write
+        # fit when the real documents' own pages did but the padding segment's did not -- found by review, not by
+        # a GPU reproduction (unlike the plain fragmentation gap `fits_pages` closes for `token_counts` alone):
+        # the one real-hardware reproduction in this release's own history used a document sized exactly to a
+        # `_round_rows` bucket, which pads to nothing, and so never exercised this second admit at all.
+        pad = _round_rows(wanted, self.engine.longest_context) - wanted
+        pages_check = [*token_counts, pad] if pad else token_counts
         tried_reclaim = False
         while self._resident:
             held = sum(shelf.documents[handle].tokens for handle in shelf.documents)
             fits_tokens = held + wanted <= self.limits.tokens
             fits_count = len(self._resident) + len(fresh) <= SHELF_MAX_RESIDENTS
-            fits_pages = shelf.would_fit(token_counts)
+            fits_pages = shelf.would_fit(pages_check)
             fits_memory = True
             if self.engine.torch_device.type == "cuda":
                 free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
