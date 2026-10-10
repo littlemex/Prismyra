@@ -322,6 +322,11 @@ def record_bucket(
         # Eager, off whatever stream recording runs on -- see the module's own paragraph on why a captured
         # version of this crashes rather than merely answers unsped-up. Writes in place (`copy_`), not an
         # assignment, so `embeds` keeps the address the capture below will read from for the bucket's life.
+        # Both asserts are the one invariant `embeds`'s own construction above already ties them to (`embeds`
+        # is built exactly when `embed_module` is given) -- mypy does not carry that across this closure, so it
+        # is stated again rather than silenced.
+        assert embeds is not None
+        assert embed_module is not None
         embeds.copy_(embed_module(ids))
 
     def run() -> torch.Tensor:
@@ -371,7 +376,9 @@ def record_bucket(
     except Exception as e:  # noqa: BLE001 - any failure means the eager path, which is always available
         return None, f"{type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}"
     return (
-        Bucket(length=length, steps=recorder.steps, ids=ids, at=at, hidden=hidden, embeds=embeds, embed_module=embed_module),
+        Bucket(
+            length=length, steps=recorder.steps, ids=ids, at=at, hidden=hidden, embeds=embeds, embed_module=embed_module
+        ),
         None,
     )
 
@@ -386,6 +393,9 @@ def replay(bucket: Bucket, ids: torch.Tensor, pad_id: int) -> torch.Tensor:
         if bucket.embeds is not None:
             # The two-stage replay a lazy input embedding needs: gather eagerly, off the recording entirely, into
             # the fixed address the capture reads from, *then* play the recorded steps -- see `record_bucket`.
+            # `bucket.embed_module` is set exactly when `bucket.embeds` is (`record_bucket`'s own construction);
+            # restated for mypy, which does not carry that tie across the two fields.
+            assert bucket.embed_module is not None
             bucket.embeds.copy_(bucket.embed_module(bucket.ids))
         for step in bucket.steps:
             if isinstance(step, tuple):

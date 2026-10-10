@@ -44,4 +44,6 @@ def make_lazy(module: nn.Embedding) -> None:
     gathered rows async-capable; without it every `_lazy_forward` call pays a staging copy first.
     """
     module.weight.data = module.weight.data.to("cpu").pin_memory()
-    module.forward = types.MethodType(_lazy_forward, module)
+    # The replacement this function exists to install -- mypy sees an instance attribute shadowing the class's
+    # own `forward`, which is the point, not a mistake.
+    module.forward = types.MethodType(_lazy_forward, module)  # type: ignore[method-assign]
