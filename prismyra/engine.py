@@ -751,6 +751,35 @@ class Prismyra:
                 raise PrismyraError(f"short_graphs records CUDA graphs and this engine is on {self.device}")
             if not (calibrate or paged):
                 self._one_pass = onepass.record_all(self, self._pad_id(), self._read_one_pass)
+        # The one-pass path's own routed-expert tile (`kernels.onepass_moe_tuning`) is a construction-time file
+        # load keyed on this process's device name, not a swap `kernels.apply`'s own `Applied` already reports --
+        # recorded here, unconditionally, so "did the pin actually load this time" is answered by `engine.applied`/
+        # `stats()` rather than by instrumenting `fused_moe._config` by hand, which is what settled a caller's
+        # report of this question the hard way (speed and the active config dict both measured, on real hardware,
+        # to carry the pinned tile, not the batch-invariant fallback -- the report's own root cause turned out to
+        # be elsewhere). `on_cuda and self._borrowed_kernel` is the same condition `wanted`'s own default above
+        # uses: whether this engine's one-pass path runs the borrowed FP8 kernel at all, which is the only
+        # condition under which the pin changes anything. `require_kernels` already means "tell me, do not
+        # silently fall back" for every other borrowed-kernel assumption in this method; a missing pin on a card
+        # this project ships `fp8-36l` for is the same kind of silent fallback, so it is held to the same bar.
+        if on_cuda and self._borrowed_kernel:
+            from .kernels import onepass_moe_tuning
+
+            pin_name = onepass_moe_tuning.device_name()
+            pin = onepass_moe_tuning.pinned_config()
+            if pin is not None:
+                self.applied.notes.append(f"onepass_moe_pin: {pin_name} loaded {pin}")
+            else:
+                msg = (
+                    f"onepass_moe_pin: no pinned one-pass MoE tile for {pin_name!r} (checked "
+                    f"{onepass_moe_tuning.PINNED_DIR}); the one-pass path (_ask_in_one_pass) falls back to "
+                    f"whatever VLLM_BATCH_INVARIANT's own small fixed tile picks for every row count, measured "
+                    f"up to ~17% slower at a context-length row count than the pinned tile this card is "
+                    f"expected to use (see kernels/onepass_moe_tuning.py)"
+                )
+                if require_kernels:
+                    raise PrismyraError(msg)
+                self.applied.notes.append(msg)
 
     # ------------------------------------------------------------------ public
     def validate(self, questions: list[Question]) -> None:
