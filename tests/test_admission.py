@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from prismyra import chunking
 from prismyra.cache import join_bytes_per_token
 from prismyra.engine import ANSWERING_MARGIN, WIDTHS, Prismyra, row_constant
 
@@ -146,3 +147,56 @@ def test_the_fallback_path_is_budgeted_at_twice_the_slope():
     fast._observed_row_constant = slow._observed_row_constant = 0
     slow._borrowed_kernel = False
     assert slow.answering_bytes(10_000, questions=8) == 2 * fast.answering_bytes(10_000, questions=8)
+
+
+def test_visible_free_is_mem_get_info_unchanged_without_a_fraction_set(monkeypatch):
+    """The common case, checked first so a bug in the correction cannot hide behind it: a process nobody has capped
+    is the whole point of `get_per_process_memory_fraction` defaulting to `1.0`, and that default has to make the
+    `min` below a no-op rather than something that happens to compute the same answer."""
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (5 * 2**30, 32 * 2**30))
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda index: 1.0)
+    free, total = chunking.visible_free(torch.device("cuda", 0))
+    assert (free, total) == (5 * 2**30, 32 * 2**30)
+
+
+def test_visible_free_corrects_for_a_process_capped_tighter_than_the_device(monkeypatch):
+    """`mem_get_info` answers for the device: on a 32 GiB card given a 0.5 fraction and already holding 12 GiB, it
+    still reports whatever the device's own free figure is -- found, on real hardware, to be most of the 32 GiB,
+    tens of gigabytes `should_chunk` and `Prismyra._check_fits` had no way to tell from room this process could
+    actually use. The correction is `cap - reserved`, not `cap - allocated`: the allocator's own idle pool between
+    the two counts against the cap just as much as a live tensor does."""
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (20 * 2**30, 32 * 2**30))
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda index: 0.5)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 12 * 2**30)
+    free, total = chunking.visible_free(torch.device("cuda", 0))
+    assert total == 16 * 2**30
+    assert free == 4 * 2**30  # cap (16 GiB) - reserved (12 GiB), not the device's 20 GiB of raw free
+
+
+def test_visible_free_does_not_go_negative_once_the_cap_is_already_spent(monkeypatch):
+    """A process already reserved past where a *newly lowered* cap would put it (the cap is set once at process
+    start in practice, but nothing stops a caller from lowering it later) has no headroom, not negative headroom --
+    the raw figure, however large, is capped at zero rather than passed through unmodified or allowed to subtract
+    below it."""
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (20 * 2**30, 32 * 2**30))
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda index: 0.5)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 18 * 2**30)
+    free, _total = chunking.visible_free(torch.device("cuda", 0))
+    assert free == 0
+
+
+def test_visible_free_resolves_an_indexless_device_to_the_current_one(monkeypatch):
+    """`get_per_process_memory_fraction` raises on `torch.device('cuda')` (no index); `mem_get_info` does not. A
+    device named the way `Prismyra.torch_device` names it must still reach the fraction call, through whichever
+    device CUDA already made current."""
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    seen_index = {}
+
+    def fraction(index):
+        seen_index["value"] = index
+        return 1.0
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1, 2))
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", fraction)
+    chunking.visible_free(torch.device("cuda"))
+    assert seen_index["value"] == 0
