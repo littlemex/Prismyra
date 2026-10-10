@@ -19,7 +19,7 @@ import torch
 if TYPE_CHECKING:  # pragma: no cover - the framework's cache type, for the annotation only
     from transformers.cache_utils import Cache
 
-from . import interleave, kernels, onepass, varlen
+from . import chunking, interleave, kernels, onepass, varlen
 from .cache import build_cache, cache_bytes, join_bytes_per_token
 from .calibration import Calibration
 from .fork import (
@@ -1601,7 +1601,16 @@ class Prismyra:
             if pad_ids.shape[1] > 0:
                 return self._read_padded(encoded, pad_ids, lengths)
         cache, room = self._claim_cache(encoded.tokens, group=group)
-        self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
+        # Chunked, in `chunking.CHUNK_TOKENS`-sized pieces, when the document is long enough and this device has
+        # little enough room to spare for a one-shot read (`chunking.should_chunk`'s own docstring). Never for
+        # media: the offset computed below is a fact about having just read the *whole* context in one forward,
+        # and chunking that has not been measured.
+        boundary = 0 if encoded.has_media else chunking.chunk_boundary(encoded.tokens)
+        if boundary and chunking.should_chunk(self, encoded.tokens):
+            chunking.read_chunked(self, cache, encoded.input_ids, boundary)
+        else:
+            boundary = 0
+        self.backbone(input_ids=encoded.input_ids[:, boundary:], use_cache=True, past_key_values=cache, **encoded.media)
         # Read after the forward, not before: the offset is something the model works out while reading the context.
         position_from = position_offset(self.backbone, encoded.tokens) if encoded.has_media else encoded.tokens
         # The fork's state buffers are allocated here rather than on the first branch pass, and the reason is the budget
@@ -2495,7 +2504,13 @@ class Prismyra:
         # `self._lazy_embed_tokens`: see the PRISMYRA_EMBED_TOKENS=lazy comment in `__init__` -- a branch-pass
         # recording would capture the same host-side gather at the same first op (`embed_tokens(ids)`) as the
         # one-pass recording this condition's sibling already excludes it from, for the same reason.
-        if not self.graphs or self.torch_device.type != "cuda" or not homogeneous or lane != 0 or self._lazy_embed_tokens:
+        if (
+            not self.graphs
+            or self.torch_device.type != "cuda"
+            or not homogeneous
+            or lane != 0
+            or self._lazy_embed_tokens
+        ):
             fork()
             return run(ids, positions)
 

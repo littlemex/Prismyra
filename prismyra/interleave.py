@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import torch
 
-from . import varlen
+from . import chunking, varlen
 from .fork import Prefill, build_suffixes, pick, snapshot_bytes, snapshot_layer, widen_for_branch, widen_for_branch_many
 
 
@@ -66,15 +66,31 @@ def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, p
     ctx_tokens = encoded.tokens
     cache, room = engine._claim_cache(ctx_tokens, group=group)
 
+    # The context's own read, ahead of the branch: chunked, in `chunking.CHUNK_TOKENS`-sized pieces, under the
+    # same condition `Prismyra._read`'s plain branch chunks under (`chunking.should_chunk`'s own docstring).
+    # Only the *prefix* is read this way, through `engine.backbone` and nothing of this module's own loop below
+    # -- the final, usually-shorter piece still goes through the layer-interleaved loop alongside the branch, so
+    # the fusion this module exists for is unchanged for whichever piece is left. Never for media, for the same
+    # reason `_read` excludes it: not measured. (`encoded.has_media` is always `False` here in practice -- the
+    # one caller, `Prismyra._ask_interleaved`, encodes with no images or videos before this is reached -- kept
+    # explicit anyway, since what runs here depends on it being so.)
+    prefix = 0 if encoded.has_media else chunking.chunk_boundary(ctx_tokens)
+    if prefix and chunking.should_chunk(engine, ctx_tokens):
+        chunking.read_chunked(engine, cache, encoded.input_ids, prefix)
+    else:
+        prefix = 0
+    ctx_ids = encoded.input_ids[:, prefix:]
+    tail_tokens = ctx_ids.shape[1]
+
     branch_ids, read_at, _ = build_suffixes(texts, engine.tokenizer, device, padded_rows, width)
     branch_width = branch_ids.shape[1]
 
-    ctx_positions = torch.arange(ctx_tokens, device=device).unsqueeze(0)
+    ctx_positions = torch.arange(prefix, ctx_tokens, device=device).unsqueeze(0)
     branch_positions = (
         torch.arange(ctx_tokens, ctx_tokens + branch_width, device=device).unsqueeze(0).expand(padded_rows, -1)
     )
 
-    hidden_ctx = text_model.embed_tokens(encoded.input_ids)
+    hidden_ctx = text_model.embed_tokens(ctx_ids)
     hidden_branch = text_model.embed_tokens(branch_ids)
     ctx_rope = text_model.rotary_emb(hidden_ctx, ctx_positions)
     branch_rope = text_model.rotary_emb(hidden_branch, branch_positions)
@@ -127,8 +143,8 @@ def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, p
         moe_out = decoder_layer.mlp(combined)
         if isinstance(moe_out, tuple):  # the unpatched block returns (output, router_logits); FusedExperts does not
             moe_out = moe_out[0]
-        moe_ctx, moe_branch = moe_out.split([ctx_tokens, padded_rows * branch_width], dim=0)
-        hidden_ctx = residual_ctx + moe_ctx.reshape(1, ctx_tokens, hidden_size)
+        moe_ctx, moe_branch = moe_out.split([tail_tokens, padded_rows * branch_width], dim=0)
+        hidden_ctx = residual_ctx + moe_ctx.reshape(1, tail_tokens, hidden_size)
         hidden_branch = residual_branch + moe_branch.reshape(padded_rows, branch_width, hidden_size)
 
     # The context's own final norm is never read -- nothing downstream of `engine._read` reads its hidden state
