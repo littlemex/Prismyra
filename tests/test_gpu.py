@@ -1258,7 +1258,7 @@ def _page_pool_of(shelf):
     """Any one `PagedForkLayer`'s `Pool` -- every layer on one shelf admits and releases in the same order for
     the same lengths, so any one of them answers for all of them (same reasoning as `Shelf.would_fit`'s own
     docstring and `Shelf.drop`'s loop over every layer just above it in `engine.py`)."""
-    return next(layer.pool for layer in shelf._cache.layers if getattr(layer, "pool", None) is not None)
+    return next(p for layer in shelf._cache.layers if (p := getattr(layer, "pool", None)) is not None)
 
 
 def test_a_fragmented_page_pool_refuses_a_document_the_token_sum_alone_would_admit(engine_paged):

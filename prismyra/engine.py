@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -275,7 +276,7 @@ class Shelf:
         """
         if self._cache is None:
             raise PrismyraError("this shelf has been closed")
-        pool = next((layer.pool for layer in self._cache.layers if getattr(layer, "pool", None) is not None), None)
+        pool = next((p for layer in self._cache.layers if (p := getattr(layer, "pool", None)) is not None), None)
         return pool is None or pool.would_admit_all(token_counts)
 
     def drop(self, handle: int) -> None:
@@ -1297,7 +1298,7 @@ class Prismyra:
                     self, shelf, contexts, texts_per_doc, width=width, padded_rows_per_doc=padded_rows_per_doc
                 )
                 token_ids = [p.token_ids for plans in plans_per_doc for p in plans]
-                options = [q.options for qs in questions_per_doc for q in qs]
+                options: list[Sequence[str]] = [q.options for qs in questions_per_doc for q in qs]
                 scored = self.heads.apply(hidden, options, score(hidden, self.unembedding, token_ids, None))
             except torch.OutOfMemoryError as e:
                 raise PrismyraError(
@@ -2904,9 +2905,9 @@ def _disable_batch_invariance() -> None:
         _BATCH_INVARIANT_SAVED_BACKENDS = None
 
 
-_BATCH_INVARIANT_DISPATCH_LIB = None
+_BATCH_INVARIANT_DISPATCH_LIB: torch.library.Library | None = None
 _BATCH_INVARIANT_REFCOUNT = 0
-_BATCH_INVARIANT_SAVED_BACKENDS = None
+_BATCH_INVARIANT_SAVED_BACKENDS: tuple[str | None, str | None, bool, bool] | None = None
 
 
 def _now(device: torch.device) -> float:
