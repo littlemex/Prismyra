@@ -29,8 +29,7 @@ import pytest
 import torch
 from gpu_room import no_room_reason
 
-from prismyra import Boolean, Choice, Prismyra, PrismyraError, Scale
-from prismyra import onepass
+from prismyra import Boolean, Choice, Prismyra, PrismyraError, Scale, onepass
 from prismyra.graphs import pays_from
 
 pytestmark = pytest.mark.gpu

@@ -513,7 +513,7 @@ class Prismyra:
         #: `Prismyra` has used until now (lane 0 keeps that stream -- `None` here means "the current/default
         #: stream", not "no stream"). Built lazily, once per lane, because building one costs nothing worth paying
         #: for an engine that is never asked for a second lane.
-        self._streams: dict[int, "torch.cuda.Stream | None"] = {0: None}
+        self._streams: dict[int, torch.cuda.Stream | None] = {0: None}
         #: Monotonic deadline before `empty_cache()` is tried again, once it has been tried and still left free
         #: memory at or below `GRAPH_MEMORY_MARGIN`. See `RECLAIM_COOLDOWN_S`.
         self._reclaim_cooldown_until = 0.0
@@ -1175,7 +1175,7 @@ class Prismyra:
             timing=Timing(context_ms=0.0, readout_ms=readout_ms),
         )
 
-    def _shelf_ask_interleaved(self, shelf, context: str, questions: list[Question]) -> tuple[Result, int, "Shelved"]:
+    def _shelf_ask_interleaved(self, shelf, context: str, questions: list[Question]) -> tuple[Result, int, Shelved]:
         """`Batcher._answer`'s path for one *fresh* document, read into `shelf` and answered in the
         same layer-interleaved pass instead of `Shelf.put_many` followed later by `Shelf.ask`. See
         `interleave.read_and_branch_shelf` for what the paged cache needed that `_ask_interleaved`'s joined-cache
@@ -1255,7 +1255,7 @@ class Prismyra:
 
     def _shelf_ask_interleaved_many(
         self, shelf, contexts: list[str], questions_per_doc: list[list[Question]]
-    ) -> list[tuple[Result, int, "Shelved"]]:
+    ) -> list[tuple[Result, int, Shelved]]:
         """`_shelf_ask_interleaved`'s own job for several *fresh* documents at once: every
         document in `formed.jobs` is fresh (`schedule.Batcher._answer`'s own generalised fusion condition --
         see that function), so one layer-interleaved pass reads and answers all of them, instead of diluting

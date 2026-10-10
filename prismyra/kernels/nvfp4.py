@@ -216,9 +216,9 @@ class FusedExpertsFp4(nn.Module):
         if self.backend == "flashinfer":
             # One fused kernel: the permutation, both grouped GEMMs, the activation and the weighted sum are inside it,
             # where the plain CUTLASS route runs them as separate kernels (row shuffles, a quantise, a reduction).
+            from flashinfer.fused_moe.core import ActivationType
             from vllm import _custom_ops as ops
             from vllm.utils.flashinfer import flashinfer_cutlass_fused_moe
-            from flashinfer.fused_moe.core import ActivationType
 
             xq, xsf = ops.scaled_fp4_quant(x.contiguous(), self.a1_gscale[:1])
             ws = self._workspace(m, xq.dtype) if os.environ.get("PRISMYRA_NVFP4_WORKSPACE", "1") == "1" else None
@@ -309,7 +309,7 @@ def tactics_status() -> dict:
     }
 
 
-def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
+def autotune_tactics(layer: FusedExpertsFp4, max_tokens: int = 16384) -> None:
     """Pick the fused MoE kernel's tactic (tile shape and schedule), the same way in every process.
 
     Without this FlashInfer runs one default tactic for every size. Every MoE layer has the same shapes, so one layer's

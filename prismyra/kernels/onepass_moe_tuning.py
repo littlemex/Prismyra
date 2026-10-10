@@ -86,7 +86,7 @@ def _load(name: str) -> dict | None:
 #: there is nothing to gain by re-reading it. `None` means "no pinned table for this card" (the ordinary
 #: batch-invariant tile keeps running); `False` is the sentinel for "not loaded yet", so a card without a table is
 #: not re-read from disk on every one-pass call.
-_PINNED: dict | None | bool = False
+_PINNED: dict | bool | None = False
 
 
 def pinned_config() -> dict | None:

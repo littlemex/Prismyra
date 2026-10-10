@@ -283,7 +283,7 @@ class _ProjectionSlot(nn.Module):
     """
 
     def __init__(
-        self, fused: _FusedDenseProjection, index: int, order: list["_ProjectionSlot"], original: Fp8Linear
+        self, fused: _FusedDenseProjection, index: int, order: list[_ProjectionSlot], original: Fp8Linear
     ):
         super().__init__()
         self.fused = fused
