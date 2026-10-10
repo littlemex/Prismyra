@@ -314,25 +314,29 @@ reported rather than smoothed over, since this project's own answer is confident
 this one measure.
 
 **Speed** (one document, held just over 3,401 Prismyra tokens; d1-3B's own tokenizer counts it slightly
-differently; 2 warm-up calls then median of 7). `fp8-36l`'s own figures are a same-day re-measurement on an
-L40S for this release; the two competitors' figures are not re-run for this release and are carried over from
-the comparison round each was first measured in -- the model that ships behind each number has not changed
-since, so the comparison still holds, but the three rows were not all measured on literally the same clock:
+differently; 2 warm-up calls then median of 7). The one-question row is a same-day, same-GPU (L40S)
+measurement for both `fp8-36l` and JEV-27B-VL, interleaved in one run; the 16- and 64-question rows for
+`fp8-36l` are from the same session's own version-to-version comparison on the identical GPU. JEV-27B-VL's
+16- and 64-question figures and all of d1-3B's figures are not from that session -- they are carried over
+from an earlier comparison round on the same hardware class, reused because neither competitor's served
+checkpoint has changed since that round:
 
 | questions | `fp8-36l` | JEV-27B-VL | d1-3B (RTX PRO 4500, compiled) | d1-3B (L40S, compiled) |
 |---|---:|---:|---:|---:|
-| 1 | 156.7 ms | **152.6 ms** | 159.3 ms | **98.1 ms** |
+| 1 | 170.5 ms | **154.8 ms** | 159.3 ms | **98.1 ms** |
 | 16 | **229.9 ms** | 1,423.7 ms | 203.1 ms | 130.1 ms |
 | 64 | **335.3 ms** | 5,719.5 ms | 298.6 ms | 190.5 ms |
 
 Three different shapes of result, not one verdict:
 
-- **Against JEV-27B-VL, the one-question gap has nearly closed.** A prior round measured `fp8-36l` at 185.2 ms
-  for one question, 17.6% slower than JEV's 152.6 ms; this release's own solo-question kernel work (the tuned
-  MoE tile pinned in v0.4.3) brings that to 156.7 ms, a 2.6% gap. At 16 and 64 questions `fp8-36l` is unchanged
-  in kind and still wins decisively (6.2x and 17.1x), because JEV's own API answers one decision per call and
-  pays for the document again on every one -- a design limit, not a tuning gap, and not something a later JEV
-  release closes without changing that API.
+- **JEV-27B-VL is 9.2% faster than `fp8-36l` at one question**, in this same-day, same-GPU measurement -- a
+  reversal from an earlier comparison round, which had reported `fp8-36l` ahead at one question by the
+  then-current figures on both sides. The cause of that reversal is not established; the tuned MoE tile
+  pinned in v0.4.3 was checked directly on this hardware and confirmed to still be loading and taking effect,
+  which rules it out as the cause. At 16 and 64 questions `fp8-36l` is unchanged in kind and still wins
+  decisively (6.2x and 17.1x), because JEV's own API answers one decision per call and pays for the document
+  again on every one -- a design limit, not a tuning gap, and not something a later JEV release closes
+  without changing that API.
 - **d1-3B is faster than `fp8-36l` at every width measured, on both cards it was measured on.** A 3B dense
   model with no routed experts has less to compute than a 35B-A3B MoE at any width; this is the honest trade
   this project's own accuracy numbers above are made against, not a result this release changes.
