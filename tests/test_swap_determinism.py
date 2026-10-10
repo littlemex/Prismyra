@@ -18,8 +18,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from prismyra.kernels.qwen3_moe import _compare, _swap_and_verify, _warn_if_close_to_tolerance
 from prismyra.kernels import Applied
+from prismyra.kernels.qwen3_moe import _compare, _swap_and_verify, _warn_if_close_to_tolerance
 
 
 def test_compare_measures_the_same_disagreement_every_time():

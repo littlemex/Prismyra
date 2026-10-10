@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -257,6 +258,27 @@ class Shelf:
             )
         return handles
 
+    def would_fit(self, token_counts: list[int]) -> bool:
+        """Would admitting documents of these lengths, in this order, succeed without the page pool refusing?
+
+        `schedule.Batcher._make_room`'s own token-sum budget is a different question from the one `Pool.admit`
+        is about to ask for real: `Pool` is a first-fit allocator over its own released runs and cursor (see its
+        own docstring), and a sum of tokens fitting the shelf's overall budget does not mean any one of those runs
+        is large enough for the document that needs it. This previews exactly `admit`'s own search, without
+        reserving anything, so a caller can keep evicting until the answer is yes instead of finding out from
+        `admit`'s own `Full`.
+
+        Reads whichever `PagedForkLayer` is holding this shelf's pages, same as `drop`'s own loop over
+        `self._cache.layers` just below -- every layer on one shelf admits and releases in the same order for the
+        same lengths, so any one of them answers for all of them. `None` only before the shelf's first document has
+        ever been written (`PagedForkLayer` allocates its `Pool` lazily, on the first write), when nothing is
+        resident to refuse against yet.
+        """
+        if self._cache is None:
+            raise PrismyraError("this shelf has been closed")
+        pool = next((p for layer in self._cache.layers if (p := getattr(layer, "pool", None)) is not None), None)
+        return pool is None or pool.would_admit_all(token_counts)
+
     def drop(self, handle: int) -> None:
         """Take a document off the shelf and give its pages back."""
         if self._cache is None:
@@ -492,7 +514,7 @@ class Prismyra:
         #: `Prismyra` has used until now (lane 0 keeps that stream -- `None` here means "the current/default
         #: stream", not "no stream"). Built lazily, once per lane, because building one costs nothing worth paying
         #: for an engine that is never asked for a second lane.
-        self._streams: dict[int, "torch.cuda.Stream | None"] = {0: None}
+        self._streams: dict[int, torch.cuda.Stream | None] = {0: None}
         #: Monotonic deadline before `empty_cache()` is tried again, once it has been tried and still left free
         #: memory at or below `GRAPH_MEMORY_MARGIN`. See `RECLAIM_COOLDOWN_S`.
         self._reclaim_cooldown_until = 0.0
@@ -730,6 +752,35 @@ class Prismyra:
                 raise PrismyraError(f"short_graphs records CUDA graphs and this engine is on {self.device}")
             if not (calibrate or paged):
                 self._one_pass = onepass.record_all(self, self._pad_id(), self._read_one_pass)
+        # The one-pass path's own routed-expert tile (`kernels.onepass_moe_tuning`) is a construction-time file
+        # load keyed on this process's device name, not a swap `kernels.apply`'s own `Applied` already reports --
+        # recorded here, unconditionally, so "did the pin actually load this time" is answered by `engine.applied`/
+        # `stats()` rather than by instrumenting `fused_moe._config` by hand, which is what settled a caller's
+        # report of this question the hard way (speed and the active config dict both measured, on real hardware,
+        # to carry the pinned tile, not the batch-invariant fallback -- the report's own root cause turned out to
+        # be elsewhere). `on_cuda and self._borrowed_kernel` is the same condition `wanted`'s own default above
+        # uses: whether this engine's one-pass path runs the borrowed FP8 kernel at all, which is the only
+        # condition under which the pin changes anything. `require_kernels` already means "tell me, do not
+        # silently fall back" for every other borrowed-kernel assumption in this method; a missing pin on a card
+        # this project ships `fp8-36l` for is the same kind of silent fallback, so it is held to the same bar.
+        if on_cuda and self._borrowed_kernel:
+            from .kernels import onepass_moe_tuning
+
+            pin_name = onepass_moe_tuning.device_name()
+            pin = onepass_moe_tuning.pinned_config()
+            if pin is not None:
+                self.applied.notes.append(f"onepass_moe_pin: {pin_name} loaded {pin}")
+            else:
+                msg = (
+                    f"onepass_moe_pin: no pinned one-pass MoE tile for {pin_name!r} (checked "
+                    f"{onepass_moe_tuning.PINNED_DIR}); the one-pass path (_ask_in_one_pass) falls back to "
+                    f"whatever VLLM_BATCH_INVARIANT's own small fixed tile picks for every row count, measured "
+                    f"up to ~17% slower at a context-length row count than the pinned tile this card is "
+                    f"expected to use (see kernels/onepass_moe_tuning.py)"
+                )
+                if require_kernels:
+                    raise PrismyraError(msg)
+                self.applied.notes.append(msg)
 
     # ------------------------------------------------------------------ public
     def validate(self, questions: list[Question]) -> None:
@@ -1125,7 +1176,7 @@ class Prismyra:
             timing=Timing(context_ms=0.0, readout_ms=readout_ms),
         )
 
-    def _shelf_ask_interleaved(self, shelf, context: str, questions: list[Question]) -> tuple[Result, int, "Shelved"]:
+    def _shelf_ask_interleaved(self, shelf, context: str, questions: list[Question]) -> tuple[Result, int, Shelved]:
         """`Batcher._answer`'s path for one *fresh* document, read into `shelf` and answered in the
         same layer-interleaved pass instead of `Shelf.put_many` followed later by `Shelf.ask`. See
         `interleave.read_and_branch_shelf` for what the paged cache needed that `_ask_interleaved`'s joined-cache
@@ -1159,18 +1210,36 @@ class Prismyra:
         padded_rows = _round_rows(len(questions), group)
         texts = [p.text for p in plans]
 
+        from .paged import Full
+
         start = _now(self.torch_device)
         with self._lock, torch.inference_mode():
             try:
                 hidden, handle, shelved = interleave.read_and_branch_shelf(
                     self, shelf, context, texts, width=width, padded_rows=padded_rows
                 )
-                scored = self.heads.apply(hidden, [q.options for q in questions], score(hidden, self.unembedding, token_ids, None))
+                scored = self.heads.apply(
+                    hidden, [q.options for q in questions], score(hidden, self.unembedding, token_ids, None)
+                )
             except torch.OutOfMemoryError as e:
                 raise PrismyraError(
                     f"ran out of memory reading and answering {len(questions)} questions about a fresh document "
                     f"on a shelf (interleaved_fork). Ask fewer questions at a time, or build the engine with a "
                     f"smaller group."
+                ) from e
+            except Full as e:
+                # The write this read does (`interleave.read_and_branch_shelf` -> `PagedForkLayer.update` ->
+                # `Pool.admit`) can refuse for a page-pool reason distinct from device memory: `Pool` is a
+                # first-fit allocator over released runs, so a shelf whose residents' released runs are
+                # fragmented can refuse a document `schedule.Batcher._make_room`'s token-level accounting
+                # believed there was room for. Found on real hardware: this exact document answered cleanly
+                # through the plain, unbatched queue (no page pool there) and raised an uncaught `Full`
+                # (a plain `RuntimeError`, not a `PrismyraError`) through this call under `--batcher`, which
+                # `server.py`'s `/ask` did not know to catch and reported as a bare HTTP 500.
+                raise PrismyraError(
+                    f"the page pool has no room for a {len(questions)}-question document on this shelf right "
+                    f"now ({e}). Retrying is reasonable -- a later pass with different shelf company may free "
+                    f"the pages this one needed."
                 ) from e
         readout_ms = _since(start, self.torch_device)
 
@@ -1189,7 +1258,7 @@ class Prismyra:
 
     def _shelf_ask_interleaved_many(
         self, shelf, contexts: list[str], questions_per_doc: list[list[Question]]
-    ) -> list[tuple[Result, int, "Shelved"]]:
+    ) -> list[tuple[Result, int, Shelved]]:
         """`_shelf_ask_interleaved`'s own job for several *fresh* documents at once: every
         document in `formed.jobs` is fresh (`schedule.Batcher._answer`'s own generalised fusion condition --
         see that function), so one layer-interleaved pass reads and answers all of them, instead of diluting
@@ -1220,6 +1289,8 @@ class Prismyra:
         ]
         texts_per_doc = [[p.text for p in plans] for plans in plans_per_doc]
 
+        from .paged import Full
+
         start = _now(self.torch_device)
         with self._lock, torch.inference_mode():
             try:
@@ -1227,12 +1298,22 @@ class Prismyra:
                     self, shelf, contexts, texts_per_doc, width=width, padded_rows_per_doc=padded_rows_per_doc
                 )
                 token_ids = [p.token_ids for plans in plans_per_doc for p in plans]
-                options = [q.options for qs in questions_per_doc for q in qs]
+                options: list[Sequence[str]] = [q.options for qs in questions_per_doc for q in qs]
                 scored = self.heads.apply(hidden, options, score(hidden, self.unembedding, token_ids, None))
             except torch.OutOfMemoryError as e:
                 raise PrismyraError(
                     f"ran out of memory reading and answering {len(contexts)} fresh documents in one "
                     f"layer-interleaved pass (interleaved_fork). Ask about fewer documents at a time."
+                ) from e
+            except Full as e:
+                # Same conversion, same reason, as `_shelf_ask_interleaved`'s own `except Full` just above it
+                # in this file: `Pool.admit`'s page-level fragmentation can refuse a write `_make_room`'s
+                # token-level accounting believed there was room for, and the plain `RuntimeError` that
+                # refusal raises is not one `server.py`'s `/ask` already knows to catch.
+                raise PrismyraError(
+                    f"the page pool has no room for {len(contexts)} fresh documents in one layer-interleaved "
+                    f"pass right now ({e}). Retrying is reasonable -- a later pass with different shelf "
+                    f"company may free the pages this one needed."
                 ) from e
         readout_ms = _since(start, self.torch_device)
 
@@ -1544,7 +1625,12 @@ class Prismyra:
                 if begin is not None:
                     begin([0, 1])  # the real document, then its padding -- one handle each, or `_write_context` refuses
             with varlen.reading(lengths, self.device) as boundaries:
-                self.backbone(input_ids=ids, position_ids=boundaries.positions(self.device), use_cache=True, past_key_values=cache)
+                self.backbone(
+                    input_ids=ids,
+                    position_ids=boundaries.positions(self.device),
+                    use_cache=True,
+                    past_key_values=cache,
+                )
                 _put_back_conv_states(cache, boundaries)
                 self._check_batched_read(cache, boundaries)
             taken = pick(snapshot(cache), 0)
@@ -1856,11 +1942,12 @@ class Prismyra:
     ):
         """The pass itself. Every row's positions start at its own document's end, which is per row not per batch.
 
-        Goes through `_run_recorded`, the same decision `_run_branch` uses for a single document. It did not used to:
-        this called the backbone directly, so `graphs=True` recorded nothing here, which is the gap `docs/PERFORMANCE.md`
-        names under "Recording the batched pass is not the next thing, and why". Wiring it is what that section says it
-        would take -- a few lines -- once the other half, `graphs.Recording` accepting a remainder bucket instead of an
-        exact context length, makes a recording survive the batch's documents changing between passes.
+        Goes through `_run_recorded`, the same decision `_run_branch` uses for a single document. It did not used
+        to: this called the backbone directly, so `graphs=True` recorded nothing here, which is the gap
+        `docs/PERFORMANCE.md` names under "Recording the batched pass is not the next thing, and why". Wiring it
+        is what that section says it would take -- a few lines -- once the other half, `graphs.Recording`
+        accepting a remainder bucket instead of an exact context length, makes a recording survive the batch's
+        documents changing between passes.
         """
         # Batch-invariant: see `_round_rows`. The row count is the only thing that otherwise differs between "two
         # documents answered together" and "either one answered alone", once the width is matched (`_round_pack_align`)
@@ -1890,7 +1977,7 @@ class Prismyra:
         padded_texts: list[str] = []
         real_row_at: list[int] = []  # index into `padded_texts`/the eventual padded rows for each real, flat row
         at = 0
-        for count, padded in zip(counts, padded_counts):
+        for count, padded in zip(counts, padded_counts, strict=True):
             block = texts[at : at + count]
             real_row_at.extend(range(len(padded_texts), len(padded_texts) + count))
             padded_texts.extend(block)
@@ -1916,7 +2003,7 @@ class Prismyra:
         parts = [(prefills[at].snapshot, padded_counts[at]) for at in range(len(counts))]
         rows_for_padded: list[int] = []
         at = 0
-        for count, padded in zip(counts, padded_counts):
+        for count, padded in zip(counts, padded_counts, strict=True):
             name = rows_for[at]  # every real row of one document already names the same document
             rows_for_padded.extend([name] * padded)
             at += count
@@ -2310,7 +2397,11 @@ class Prismyra:
         from .paged import BLOCK as page_block
 
         remainder = next(
-            (held % page_block for layer in cache.layers if (held := getattr(layer, "context_length", None)) is not None),
+            (
+                held % page_block
+                for layer in cache.layers
+                if (held := getattr(layer, "context_length", None)) is not None
+            ),
             None,
         )
         return (rows, width) if remainder is None else (rows, width, remainder)
@@ -2423,9 +2514,7 @@ class Prismyra:
         # memory margin alone did not stop it recurring, because the margin only ever asks "is there room for one
         # more", never "how many are there already". `MAX_KEPT_RECORDINGS` asks the second question; the margin
         # stays as a check the first still answers usefully once the count is bounded.
-        free, _ = (
-            torch.cuda.mem_get_info(self.torch_device) if self.torch_device.type == "cuda" else (1 << 62, 1 << 62)
-        )
+        free, _ = torch.cuda.mem_get_info(self.torch_device) if self.torch_device.type == "cuda" else (1 << 62, 1 << 62)
         # Measured the gap directly --
         # after a rate=10 burst, `mem_get_info`'s free number was 2.16 GiB (below this margin) while PyTorch's own
         # `reserved - allocated` gap was 7.6 GiB of cached-but-unallocated blocks the caching allocator was simply
@@ -2630,8 +2719,9 @@ def _enable_batch_invariance() -> None:
     0.0039 between a solo read and the real 8-document batch with router+tiling already fixed -- before the
     router, before any MoE op, inside the recurrence this engine depends on for its batching to be fast at all.
 
-    Two candidates were measured head-to-head at full scale (a single-layer signal, and separately the decisive 80-document/11-batch count):
-    disabling TF32 and bf16/fp16 reduced-precision matmul reduction closed layer 0's gap (0.0039 -> 0.0) but
+    Two candidates were measured head-to-head at full scale (a single-layer signal, and separately the decisive
+    80-document/11-batch count): disabling TF32 and bf16/fp16 reduced-precision matmul reduction closed layer
+    0's gap (0.0039 -> 0.0) but
     *reopened* it at layer 4 once checked across all 40 layers on the real batch -- a precision change shrinks the
     chunk-boundary reduction-order effect enough to round to zero at shallow layers, not remove it, so it does not
     survive the full benchmark (still 2/80 mismatches). Registering vLLM's fixed-tile Triton matmul on
@@ -2698,7 +2788,7 @@ def _enable_batch_invariance() -> None:
     )
     from vllm.platforms import current_platform
 
-    global _BATCH_INVARIANT_REFCOUNT
+    global _BATCH_INVARIANT_REFCOUNT  # noqa: PLW0603 - a process-wide refcount for a process-wide dispatcher claim
     _BATCH_INVARIANT_REFCOUNT += 1
 
     # fused_moe.py's own guard (`get_default_config`): picks a fixed MoE tiling config instead of one keyed by the
@@ -2753,7 +2843,7 @@ def _enable_batch_invariance() -> None:
     # Kept alive while the refcount is above zero (matching `enable_batch_invariant_mode`'s own module-level
     # singleton while it is wanted at all): letting it be garbage-collected is now how `_disable_batch_invariance`
     # un-registers these four, deliberately, rather than something to avoid happening by accident.
-    global _BATCH_INVARIANT_DISPATCH_LIB
+    global _BATCH_INVARIANT_DISPATCH_LIB  # noqa: PLW0603 - kept alive at module scope; see the comment above
     _BATCH_INVARIANT_DISPATCH_LIB = lib
 
     if not current_platform.is_device_capability_family(80):
@@ -2762,7 +2852,7 @@ def _enable_batch_invariance() -> None:
         # through one of the four aten ops above (e.g. a custom op that calls `at::cuda::blas::gemm` itself).
         # Original values saved on the module (`_BATCH_INVARIANT_SAVED_BACKENDS`) so `_disable_batch_invariance`
         # can put them back rather than guessing torch's defaults.
-        global _BATCH_INVARIANT_SAVED_BACKENDS
+        global _BATCH_INVARIANT_SAVED_BACKENDS  # noqa: PLW0603 - process-wide save slot for the restore below
         _BATCH_INVARIANT_SAVED_BACKENDS = (
             os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
             os.environ.get("CUBLASLT_WORKSPACE_SIZE"),
@@ -2786,7 +2876,8 @@ def _disable_batch_invariance() -> None:
     anything un-paged, and leaving a stray env var set is a smaller risk than mis-timing when fused_moe.py reads
     it.
     """
-    global _BATCH_INVARIANT_REFCOUNT, _BATCH_INVARIANT_DISPATCH_LIB, _BATCH_INVARIANT_SAVED_BACKENDS
+    # The same deliberate module-level trio `_enable_batch_invariance`'s own three `global` statements above claim.
+    global _BATCH_INVARIANT_REFCOUNT, _BATCH_INVARIANT_DISPATCH_LIB, _BATCH_INVARIANT_SAVED_BACKENDS  # noqa: PLW0603
     if _BATCH_INVARIANT_REFCOUNT == 0:
         return
     _BATCH_INVARIANT_REFCOUNT -= 1
@@ -2814,9 +2905,9 @@ def _disable_batch_invariance() -> None:
         _BATCH_INVARIANT_SAVED_BACKENDS = None
 
 
-_BATCH_INVARIANT_DISPATCH_LIB = None
+_BATCH_INVARIANT_DISPATCH_LIB: torch.library.Library | None = None
 _BATCH_INVARIANT_REFCOUNT = 0
-_BATCH_INVARIANT_SAVED_BACKENDS = None
+_BATCH_INVARIANT_SAVED_BACKENDS: tuple[str | None, str | None, bool, bool] | None = None
 
 
 def _now(device: torch.device) -> float:

@@ -157,7 +157,7 @@ def test_the_served_version_is_the_package_version():
     prismyra.Prismyra = lambda *a, **k: StubEngine()
     try:
         app = create_app("stub/model")
-        assert app.version == prismyra.__version__ == "0.4.3"
+        assert app.version == prismyra.__version__ == "0.4.4"
         client = TestClient(app)
         assert client.get("/openapi.json").json()["info"]["version"] == prismyra.__version__
     finally:
@@ -355,6 +355,10 @@ class _StubShelf:
             self.engine.shelf_asks.append((handle, len(questions)))
             out[handle] = _stub_result(questions)
         return out
+
+    def would_fit(self, token_counts: list[int]) -> bool:
+        """Enough of `Shelf.would_fit` for `Batcher._make_room` to call -- this stub has no page pool to fragment."""
+        return True
 
     def drop(self, handle):
         self.documents.pop(handle, None)
@@ -567,3 +571,103 @@ def test_restore_ids_drops_a_companions_answers_from_the_shared_merged_result():
 
     assert set(restored.answers) == {"q0"}, "a companion's answer must not leak into this request's response"
     assert restored["q0"].value is True
+
+
+# --------------------------------------------------------------------------- /v1/decide, over real HTTP
+#
+# `prismyra.decide`'s own tests (`tests/test_decide.py`) cover the parsing, labelling and grouping logic without a
+# device. What is new here is the wiring: the route exists, takes a single JEV-shaped object or a JSON array, and
+# answers through the same `worker` `/ask` already uses -- not by calling `engine.ask` from the HTTP handler's own
+# thread, which `server.py`'s own docstring says must not happen.
+
+
+class _DecideStubEngine:
+    model_name = "stub"
+    group = 32
+
+    class _Tok:
+        def __call__(self, text, **_):
+            return {"input_ids": [hash(text.strip()) % 10_000_000]}
+
+    tokenizer = _Tok()
+
+    def __init__(self):
+        self.asks: list[tuple] = []
+
+    def cache_bytes(self, tokens):
+        return tokens * 1024
+
+    def stats(self):
+        return {"model": "stub"}
+
+    def ask(self, context, questions, images=None, videos=None):
+        self.asks.append((context, [q.id for q in questions]))
+        answers = {
+            q.id: Answer(
+                id=q.id,
+                kind=q.kind,
+                value=q.value_of(q.options[0]),
+                option=q.options[0],
+                probabilities=dict.fromkeys(q.options, 1.0 / len(q.options)),
+            )
+            for q in questions
+        }
+        return Result(answers=answers, timing=Timing(context_ms=1.0, readout_ms=1.0), model="stub")
+
+
+def _decide_client(engine):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    import prismyra
+    from prismyra.server import create_app
+
+    real = prismyra.Prismyra
+    prismyra.Prismyra = lambda *a, **k: engine
+    try:
+        app = create_app("stub/model")
+    finally:
+        prismyra.Prismyra = real
+    return TestClient(app)
+
+
+def test_decide_endpoint_answers_a_single_jev_shaped_object():
+    engine = _DecideStubEngine()
+    client = _decide_client(engine)
+    response = client.post(
+        "/v1/decide",
+        json={"kind": "noul", "state": "a short document", "question": "Is it urgent?"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["kind"] == "noul"
+    assert body["options"] == ["false", "true"]
+    assert body["protocol"] == "prismyra-decide-v1"
+    assert "results" not in body  # a single object in gets a single object back, JEV's own shape
+
+
+def test_decide_endpoint_merges_a_batch_sharing_one_state_into_one_ask_call():
+    engine = _DecideStubEngine()
+    client = _decide_client(engine)
+    response = client.post(
+        "/v1/decide",
+        json=[
+            {"kind": "noul", "state": "the same record", "question": "Is it urgent?", "id": "a"},
+            {"kind": "score", "state": "the same record", "question": "How clear is it?", "id": "b"},
+        ],
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["num_model_requests"] == 1
+    assert len(engine.asks) == 1 and len(engine.asks[0][1]) == 2
+    by_id = {r["id"]: r for r in body["results"]}
+    assert by_id["a"]["merged_with"] == ["b"]
+
+
+def test_decide_endpoint_refuses_a_bad_kind_before_touching_the_device():
+    engine = _DecideStubEngine()
+    client = _decide_client(engine)
+    response = client.post("/v1/decide", json={"kind": "freeform", "state": "x", "question": "?"})
+    assert response.status_code == 422
+    assert engine.asks == []

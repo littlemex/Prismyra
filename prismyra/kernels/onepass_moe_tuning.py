@@ -60,7 +60,7 @@ def device_name() -> str | None:
         from vllm.platforms import current_platform
 
         return current_platform.get_device_name().replace(" ", "_")
-    except Exception:
+    except Exception:  # noqa: BLE001 - best-effort device probe; any failure here means "no pinned table"
         return None
 
 
@@ -86,14 +86,14 @@ def _load(name: str) -> dict | None:
 #: there is nothing to gain by re-reading it. `None` means "no pinned table for this card" (the ordinary
 #: batch-invariant tile keeps running); `False` is the sentinel for "not loaded yet", so a card without a table is
 #: not re-read from disk on every one-pass call.
-_PINNED: dict | None | bool = False
+_PINNED: dict | bool | None = False
 
 
 def pinned_config() -> dict | None:
     """This card's pinned table, from disk, cached after the first call. Not gated on the escape hatch below --
     that is checked fresh on every call in `scope()`, not baked into this cache, so flipping it mid-process (an
     interleaved A/B measurement, `BRIEF-COMMON.md` rule 3) takes effect on the very next call."""
-    global _PINNED
+    global _PINNED  # noqa: PLW0603 - a process-wide, read-only-after-first-call cache, by design (see above)
     if _PINNED is False:
         name = device_name()
         _PINNED = _load(name) if name else None

@@ -19,17 +19,17 @@ Run with:
 
 from __future__ import annotations
 
-import itertools
+import json
 import os
-import statistics
-import time
+import subprocess
+import sys
 
 import numpy as np
 import pytest
 import torch
+from gpu_room import no_room_reason
 
-from prismyra import Boolean, Choice, Prismyra, PrismyraError, Scale
-from prismyra import onepass
+from prismyra import Boolean, Choice, Prismyra, PrismyraError, Scale, onepass
 from prismyra.graphs import pays_from
 
 pytestmark = pytest.mark.gpu
@@ -271,15 +271,85 @@ def test_padding_a_batch_does_not_reach_an_answer(engine):
         assert padded[q.id].option == exact[q.id].option
 
 
-def test_an_open_context_answers_as_a_fresh_one(engine):
-    """The saving is only legitimate if reading once and reusing gives what re-reading gives."""
-    asked = [Boolean(id="thirty", prompt="Is there a thirty day limit?")]
-    reused = engine.open_context(CONTEXT)
-    assert reused.ask(asked)["thirty"].option == engine.ask(CONTEXT, asked)["thirty"].option
-    assert reused.ask(asked)["thirty"].option == reused.ask(asked)["thirty"].option
+#: Builds its own engine, in its own subprocess -- see this test's own docstring for why. `CONTEXT` is spliced in
+#: by `repr()`, not read from a file, so the subprocess asks about exactly the string this module's own `CONTEXT`
+#: names, with no second copy of it to keep in step.
+_OPEN_CONTEXT_FRESH_SCRIPT = """
+import json, sys
+from prismyra import Boolean, Prismyra
+
+CONTEXT = {context!r}
+engine = Prismyra(sys.argv[1])
+asked = [Boolean(id="thirty", prompt="Is there a thirty day limit?")]
+reused = engine.open_context(CONTEXT)
+reused_answer = reused.ask(asked)["thirty"].option
+fresh_answer = engine.ask(CONTEXT, asked)["thirty"].option
+reused_again = reused.ask(asked)["thirty"].option
+outcome = {{"reused_vs_fresh": reused_answer == fresh_answer, "reused_vs_reused": reused_answer == reused_again}}
+print(json.dumps(outcome))
+"""
 
 
-def test_a_first_seen_context_costs_no_more_than_a_repeated_one(engine):
+def test_an_open_context_answers_as_a_fresh_one():
+    """The saving is only legitimate if reading once and reusing gives what re-reading gives.
+
+    Builds its own `Prismyra` in a subprocess, deliberately apart from the module-scoped `engine` fixture every
+    other test in this file shares. Found on a 32 GiB card (`RUN-rel5.md`'s own 5.6 section, not shipped with this
+    package): run after enough of this file's other tests to have left the shared engine's own cache holding
+    several contexts' worth of resident memory, this exact comparison -- unchanged, and passing on its own --
+    failed every time with a resource refusal, not a probability mismatch. The failure was never this test's own
+    property; it was how much of the card the tests that happened to run first had already spent. A fresh process
+    starts the card the way a caller who has not yet asked this engine anything else would see it, which is the
+    thing this test is actually about: the followed-up document should cost what the engine says it costs,
+    independent of what else that process did first.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    reason = no_room_reason(MODEL, __file__)
+    if reason:
+        pytest.skip(reason)
+    script = _OPEN_CONTEXT_FRESH_SCRIPT.format(context=CONTEXT)
+    done = subprocess.run([sys.executable, "-c", script, MODEL], capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        # Same discipline as `test_gpu_require_kernels.py`: a resource self-check that could not run at all now
+        # raises a loud, named error instead of silently choosing a different kernel path. Report it as a skip
+        # with the subprocess's own words, not a bare assertion against output that was never produced.
+        reason = done.stderr.strip().splitlines()[-1] if done.stderr.strip() else f"exit {done.returncode}"
+        pytest.skip(f"the subprocess construction could not run this comparison right now: {reason}")
+    outcome = json.loads(done.stdout.strip().splitlines()[-1])
+    assert outcome["reused_vs_fresh"] is True, outcome
+    assert outcome["reused_vs_reused"] is True, outcome
+
+
+_FIRST_SEEN_COST_SCRIPT = """
+import itertools, json, statistics, sys, time
+import torch
+from prismyra import Boolean, Prismyra
+
+LONG_CONTEXT = ({context!r}) * 40  # thousands of tokens, past the smallest bucket, where the benchmark ran
+asked = [Boolean(id=f"q{{i}}", prompt=f"Is clause {{i}} about shipping?") for i in range({n})]
+engine = Prismyra(sys.argv[1])
+
+def median_ms(build_context):
+    engine.ask(build_context(), asked)
+    engine.ask(build_context(), asked)
+    times = []
+    for _ in range(5):
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        engine.ask(build_context(), asked)
+        torch.cuda.synchronize()
+        times.append((time.perf_counter() - started) * 1000)
+    return statistics.median(times)
+
+repeated_ms = median_ms(lambda: LONG_CONTEXT)
+counter = itertools.count()
+fresh_ms = median_ms(lambda: f"[{{next(counter)}}]\\n{{LONG_CONTEXT}}")
+print(json.dumps({{"repeated_ms": repeated_ms, "fresh_ms": fresh_ms}}))
+"""
+
+
+def test_a_first_seen_context_costs_no_more_than_a_repeated_one():
     """A document read for the first time must not cost more than the same document read again, once both have paid
     for their shape once.
 
@@ -299,25 +369,32 @@ def test_a_first_seen_context_costs_no_more_than_a_repeated_one(engine):
     kernel selection, which a served request does not."** That cost is paid once per shape, not once per document, so
     both the repeated document and the fresh one pay it during warm-up and neither should pay it again during the
     timed calls that follow.
+
+    Builds its own `Prismyra` in a subprocess, the same reason and the same shape as
+    `test_an_open_context_answers_as_a_fresh_one` just above it in this file: found on a 32 GiB card
+    (`RUN-v044.md`'s own 7.4 section, not shipped with this package), this comparison -- unchanged, and passing on
+    its own -- failed on the module-scoped `engine` fixture once 46 of this file's other tests had already left
+    residents on its shelf and admission refused the "fresh" variant on a resource ground, not a timing one. The
+    failure was never a property of this comparison; it was how much of the card the tests that happened to run
+    first had already spent. A fresh process measures both the repeated and the fresh document against the card
+    the way a caller who has asked this engine nothing else would see it, which is the thing this test is actually
+    about.
     """
-    long_context = CONTEXT * 40  # thousands of tokens, past the smallest bucket, where the benchmark ran
-    asked = questions(16)
-
-    def median_ms(build_context) -> float:
-        engine.ask(build_context(), asked)
-        engine.ask(build_context(), asked)
-        times = []
-        for _ in range(5):
-            torch.cuda.synchronize()
-            started = time.perf_counter()
-            engine.ask(build_context(), asked)
-            torch.cuda.synchronize()
-            times.append((time.perf_counter() - started) * 1000)
-        return statistics.median(times)
-
-    repeated_ms = median_ms(lambda: long_context)
-    counter = itertools.count()
-    fresh_ms = median_ms(lambda: f"[{next(counter)}]\n{long_context}")
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    reason = no_room_reason(MODEL, __file__)
+    if reason:
+        pytest.skip(reason)
+    script = _FIRST_SEEN_COST_SCRIPT.format(context=CONTEXT, n=16)
+    done = subprocess.run([sys.executable, "-c", script, MODEL], capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        # Same discipline as `test_an_open_context_answers_as_a_fresh_one`: a resource self-check that could not
+        # run at all now raises a loud, named error instead of silently choosing a different kernel path. Report
+        # it as a skip with the subprocess's own words, not a bare assertion against output that was never produced.
+        reason = done.stderr.strip().splitlines()[-1] if done.stderr.strip() else f"exit {done.returncode}"
+        pytest.skip(f"the subprocess construction could not run this comparison right now: {reason}")
+    outcome = json.loads(done.stdout.strip().splitlines()[-1])
+    repeated_ms, fresh_ms = outcome["repeated_ms"], outcome["fresh_ms"]
 
     # Half again above what the matched-width measurement above showed, for the same reason `COMPANION_MOVEMENT` sits
     # above its own measured maximum: room for this machine's own noise without hiding a real regression.
@@ -904,7 +981,8 @@ def test_graphs_never_corrupt_a_batch_naming_more_than_one_document(engine_paged
                     assert mixed[q.id].option == alone[q.id].option, f"{q.id} changed its answer in a mixed batch"
                     for option, p in alone[q.id].probabilities.items():
                         assert abs(mixed[q.id].probabilities[option] - p) <= COMPANION_MOVEMENT_QN1_ATTENTION, (
-                            q.id, option,
+                            q.id,
+                            option,
                         )
     finally:
         engine_paged.graphs = was
@@ -1172,6 +1250,133 @@ def test_shelf_resident_count_stays_at_the_cap_with_room_to_spare(engine_paged):
                 f"after document {i}, {len(batcher._resident)} documents are resident, above the cap of {cap} -- "
                 f"neither the token budget nor the memory margin would have evicted for this short a document"
             )
+    finally:
+        batcher.stop()
+
+
+def _page_pool_of(shelf):
+    """Any one `PagedForkLayer`'s `Pool` -- every layer on one shelf admits and releases in the same order for
+    the same lengths, so any one of them answers for all of them (same reasoning as `Shelf.would_fit`'s own
+    docstring and `Shelf.drop`'s loop over every layer just above it in `engine.py`)."""
+    return next(p for layer in shelf._cache.layers if (p := getattr(layer, "pool", None)) is not None)
+
+
+def test_a_fragmented_page_pool_refuses_a_document_the_token_sum_alone_would_admit(engine_paged):
+    """The real bug this whole file's `--batcher` tests exist to close, reproduced directly against the real
+    `Pool` a real `Shelf` holds -- no `Batcher`, no scheduler, just the allocator `RUN-v044b.md`'s 3rd section
+    found this failing on real hardware.
+
+    `Pool.admit` is a first-fit allocator over whatever runs its own `released` list and cursor actually hold
+    (`paged.py`'s own docstring: "a free-list allocator inside a page pool is a second allocator with its own
+    fragmentation"). A caller that only sums tokens -- which is all `schedule.Batcher._make_room` did before this
+    fix -- can believe there is room for a document that `admit` then refuses, because the free pages are real but
+    scattered across several released runs, none of them individually large enough.
+
+    Built here without a `Batcher`: fill `Shelf.put` past the cursor's own room (so there is no slack left to
+    fall back on), release every other filler (each released run isolated by a kept neighbour on both sides, so
+    none of them merges into something bigger), then ask for a document that needs more pages than any one
+    released run, in a token count that sits exactly on a `_round_rows` bucket boundary -- no padding segment, so
+    this is one clean `admit` call rather than two (the real document's and a padding segment's, which
+    `RUN-v044b.md` found could fail on its own and would otherwise muddy what this test is isolating).
+    """
+    from prismyra.paged import Full
+
+    shelf = engine_paged.open_shelf(room=512)
+    try:
+        pool = _page_pool_of(shelf)
+        handles = []
+        while pool.free_pages > 8:
+            ctx = f"Filler document {len(handles):03d}: nothing in common with its neighbours, a short policy note."
+            handles.append(shelf.put(ctx))
+        for i in range(1, len(handles), 2):
+            shelf.drop(handles[i])
+        assert pool.released, "nothing was released -- this run did not fragment the pool at all"
+        assert max(size for _, size in pool.released) < 64, (
+            "a released run already big enough for the 64-page document below -- this did not fragment the pool "
+            "the way the test means to"
+        )
+
+        big = _context_of_exactly(engine_paged, 1024)  # a `_round_rows` bucket: no padding segment
+        with pytest.raises(Full) as raised:
+            shelf.put(big)
+        assert "largest released run" in str(raised.value), raised.value
+    finally:
+        shelf.close()
+
+
+def _context_of_exactly(engine, tokens: int) -> str:
+    """A document that tokenises to exactly `tokens` -- not approximately, because this file's own fragmentation
+    tests depend on landing precisely on (or precisely off) a `_round_rows` bucket boundary."""
+    words = ["word"] * (tokens * 2)
+    text = " ".join(words)
+    while True:
+        count = engine.encode_context(text).tokens
+        if count == tokens:
+            return text
+        words = words[:-1] if count > tokens else [*words, "word"]
+        text = " ".join(words)
+
+
+def test_the_batcher_answers_a_document_a_fragmented_pool_would_otherwise_refuse(engine_paged):
+    """The fix for the test just above: `Batcher._make_room` now asks `Shelf.would_fit` the same page-level
+    question `Pool.admit` is about to ask for real (see `_make_room`'s own docstring), so it keeps evicting
+    residents until that answer is yes -- instead of stopping as soon as the token *sum* fit, which is what let
+    the fragmented-pool refusal above reach `/ask` as a bare, uncaught `Full` under `--batcher`
+    (`RUN-v044b.md`'s 3rd section: reproduced against `9106dc1`, before any `except Full` existed, where this
+    exact scenario surfaced as a bare `RuntimeError` subclass neither `server.py`'s `/ask` nor `_ask_via_batcher`
+    catches by name -- FastAPI's own default is an unhandled-exception 500).
+
+    The real fragmented `Shelf`/`Pool` from the test above is grafted onto a fresh `Batcher` (`batcher._shelf`,
+    plus the bookkeeping `_make_room`'s own eviction loop would have written) rather than rebuilt through
+    `Batcher.submit` one filler at a time: `schedule.SHELF_MAX_RESIDENTS` caps what a `Batcher`-driven fill can
+    ever hold resident at once, well below what this fragmentation needs, which is exactly why the test above
+    does not use a `Batcher` to build it either.
+
+    Decisive part: the answer `Batcher.submit` gives for the admitted document is compared, bit for bit, against
+    `engine.ask()` called directly on the same context and question. The fix only changes *how much a pass evicts
+    before it writes*, never *how the write itself is computed* -- so if the fragmented-but-now-successfully-
+    admitted path ever disagreed with the plain one, that would mean the fix leaked which eviction history a
+    document happened to arrive after into its own answer, which is exactly the determinism this fix must not
+    trade away to close the 500.
+    """
+    from prismyra.schedule import Batcher, _digest
+
+    question = Boolean(id="q", prompt="Does this note mention a return policy?")
+    shelf = engine_paged.open_shelf(room=512)
+    pool = _page_pool_of(shelf)
+    handles = []
+    while pool.free_pages > 8:
+        ctx = f"Filler document {len(handles):03d}: nothing in common with its neighbours, a short policy note."
+        handles.append(shelf.put(ctx))
+    kept = {}
+    for i, handle in enumerate(handles):
+        if i % 2 == 1:
+            shelf.drop(handle)
+        else:
+            kept[i] = handle
+    assert pool.released and max(size for _, size in pool.released) < 64
+
+    big = _context_of_exactly(engine_paged, 1024)
+    batcher = Batcher(engine_paged, linger_ms=0.0, lane_room=512).start()
+    try:
+        batcher._shelf = shelf
+        for clock, (i, handle) in enumerate(kept.items()):
+            ctx = f"Filler document {i:03d}: nothing in common with its neighbours, a short policy note."
+            digest = _digest(ctx)
+            batcher._resident[digest] = handle
+            batcher._digest_of[handle] = digest
+            batcher._used[handle] = clock
+        batcher._clock = len(kept) + 1
+
+        job = batcher.submit(big, [question])
+        assert job.done.wait(timeout=60), "the document the fragmented pool refused directly never answered"
+        assert job.error is None, job.error
+
+        direct = engine_paged.ask(big, [question])
+        assert job.result["q"].probabilities == direct["q"].probabilities, (
+            "the batched answer for a document that needed extra eviction to admit does not bit-match the plain "
+            "ask() answer for the identical context and question -- the fix let eviction history move an answer"
+        )
     finally:
         batcher.stop()
 
@@ -1583,8 +1788,6 @@ def test_a_short_question_replays_exactly_as_it_reads_eagerly(engine):
         engine._one_pass = original
 
 
-
-
 HEAD_OPTIONS = ["seller", "buyer"]
 HEAD_BIAS = [2.0, -1.0]
 NOT_HEADED = [
@@ -1625,7 +1828,7 @@ def _with_heads(engine, heads, answer):
 def _check_heads(before, after):
     expected = torch.softmax(torch.tensor(HEAD_BIAS), dim=-1).tolist()
     for q in NOT_HEADED:
-        assert after[q.id].probabilities == before[q.id].probabilities, q.id   # bit-identical, not merely close
+        assert after[q.id].probabilities == before[q.id].probabilities, q.id  # bit-identical, not merely close
         assert after[q.id].read_by is None
     for q in (HEADED, HEADED_SWAPPED):
         got = after[q.id]

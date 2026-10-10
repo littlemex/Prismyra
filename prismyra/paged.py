@@ -281,6 +281,31 @@ class Pool:
         self.documents.append(held)
         return held
 
+    def would_admit_all(self, token_counts: list[int]) -> bool:
+        """Would `admit` succeed for every one of `token_counts`, called in this order, from where the pool stands now?
+
+        Mirrors `admit`'s own first-fit search -- a released run large enough, or the cursor's free pages -- over a
+        *copy* of `released` and `cursor`, so calling this never reserves anything. It exists because a sum of tokens
+        fitting the pool's overall budget is not the question `admit` asks: `admit` is first fit over whatever runs
+        are actually free, and several small released runs can sum to more tokens than a new document needs while
+        none of them, alone, is large enough for it -- the gap `schedule.Batcher._make_room`'s own token-level
+        accounting cannot see, documented in `admit`'s own docstring as a free-list allocator's fragmentation. Calling
+        this before `_make_room` stops evicting is what lets it keep going until the `admit` calls that follow are
+        actually going to succeed, rather than finding out from `admit`'s own `Full`.
+        """
+        released = list(self.released)
+        cursor = self.cursor
+        for tokens in token_counts:
+            need = self.pages_for(tokens)
+            at = next((n for n, (_, size) in enumerate(released) if size >= need), None)
+            if at is not None:
+                del released[at]
+                continue
+            if need > self.private_first - cursor:
+                return False
+            cursor += need
+        return True
+
     def release(self, held: Held) -> None:
         """Give a document's pages back to be handed out again.
 
@@ -671,8 +696,8 @@ class PagedForkLayer(CacheLayerMixin):
         `_set_lengths` rebuilds the tensor from `Pool.lengths`, which allocates a plain CPU list and copies it to the
         device -- fine from `begin_branches`, outside any recording, and illegal inside one: `torch.cuda.graph` raises
         `RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is
-        pinned` the first time a branch pass with the paged storage is captured, because `_advance` called `_set_lengths`
-        from inside the write every recorded forward makes.
+        pinned` the first time a branch pass with the paged storage is captured, because `_advance` called
+        `_set_lengths` from inside the write every recorded forward makes.
 
         The two updates are the same number, which is what makes replacing one with the other correct rather than just
         legal. Every row's length is `that row's document tokens + branch_progress`, one shared counter added to every

@@ -17,6 +17,7 @@ import os
 import threading
 import warnings
 from pathlib import Path
+from typing import ClassVar
 
 import torch
 from torch import nn
@@ -59,7 +60,11 @@ def quantize_search(w: torch.Tensor, global_scale: torch.Tensor, importance: tor
     `importance` is per input column (e.g. the mean squared input); None means plain squared error."""
     rows, cols = w.shape
     blocks = w.view(rows, cols // 16, 16)
-    imp = (importance.float().view(1, cols // 16, 16) if importance is not None else torch.ones(1, cols // 16, 16, device=w.device))
+    imp = (
+        importance.float().view(1, cols // 16, 16)
+        if importance is not None
+        else torch.ones(1, cols // 16, 16, device=w.device)
+    )
     amax = blocks.abs().amax(-1)
     table = _e2m1(w.device)
     best_err = best_scale = None
@@ -74,7 +79,8 @@ def quantize_search(w: torch.Tensor, global_scale: torch.Tensor, importance: tor
             best_err, best_scale = err, scale.float()
         else:
             better = err < best_err
-            best_err = torch.where(better, err, best_err); best_scale = torch.where(better, scale.float(), best_scale)
+            best_err = torch.where(better, err, best_err)
+            best_scale = torch.where(better, scale.float(), best_scale)
     scale = best_scale.to(FP8)
     eff = (scale.float() / global_scale).unsqueeze(-1)
     x = torch.where(eff > 0, blocks / eff, torch.zeros_like(blocks)).clamp(-6, 6)
@@ -110,7 +116,9 @@ class FusedExpertsFp4(nn.Module):
         super().__init__()
         from vllm.model_executor.layers.quantization.utils.nvfp4_utils import swizzle_blockscale
 
-        self.gate, self.shared_expert, self.shared_expert_gate = block.gate, block.shared_expert, block.shared_expert_gate
+        self.gate = block.gate
+        self.shared_expert = block.shared_expert
+        self.shared_expert_gate = block.shared_expert_gate
         self.top_k = top_k
         t = {k: v.to(device) for k, v in prepared.items()}
         e = t["w1"].shape[0]
@@ -135,7 +143,6 @@ class FusedExpertsFp4(nn.Module):
         self.n, self.k, self.e = t["w2"].shape[2] * 2, t["w1"].shape[2] * 2, e
         if hasattr(block, "experts"):
             del block.experts
-
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_topk
@@ -162,8 +169,8 @@ class FusedExpertsFp4(nn.Module):
         shared = torch.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
         return (out + shared).reshape(shape)
 
-    _ws: dict = {}
-    _ws_size: dict = {}
+    _ws: ClassVar[dict] = {}
+    _ws_size: ClassVar[dict] = {}
 
     def _workspace(self, m: int, x_dtype) -> torch.Tensor:
         """One scratch buffer per calling thread for every MoE layer (they share shapes), grown to the largest
@@ -193,10 +200,19 @@ class FusedExpertsFp4(nn.Module):
         size = FusedExpertsFp4._ws_size.get((key, m))
         if size is None:
             size = FusedExpertsFp4._ws_size[(key, m)] = cutlass_fused_moe_workspace_size(
-                m, self.k, self.n, self.e, self.top_k, x_dtype=x_dtype, weight_dtype=torch.long,
-                output_dtype=torch.bfloat16, use_fused_finalize=self.fused_finalize, device=self.w1.device)
+                m,
+                self.k,
+                self.n,
+                self.e,
+                self.top_k,
+                x_dtype=x_dtype,
+                weight_dtype=torch.long,
+                output_dtype=torch.bfloat16,
+                use_fused_finalize=self.fused_finalize,
+                device=self.w1.device,
+            )
         if size > WORKSPACE_CAP:
-            return None                     # rare very large calls (the autotune sweep) keep the kernel's own scratch
+            return None  # rare very large calls (the autotune sweep) keep the kernel's own scratch
         buf = FusedExpertsFp4._ws.get(key)
         if buf is None or buf.numel() < size:
             FusedExpertsFp4._ws[key] = None
@@ -216,29 +232,61 @@ class FusedExpertsFp4(nn.Module):
         if self.backend == "flashinfer":
             # One fused kernel: the permutation, both grouped GEMMs, the activation and the weighted sum are inside it,
             # where the plain CUTLASS route runs them as separate kernels (row shuffles, a quantise, a reduction).
+            from flashinfer.fused_moe.core import ActivationType
             from vllm import _custom_ops as ops
             from vllm.utils.flashinfer import flashinfer_cutlass_fused_moe
-            from flashinfer.fused_moe.core import ActivationType
 
             xq, xsf = ops.scaled_fp4_quant(x.contiguous(), self.a1_gscale[:1])
             ws = self._workspace(m, xq.dtype) if os.environ.get("PRISMYRA_NVFP4_WORKSPACE", "1") == "1" else None
             flashinfer_cutlass_fused_moe(
-                input=xq, token_selected_experts=ids.to(torch.int), token_final_scales=weights,
-                fc1_expert_weights=self.w1.view(torch.long), fc2_expert_weights=self.w2.view(torch.long),
-                output=out, output_dtype=x.dtype,
-                quant_scales=[self.a1_gscale, self.w1_scale.view(torch.int32), self.g1_alphas,
-                              self.a2_gscale, self.w2_scale.view(torch.int32), self.g2_alphas],
-                input_sf=xsf, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, activation_type=ActivationType.Swiglu,
-                use_fused_finalize=self.fused_finalize, workspace_buffer=ws,
+                input=xq,
+                token_selected_experts=ids.to(torch.int),
+                token_final_scales=weights,
+                fc1_expert_weights=self.w1.view(torch.long),
+                fc2_expert_weights=self.w2.view(torch.long),
+                output=out,
+                output_dtype=x.dtype,
+                quant_scales=[
+                    self.a1_gscale,
+                    self.w1_scale.view(torch.int32),
+                    self.g1_alphas,
+                    self.a2_gscale,
+                    self.w2_scale.view(torch.int32),
+                    self.g2_alphas,
+                ],
+                input_sf=xsf,
+                tp_size=1,
+                tp_rank=0,
+                ep_size=1,
+                ep_rank=0,
+                activation_type=ActivationType.Swiglu,
+                use_fused_finalize=self.fused_finalize,
+                workspace_buffer=ws,
             )
             return out
         ws13 = torch.empty(m * self.top_k * max(2 * self.n, self.k), dtype=x.dtype, device=x.device)
         ws2 = torch.empty(m * self.top_k * self.n, dtype=x.dtype, device=x.device)
         run_cutlass_moe_fp4(
-            output=out, a=x.contiguous(), a1_gscale=self.a1_gscale, w1_fp4=self.w1, w1_blockscale=self.w1_scale,
-            w1_alphas=self.g1_alphas, a2_gscale=self.a2_gscale, w2_fp4=self.w2, w2_blockscale=self.w2_scale,
-            w2_alphas=self.g2_alphas, topk_weights=weights, topk_ids=ids.to(torch.int32), activation=MoEActivation.SILU,
-            workspace13=ws13, workspace2=ws2, m=m, n=self.n, k=self.k, e=self.e, device=x.device,
+            output=out,
+            a=x.contiguous(),
+            a1_gscale=self.a1_gscale,
+            w1_fp4=self.w1,
+            w1_blockscale=self.w1_scale,
+            w1_alphas=self.g1_alphas,
+            a2_gscale=self.a2_gscale,
+            w2_fp4=self.w2,
+            w2_blockscale=self.w2_scale,
+            w2_alphas=self.g2_alphas,
+            topk_weights=weights,
+            topk_ids=ids.to(torch.int32),
+            activation=MoEActivation.SILU,
+            workspace13=ws13,
+            workspace2=ws2,
+            m=m,
+            n=self.n,
+            k=self.k,
+            e=self.e,
+            device=x.device,
         )
         return out
 
@@ -256,7 +304,9 @@ def prepare_layer(w13, s13, w2, s2, device, imp_in=None, imp_mid=None, tok=None)
                 p, sc = quantize_search(d, g, imp)
             else:
                 p, sc = quantize(d, g)
-            out["w" + k].append(p); out["s" + k].append(sc); out["g" + k].append(g.float())
+            out["w" + k].append(p)
+            out["s" + k].append(sc)
+            out["g" + k].append(g.float())
     return {k: torch.stack(v).cpu() for k, v in out.items()}
 
 
@@ -309,7 +359,7 @@ def tactics_status() -> dict:
     }
 
 
-def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
+def autotune_tactics(layer: FusedExpertsFp4, max_tokens: int = 16384) -> None:
     """Pick the fused MoE kernel's tactic (tile shape and schedule), the same way in every process.
 
     Without this FlashInfer runs one default tactic for every size. Every MoE layer has the same shapes, so one layer's
@@ -350,7 +400,7 @@ def autotune_tactics(layer: "FusedExpertsFp4", max_tokens: int = 16384) -> None:
     """
     from flashinfer.autotuner import AutoTuner, autotune
 
-    global _INFERENCE_AUTOTUNE_CTX, _TACTIC_SOURCE
+    global _INFERENCE_AUTOTUNE_CTX, _TACTIC_SOURCE  # noqa: PLW0603 - process-wide autotune state, by design
     buckets = (max_tokens,)
     env_cache = os.environ.get("PRISMYRA_NVFP4_TACTICS")
     cache = env_cache
@@ -435,7 +485,10 @@ class Fp4Linear(nn.Module):
 
         w = _dequant_fp8(fp8.weight, fp8.scale)
         g = 448.0 * 6.0 / w.abs().amax().clamp_min(1e-12)
-        packed, sc = quantize_search(w, g, importance.to(w.device) if importance is not None else None) if search else quantize(w, g)
+        if search:
+            packed, sc = quantize_search(w, g, importance.to(w.device) if importance is not None else None)
+        else:
+            packed, sc = quantize(w, g)
         self.out_features, self.in_features = w.shape
         self.weight, self.pad = pad_nvfp4_weight_for_cutlass(packed)
         self.weight_scale = swizzle_blockscale(sc)
@@ -449,8 +502,9 @@ class Fp4Linear(nn.Module):
 
         shape = x.shape
         x2 = x.reshape(-1, shape[-1])
-        xq, xs = scaled_fp4_quant(x2, self.ga, is_sf_swizzled_layout=True, backend="cutlass",
-                                  padded_n=shape[-1] + self.pad * 2)
+        xq, xs = scaled_fp4_quant(
+            x2, self.ga, is_sf_swizzled_layout=True, backend="cutlass", padded_n=shape[-1] + self.pad * 2
+        )
         out = cutlass_scaled_fp4_mm(xq, self.weight, xs, self.weight_scale, self.alpha, x.dtype)
         return slice_nvfp4_output(out, self.out_features).reshape(*shape[:-1], self.out_features)
 
@@ -460,7 +514,8 @@ def convert_dense(model: nn.Module) -> int:
     """Replace every Fp8Linear whose name does not match PRISMYRA_DENSE_KEEP (a regex) with Fp4Linear."""
     import re
 
-    calib = json.load(open(os.environ["PRISMYRA_NVFP4_CALIB"]))["dense_in_amax"]
+    with open(os.environ["PRISMYRA_NVFP4_CALIB"]) as f:
+        calib = json.load(f)["dense_in_amax"]
     keep = re.compile(os.environ.get("PRISMYRA_DENSE_KEEP", "^$"))
     search = os.environ.get("PRISMYRA_NVFP4_SEARCH") == "1"
     stats = _importance() if search else None
@@ -472,7 +527,10 @@ def convert_dense(model: nn.Module) -> int:
         if key not in calib:
             continue
         parent = model.get_submodule(name.rsplit(".", 1)[0])
-        imp = stats[key]["in"] / max(1.0, float(stats[key].get("tok", torch.tensor(1.0)).sum())) if stats and key in stats else None
+        if stats and key in stats:
+            imp = stats[key]["in"] / max(1.0, float(stats[key].get("tok", torch.tensor(1.0)).sum()))
+        else:
+            imp = None
         setattr(parent, name.rsplit(".", 1)[1], Fp4Linear(m, calib[key], imp, search))
         del m
         done += 1

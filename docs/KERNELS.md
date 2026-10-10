@@ -175,6 +175,41 @@ second copy of the weights, and still runs first). A subprocess failure naming a
 JSON; checked on both of this project's checkpoints after the fix (fp8-36l on the L40S, nvfp4-36l on the RTX PRO
 4500) and neither raises it when run this way.
 
+## The same answer in every process, part four: a device that cannot repeat its own FP8 kernel is refused
+
+Parts two and three above close every gap this project found in its *own* code: an unseeded probe, and a probe's
+own exception silently picking a kernel path. Both assume the device itself gives the same answer to the same
+input every time it is asked. An internal investigation (not shipped with this package) found a card where that
+assumption did not hold: a single GPU of a kind this project serves on, with a clean ECC/Xid/thermal/power history
+and nothing structurally wrong in how its kernels were built or called, returned a handful of differing elements
+-- a few bits in the last place, on a fraction of repeated calls -- to the exact same FP8 matmul given the exact
+same input, on both the vendor's own cuBLAS path and this project's own borrowed Triton kernel independently. A
+second card of the identical model, same driver, same software, showed zero mismatches across the same test.
+Full (non-FP8) precision was unaffected on both cards. The two FP8 implementations are written by different
+people and share nothing but the instruction they both lower to -- so the fault is in that one chip's low-precision
+execution path, not in either implementation.
+
+No kernel self-check against a reference implementation can see this, however tight its tolerance: both parts two
+and three above ask whether a replacement *agrees with something else*, and a device that disagrees with its own
+last answer agrees with nothing reliably. The only check that can see it is asking the device to repeat itself.
+`_check_fp8_determinism` (`kernels/qwen3_moe.py`) does exactly that at construction: it calls one already-installed
+FP8 kernel on a fixed, seeded input eight times in the one process that is about to serve requests, and requires
+every call to return bit-identical output to the first. A mismatch raises `AdapterError` -- "this device is not
+giving this process the same FP8 answer twice" -- independent of `require_kernels`, because the framework's own
+fallback for this operation does not use FP8 Tensor Core instructions at all and would hide the fault rather than
+avoid it. The check declines (does not raise) only for the same resource reason parts two and three already
+distinguish (`_reraise_if_resource_exhausted` still runs first) or when no FP8 kernel is installed to check at all.
+
+Eight repeats, not a long run: this is not an attempt to measure a failure rate, only to catch a failure that
+exists at all before the first real request does. It is on by default and can be turned off with
+`PRISMYRA_WITHOUT=fp8_determinism`, the same opt-out mechanism `dense_fusion`, `gated_norm`, `gated_delta_rule` and
+`head_duplication` already use, for a caller who has already decided to accept the risk (debugging on a card
+already known to have this fault, for instance). The added construction-time cost is eight forward calls to the
+one probe module this check builds (the same shape of probe `_compare`'s own "dense_matmul" check already uses):
+measured directly on an L40S, with the model already loaded (isolating the check's own cost from the much larger
+and noisier cost of loading the weights), 4.1-5.7 ms across ten calls, median 4.7 ms -- immaterial next to the
+tens of seconds construction already spends loading the weights.
+
 ## What each replacement is worth
 
 Measured on one context of about 5,000 tokens. Each row is its own paired run -- the same process with and without that

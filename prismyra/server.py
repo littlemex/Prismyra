@@ -29,6 +29,7 @@ import dataclasses
 import uuid
 from typing import Any, Literal
 
+from . import decide as decide_mod
 from .media import MAX_DECODED_FRAMES, decode_image, decode_video
 from .queue import QueueFull, Worker
 from .schema import Boolean, Choice, PrismyraError, Question, QuestionError, Result, Scale
@@ -262,6 +263,22 @@ def create_app(
         images: list[str] = Field(default_factory=list, max_length=MAX_IMAGES)
         videos: list[str] = Field(default_factory=list, max_length=MAX_VIDEOS)
 
+    class DecideIn(BaseModel):
+        """JEV's own `DecideRequest` shape (`autotrust/JEV-27B-VL`'s `serve_decide.py`), accepted as-is so a client
+        built against JEV needs no changes to its request body. `state` is `str | dict` rather than JEV's
+        `str | dict | list`: the list form carries image/video parts, which `decide.py` refuses by name rather than
+        silently reading only the text half of it -- see `decide._state_to_context`.
+        """
+
+        kind: Literal["noul", "score", "choice"]
+        state: str | dict = ""
+        question: str
+        options: list[str] | None = None
+        #: Not part of JEV's protocol. Only meaningful in a batched request (a JSON array body): it is echoed back
+        #: so a caller can match a response item to the request item that produced it without relying on list order,
+        #: and it is what `merged_with` names the other items in a group by.
+        id: str | None = None
+
     app = FastAPI(
         title="prismyra",
         version=__version__,
@@ -333,6 +350,48 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(e)) from e
         result = _restore_ids(job.result, id_map) if id_map is not None else job.result
         return as_json(with_queue_time(result, job.queue_ms))
+
+    @app.post("/v1/decide")
+    def decide(body: DecideIn | list[DecideIn]) -> dict:
+        """A JEV-compatible read-out (see `prismyra.decide`'s own module docstring for the contract and why
+        a `choice` question is always relabelled). The body is a single JEV-shaped decision -- answered and
+        returned exactly as JEV's own `/v1/decide` would shape one -- or a JSON array of them, Prismyra's own
+        extension: items that share one `state` are answered in one `ask()` call instead of one each, and the
+        response is wrapped with `num_model_requests` so that saving is something a caller can see rather than
+        take on faith.
+
+        Goes through the same single-worker queue `/ask` uses when `--batcher` is off, not through `Batcher`:
+        this endpoint's own saving is merging *one request's own* decisions sharing a state, which needs no
+        more than the queue already serialising access to the device; cross-request batching is `Batcher`'s
+        job and this does not attempt it.
+        """
+        if isinstance(body, DecideIn):
+            single = True
+            raw_items = [body.model_dump()]
+        else:
+            single = False
+            raw_items = [b.model_dump() for b in body]
+
+        def ask(context: str, questions: list[Question]):
+            job = worker.submit((context, questions, None, None), timeout=request_timeout)
+            return job.result
+
+        try:
+            responses, num_requests = decide_mod.decide_many(engine, raw_items, ask)
+        except decide_mod.DecideError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        except QuestionError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        except QueueFull as e:
+            raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"}) from e
+        except TimeoutError as e:
+            raise HTTPException(status_code=504, detail=str(e), headers={"Retry-After": "5"}) from e
+        except PrismyraError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+
+        if single:
+            return responses[0]
+        return {"results": responses, "num_model_requests": num_requests}
 
     @app.get("/health")
     def health() -> dict:

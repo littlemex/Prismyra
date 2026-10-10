@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import pytest
 
 from prismyra import Boolean
+from prismyra.paged import Full
 from prismyra.schedule import Batcher
 from prismyra.schema import PrismyraError
 
@@ -120,6 +121,10 @@ class FakeShelf:
         self.engine = engine
         self.documents: dict[int, FakeShelved] = {}
         self._next = 0
+        #: Every `token_counts` argument `_make_room` has asked `would_fit` about, in call order -- what
+        #: `test_make_room_previews_the_padding_segment_too` reads to confirm the padding segment this fake has no
+        #: page pool to refuse is still included in the question asked, not silently dropped.
+        self.would_fit_calls: list[list[int]] = []
 
     def put_many(self, contexts: list[str]) -> list[int]:
         self.engine.reads.append(list(contexts))
@@ -137,6 +142,12 @@ class FakeShelf:
     def ask(self, asked: dict, lane: int = 0) -> dict:
         self.engine.passes.append(sorted(asked))
         return {handle: FakeResult({q.id: handle for q in questions}) for handle, questions in asked.items()}
+
+    def would_fit(self, token_counts: list[int]) -> bool:
+        """The fake has no page pool to fragment; everything always fits. Records what it was asked, so a test can
+        confirm `_make_room` asked about the padding segment too, not only the real documents' own tokens."""
+        self.would_fit_calls.append(list(token_counts))
+        return True
 
     def drop(self, handle: int) -> None:
         self.engine.dropped.append(handle)
@@ -323,6 +334,110 @@ def test_a_failing_pass_fails_every_request_in_it():
         for job in jobs:
             assert job.done.wait(5), "a job never completed"
             assert isinstance(job.error, RuntimeError)
+    finally:
+        batcher.stop()
+
+
+def test_a_page_pool_refusal_surfaces_as_a_prismyraerror_not_a_bare_runtimeerror():
+    """`shelf.put_many`'s page pool (`prismyra.paged.Pool`) can refuse a write that `_make_room`'s own
+    token-level accounting believed there was room for -- `Pool` is a first-fit allocator over released runs
+    (its own docstring: "a free-list allocator inside a page pool is a second allocator with its own
+    fragmentation"), a case `_make_room`'s token-sum arithmetic cannot see. The refusal is
+    `prismyra.paged.Full`, a plain `RuntimeError` with no `PrismyraError` lineage.
+
+    Found on real hardware (an internal investigation, not shipped with this package): one specific document
+    answered cleanly, repeatedly, through the plain unbatched queue (the joined storage has no page pool to
+    fragment) and raised exactly this uncaught `Full` through `--batcher` every time -- `server.py`'s `/ask`
+    only catches `QueueFull`, `TimeoutError` and `PrismyraError` by name, so the bare `RuntimeError` fell
+    through to an unstructured HTTP 500 instead of the clean, retryable refusal every other capacity limit in
+    this project already gives a caller. `_answer` must convert it, the same way `engine.py`'s two fused
+    shelf-write paths already convert a `torch.OutOfMemoryError` from the identical kind of write.
+    """
+
+    class RefusingShelf(FakeShelf):
+        def put_many(self, contexts):
+            raise Full("simulated: no free pages for this document")
+
+    class Engine(FakeEngine):
+        def open_shelf(self, room: int | None = None, lane: int = 0, group: int | None = None):
+            self.shelves += 1
+            return RefusingShelf(self)
+
+    engine = Engine(group=8)
+    batcher = Batcher(engine)
+    job = batcher.submit("a document", asking(1))
+    batcher.start()
+    try:
+        assert job.done.wait(5), "a job never completed"
+        assert isinstance(job.error, PrismyraError), job.error
+        assert not isinstance(job.error, Full), "the pool-internal type must not leak past the scheduler"
+        assert "page pool has no room" in str(job.error)
+    finally:
+        batcher.stop()
+
+
+def test_make_room_previews_the_padding_segment_too():
+    """`_make_room`'s own preview of what the write that follows will admit is not only `token_counts`:
+    `interleave.read_and_branch_shelf`(`_many`) and `Shelf.put_many` all pad a fresh read's *combined* length up
+    to a `_round_rows` bucket (`Prismyra._pad_context_lengths`'s own docstring: a chunked recurrent kernel picks
+    its config by the read's *total* length), and write that padding as its own, separate admission, after
+    every real document's own pages. A preview that only asked `would_fit` about the real tokens would believe
+    a write fit once the real documents' own pages did, missing the one case the padding segment's own
+    admission still refuses -- found by review, not by a GPU reproduction: the one real-hardware reproduction
+    `tests/test_gpu.py` carries for this fix used a document sized exactly to a `_round_rows` bucket, which
+    pads to nothing, and so never exercised this second admission at all.
+    """
+    engine = FakeEngine(group=8, longest_context=1000)
+    batcher = Batcher(engine, linger_ms=0.0)
+    batcher.start()
+    try:
+        # `_make_room`'s own eviction loop only runs once something is already resident (nothing to preview
+        # admitting past, on the very first document ever) -- so this needs a second, distinct document before
+        # `would_fit` is ever asked anything at all.
+        first = batcher.submit("a different first document here", asking(1))
+        assert first.done.wait(5), "the first job never completed"
+        assert first.error is None, first.error
+        # Five words -> five tokens (`FakeEngine.tokenizer`'s one-token-per-word rule) -> `_round_rows(5, 1000)`
+        # pads to 8, a padding segment of 3 tokens admitted after the real document's own 5.
+        job = batcher.submit("one two three four five", asking(1))
+        assert job.done.wait(5), "the second job never completed"
+        assert job.error is None, job.error
+        shelf = batcher._shelf
+        assert [5, 3] in shelf.would_fit_calls, (
+            f"would_fit was never asked about the 3-token padding segment alongside the real document's own 5: "
+            f"{shelf.would_fit_calls}"
+        )
+    finally:
+        batcher.stop()
+
+
+def test_an_out_of_memory_write_in_the_two_step_path_also_surfaces_as_a_prismyraerror():
+    """The two-step `shelf.put_many` path (used whenever a pass is not every document fresh, or not a single
+    fresh document -- `interleaved_fork=False` here routes every pass through it) had no `torch.
+    OutOfMemoryError` -> `PrismyraError` conversion at all before this fix, unlike the two fused shelf-write
+    paths in `engine.py` that already had one. Added for parity: the write this path does is the same kind of
+    device write, and leaving it unconverted here would have been the same uncaught-RuntimeError shape as the
+    `Full` case above, just for a different exception type.
+    """
+    import torch
+
+    class RefusingShelf(FakeShelf):
+        def put_many(self, contexts):
+            raise torch.OutOfMemoryError("simulated: out of memory")
+
+    class Engine(FakeEngine):
+        def open_shelf(self, room: int | None = None, lane: int = 0, group: int | None = None):
+            self.shelves += 1
+            return RefusingShelf(self)
+
+    engine = Engine(group=8)
+    batcher = Batcher(engine)
+    job = batcher.submit("a document", asking(1))
+    batcher.start()
+    try:
+        assert job.done.wait(5), "a job never completed"
+        assert isinstance(job.error, PrismyraError), job.error
+        assert "ran out of memory" in str(job.error)
     finally:
         batcher.stop()
 

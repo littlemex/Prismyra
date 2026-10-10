@@ -221,3 +221,70 @@ def test_reuse_does_not_hand_the_same_run_to_two_documents():
     b = p.admit(BLOCK)
     assert a.first_page != b.first_page
     assert set(a.pages()).isdisjoint(b.pages())
+
+
+# --------------------------------------------------------------------------- would_admit_all: a non-mutating preview
+#
+# `schedule.Batcher._make_room`'s own token-sum accounting is not the question `admit` is about to ask for real: a
+# sum of tokens fitting the shelf's whole budget says nothing about whether any *one* released run, or the cursor
+# alone, is big enough for the document that needs it. Found on real hardware (`RUN-v044b.md`'s 3rd section): a
+# document the token sum called room for was refused by `admit` with `Full`, over `--batcher`, where the plain
+# unbatched queue (no page pool to fragment) answered the identical document without complaint. `would_admit_all`
+# previews exactly `admit`'s own search, so `_make_room` can keep evicting until the real `admit` call that follows
+# is actually going to succeed.
+
+
+def test_would_admit_all_agrees_with_a_real_admit_that_succeeds():
+    """The preview is not a separate opinion -- it has to agree with what `admit` itself then does."""
+    p = pool(total_pages=64)
+    assert p.would_admit_all([BLOCK, BLOCK * 2]) is True
+    p.admit(BLOCK)
+    p.admit(BLOCK * 2)  # did not raise -- the preview was right
+
+
+def test_would_admit_all_sees_fragmentation_a_token_sum_alone_would_miss():
+    """The exact shape of the bug this exists to close: several released runs sum to more tokens than a new
+    document needs, and none of them, alone, is large enough for it.
+
+    `rows=1, branch_tokens=0`: the smallest private region (`private_pages=1`) this pool arithmetic allows, so a
+    handful of one-page documents is enough to exhaust the *cursor* too -- without that, a document's need would
+    still be satisfied from the cursor's own slack regardless of how fragmented the released runs are, and this
+    test would not be exercising the fragmentation path at all.
+    """
+    p = pool(total_pages=8, rows=1, branch_tokens=0)
+    assert p.private_first == 7
+    docs = [p.admit(BLOCK) for _ in range(7)]  # pages 0..6, cursor now at private_first: no cursor slack left
+    p.release(docs[0])  # page 0, isolated: the document at page 1 is still held above it
+    p.release(docs[3])  # page 3, isolated the same way: page 2 below and page 4 above are still held
+    # Two released one-page runs sum to two pages -- comfortably more than the one page either alone needs -- but
+    # neither run by itself is enough for a document that needs both pages' worth in one contiguous run.
+    assert p.would_admit_all([BLOCK * 2]) is False
+    with pytest.raises(Full):
+        p.admit(BLOCK * 2)
+
+
+def test_would_admit_all_does_not_mutate_the_pool_either_way():
+    """A preview that reserved anything would not be safe to call from a loop deciding whether to evict more."""
+    p = pool(total_pages=8, rows=1, branch_tokens=0)
+    docs = [p.admit(BLOCK) for _ in range(7)]
+    p.release(docs[0])
+    p.release(docs[3])
+    before = (p.cursor, list(p.released), list(p.documents))
+    assert p.would_admit_all([BLOCK * 2]) is False  # does not fit -- the interesting case to check for a mutation
+    assert p.would_admit_all([BLOCK]) is True  # does fit -- the other interesting case
+    after = (p.cursor, list(p.released), list(p.documents))
+    assert before == after
+
+
+def test_would_admit_all_checks_a_sequence_in_order_not_independently():
+    """Several documents admitted in one pass share the pool's state as they go -- the preview has to simulate that
+    order, not ask whether each would fit the pool's *current* state independently of the others."""
+    p = pool(total_pages=64, rows=4, branch_tokens=32)
+    a = p.admit(BLOCK)
+    p.release(a)
+    # One released one-page run. Two one-page documents in a row: the first reuses the run, the second must come
+    # from the cursor -- both succeed, because the cursor still has room. Checked here as a sequence, not reusing
+    # the same run twice.
+    assert p.would_admit_all([BLOCK, BLOCK]) is True
+    p.admit(BLOCK)
+    p.admit(BLOCK)  # did not raise -- confirms the sequence really was admissible in this order

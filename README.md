@@ -2,6 +2,56 @@
 
 Read one context once, then answer many typed questions about it.
 
+## Quickstart
+
+Install, start the server, and ask it something -- in process or over HTTP. `pip install -e ".[server,fast]"`
+needs Linux and CUDA for the `fast` extra; drop it to run on the framework's own (slower) fallback instead.
+
+```bash
+git clone --branch v0.4.4 https://github.com/littlemex/Prismyra
+cd Prismyra
+pip install -e ".[server,fast]"
+prismyra-serve --host 127.0.0.1 --port 8000 --batcher &
+curl -s localhost:8000/health   # {"ok":true,"depth":0} once the weights have loaded
+```
+
+```bash
+curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
+  "context": "Returns are accepted within thirty days of delivery. Unopened items are refunded in full.",
+  "questions": [{"id": "thirty", "prompt": "Is there a thirty day limit?"}]
+}'
+```
+
+```json
+{"answers":{"thirty":{"kind":"boolean","value":true,"option":"yes","probabilities":{"no":0.001132,"yes":0.998868}}},
+ "timing":{"queue_ms":0.1,"context_ms":0.0,"readout_ms":367.8,"total_ms":367.8},
+ "model":"littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l","scoring_version":1,"context_tokens":17}
+```
+
+`POST /v1/decide` answers the same question through autotrust's JEV-27B request shape (`kind`/`state`/
+`question`/`options`), for a caller already built against JEV's API -- see
+[docs/DECIDE.md](docs/DECIDE.md) for the full contract:
+
+```bash
+curl -s localhost:8000/v1/decide -H 'content-type: application/json' -d '{
+  "kind": "noul",
+  "state": "Returns are accepted within thirty days of delivery. Unopened items are refunded in full.",
+  "question": "Is there a thirty day limit?"
+}'
+```
+
+```json
+{"id":"0","kind":"noul","options":["false","true"],"probabilities":[0.001131512108258903,0.998868465423584],
+ "choice_index":1,"choice":"true","value":true,"adaptation":"native","symbols":null,
+ "protocol":"prismyra-decide-v1","model":"littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l","merged_with":[]}
+```
+
+The two numbers agree to every digit `/ask` reports (`0.001132`/`0.998868`, rounded there to six places) --
+same engine, same question, read through two different wire shapes. In process, without a server, is the
+library call below.
+
+## The library
+
 ```python
 from prismyra import Prismyra, Boolean, Choice
 
@@ -104,14 +154,14 @@ help and one figure this project published and then withdrew.
 **There is no release on PyPI**, so it installs from the repository, pinned to a tag:
 
 ```bash
-pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.4.3"                  # runs, and leaves every borrowed kernel on its fallback
-pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.4.3"             # the kernels: needs vLLM and Triton, so Linux and CUDA
+pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.4.4"                  # runs, and leaves every borrowed kernel on its fallback
+pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.4.4"             # the kernels: needs vLLM and Triton, so Linux and CUDA
 ```
 
 A clone works the same way, checked out at the same tag:
 
 ```bash
-git clone --branch v0.4.3 https://github.com/littlemex/Prismyra
+git clone --branch v0.4.4 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e .                  # runs, and leaves every borrowed kernel on its fallback
 pip install -e ".[fast]"          # the kernels: needs vLLM and Triton, so Linux and CUDA
@@ -361,6 +411,15 @@ prismyra-bench compare --against benchmarks/results/qwen3_6_35b_a3b_fp8__rtx_pro
 
 `compare` exits non-zero on any point more than ten per cent slower. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+**Against two other decision models**, `autotrust/JEV-27B-VL` and `LiquidAI/d1-3B`: `fp8-36l` ties or beats both
+on accuracy on every one of five sets measured, and answers 6-17x faster than JEV-27B-VL once more than one
+question is asked about the same document -- JEV's own API pays for the document again on every question. d1-3B
+is faster at every width measured and uses a fifth of the memory; JEV-27B-VL is not bit-deterministic, where
+this project's checkpoints are built to be. See
+[recipes/decision-lora/README.md's own comparison](recipes/decision-lora/README.md#against-autotrustjev-27b-vl-and-liquidaid1-3b)
+for the full numbers, what was and was not re-measured for this release, and
+[`benchmarks/compare_jev_d1.py`](benchmarks/compare_jev_d1.py) to reproduce the speed half.
+
 A handful of engine settings trade speed for a change in how an answer is computed. Three (`interleaved_fork`,
 `PRISMYRA_WITHOUT=dense_fusion`, and `wide_group`) ship with a default verified bit-identical to its non-default
 alternative; only `PRISMYRA_INVARIANCE_SCOPE`'s non-default `narrow` setting has a side that is not bit-identical,
@@ -385,6 +444,7 @@ replaces, nothing else.
 | | |
 |---|---|
 | [docs/FORK.md](docs/FORK.md) | How one context serves many questions, and the asymmetry it rests on |
+| [docs/DECIDE.md](docs/DECIDE.md) | `POST /v1/decide`, a JEV-compatible read-out, and how it batches several decisions into one read |
 | [docs/READOUT.md](docs/READOUT.md) | What a probability is, exactly |
 | [docs/HEADS.md](docs/HEADS.md) | A learned read-out for one option set, used only by the questions that declare that set |
 | [docs/KERNELS.md](docs/KERNELS.md) | Each replacement, what it is worth, and what was rejected |
@@ -403,7 +463,7 @@ that depends on how the work was arranged, so `0.999492` and `0.99974` are the s
 differs from one below, that is worth reporting.
 
 ```bash
-git clone --branch v0.4.3 https://github.com/littlemex/Prismyra
+git clone --branch v0.4.4 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e ".[server,fast]"
 prismyra-serve --host 127.0.0.1 --port 8000
@@ -532,6 +592,31 @@ curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
 Right, yes, blue, three seconds -- and the clip is three seconds. **The duration is the one to check**, because it is the
 question that fails when a clip is handed over as a pile of frames with its timing dropped: the model then answers about
 how many frames survived rather than how long the clip was. See [images and video](#images-and-video).
+
+### A decision (JEV-compatible)
+
+`POST /v1/decide` answers the same question through autotrust's JEV-27B request shape instead of this project's
+own `/ask` -- see [docs/DECIDE.md](docs/DECIDE.md) for the full contract and the batching extension beyond it.
+
+```bash
+curl -s localhost:8000/v1/decide -H 'content-type: application/json' -d '{
+  "kind": "choice",
+  "state": "Returns are accepted within thirty days of delivery. Return shipping is paid by the seller when the item is faulty and by the buyer otherwise.",
+  "question": "Who pays return shipping when the item is not faulty?",
+  "options": ["seller", "buyer"]
+}'
+```
+
+```json
+{"id":"0","kind":"choice","options":["seller","buyer"],"probabilities":[0.0022060030605643988,0.9977940320968628],
+ "choice_index":1,"choice":"buyer","value":"buyer","adaptation":"symbol-labelled","symbols":{"seller":"A","buyer":"B"},
+ "protocol":"prismyra-decide-v1","model":"littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l","merged_with":[]}
+```
+
+Every `choice` question is read through a single-token symbol for each option (`symbols` says which), the same
+way JEV's own prompt already lists `A) seller`, `B) buyer`; the response translates the chosen symbol back to
+the caller's own option text. Send a JSON array instead of one object to ask several decisions about the same
+`state` in one read -- see `merged_with` in [docs/DECIDE.md](docs/DECIDE.md#batching-several-decisions-about-one-record-cost-one-read-not-several).
 
 ### Limits, and the error you will hit first
 

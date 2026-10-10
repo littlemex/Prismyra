@@ -275,3 +275,77 @@ Folding the adapter in costs nothing measurable against the untrained base at th
 733.4 ms is within the run-to-run noise this project treats as no difference); the speed difference across the three
 published checkpoints tracks their layer count, as it should. Raw data:
 [`benchmarks/results/decision_checkpoints_vs_base__l40s__repeated_document.jsonl`](../../benchmarks/results/decision_checkpoints_vs_base__l40s__repeated_document.jsonl).
+
+## Against autotrust/JEV-27B-VL and LiquidAI/d1-3B
+
+Two more decision models, measured against `fp8-36l` the same way as the three above: same gold labels, same
+2,057 questions across the five sets this project's own README describes, each model read through its own
+native API rather than forced through the other's. `JEV-27B-VL`'s FP8 quantisation (`Atlas3D/JEV-27B-VL-FP8`, a
+community release, not an official one) was used in place of the unquantised 27B original -- it does not fit a
+48 GB-class card -- after confirming its own model card's claim that it answers text questions the same as the
+unquantised text-only sibling it is derived from. Reproduce the speed half with
+[`benchmarks/compare_jev_d1.py`](../../benchmarks/compare_jev_d1.py); the two competitors' own numbers below were
+read through their own serving code, not through this script -- see that script's own docstring for why.
+
+**Accuracy** (sign test per set, Holm-corrected across the five; "tie" means not significant after correction):
+
+| set | `fp8-36l` | JEV-27B-VL | d1-3B | `fp8-36l` vs JEV | `fp8-36l` vs d1-3B |
+|---|---:|---:|---:|---|---|
+| RACE (579) | 96.37% | 96.37% | ~90.2% | tie (p = 1.000) | **36l wins** (p < 0.0001) |
+| BoolQ (400) | 90.50% | 90.25% | ~85.8% | tie (p = 1.000) | **36l wins** (p = 0.0091) |
+| RACE buried ~7k (157) | 94.90% | 93.63% | ~79.6% | tie (p = 1.000) | **36l wins** (p = 0.0001) |
+| RACE buried ~10k (157) | 92.99% | 91.08% | ~77.7% | tie (p = 1.000) | **36l wins** (p = 0.0003) |
+| Kev transfer-v4 (764) | 87.04% | 79.97% | ~77.9% | **36l wins** (p < 0.0001) | **36l wins** (p < 0.0001) |
+| **pooled, 2,057** | **91.40%** | 88.48% | 83.08-83.13% | **36l wins by 2.92pt** | **36l wins by 8.3-8.4pt** |
+
+`fp8-36l` ties JEV-27B-VL on four of five sets and beats it on the fifth (Kev, this project's own hardest
+transfer set); it beats d1-3B significantly on every one of the five. **Neither competitor beats this checkpoint
+on accuracy on any set measured.**
+
+**Probability quality** (2,057 questions, lower is better for both):
+
+| | `fp8-36l` | JEV-27B-VL | d1-3B |
+|---|---:|---:|---:|
+| Brier | **0.135** | 0.174 | 0.234-0.235 |
+| ECE (15 bins) | 0.043 | **0.037** | **0.025-0.027** |
+
+`fp8-36l` wins on Brier against both; both competitors are better calibrated by ECE, d1-3B markedly so --
+reported rather than smoothed over, since this project's own answer is confident more often than it is right by
+this one measure.
+
+**Speed** (one document, held just over 3,401 Prismyra tokens; d1-3B's own tokenizer counts it slightly
+differently; 2 warm-up calls then median of 7). `fp8-36l`'s own figures are a same-day re-measurement on an
+L40S for this release; the two competitors' figures are not re-run for this release and are carried over from
+the comparison round each was first measured in -- the model that ships behind each number has not changed
+since, so the comparison still holds, but the three rows were not all measured on literally the same clock:
+
+| questions | `fp8-36l` | JEV-27B-VL | d1-3B (RTX PRO 4500, compiled) | d1-3B (L40S, compiled) |
+|---|---:|---:|---:|---:|
+| 1 | 156.7 ms | **152.6 ms** | 159.3 ms | **98.1 ms** |
+| 16 | **229.9 ms** | 1,423.7 ms | 203.1 ms | 130.1 ms |
+| 64 | **335.3 ms** | 5,719.5 ms | 298.6 ms | 190.5 ms |
+
+Three different shapes of result, not one verdict:
+
+- **Against JEV-27B-VL, the one-question gap has nearly closed.** A prior round measured `fp8-36l` at 185.2 ms
+  for one question, 17.6% slower than JEV's 152.6 ms; this release's own solo-question kernel work (the tuned
+  MoE tile pinned in v0.4.3) brings that to 156.7 ms, a 2.6% gap. At 16 and 64 questions `fp8-36l` is unchanged
+  in kind and still wins decisively (6.2x and 17.1x), because JEV's own API answers one decision per call and
+  pays for the document again on every one -- a design limit, not a tuning gap, and not something a later JEV
+  release closes without changing that API.
+- **d1-3B is faster than `fp8-36l` at every width measured, on both cards it was measured on.** A 3B dense
+  model with no routed experts has less to compute than a 35B-A3B MoE at any width; this is the honest trade
+  this project's own accuracy numbers above are made against, not a result this release changes.
+- **JEV-27B-VL is not bit-deterministic; this project's own checkpoints are built to be.** The same input, read
+  repeatedly in one process, across companions in one batch, and across process restarts, returned at least
+  three distinct probability values for JEV-27B-VL in an eleven-trial sample. This release adds a construction-
+  time self-check (`_check_fp8_determinism`, [docs/KERNELS.md](../../docs/KERNELS.md)) specifically for the
+  one hardware-level gap in `fp8-36l`'s own determinism story that unseeded kernel probes could not see --
+  confirmed on real hardware on both of this project's served cards (L40S and RTX PRO 4500) as part of this
+  release.
+
+**Memory**: `fp8-36l` holds about 32.7 GiB on an L40S; JEV-27B-VL's FP8 quantisation holds about 34.2 GiB
+(similar, despite the regular-dense-27B-against-MoE-35B difference, because JEV also carries a vision encoder
+this comparison's text-only questions never use); d1-3B holds about 6 GiB on either card, light enough to run
+several copies beside everything else on one GPU. Pick on this axis is a question about how many other things
+need to share the card, not about the model's own ability to answer questions.
