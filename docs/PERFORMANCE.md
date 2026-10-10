@@ -89,6 +89,35 @@ of those instead overstates the cache by 8x or 16x.
 by `ceil(questions / group)`. `Prismyra.cache_bytes(tokens)` reports the figure for a given configuration, and
 `open_context` refuses a context that will not fit rather than letting the allocator refuse it.
 
+### A process capped tighter than its device
+
+`torch.cuda.mem_get_info` answers for the device, not for the process asking. A process given a software fraction of
+a card smaller than the whole of it (`torch.cuda.set_per_process_memory_fraction`, the documented way to run under a
+budget smaller than the physical device -- a smaller real card simulated for testing, or a share of a larger one in
+a multi-tenant deployment) has that fraction enforced by the allocator, which refuses an allocation past it with no
+warning either `should_chunk` or admission (`Prismyra._check_fits`) had the chance to give, because both read
+`mem_get_info` directly and it kept answering for the whole device throughout. Measured directly: a 16,000-token
+context answered for 32 questions at once reached a peak within a few hundred MiB of the same pass's peak with no
+cap at all on the same card, confirming neither check had seen the cap. `chunking.visible_free` corrects both for
+`get_per_process_memory_fraction`; a process with no fraction set (the default) is unaffected.
+
+### Fitting a long context and a wide group on one card
+
+On the NVFP4 checkpoint's card (32 GiB of RTX PRO 4500, a budget set to 22.5 and to 24 GiB to stand in for a smaller
+one), a 16,000-token context together with 32 questions at once needs more than the default group (32) can hold in
+22.5 GiB even with the correction above -- 0.47 GiB short of the 22.5 GiB budget, the single largest remaining cost
+being the one-copy-per-layer join `cache.ForkLayer` makes for the branch read (0.98 GiB transient at this width and
+length). Building the engine with a narrower group fits it: `group=16` leaves 0.32 GiB free at 22.5 GiB and 1.53 GiB
+at 24 GiB, verified bit-identical to `group=32` across five context lengths and seven question counts straddling
+every group boundary (35/35 cases, `torch.equal` on the full probability output). What it costs: for a question
+count the narrower group now has to answer in more than one pass, every pass after the first falls back to the
+two-pass path (`ask()`'s own docstring, above) rather than the layer-interleaved one -- for 32 questions at this
+context length, measured at +11.9% median latency against the same engine at `group=32`. A question count that
+already fit one pass at the narrower group (16 or fewer) is unaffected. Narrowing further (`group=8`) buys more
+headroom (1.03 GiB free at 22.5 GiB) at a larger cost, because it now also splits a 16-question pass. Removing the
+join's per-row copy rather than trading it for a narrower group -- so a 32-question pass stays one pass whatever the
+budget -- is the cheaper fix and is not done; see [the second copy of the join](#the-second-copy-of-the-join) above.
+
 ## Where it wins and where it loses
 
 | questions | Prismyra | vLLM |
