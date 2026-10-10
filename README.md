@@ -447,6 +447,7 @@ replaces, nothing else.
 | [docs/DECIDE.md](docs/DECIDE.md) | `POST /v1/decide`, a JEV-compatible read-out, and how it batches several decisions into one read |
 | [docs/READOUT.md](docs/READOUT.md) | What a probability is, exactly |
 | [docs/HEADS.md](docs/HEADS.md) | A learned read-out for one option set, used only by the questions that declare that set |
+| [docs/LEARN.md](docs/LEARN.md) | Registered tags, a bounded experience log, and an offline-trained student (`--learn-spec`); off by default |
 | [docs/KERNELS.md](docs/KERNELS.md) | Each replacement, what it is worth, and what was rejected |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | How the numbers were measured and how to reproduce them |
 | [docs/ACCURACY.md](docs/ACCURACY.md) | Whether the answers are right, on public labels, and where they are not |
