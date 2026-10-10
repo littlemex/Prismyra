@@ -257,6 +257,27 @@ class Shelf:
             )
         return handles
 
+    def would_fit(self, token_counts: list[int]) -> bool:
+        """Would admitting documents of these lengths, in this order, succeed without the page pool refusing?
+
+        `schedule.Batcher._make_room`'s own token-sum budget is a different question from the one `Pool.admit`
+        is about to ask for real: `Pool` is a first-fit allocator over its own released runs and cursor (see its
+        own docstring), and a sum of tokens fitting the shelf's overall budget does not mean any one of those runs
+        is large enough for the document that needs it. This previews exactly `admit`'s own search, without
+        reserving anything, so a caller can keep evicting until the answer is yes instead of finding out from
+        `admit`'s own `Full`.
+
+        Reads whichever `PagedForkLayer` is holding this shelf's pages, same as `drop`'s own loop over
+        `self._cache.layers` just below -- every layer on one shelf admits and releases in the same order for the
+        same lengths, so any one of them answers for all of them. `None` only before the shelf's first document has
+        ever been written (`PagedForkLayer` allocates its `Pool` lazily, on the first write), when nothing is
+        resident to refuse against yet.
+        """
+        if self._cache is None:
+            raise PrismyraError("this shelf has been closed")
+        pool = next((layer.pool for layer in self._cache.layers if getattr(layer, "pool", None) is not None), None)
+        return pool is None or pool.would_admit_all(token_counts)
+
     def drop(self, handle: int) -> None:
         """Take a document off the shelf and give its pages back."""
         if self._cache is None:

@@ -356,6 +356,10 @@ class _StubShelf:
             out[handle] = _stub_result(questions)
         return out
 
+    def would_fit(self, token_counts: list[int]) -> bool:
+        """Enough of `Shelf.would_fit` for `Batcher._make_room` to call -- this stub has no page pool to fragment."""
+        return True
+
     def drop(self, handle):
         self.documents.pop(handle, None)
 

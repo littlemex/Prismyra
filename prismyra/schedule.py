@@ -620,15 +620,30 @@ class Batcher:
         folded into this same loop rather than a separate pass, so a resident kept past the cap because the pass
         being formed needed it (`keep`) is still protected the same way `fits_tokens`/`fits_memory` already protect
         it.
+
+        Still not enough, and this time the gap *is* pages: `fits_tokens` is a sum against the shelf's whole token
+        budget, and `Pool.admit` (`prismyra.paged.py`) is a first-fit allocator over whatever runs its own
+        `released` list and cursor actually hold -- a case the sum cannot see is several *released* runs that
+        together cover `wanted` tokens while none, alone, is large enough for the document that needs them (`Pool`'s
+        own docstring: "a free-list allocator inside a page pool is a second allocator with its own fragmentation").
+        Found on real hardware (`RUN-v044.md`'s 6th section, and this file's own GPU regression test): a document
+        that `fits_tokens` already called room for was then refused by `Pool.admit` with `Full`, over `--batcher`,
+        a request the plain unbatched queue (no page pool to fragment) answered without complaint. `fits_pages`
+        below asks `shelf.would_fit` the same question `admit` is about to ask for real, so this loop keeps evicting
+        until that answer is yes -- never changing *how* the document that follows gets read (it still goes through
+        the same paged shelf, the same kernels, the same answer any other admission would give it), only *how much
+        the shelf had already evicted* by the time it does, which is this loop's job either way.
         """
         shelf = self._on_shelf()
-        wanted = sum(self._tokens(job) for job in fresh)
+        token_counts = [self._tokens(job) for job in fresh]
+        wanted = sum(token_counts)
         incoming_snapshot = len(fresh) * self._slot_bytes
         tried_reclaim = False
         while self._resident:
             held = sum(shelf.documents[handle].tokens for handle in shelf.documents)
             fits_tokens = held + wanted <= self.limits.tokens
             fits_count = len(self._resident) + len(fresh) <= SHELF_MAX_RESIDENTS
+            fits_pages = shelf.would_fit(token_counts)
             fits_memory = True
             if self.engine.torch_device.type == "cuda":
                 free, _ = torch.cuda.mem_get_info(self.engine.torch_device)
@@ -677,7 +692,7 @@ class Batcher:
                         fits_memory = free - incoming_snapshot > SHELF_MEMORY_MARGIN
                         if not fits_memory:
                             self._reclaim_cooldown_until = now + RECLAIM_COOLDOWN_S
-            if fits_tokens and fits_memory and fits_count:
+            if fits_tokens and fits_memory and fits_count and fits_pages:
                 return
             oldest = min(
                 (handle for handle in shelf.documents if self._digest_of.get(handle) not in keep),

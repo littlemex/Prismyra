@@ -139,6 +139,10 @@ class FakeShelf:
         self.engine.passes.append(sorted(asked))
         return {handle: FakeResult({q.id: handle for q in questions}) for handle, questions in asked.items()}
 
+    def would_fit(self, token_counts: list[int]) -> bool:
+        """The fake has no page pool to fragment; everything always fits."""
+        return True
+
     def drop(self, handle: int) -> None:
         self.engine.dropped.append(handle)
         del self.documents[handle]
