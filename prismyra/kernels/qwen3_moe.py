@@ -64,6 +64,7 @@ def _reraise_if_resource_exhausted(e: Exception, context: str) -> None:
             f"between the two sides, and is not expected to be fixed by retrying alone"
         ) from e
 
+
 #: Rows at or below this width take a fused group's one combined matmul (`_ProjectionSlot`); above it, each slot
 #: falls back to its own separate `Fp8Linear` call. Both sides are bit-identical to the pre-fusion separate calls
 #: (`_fuse_pair` checks the fused side against them), so switching on M changes nothing a caller reads back -- only
@@ -282,9 +283,7 @@ class _ProjectionSlot(nn.Module):
     slot in the group sees the same `x` and so takes the same branch on the same call, without needing to agree.
     """
 
-    def __init__(
-        self, fused: _FusedDenseProjection, index: int, order: list[_ProjectionSlot], original: Fp8Linear
-    ):
+    def __init__(self, fused: _FusedDenseProjection, index: int, order: list[_ProjectionSlot], original: Fp8Linear):
         super().__init__()
         self.fused = fused
         self.index = index
@@ -355,9 +354,7 @@ def _fuse_dense_projections(applied, root: nn.Module) -> None:
                 fused_groups += 1
         elif type(module).__name__ == "Qwen3_5MoeGatedDeltaNet":
             total_groups += 1
-            if _fuse_pair(
-                applied, module, ("in_proj_qkv", "in_proj_z"), "dense_fusion: GDN in_proj_qkv+in_proj_z"
-            ):
+            if _fuse_pair(applied, module, ("in_proj_qkv", "in_proj_z"), "dense_fusion: GDN in_proj_qkv+in_proj_z"):
                 fused_groups += 1
         elif hasattr(module, "shared_expert") and hasattr(module, "shared_expert_gate"):
             # `FusedExperts` (FP8 routed experts) or `FusedExpertsFp4` (NVFP4 routed experts) -- whichever this
@@ -547,7 +544,12 @@ class FlashAttention(nn.Module):
     def forward(  # noqa: PLR0911 - one early return per attention shape this layer can be called with (context,
         # branch over a page pool, branch over a dense join -- the one this change adds -- and packed/fallback);
         # folding them into one return would hide which shape is which, which is what each early return documents
-        self, hidden_states, position_embeddings, attention_mask=None, past_key_values=None, **kwargs
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask=None,
+        past_key_values=None,
+        **kwargs,
     ):
         try:
             from vllm.vllm_flash_attn import flash_attn_varlen_func
@@ -712,9 +714,9 @@ class FlashAttention(nn.Module):
                         v_dense = torch.nn.functional.pad(v_dense, (0, 0, 0, 0, 0, pad))
                     pool_values = v_dense.reshape(rows * pages_per_row, page_block, *v_dense.shape[-2:])
                     del v_dense
-                    block_table = torch.arange(
-                        rows * pages_per_row, device=q.device, dtype=torch.int32
-                    ).reshape(rows, pages_per_row)
+                    block_table = torch.arange(rows * pages_per_row, device=q.device, dtype=torch.int32).reshape(
+                        rows, pages_per_row
+                    )
                     seqused = torch.full((rows,), k_len, device=q.device, dtype=torch.int32)
                     out = torch.empty_like(q)
                     unified_attention(
@@ -1129,9 +1131,9 @@ def _install_conv() -> bool:
             # this, a (4, 24)-shaped branch recording failed with "operation failed due to a previous error during
             # capture" (the first version of this fix broke `test_a_paged_recording_answers_a_
             # later_document_of_a_different_length` and two neighbouring recording tests on both cards).
-            row_starts = torch.arange(
-                0, batch * width, width, device=x.device, dtype=torch.int32
-            ).repeat_interleave(width)
+            row_starts = torch.arange(0, batch * width, width, device=x.device, dtype=torch.int32).repeat_interleave(
+                width
+            )
             out = causal_depthwise_conv1d(
                 flat, weight, seq_starts=row_starts, activation=activation if activation is not None else "silu"
             )
@@ -1309,8 +1311,10 @@ class Qwen3MoeAdapter:
         # default until a full torch.equal sweep says otherwise on both cards.
         gates = _patch_gdn_gates(text)
         if gates:
-            applied.notes.append(f"{gates} GatedDeltaNet gate projections (in_proj_a/in_proj_b) narrowed to the "
-                                  "batch-invariant kernel directly, independent of the process-wide registration")
+            applied.notes.append(
+                f"{gates} GatedDeltaNet gate projections (in_proj_a/in_proj_b) narrowed to the "
+                "batch-invariant kernel directly, independent of the process-wide registration"
+            )
         return applied
 
 

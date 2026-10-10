@@ -315,7 +315,5 @@ def decide_many(engine, raw_items: list[dict], ask) -> tuple[list[dict], int]:
     for item in items:
         group = groups[item.context]
         merged_with = [other.external_id for other in group if other is not item]
-        responses.append(
-            _item_response(item, answers_by_internal_id[item.question.id], engine.model_name, merged_with)
-        )
+        responses.append(_item_response(item, answers_by_internal_id[item.question.id], engine.model_name, merged_with))
     return responses, len(order)

@@ -2513,9 +2513,7 @@ class Prismyra:
         # memory margin alone did not stop it recurring, because the margin only ever asks "is there room for one
         # more", never "how many are there already". `MAX_KEPT_RECORDINGS` asks the second question; the margin
         # stays as a check the first still answers usefully once the count is bounded.
-        free, _ = (
-            torch.cuda.mem_get_info(self.torch_device) if self.torch_device.type == "cuda" else (1 << 62, 1 << 62)
-        )
+        free, _ = torch.cuda.mem_get_info(self.torch_device) if self.torch_device.type == "cuda" else (1 << 62, 1 << 62)
         # Measured the gap directly --
         # after a rate=10 burst, `mem_get_info`'s free number was 2.16 GiB (below this margin) while PyTorch's own
         # `reserved - allocated` gap was 7.6 GiB of cached-but-unallocated blocks the caching allocator was simply

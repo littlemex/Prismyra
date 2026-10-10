@@ -981,7 +981,8 @@ def test_graphs_never_corrupt_a_batch_naming_more_than_one_document(engine_paged
                     assert mixed[q.id].option == alone[q.id].option, f"{q.id} changed its answer in a mixed batch"
                     for option, p in alone[q.id].probabilities.items():
                         assert abs(mixed[q.id].probabilities[option] - p) <= COMPANION_MOVEMENT_QN1_ATTENTION, (
-                            q.id, option,
+                            q.id,
+                            option,
                         )
     finally:
         engine_paged.graphs = was
@@ -1787,8 +1788,6 @@ def test_a_short_question_replays_exactly_as_it_reads_eagerly(engine):
         engine._one_pass = original
 
 
-
-
 HEAD_OPTIONS = ["seller", "buyer"]
 HEAD_BIAS = [2.0, -1.0]
 NOT_HEADED = [
@@ -1829,7 +1828,7 @@ def _with_heads(engine, heads, answer):
 def _check_heads(before, after):
     expected = torch.softmax(torch.tensor(HEAD_BIAS), dim=-1).tolist()
     for q in NOT_HEADED:
-        assert after[q.id].probabilities == before[q.id].probabilities, q.id   # bit-identical, not merely close
+        assert after[q.id].probabilities == before[q.id].probabilities, q.id  # bit-identical, not merely close
         assert after[q.id].read_by is None
     for q in (HEADED, HEADED_SWAPPED):
         got = after[q.id]

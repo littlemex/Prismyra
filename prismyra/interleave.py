@@ -70,9 +70,9 @@ def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, p
     branch_width = branch_ids.shape[1]
 
     ctx_positions = torch.arange(ctx_tokens, device=device).unsqueeze(0)
-    branch_positions = torch.arange(
-        ctx_tokens, ctx_tokens + branch_width, device=device
-    ).unsqueeze(0).expand(padded_rows, -1)
+    branch_positions = (
+        torch.arange(ctx_tokens, ctx_tokens + branch_width, device=device).unsqueeze(0).expand(padded_rows, -1)
+    )
 
     hidden_ctx = text_model.embed_tokens(encoded.input_ids)
     hidden_branch = text_model.embed_tokens(branch_ids)
@@ -123,9 +123,7 @@ def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, p
         residual_ctx, residual_branch = hidden_ctx, hidden_branch
         normed2_ctx = decoder_layer.post_attention_layernorm(hidden_ctx)
         normed2_branch = decoder_layer.post_attention_layernorm(hidden_branch)
-        combined = torch.cat(
-            (normed2_ctx.reshape(-1, hidden_size), normed2_branch.reshape(-1, hidden_size)), dim=0
-        )
+        combined = torch.cat((normed2_ctx.reshape(-1, hidden_size), normed2_branch.reshape(-1, hidden_size)), dim=0)
         moe_out = decoder_layer.mlp(combined)
         if isinstance(moe_out, tuple):  # the unpatched block returns (output, router_logits); FusedExperts does not
             moe_out = moe_out[0]
@@ -225,9 +223,9 @@ def read_and_branch_shelf(engine, shelf, context: str, texts: list[str], width: 
     branch_ids, read_at, _ = build_suffixes(texts, engine.tokenizer, device, padded_rows, width)
     branch_width = branch_ids.shape[1]
     hidden_branch = text_model.embed_tokens(branch_ids)
-    branch_positions = torch.arange(
-        encoded.tokens, encoded.tokens + branch_width, device=device
-    ).unsqueeze(0).expand(padded_rows, -1)
+    branch_positions = (
+        torch.arange(encoded.tokens, encoded.tokens + branch_width, device=device).unsqueeze(0).expand(padded_rows, -1)
+    )
     branch_rope = text_model.rotary_emb(hidden_branch, branch_positions)
 
     for layer in cache.layers:
@@ -324,9 +322,7 @@ def read_and_branch_shelf(engine, shelf, context: str, texts: list[str], width: 
         residual_ctx, residual_branch = hidden_ctx, hidden_branch
         normed2_ctx = decoder_layer.post_attention_layernorm(hidden_ctx)
         normed2_branch = decoder_layer.post_attention_layernorm(hidden_branch)
-        combined = torch.cat(
-            (normed2_ctx.reshape(-1, hidden_size), normed2_branch.reshape(-1, hidden_size)), dim=0
-        )
+        combined = torch.cat((normed2_ctx.reshape(-1, hidden_size), normed2_branch.reshape(-1, hidden_size)), dim=0)
         moe_out = decoder_layer.mlp(combined)
         if isinstance(moe_out, tuple):
             moe_out = moe_out[0]
@@ -410,8 +406,10 @@ def read_and_branch_shelf_many(
             "read_and_branch_shelf_many needs at least two fresh documents; use read_and_branch_shelf for one"
         )
     if len(texts_per_doc) != n or len(padded_rows_per_doc) != n:
-        raise ValueError(f"{n} documents need {n} question lists and {n} padded-row counts, not "
-                          f"{len(texts_per_doc)} and {len(padded_rows_per_doc)}")
+        raise ValueError(
+            f"{n} documents need {n} question lists and {n} padded-row counts, not "
+            f"{len(texts_per_doc)} and {len(padded_rows_per_doc)}"
+        )
 
     cache = shelf._cache
     encoded = [engine.encode_context(c) for c in contexts]
@@ -430,8 +428,10 @@ def read_and_branch_shelf_many(
         pad_handle = shelf._next_handle
         shelf._next_handle += 1
     doc_handles = [*handles, pad_handle] if has_pad else list(handles)
-    ctx_ids = torch.cat([*(e.input_ids for e in encoded), pad_ids], dim=1) if has_pad else torch.cat(
-        [e.input_ids for e in encoded], dim=1
+    ctx_ids = (
+        torch.cat([*(e.input_ids for e in encoded), pad_ids], dim=1)
+        if has_pad
+        else torch.cat([e.input_ids for e in encoded], dim=1)
     )
     ctx_tokens = ctx_ids.shape[1]
 
@@ -530,9 +530,7 @@ def read_and_branch_shelf_many(
         residual_ctx, residual_branch = hidden_ctx, hidden_branch
         normed2_ctx = decoder_layer.post_attention_layernorm(hidden_ctx)
         normed2_branch = decoder_layer.post_attention_layernorm(hidden_branch)
-        combined = torch.cat(
-            (normed2_ctx.reshape(-1, hidden_size), normed2_branch.reshape(-1, hidden_size)), dim=0
-        )
+        combined = torch.cat((normed2_ctx.reshape(-1, hidden_size), normed2_branch.reshape(-1, hidden_size)), dim=0)
         moe_out = decoder_layer.mlp(combined)
         if isinstance(moe_out, tuple):
             moe_out = moe_out[0]

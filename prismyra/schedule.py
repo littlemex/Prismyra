@@ -495,12 +495,7 @@ class Batcher:
         # the smaller cap).
         cap = WIDE_GROUP if self.engine.wide_group else self.engine.group
         padded_total = sum(_round_rows(len(job.payload.questions), cap) for job in formed.jobs)
-        if (
-            self.engine.interleaved_fork
-            and len(fresh) == len(formed.jobs)
-            and len(fresh) >= 2
-            and padded_total <= cap
-        ):
+        if self.engine.interleaved_fork and len(fresh) == len(formed.jobs) and len(fresh) >= 2 and padded_total <= cap:
             self._fused_many_passes += 1
             jobs = formed.jobs
             self._make_room(jobs, keep={job.payload.digest for job in jobs})

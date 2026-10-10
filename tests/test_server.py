@@ -668,8 +668,6 @@ def test_decide_endpoint_merges_a_batch_sharing_one_state_into_one_ask_call():
 def test_decide_endpoint_refuses_a_bad_kind_before_touching_the_device():
     engine = _DecideStubEngine()
     client = _decide_client(engine)
-    response = client.post(
-        "/v1/decide", json={"kind": "freeform", "state": "x", "question": "?"}
-    )
+    response = client.post("/v1/decide", json={"kind": "freeform", "state": "x", "question": "?"})
     assert response.status_code == 422
     assert engine.asks == []

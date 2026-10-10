@@ -61,8 +61,12 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--require-kernels", action="store_true")
-    parser.add_argument("--doc-out", default=None, help="write the generated document's text here, so a competing "
-                        "model's own client can be pointed at the identical bytes")
+    parser.add_argument(
+        "--doc-out",
+        default=None,
+        help="write the generated document's text here, so a competing "
+        "model's own client can be pointed at the identical bytes",
+    )
     args = parser.parse_args()
 
     from prismyra import Boolean, Prismyra
@@ -89,8 +93,10 @@ def main() -> int:
             "max_ms": max(times_ms),
             "all_ms": times_ms,
         }
-        print(f"{n:>3} question(s): median {results[str(n)]['median_ms']:.1f} ms "
-              f"(min {results[str(n)]['min_ms']:.1f}, max {results[str(n)]['max_ms']:.1f})")
+        print(
+            f"{n:>3} question(s): median {results[str(n)]['median_ms']:.1f} ms "
+            f"(min {results[str(n)]['min_ms']:.1f}, max {results[str(n)]['max_ms']:.1f})"
+        )
 
     print(json.dumps(results))
     return 0

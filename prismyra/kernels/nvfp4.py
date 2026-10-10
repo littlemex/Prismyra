@@ -144,7 +144,6 @@ class FusedExpertsFp4(nn.Module):
         if hasattr(block, "experts"):
             del block.experts
 
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_topk
 
@@ -201,10 +200,19 @@ class FusedExpertsFp4(nn.Module):
         size = FusedExpertsFp4._ws_size.get((key, m))
         if size is None:
             size = FusedExpertsFp4._ws_size[(key, m)] = cutlass_fused_moe_workspace_size(
-                m, self.k, self.n, self.e, self.top_k, x_dtype=x_dtype, weight_dtype=torch.long,
-                output_dtype=torch.bfloat16, use_fused_finalize=self.fused_finalize, device=self.w1.device)
+                m,
+                self.k,
+                self.n,
+                self.e,
+                self.top_k,
+                x_dtype=x_dtype,
+                weight_dtype=torch.long,
+                output_dtype=torch.bfloat16,
+                use_fused_finalize=self.fused_finalize,
+                device=self.w1.device,
+            )
         if size > WORKSPACE_CAP:
-            return None                     # rare very large calls (the autotune sweep) keep the kernel's own scratch
+            return None  # rare very large calls (the autotune sweep) keep the kernel's own scratch
         buf = FusedExpertsFp4._ws.get(key)
         if buf is None or buf.numel() < size:
             FusedExpertsFp4._ws[key] = None
@@ -231,22 +239,54 @@ class FusedExpertsFp4(nn.Module):
             xq, xsf = ops.scaled_fp4_quant(x.contiguous(), self.a1_gscale[:1])
             ws = self._workspace(m, xq.dtype) if os.environ.get("PRISMYRA_NVFP4_WORKSPACE", "1") == "1" else None
             flashinfer_cutlass_fused_moe(
-                input=xq, token_selected_experts=ids.to(torch.int), token_final_scales=weights,
-                fc1_expert_weights=self.w1.view(torch.long), fc2_expert_weights=self.w2.view(torch.long),
-                output=out, output_dtype=x.dtype,
-                quant_scales=[self.a1_gscale, self.w1_scale.view(torch.int32), self.g1_alphas,
-                              self.a2_gscale, self.w2_scale.view(torch.int32), self.g2_alphas],
-                input_sf=xsf, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, activation_type=ActivationType.Swiglu,
-                use_fused_finalize=self.fused_finalize, workspace_buffer=ws,
+                input=xq,
+                token_selected_experts=ids.to(torch.int),
+                token_final_scales=weights,
+                fc1_expert_weights=self.w1.view(torch.long),
+                fc2_expert_weights=self.w2.view(torch.long),
+                output=out,
+                output_dtype=x.dtype,
+                quant_scales=[
+                    self.a1_gscale,
+                    self.w1_scale.view(torch.int32),
+                    self.g1_alphas,
+                    self.a2_gscale,
+                    self.w2_scale.view(torch.int32),
+                    self.g2_alphas,
+                ],
+                input_sf=xsf,
+                tp_size=1,
+                tp_rank=0,
+                ep_size=1,
+                ep_rank=0,
+                activation_type=ActivationType.Swiglu,
+                use_fused_finalize=self.fused_finalize,
+                workspace_buffer=ws,
             )
             return out
         ws13 = torch.empty(m * self.top_k * max(2 * self.n, self.k), dtype=x.dtype, device=x.device)
         ws2 = torch.empty(m * self.top_k * self.n, dtype=x.dtype, device=x.device)
         run_cutlass_moe_fp4(
-            output=out, a=x.contiguous(), a1_gscale=self.a1_gscale, w1_fp4=self.w1, w1_blockscale=self.w1_scale,
-            w1_alphas=self.g1_alphas, a2_gscale=self.a2_gscale, w2_fp4=self.w2, w2_blockscale=self.w2_scale,
-            w2_alphas=self.g2_alphas, topk_weights=weights, topk_ids=ids.to(torch.int32), activation=MoEActivation.SILU,
-            workspace13=ws13, workspace2=ws2, m=m, n=self.n, k=self.k, e=self.e, device=x.device,
+            output=out,
+            a=x.contiguous(),
+            a1_gscale=self.a1_gscale,
+            w1_fp4=self.w1,
+            w1_blockscale=self.w1_scale,
+            w1_alphas=self.g1_alphas,
+            a2_gscale=self.a2_gscale,
+            w2_fp4=self.w2,
+            w2_blockscale=self.w2_scale,
+            w2_alphas=self.g2_alphas,
+            topk_weights=weights,
+            topk_ids=ids.to(torch.int32),
+            activation=MoEActivation.SILU,
+            workspace13=ws13,
+            workspace2=ws2,
+            m=m,
+            n=self.n,
+            k=self.k,
+            e=self.e,
+            device=x.device,
         )
         return out
 
@@ -462,8 +502,9 @@ class Fp4Linear(nn.Module):
 
         shape = x.shape
         x2 = x.reshape(-1, shape[-1])
-        xq, xs = scaled_fp4_quant(x2, self.ga, is_sf_swizzled_layout=True, backend="cutlass",
-                                  padded_n=shape[-1] + self.pad * 2)
+        xq, xs = scaled_fp4_quant(
+            x2, self.ga, is_sf_swizzled_layout=True, backend="cutlass", padded_n=shape[-1] + self.pad * 2
+        )
         out = cutlass_scaled_fp4_mm(xq, self.weight, xs, self.weight_scale, self.alpha, x.dtype)
         return slice_nvfp4_output(out, self.out_features).reshape(*shape[:-1], self.out_features)
 
