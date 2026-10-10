@@ -652,26 +652,32 @@ class Prismyra:
         # PRISMYRA_EMBED_TOKENS=lazy. See `embed.make_lazy`'s module docstring; this is the input-side counterpart
         # to PRISMYRA_LM_HEAD=lazy above and is independent of it (either, both, or neither may be set).
         #
-        # Measured on real hardware (RTX PRO 4500, `/Users/akazawt/tmp/smr/air/RUN-q2.md`, 2026-10-10): a lazy
-        # input embedding is NOT a drop-in substitute for the resident one the way the output embedding is. The
-        # output embedding is only ever read *after* the one-pass CUDA graph below finishes replaying (it scores
-        # the already-produced hidden state), but the input embedding is the *first op inside the captured
-        # forward* -- `embed_tokens(input_ids)` runs before any decoder layer. A capture that reaches a host-side
-        # gather and a device<->host copy mid-capture is invalid CUDA: it was observed to record an empty graph
-        # (`torch.cuda.graphs: "The CUDA Graph is empty"`) and leave the capturing stream in a state
-        # (`cudaErrorIllegalState`) that crashes the *next* bucket's own unrelated, unguarded setup code,
-        # reproduced on 2 of 2 fresh-process attempts. So `_lazy_embed_tokens` below additionally disables the
-        # one-pass recording (`wanted` further down): it still answers correctly (the eager path this engine
-        # always has as a fallback), it is simply not sped up by a graph replay at short lengths while this flag
-        # is set. Fixing that trade-off (teaching `onepass.record_bucket` to treat the input-embedding lookup as
-        # another eagerly-run "island", like the row-dependent `F.linear` calls already are) is unimplemented --
-        # left for a future round, named here rather than silently accepted.
+        # Measured on real hardware (RTX PRO 4500, `/Users/akazawt/tmp/smr/air/RUN-q2.md` and `RUN-q3.md`,
+        # 2026-10-10): a lazy input embedding is NOT a drop-in substitute for the resident one the way the output
+        # embedding is. The output embedding is only ever read *after* the one-pass CUDA graph below finishes
+        # replaying (it scores the already-produced hidden state), but the input embedding is the *first op inside
+        # the captured forward* -- `embed_tokens(input_ids)` runs before any decoder layer. A capture that reaches
+        # a host-side gather and a device<->host copy mid-capture is invalid CUDA (reproduced on 2 of 2 fresh-process
+        # attempts: an empty recorded graph, then a crash in the next bucket's unrelated setup code). Two earlier
+        # rounds (RUN-q2.md, RUN-q3.md) responded by disabling the one-pass recording outright whenever this flag
+        # is set -- correct answers, no graph replay, 73-87% slower at short lengths than the default.
+        #
+        # Fixed here (`RUN-q4.md`, 2026-10-10) by not treating the gather as something a capture ever has to see at
+        # all: `self._lazy_embed_module`, below, is handed to `onepass.record_all`, which gathers it eagerly into a
+        # static buffer *before* each bucket's capture begins and records every bucket with `inputs_embeds=` that
+        # buffer rather than `input_ids=`. See `onepass.record_bucket`'s own docstring for why this is bit-identical
+        # rather than merely close. The branch-pass recording a few hundred lines down (`_run_recorded`) is left
+        # disabled by this flag, same as before -- out of this round's scope, and RUN-q3.md's section 1.5 found it
+        # never fires under this engine's default (`paged=False`) configuration anyway.
         self._lazy_embed_tokens = on_cuda and os.environ.get("PRISMYRA_EMBED_TOKENS") == "lazy"
+        self._lazy_embed_module = None
         if self._lazy_embed_tokens:
             from .embed import make_lazy as _make_embedding_lazy
 
             text_model = self.backbone.language_model if hasattr(self.backbone, "language_model") else self.backbone
-            _make_embedding_lazy(text_model.get_input_embeddings())
+            embedding = text_model.get_input_embeddings()
+            _make_embedding_lazy(embedding)
+            self._lazy_embed_module = embedding
 
         decoder = getattr(self.config, "text_config", self.config)
         self.hidden_size = decoder.hidden_size
@@ -779,12 +785,13 @@ class Prismyra:
         if wanted:
             if not on_cuda:
                 raise PrismyraError(f"short_graphs records CUDA graphs and this engine is on {self.device}")
-            # See the PRISMYRA_EMBED_TOKENS=lazy comment above: recording would try to capture a host-side gather
-            # at the very first op of the forward and crash, not just answer slower, so it is skipped outright
-            # (`self._one_pass` stays None, and `_ask_in_one_pass` already falls back to the eager path whenever
-            # `bucket_for` has nothing to offer -- the same fallback `calibrate`/`paged` already use here).
-            if not (calibrate or paged or self._lazy_embed_tokens):
-                self._one_pass = onepass.record_all(self, self._pad_id(), self._read_one_pass)
+            # See the PRISMYRA_EMBED_TOKENS=lazy comment above: `embed_module` makes every bucket's capture skip
+            # the gather entirely rather than try and fail to record it, so lazy embedding no longer has to be
+            # excluded here the way it did before this round.
+            if not (calibrate or paged):
+                self._one_pass = onepass.record_all(
+                    self, self._pad_id(), self._read_one_pass, embed_module=self._lazy_embed_module
+                )
         # The one-pass path's own routed-expert tile (`kernels.onepass_moe_tuning`) is a construction-time file
         # load keyed on this process's device name, not a swap `kernels.apply`'s own `Applied` already reports --
         # recorded here, unconditionally, so "did the pin actually load this time" is answered by `engine.applied`/
