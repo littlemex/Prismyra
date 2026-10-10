@@ -212,3 +212,148 @@ def test_a_plain_structural_mismatch_still_declines_quietly():
             raise RuntimeError("simulated: shape mismatch, nothing to do with a resource limit")
 
     assert _compare(RaisesShapeError(), RaisesShapeError(), "dense_matmul") is None
+
+
+# --------------------------------------------------------------------------- fp8_determinism: no device needed
+#
+# `_check_fp8_determinism` asks a different question than every other self-check above: not "does the replacement
+# agree with the framework's own implementation" but "does the installed kernel agree with its own last answer,
+# called again on the same input". No device is needed to check that the *logic* of that question is right -- a
+# fake module named the way the real installed kernels are (`_find_children` matches by `type(m).__name__`, not
+# by import identity) can simulate a device that does, and does not, repeat itself.
+
+
+def test_fp8_determinism_check_passes_when_the_kernel_repeats_itself():
+    import torch
+
+    from prismyra.kernels.qwen3_moe import _check_fp8_determinism
+
+    class Fp8Linear(nn.Module):
+        in_features = 8
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, 8, dtype=torch.bfloat16))
+
+        def forward(self, x):
+            return x @ self.weight.t()
+
+    root = nn.Module()
+    root.proj = Fp8Linear()
+    applied = Applied(adapter="x")
+    _check_fp8_determinism(applied, root)
+    assert any("agreed bit-for-bit" in note for note in applied.notes)
+
+
+def test_fp8_determinism_check_fails_construction_when_the_kernel_does_not_repeat_itself():
+    """The finding this check exists for: a device that answers the same input differently from one call to the
+    next. Simulated here by a module whose third call perturbs its own output -- not a resource exception, not a
+    disagreement with a reference implementation, just the same call made again returning something else."""
+    import torch
+
+    from prismyra.kernels import AdapterError
+    from prismyra.kernels.qwen3_moe import _check_fp8_determinism
+
+    class Fp8Linear(nn.Module):
+        in_features = 8
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, 8, dtype=torch.bfloat16))
+            self.calls = 0
+
+        def forward(self, x):
+            self.calls += 1
+            out = x @ self.weight.t()
+            return out + 1.0 if self.calls == 3 else out
+
+    root = nn.Module()
+    root.proj = Fp8Linear()
+    applied = Applied(adapter="x")
+    with pytest.raises(AdapterError, match="answered the same input differently"):
+        _check_fp8_determinism(applied, root)
+
+
+def test_fp8_determinism_check_raises_loudly_on_resource_exhaustion():
+    """Same discipline as `_compare`: a probe that cannot run at all for a resource reason is not evidence of
+    non-determinism, and must still raise rather than being folded into the determinism finding above."""
+    import torch
+
+    from prismyra.kernels import AdapterError
+    from prismyra.kernels.qwen3_moe import _check_fp8_determinism
+
+    class Fp8Linear(nn.Module):
+        in_features = 8
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, 8, dtype=torch.bfloat16))
+
+        def forward(self, x):
+            raise torch.OutOfMemoryError("simulated: out of memory")
+
+    root = nn.Module()
+    root.proj = Fp8Linear()
+    applied = Applied(adapter="x")
+    with pytest.raises(AdapterError, match="ran out of GPU memory"):
+        _check_fp8_determinism(applied, root)
+
+
+def test_fp8_determinism_check_declines_quietly_for_a_structural_reason():
+    """The opposite of the resource case: a probe that cannot run because the module is the wrong shape (nothing
+    to do with a resource limit) is recorded as not checked, not raised, and not confused with a mismatch."""
+    import torch
+
+    from prismyra.kernels.qwen3_moe import _check_fp8_determinism
+
+    class Fp8Linear(nn.Module):
+        in_features = 8
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, 8, dtype=torch.bfloat16))
+
+        def forward(self, x):
+            raise RuntimeError("simulated: shape mismatch, nothing to do with a resource limit")
+
+    root = nn.Module()
+    root.proj = Fp8Linear()
+    applied = Applied(adapter="x")
+    _check_fp8_determinism(applied, root)
+    assert any("not checked this construction" in skip for skip in applied.skipped)
+
+
+def test_fp8_determinism_check_notes_rather_than_fails_when_nothing_is_installed():
+    """A build without the FP8 kernels (no vLLM, or the framework's own fallback) has nothing this check is
+    about -- recorded as a note, the same as `_swap_and_verify`'s own "nothing matched" skip, not a failure."""
+    from prismyra.kernels.qwen3_moe import _check_fp8_determinism
+
+    applied = Applied(adapter="x")
+    _check_fp8_determinism(applied, nn.Module())
+    assert any("nothing matched" in note for note in applied.notes)
+
+
+def test_fp8_determinism_check_handles_a_tuple_returning_fused_projection():
+    """`_FusedDenseProjection.forward` returns a tuple (each sibling's own share, split back out), not one
+    tensor like `Fp8Linear.forward` -- the check must normalise before comparing, not crash on `torch.equal`
+    being handed a tuple."""
+    import torch
+
+    from prismyra.kernels.qwen3_moe import _check_fp8_determinism
+
+    class _FusedDenseProjection(nn.Module):
+        in_features = 8
+
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.zeros(4, 8, dtype=torch.bfloat16))
+
+        def forward(self, x):
+            out = x @ self.weight.t()
+            return torch.split(out, [2, 2], dim=-1)
+
+    root = nn.Module()
+    root.proj = _FusedDenseProjection()
+    applied = Applied(adapter="x")
+    _check_fp8_determinism(applied, root)
+    assert any("agreed bit-for-bit" in note for note in applied.notes)

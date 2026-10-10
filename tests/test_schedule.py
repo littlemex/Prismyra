@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import pytest
 
 from prismyra import Boolean
+from prismyra.paged import Full
 from prismyra.schedule import Batcher
 from prismyra.schema import PrismyraError
 
@@ -323,6 +324,75 @@ def test_a_failing_pass_fails_every_request_in_it():
         for job in jobs:
             assert job.done.wait(5), "a job never completed"
             assert isinstance(job.error, RuntimeError)
+    finally:
+        batcher.stop()
+
+
+def test_a_page_pool_refusal_surfaces_as_a_prismyraerror_not_a_bare_runtimeerror():
+    """`shelf.put_many`'s page pool (`prismyra.paged.Pool`) can refuse a write that `_make_room`'s own
+    token-level accounting believed there was room for -- `Pool` is a first-fit allocator over released runs
+    (its own docstring: "a free-list allocator inside a page pool is a second allocator with its own
+    fragmentation"), a case `_make_room`'s token-sum arithmetic cannot see. The refusal is
+    `prismyra.paged.Full`, a plain `RuntimeError` with no `PrismyraError` lineage.
+
+    Found on real hardware (an internal investigation, not shipped with this package): one specific document
+    answered cleanly, repeatedly, through the plain unbatched queue (the joined storage has no page pool to
+    fragment) and raised exactly this uncaught `Full` through `--batcher` every time -- `server.py`'s `/ask`
+    only catches `QueueFull`, `TimeoutError` and `PrismyraError` by name, so the bare `RuntimeError` fell
+    through to an unstructured HTTP 500 instead of the clean, retryable refusal every other capacity limit in
+    this project already gives a caller. `_answer` must convert it, the same way `engine.py`'s two fused
+    shelf-write paths already convert a `torch.OutOfMemoryError` from the identical kind of write.
+    """
+
+    class RefusingShelf(FakeShelf):
+        def put_many(self, contexts):
+            raise Full("simulated: no free pages for this document")
+
+    class Engine(FakeEngine):
+        def open_shelf(self, room: int | None = None, lane: int = 0, group: int | None = None):
+            self.shelves += 1
+            return RefusingShelf(self)
+
+    engine = Engine(group=8)
+    batcher = Batcher(engine)
+    job = batcher.submit("a document", asking(1))
+    batcher.start()
+    try:
+        assert job.done.wait(5), "a job never completed"
+        assert isinstance(job.error, PrismyraError), job.error
+        assert not isinstance(job.error, Full), "the pool-internal type must not leak past the scheduler"
+        assert "page pool has no room" in str(job.error)
+    finally:
+        batcher.stop()
+
+
+def test_an_out_of_memory_write_in_the_two_step_path_also_surfaces_as_a_prismyraerror():
+    """The two-step `shelf.put_many` path (used whenever a pass is not every document fresh, or not a single
+    fresh document -- `interleaved_fork=False` here routes every pass through it) had no `torch.
+    OutOfMemoryError` -> `PrismyraError` conversion at all before this fix, unlike the two fused shelf-write
+    paths in `engine.py` that already had one. Added for parity: the write this path does is the same kind of
+    device write, and leaving it unconverted here would have been the same uncaught-RuntimeError shape as the
+    `Full` case above, just for a different exception type.
+    """
+    import torch
+
+    class RefusingShelf(FakeShelf):
+        def put_many(self, contexts):
+            raise torch.OutOfMemoryError("simulated: out of memory")
+
+    class Engine(FakeEngine):
+        def open_shelf(self, room: int | None = None, lane: int = 0, group: int | None = None):
+            self.shelves += 1
+            return RefusingShelf(self)
+
+    engine = Engine(group=8)
+    batcher = Batcher(engine)
+    job = batcher.submit("a document", asking(1))
+    batcher.start()
+    try:
+        assert job.done.wait(5), "a job never completed"
+        assert isinstance(job.error, PrismyraError), job.error
+        assert "ran out of memory" in str(job.error)
     finally:
         batcher.stop()
 

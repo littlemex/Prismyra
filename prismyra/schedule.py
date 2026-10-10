@@ -54,6 +54,7 @@ from typing import Any
 import torch
 
 from .engine import WIDE_GROUP, _round_rows
+from .paged import Full
 from .queue import Job, QueueFull, Worker, WorkerStopped
 from .schema import PrismyraError, Question, Result
 
@@ -528,7 +529,42 @@ class Batcher:
         if fresh:
             jobs = list(fresh.values())
             self._make_room(jobs, keep={job.payload.digest for job in formed.jobs})
-            handles = shelf.put_many([job.payload.context for job in jobs])
+            # `_make_room` bounds this read by *tokens* (`fits_tokens`, against `self.limits.tokens`) and by
+            # device memory margin -- neither of which is the same question `Pool.admit` (`prismyra.paged.py`)
+            # asks when `shelf.put_many` actually writes these documents' pages. `Pool` is a first-fit
+            # allocator over released runs (its own docstring: "a free-list allocator inside a page pool is a
+            # second allocator with its own fragmentation"), so several residents' released runs can sum to
+            # more tokens than `fits_tokens` compares against while none of them is individually large enough
+            # for *this* admission -- a case `_make_room`'s token-level arithmetic cannot see and `Pool.admit`
+            # then refuses by raising `Full`, a plain `RuntimeError` carrying no `PrismyraError` lineage.
+            # Found on real hardware: a specific document admitted cleanly through the plain, unbatched queue
+            # (the joined storage has no page pool to fragment) raised an uncaught `Full` through this exact
+            # call, over `--batcher`, and server.py's `/ask` -- whose exception handling names `QueueFull`,
+            # `TimeoutError` and `PrismyraError`, not a paged-pool-internal type nobody told it to expect --
+            # let it fall through to a bare HTTP 500. Converting it here, the same way `engine.py`'s
+            # `_shelf_ask_interleaved`/`_shelf_ask_interleaved_many` already convert a `torch.OutOfMemoryError`
+            # from the same kind of write, is what makes it a `PrismyraError` every caller (HTTP or in-process)
+            # already knows to expect, worded as a refusal worth retrying rather than a request to rewrite.
+            try:
+                handles = shelf.put_many([job.payload.context for job in jobs])
+            except torch.OutOfMemoryError as e:
+                # The same conversion `engine.py`'s two fused shelf-write paths already make for this exact
+                # failure; this two-step path (`shelf.put_many` on its own, used whenever a pass is not every
+                # document fresh or not single-fresh) had no equivalent until now and would have let a device
+                # OOM leak through just as uncaught as `Full` did.
+                raise PrismyraError(
+                    f"ran out of memory reading {len(jobs)} fresh document(s) onto a shelf. Ask about fewer "
+                    f"documents at a time, or build the engine with a smaller group."
+                ) from e
+            except Full as e:
+                raise PrismyraError(
+                    f"the page pool has no room for {len(jobs)} fresh document(s) on this shelf right now "
+                    f"({e}). `_make_room` already tried to evict the least recently used residents it could; "
+                    f"this is the pool's own page-level accounting (fragmented released runs, or a genuine "
+                    f"shortage) refusing where that token-level eviction estimate did not. Retrying is "
+                    f"reasonable -- a later pass with different shelf company may free the pages this one "
+                    f"needed -- and so is asking about fewer documents at once."
+                ) from e
             for job, handle in zip(jobs, handles, strict=True):
                 self._resident[job.payload.digest] = handle
                 self._digest_of[handle] = job.payload.digest

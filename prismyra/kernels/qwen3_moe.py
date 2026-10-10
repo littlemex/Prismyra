@@ -1255,6 +1255,12 @@ class Qwen3MoeAdapter:
                 from . import decoder_fusion
 
                 decoder_fusion.install(applied, text)
+            # After fusion, not before: this checks the FP8 kernel this process will actually serve requests
+            # with, and some dense projections only reach their final shape (`_FusedDenseProjection`) once
+            # `_fuse_dense_projections` has run -- probing an about-to-be-replaced standalone `Fp8Linear`
+            # would check a module no request ever calls.
+            if "fp8_determinism" not in _withheld():
+                _check_fp8_determinism(applied, text)
         else:
             applied.skipped.append("vllm is not installed: the borrowed kernels are unavailable")
         # Triton rather than vLLM, so it is not gated on the borrowed kernels.
@@ -1404,6 +1410,95 @@ def _compare(original: nn.Module, replacement: nn.Module, name: str = "dense_mat
         return None
     scale = want.float().abs().max().item()
     return (want.float() - got.float()).abs().max().item() / max(scale, 1e-6)
+
+
+#: How many times the FP8 determinism self-check calls the same installed kernel on the same input in this one
+#: process. Eight, not the 100 `RUN-nd1.md`'s own repro used (that count characterised a failure rate once a
+#: hardware fault was already suspected; a mismatch among a handful of repeats of a module this file already
+#: argued has no autotune and no competing writes -- `_swap_and_verify`'s own docstring -- is already a finding,
+#: not a rate to measure).
+FP8_DETERMINISM_PROBES = 8
+
+
+def _check_fp8_determinism(applied: Applied, root: nn.Module) -> None:
+    """Call one installed FP8 kernel on a fixed input several times in this one process, and refuse to start the
+    engine if it does not return the same bits every time.
+
+    This is not another `_compare`. `_compare`'s probe asks whether the replacement *agrees with the framework's
+    own implementation* -- a question about correctness, settled once, against a tolerance, because the two
+    implementations round at different points. This probe calls the **same already-installed replacement twice**
+    on the **same input** and asks only whether it agrees with *itself* -- a question with no legitimate tolerance,
+    because a GEMM run twice on unchanged data has no correct reason to move at all.
+
+    Found necessary on real hardware (an internal investigation, not shipped with this package, into one caller's
+    report of a construction-to-construction drift in a swap self-check's own measured value): a single L40S
+    individual, with a clean ECC/Xid/thermal/power history and nothing structurally wrong in how its FP8 kernels
+    were built or called, nonetheless returned a handful of differing elements, a few ULPs each, on a fraction of
+    repeated calls to the exact same FP8 matmul with the exact same input -- both the vendor's own cuBLAS path
+    (`torch._scaled_mm`) and this project's own borrowed Triton kernel, independently, on that one card; a second
+    physical card of the identical instance type showed zero mismatches across the same test. Standard precision
+    (`torch.matmul` in bf16/fp32) was unaffected on both cards -- only the FP8 Tensor Core path drifted, which is a
+    property of that one chip's low-precision execution units, not of this project's code or of a resource
+    collision in the process (`_reraise_if_resource_exhausted`'s own finding is a different failure, and was ruled
+    out before concluding this one). No kernel self-check against a reference implementation, however tight its
+    tolerance, can see a device disagree with its own last answer -- only asking it to repeat itself can.
+
+    Raised as `AdapterError`, independent of `require_kernels`: BRIEF-COMMON's determinism rule (every answer
+    bit-identical and company-independent) is not something a process on a device that cannot even repeat one GEMM
+    can meet, with or without the faster kernels, since the framework's own fallback for this op does not run on
+    FP8 Tensor Core instructions at all and would hide the fault rather than avoid it. Declines (does not raise)
+    only when it cannot run the probe at all for a resource reason, the same distinction `_compare` already draws
+    (`_reraise_if_resource_exhausted`), and when no installed module matches -- a build without the FP8 kernels has
+    nothing this check is about. `PRISMYRA_WITHOUT=fp8_determinism` turns it off for a caller that has already
+    decided to accept the risk; the shipped default is on.
+    """
+    # `Fp8Linear` first: its `forward` returns one tensor. `_FusedDenseProjection` (the only other installed
+    # module this file's own FP8 kernel runs under) returns a tuple -- one dense projection that happened to be
+    # fusible with its siblings, split back out -- and is only reached here if every standalone `Fp8Linear` was
+    # itself absorbed into a fused group, which `supports()`'s own MEASURED_CONFIG does not do for this model.
+    targets = _find_children(root, lambda m: type(m).__name__ == "Fp8Linear")
+    if not targets:
+        targets = _find_children(root, lambda m: type(m).__name__ == "_FusedDenseProjection")
+    if not targets:
+        applied.notes.append("fp8_determinism: nothing matched (no FP8 kernel is installed to check)")
+        return
+    _, _, probe = targets[0]
+    p = next(probe.parameters()) if list(probe.parameters()) else probe.weight
+    width = getattr(probe, "in_features", None) or p.shape[-1]
+    generator = torch.Generator(device="cpu").manual_seed(width)
+    x = (torch.randn(64, width, generator=generator) * 0.1).to(device=p.device, dtype=torch.bfloat16)
+
+    def _call(x: torch.Tensor) -> torch.Tensor:
+        # Normalised to one tensor so `torch.equal` has one thing to compare: `_FusedDenseProjection.forward`
+        # returns a tuple (each sibling's own share, split back out), `Fp8Linear.forward` returns one tensor
+        # already. Concatenating costs nothing a correctness check needs to economise on.
+        out = probe(x)
+        return torch.cat(out, dim=-1) if isinstance(out, tuple) else out
+
+    try:
+        with torch.inference_mode():
+            first = _call(x)
+            repeats = [_call(x) for _ in range(FP8_DETERMINISM_PROBES - 1)]
+    except Exception as e:  # noqa: BLE001 - a probe that cannot run at all is a resource question, not a finding
+        _reraise_if_resource_exhausted(e, "fp8_determinism")
+        applied.skipped.append(
+            f"fp8_determinism: the probe raised {type(e).__name__}: {e} -- not checked this construction"
+        )
+        return
+    mismatched = [i for i, again in enumerate(repeats) if not torch.equal(first, again)]
+    if mismatched:
+        moved = max((first.float() - repeats[i].float()).abs().max().item() for i in mismatched)
+        raise AdapterError(
+            f"fp8_determinism: the installed FP8 kernel answered the same input differently across "
+            f"{len(mismatched)} of {FP8_DETERMINISM_PROBES - 1} repeated calls in this process (max difference "
+            f"{moved:.3e}, bfloat16 output) -- this is the signature of a device whose FP8 Tensor Core execution "
+            f"is not giving this process the same bits back twice, not a disagreement this project's code can fix "
+            f"by retrying or by picking a different kernel. Move this process to a different GPU, or set "
+            f"PRISMYRA_WITHOUT=fp8_determinism to serve from this device anyway."
+        )
+    applied.notes.append(
+        f"fp8_determinism: {FP8_DETERMINISM_PROBES} calls to the installed FP8 kernel agreed bit-for-bit"
+    )
 
 
 def _is_block_quantised(module: nn.Module) -> bool:

@@ -1159,6 +1159,8 @@ class Prismyra:
         padded_rows = _round_rows(len(questions), group)
         texts = [p.text for p in plans]
 
+        from .paged import Full
+
         start = _now(self.torch_device)
         with self._lock, torch.inference_mode():
             try:
@@ -1171,6 +1173,20 @@ class Prismyra:
                     f"ran out of memory reading and answering {len(questions)} questions about a fresh document "
                     f"on a shelf (interleaved_fork). Ask fewer questions at a time, or build the engine with a "
                     f"smaller group."
+                ) from e
+            except Full as e:
+                # The write this read does (`interleave.read_and_branch_shelf` -> `PagedForkLayer.update` ->
+                # `Pool.admit`) can refuse for a page-pool reason distinct from device memory: `Pool` is a
+                # first-fit allocator over released runs, so a shelf whose residents' released runs are
+                # fragmented can refuse a document `schedule.Batcher._make_room`'s token-level accounting
+                # believed there was room for. Found on real hardware: this exact document answered cleanly
+                # through the plain, unbatched queue (no page pool there) and raised an uncaught `Full`
+                # (a plain `RuntimeError`, not a `PrismyraError`) through this call under `--batcher`, which
+                # `server.py`'s `/ask` did not know to catch and reported as a bare HTTP 500.
+                raise PrismyraError(
+                    f"the page pool has no room for a {len(questions)}-question document on this shelf right "
+                    f"now ({e}). Retrying is reasonable -- a later pass with different shelf company may free "
+                    f"the pages this one needed."
                 ) from e
         readout_ms = _since(start, self.torch_device)
 
@@ -1220,6 +1236,8 @@ class Prismyra:
         ]
         texts_per_doc = [[p.text for p in plans] for plans in plans_per_doc]
 
+        from .paged import Full
+
         start = _now(self.torch_device)
         with self._lock, torch.inference_mode():
             try:
@@ -1233,6 +1251,16 @@ class Prismyra:
                 raise PrismyraError(
                     f"ran out of memory reading and answering {len(contexts)} fresh documents in one "
                     f"layer-interleaved pass (interleaved_fork). Ask about fewer documents at a time."
+                ) from e
+            except Full as e:
+                # Same conversion, same reason, as `_shelf_ask_interleaved`'s own `except Full` just above it
+                # in this file: `Pool.admit`'s page-level fragmentation can refuse a write `_make_room`'s
+                # token-level accounting believed there was room for, and the plain `RuntimeError` that
+                # refusal raises is not one `server.py`'s `/ask` already knows to catch.
+                raise PrismyraError(
+                    f"the page pool has no room for {len(contexts)} fresh documents in one layer-interleaved "
+                    f"pass right now ({e}). Retrying is reasonable -- a later pass with different shelf "
+                    f"company may free the pages this one needed."
                 ) from e
         readout_ms = _since(start, self.torch_device)
 

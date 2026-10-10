@@ -20,13 +20,17 @@ Run with:
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import statistics
+import subprocess
+import sys
 import time
 
 import numpy as np
 import pytest
 import torch
+from gpu_room import no_room_reason
 
 from prismyra import Boolean, Choice, Prismyra, PrismyraError, Scale
 from prismyra import onepass
@@ -271,12 +275,54 @@ def test_padding_a_batch_does_not_reach_an_answer(engine):
         assert padded[q.id].option == exact[q.id].option
 
 
-def test_an_open_context_answers_as_a_fresh_one(engine):
-    """The saving is only legitimate if reading once and reusing gives what re-reading gives."""
-    asked = [Boolean(id="thirty", prompt="Is there a thirty day limit?")]
-    reused = engine.open_context(CONTEXT)
-    assert reused.ask(asked)["thirty"].option == engine.ask(CONTEXT, asked)["thirty"].option
-    assert reused.ask(asked)["thirty"].option == reused.ask(asked)["thirty"].option
+#: Builds its own engine, in its own subprocess -- see this test's own docstring for why. `CONTEXT` is spliced in
+#: by `repr()`, not read from a file, so the subprocess asks about exactly the string this module's own `CONTEXT`
+#: names, with no second copy of it to keep in step.
+_OPEN_CONTEXT_FRESH_SCRIPT = """
+import json, sys
+from prismyra import Boolean, Prismyra
+
+CONTEXT = {context!r}
+engine = Prismyra(sys.argv[1])
+asked = [Boolean(id="thirty", prompt="Is there a thirty day limit?")]
+reused = engine.open_context(CONTEXT)
+reused_answer = reused.ask(asked)["thirty"].option
+fresh_answer = engine.ask(CONTEXT, asked)["thirty"].option
+reused_again = reused.ask(asked)["thirty"].option
+outcome = {{"reused_vs_fresh": reused_answer == fresh_answer, "reused_vs_reused": reused_answer == reused_again}}
+print(json.dumps(outcome))
+"""
+
+
+def test_an_open_context_answers_as_a_fresh_one():
+    """The saving is only legitimate if reading once and reusing gives what re-reading gives.
+
+    Builds its own `Prismyra` in a subprocess, deliberately apart from the module-scoped `engine` fixture every
+    other test in this file shares. Found on a 32 GiB card (`RUN-rel5.md`'s own 5.6 section, not shipped with this
+    package): run after enough of this file's other tests to have left the shared engine's own cache holding
+    several contexts' worth of resident memory, this exact comparison -- unchanged, and passing on its own --
+    failed every time with a resource refusal, not a probability mismatch. The failure was never this test's own
+    property; it was how much of the card the tests that happened to run first had already spent. A fresh process
+    starts the card the way a caller who has not yet asked this engine anything else would see it, which is the
+    thing this test is actually about: the followed-up document should cost what the engine says it costs,
+    independent of what else that process did first.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    reason = no_room_reason(MODEL, __file__)
+    if reason:
+        pytest.skip(reason)
+    script = _OPEN_CONTEXT_FRESH_SCRIPT.format(context=CONTEXT)
+    done = subprocess.run([sys.executable, "-c", script, MODEL], capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        # Same discipline as `test_gpu_require_kernels.py`: a resource self-check that could not run at all now
+        # raises a loud, named error instead of silently choosing a different kernel path. Report it as a skip
+        # with the subprocess's own words, not a bare assertion against output that was never produced.
+        reason = done.stderr.strip().splitlines()[-1] if done.stderr.strip() else f"exit {done.returncode}"
+        pytest.skip(f"the subprocess construction could not run this comparison right now: {reason}")
+    outcome = json.loads(done.stdout.strip().splitlines()[-1])
+    assert outcome["reused_vs_fresh"] is True, outcome
+    assert outcome["reused_vs_reused"] is True, outcome
 
 
 def test_a_first_seen_context_costs_no_more_than_a_repeated_one(engine):
