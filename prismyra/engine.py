@@ -728,7 +728,11 @@ class Prismyra:
                     f"batch-invariant mode not available ({e}); open_batch/Batcher/read_and_branch may still "
                     "move an answer by who else shares the pass"
                 )
-        self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
+        # Experimental: keep the output-embedding matrix off the device, selected with `PRISMYRA_LM_HEAD=lazy`.
+        # See `readout.load_unembedding`'s `lazy` parameter: measured to free 0.947 GiB on a 36-layer checkpoint's
+        # vocabulary with no change to any answer (`/Users/akazawt/tmp/smr/air/RUN-q1.md`, 2026-10-10).
+        lazy_lm_head = os.environ.get("PRISMYRA_LM_HEAD") == "lazy"
+        self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype, lazy=lazy_lm_head)
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
         # measured question rather than an obvious one -- `evals/run.py` compares the two.
         self.calibration = Calibration() if calibrate else None
