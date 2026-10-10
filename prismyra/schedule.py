@@ -452,7 +452,9 @@ class Batcher:
             self._fused_single_passes += 1
             job = formed.jobs[0]
             self._make_room([job], keep={job.payload.digest})
-            result, handle, shelved = self.engine._shelf_ask_interleaved(shelf, job.payload.context, list(job.payload.questions))
+            result, handle, shelved = self.engine._shelf_ask_interleaved(
+                shelf, job.payload.context, list(job.payload.questions)
+            )
             self._resident[job.payload.digest] = handle
             self._digest_of[handle] = job.payload.digest
             shelf.documents[handle] = shelved

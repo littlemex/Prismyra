@@ -1,4 +1,5 @@
-"""Carry this card's dense-FP8 matmul tuning with the package, instead of leaving it to evaporate with the machine it was tuned on.
+"""Carry this card's dense-FP8 matmul tuning with the package, instead of leaving it to evaporate with the machine
+it was tuned on.
 
 Why this exists. vLLM's block-FP8 Triton matmul (`w8a8_triton_block_scaled_mm`, used by `Fp8Linear` and by every FP8
 dense projection in both the FP8-only and the NVFP4-experts checkpoints) is not itself a `triton.autotune` kernel --
@@ -16,12 +17,13 @@ figure for this tuning was never at risk of being wrong -- it was at risk of bei
 happened to run the tuner, and silently absent on every machine built since.
 
 What this does. Ships the already-tuned tables for the generations this project measures (one JSON file per
-(N, K, device name) cell, same format the project's own tuner writes, same `BLOCK_SIZE_K=128` as the untuned fallback so the
-inner reduction loop sums the same K-blocks in the same order -- `torch.equal` against the fallback was checked for
-every cell this project's checkpoints use before any file here was kept) under `pinned/fp8_block_configs/`, and
-copies the ones that match this process's device into vLLM's own configs directory before the first dense FP8 matmul
-runs, if vLLM does not already have a file there. It never overwrites a file vLLM already has: a machine someone tuned
-by hand, or a newer measurement placed there in this same session, is left alone.
+(N, K, device name) cell, same format the project's own tuner writes, same `BLOCK_SIZE_K=128` as the untuned
+fallback so the inner reduction loop sums the same K-blocks in the same order -- `torch.equal` against the
+fallback was checked for every cell this project's checkpoints use before any file here was kept) under
+`pinned/fp8_block_configs/`, and copies the ones that match this process's device into vLLM's own configs
+directory before the first dense FP8 matmul runs, if vLLM does not already have a file there. It never
+overwrites a file vLLM already has: a machine someone tuned by hand, or a newer measurement placed there in this
+same session, is left alone.
 """
 
 from __future__ import annotations
@@ -45,14 +47,14 @@ def device_name() -> str | None:
         from vllm.platforms import current_platform
 
         return current_platform.get_device_name().replace(" ", "_")
-    except Exception:
+    except Exception:  # noqa: BLE001 - best-effort device probe; any failure here means "untuned", not a crash
         return None
 
 
 def _vllm_configs_dir() -> Path | None:
     try:
         import vllm.model_executor.layers.quantization.utils.fp8_utils as F
-    except Exception:
+    except Exception:  # noqa: BLE001 - best-effort probe; an unexpected vLLM layout means "nothing to install"
         return None
     return Path(F.__file__).parent / "configs"
 

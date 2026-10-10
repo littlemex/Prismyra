@@ -406,7 +406,9 @@ def read_and_branch_shelf_many(
 
     n = len(contexts)
     if n < 2:
-        raise ValueError("read_and_branch_shelf_many needs at least two fresh documents; use read_and_branch_shelf for one")
+        raise ValueError(
+            "read_and_branch_shelf_many needs at least two fresh documents; use read_and_branch_shelf for one"
+        )
     if len(texts_per_doc) != n or len(padded_rows_per_doc) != n:
         raise ValueError(f"{n} documents need {n} question lists and {n} padded-row counts, not "
                           f"{len(texts_per_doc)} and {len(padded_rows_per_doc)}")

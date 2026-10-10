@@ -79,7 +79,9 @@ PROTOCOL = "prismyra-decide-v1"
 #: order here does not need to match the order a rendered prompt lists its options in).
 import string as _string  # noqa: E402 - kept local to the constant it builds, not a module-wide import
 
-_LABEL_CANDIDATES = list(_string.ascii_uppercase) + [a + b for a in _string.ascii_uppercase for b in _string.ascii_uppercase]
+_LABEL_CANDIDATES = list(_string.ascii_uppercase) + [
+    a + b for a in _string.ascii_uppercase for b in _string.ascii_uppercase
+]
 
 
 class DecideError(PrismyraError):

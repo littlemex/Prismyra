@@ -300,7 +300,7 @@ class _ProjectionSlot(nn.Module):
             return self.original(x)
         if self is self.order[0]:
             parts = self.fused(x)
-            for slot, part in zip(self.order[1:], parts[1:]):
+            for slot, part in zip(self.order[1:], parts[1:], strict=True):
                 slot._local.pending = part
             return parts[0]
         pending = self._local.pending
@@ -332,10 +332,10 @@ def _fuse_pair(applied, parent: nn.Module, names: tuple[str, ...], label: str) -
         with torch.inference_mode():
             want = [o(probe) for o in originals]
             got = [slot(probe) for slot in order]
-        if not all(torch.equal(w, g) for w, g in zip(want, got)):
+        if not all(torch.equal(w, g) for w, g in zip(want, got, strict=True)):
             applied.skipped.append(f"{label}: the {branch} branch disagreed with the separate calls, left separate")
             return False
-    for n, slot in zip(names, order):
+    for n, slot in zip(names, order, strict=True):
         setattr(parent, n, slot)
     return True
 

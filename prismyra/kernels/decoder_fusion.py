@@ -119,8 +119,6 @@ def install(applied, text: nn.Module) -> None:
         layer._fused_post_attention_layernorm = _FusedNorm(post_norm)
         layer.forward = types.MethodType(_layer_forward, layer)
     text._fused_final_norm = _FusedNorm(final_norm)
-    config = text.config
-    original_forward = text.forward.__func__ if hasattr(text.forward, "__func__") else type(text).forward
 
     def wrapped_forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None,
                          inputs_embeds=None, use_cache=None, **kwargs):

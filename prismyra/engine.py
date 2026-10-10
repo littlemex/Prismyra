@@ -1217,7 +1217,9 @@ class Prismyra:
                 hidden, handle, shelved = interleave.read_and_branch_shelf(
                     self, shelf, context, texts, width=width, padded_rows=padded_rows
                 )
-                scored = self.heads.apply(hidden, [q.options for q in questions], score(hidden, self.unembedding, token_ids, None))
+                scored = self.heads.apply(
+                    hidden, [q.options for q in questions], score(hidden, self.unembedding, token_ids, None)
+                )
             except torch.OutOfMemoryError as e:
                 raise PrismyraError(
                     f"ran out of memory reading and answering {len(questions)} questions about a fresh document "
@@ -1622,7 +1624,12 @@ class Prismyra:
                 if begin is not None:
                     begin([0, 1])  # the real document, then its padding -- one handle each, or `_write_context` refuses
             with varlen.reading(lengths, self.device) as boundaries:
-                self.backbone(input_ids=ids, position_ids=boundaries.positions(self.device), use_cache=True, past_key_values=cache)
+                self.backbone(
+                    input_ids=ids,
+                    position_ids=boundaries.positions(self.device),
+                    use_cache=True,
+                    past_key_values=cache,
+                )
                 _put_back_conv_states(cache, boundaries)
                 self._check_batched_read(cache, boundaries)
             taken = pick(snapshot(cache), 0)
@@ -1934,11 +1941,12 @@ class Prismyra:
     ):
         """The pass itself. Every row's positions start at its own document's end, which is per row not per batch.
 
-        Goes through `_run_recorded`, the same decision `_run_branch` uses for a single document. It did not used to:
-        this called the backbone directly, so `graphs=True` recorded nothing here, which is the gap `docs/PERFORMANCE.md`
-        names under "Recording the batched pass is not the next thing, and why". Wiring it is what that section says it
-        would take -- a few lines -- once the other half, `graphs.Recording` accepting a remainder bucket instead of an
-        exact context length, makes a recording survive the batch's documents changing between passes.
+        Goes through `_run_recorded`, the same decision `_run_branch` uses for a single document. It did not used
+        to: this called the backbone directly, so `graphs=True` recorded nothing here, which is the gap
+        `docs/PERFORMANCE.md` names under "Recording the batched pass is not the next thing, and why". Wiring it
+        is what that section says it would take -- a few lines -- once the other half, `graphs.Recording`
+        accepting a remainder bucket instead of an exact context length, makes a recording survive the batch's
+        documents changing between passes.
         """
         # Batch-invariant: see `_round_rows`. The row count is the only thing that otherwise differs between "two
         # documents answered together" and "either one answered alone", once the width is matched (`_round_pack_align`)
@@ -1968,7 +1976,7 @@ class Prismyra:
         padded_texts: list[str] = []
         real_row_at: list[int] = []  # index into `padded_texts`/the eventual padded rows for each real, flat row
         at = 0
-        for count, padded in zip(counts, padded_counts):
+        for count, padded in zip(counts, padded_counts, strict=True):
             block = texts[at : at + count]
             real_row_at.extend(range(len(padded_texts), len(padded_texts) + count))
             padded_texts.extend(block)
@@ -1994,7 +2002,7 @@ class Prismyra:
         parts = [(prefills[at].snapshot, padded_counts[at]) for at in range(len(counts))]
         rows_for_padded: list[int] = []
         at = 0
-        for count, padded in zip(counts, padded_counts):
+        for count, padded in zip(counts, padded_counts, strict=True):
             name = rows_for[at]  # every real row of one document already names the same document
             rows_for_padded.extend([name] * padded)
             at += count
@@ -2388,7 +2396,11 @@ class Prismyra:
         from .paged import BLOCK as page_block
 
         remainder = next(
-            (held % page_block for layer in cache.layers if (held := getattr(layer, "context_length", None)) is not None),
+            (
+                held % page_block
+                for layer in cache.layers
+                if (held := getattr(layer, "context_length", None)) is not None
+            ),
             None,
         )
         return (rows, width) if remainder is None else (rows, width, remainder)
@@ -2708,8 +2720,9 @@ def _enable_batch_invariance() -> None:
     0.0039 between a solo read and the real 8-document batch with router+tiling already fixed -- before the
     router, before any MoE op, inside the recurrence this engine depends on for its batching to be fast at all.
 
-    Two candidates were measured head-to-head at full scale (a single-layer signal, and separately the decisive 80-document/11-batch count):
-    disabling TF32 and bf16/fp16 reduced-precision matmul reduction closed layer 0's gap (0.0039 -> 0.0) but
+    Two candidates were measured head-to-head at full scale (a single-layer signal, and separately the decisive
+    80-document/11-batch count): disabling TF32 and bf16/fp16 reduced-precision matmul reduction closed layer
+    0's gap (0.0039 -> 0.0) but
     *reopened* it at layer 4 once checked across all 40 layers on the real batch -- a precision change shrinks the
     chunk-boundary reduction-order effect enough to round to zero at shallow layers, not remove it, so it does not
     survive the full benchmark (still 2/80 mismatches). Registering vLLM's fixed-tile Triton matmul on
@@ -2776,7 +2789,7 @@ def _enable_batch_invariance() -> None:
     )
     from vllm.platforms import current_platform
 
-    global _BATCH_INVARIANT_REFCOUNT
+    global _BATCH_INVARIANT_REFCOUNT  # noqa: PLW0603 - a process-wide refcount for a process-wide dispatcher claim
     _BATCH_INVARIANT_REFCOUNT += 1
 
     # fused_moe.py's own guard (`get_default_config`): picks a fixed MoE tiling config instead of one keyed by the
@@ -2831,7 +2844,7 @@ def _enable_batch_invariance() -> None:
     # Kept alive while the refcount is above zero (matching `enable_batch_invariant_mode`'s own module-level
     # singleton while it is wanted at all): letting it be garbage-collected is now how `_disable_batch_invariance`
     # un-registers these four, deliberately, rather than something to avoid happening by accident.
-    global _BATCH_INVARIANT_DISPATCH_LIB
+    global _BATCH_INVARIANT_DISPATCH_LIB  # noqa: PLW0603 - kept alive at module scope; see the comment above
     _BATCH_INVARIANT_DISPATCH_LIB = lib
 
     if not current_platform.is_device_capability_family(80):
@@ -2840,7 +2853,7 @@ def _enable_batch_invariance() -> None:
         # through one of the four aten ops above (e.g. a custom op that calls `at::cuda::blas::gemm` itself).
         # Original values saved on the module (`_BATCH_INVARIANT_SAVED_BACKENDS`) so `_disable_batch_invariance`
         # can put them back rather than guessing torch's defaults.
-        global _BATCH_INVARIANT_SAVED_BACKENDS
+        global _BATCH_INVARIANT_SAVED_BACKENDS  # noqa: PLW0603 - process-wide save slot for the restore below
         _BATCH_INVARIANT_SAVED_BACKENDS = (
             os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
             os.environ.get("CUBLASLT_WORKSPACE_SIZE"),
@@ -2864,7 +2877,8 @@ def _disable_batch_invariance() -> None:
     anything un-paged, and leaving a stray env var set is a smaller risk than mis-timing when fused_moe.py reads
     it.
     """
-    global _BATCH_INVARIANT_REFCOUNT, _BATCH_INVARIANT_DISPATCH_LIB, _BATCH_INVARIANT_SAVED_BACKENDS
+    # The same deliberate module-level trio `_enable_batch_invariance`'s own three `global` statements above claim.
+    global _BATCH_INVARIANT_REFCOUNT, _BATCH_INVARIANT_DISPATCH_LIB, _BATCH_INVARIANT_SAVED_BACKENDS  # noqa: PLW0603
     if _BATCH_INVARIANT_REFCOUNT == 0:
         return
     _BATCH_INVARIANT_REFCOUNT -= 1

@@ -34,7 +34,8 @@ def _fp8_source(rows: int, cols: int, seed: int) -> tuple[torch.Tensor, torch.Te
     g = torch.Generator().manual_seed(seed)
     full = torch.randn(rows, cols, generator=g) * 0.3
     block_scale = full.view(rows // 128, 128, cols // 128, 128).abs().amax((1, 3)) / 448.0
-    quantised = (full.view(rows // 128, 128, cols // 128, 128) / block_scale.view(rows // 128, 1, cols // 128, 1).clamp(min=1e-12)).clamp(-448, 448).to(FP8)
+    divisor = block_scale.view(rows // 128, 1, cols // 128, 1).clamp(min=1e-12)
+    quantised = (full.view(rows // 128, 128, cols // 128, 128) / divisor).clamp(-448, 448).to(FP8)
     return quantised.view(rows, cols), block_scale.contiguous(), full
 
 
@@ -57,7 +58,10 @@ def _decode(packed: torch.Tensor, scale: torch.Tensor, g: torch.Tensor, device) 
     value per original column -- is what a decoder has to do, not an extra step for a test to skip."""
     lo, hi = (packed & 0x0F).long(), ((packed >> 4) & 0x0F).long()
     table = _e2m1(device)
-    sign = lambda c: torch.where((c & 0x8).bool(), -1.0, 1.0)
+
+    def sign(c):
+        return torch.where((c & 0x8).bool(), -1.0, 1.0)
+
     lo_val, hi_val = table[lo & 0x7] * sign(lo), table[hi & 0x7] * sign(hi)
     code_vals = torch.stack([lo_val, hi_val], dim=-1).flatten(-2)  # (rows, cols), columns back in original order
     eff = (scale.float() / g).repeat_interleave(16, dim=-1)  # one group's scale broadcast to its sixteen columns
@@ -118,7 +122,9 @@ def test_the_adapter_runs_the_routed_experts_in_nvfp4_and_still_answers():
         pytest.skip("no CUDA device")
     model = os.environ.get("PRISMYRA_NVFP4_TEST_MODEL")
     if not model or os.environ.get("PRISMYRA_EXPERTS") != "nvfp4":
-        pytest.skip("set PRISMYRA_NVFP4_TEST_MODEL, PRISMYRA_EXPERTS=nvfp4, PRISMYRA_NVFP4_EXPERTS, PRISMYRA_NVFP4_CALIB")
+        pytest.skip(
+            "set PRISMYRA_NVFP4_TEST_MODEL, PRISMYRA_EXPERTS=nvfp4, PRISMYRA_NVFP4_EXPERTS, PRISMYRA_NVFP4_CALIB"
+        )
     try:
         import flashinfer  # noqa: F401
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import run_cutlass_moe_fp4  # noqa: F401

@@ -109,7 +109,9 @@ def test_cold_starts_pin_the_nvfp4_tactic_too(tmp_path):
         pytest.skip("no CUDA device")
     model = os.environ.get("PRISMYRA_NVFP4_TEST_MODEL")
     if not model or os.environ.get("PRISMYRA_EXPERTS") != "nvfp4":
-        pytest.skip("set PRISMYRA_NVFP4_TEST_MODEL, PRISMYRA_EXPERTS=nvfp4, PRISMYRA_NVFP4_EXPERTS, PRISMYRA_NVFP4_CALIB")
+        pytest.skip(
+            "set PRISMYRA_NVFP4_TEST_MODEL, PRISMYRA_EXPERTS=nvfp4, PRISMYRA_NVFP4_EXPERTS, PRISMYRA_NVFP4_CALIB"
+        )
     import gc
 
     gc.collect()

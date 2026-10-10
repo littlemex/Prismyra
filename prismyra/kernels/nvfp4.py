@@ -17,6 +17,7 @@ import os
 import threading
 import warnings
 from pathlib import Path
+from typing import ClassVar
 
 import torch
 from torch import nn
@@ -59,7 +60,11 @@ def quantize_search(w: torch.Tensor, global_scale: torch.Tensor, importance: tor
     `importance` is per input column (e.g. the mean squared input); None means plain squared error."""
     rows, cols = w.shape
     blocks = w.view(rows, cols // 16, 16)
-    imp = (importance.float().view(1, cols // 16, 16) if importance is not None else torch.ones(1, cols // 16, 16, device=w.device))
+    imp = (
+        importance.float().view(1, cols // 16, 16)
+        if importance is not None
+        else torch.ones(1, cols // 16, 16, device=w.device)
+    )
     amax = blocks.abs().amax(-1)
     table = _e2m1(w.device)
     best_err = best_scale = None
@@ -74,7 +79,8 @@ def quantize_search(w: torch.Tensor, global_scale: torch.Tensor, importance: tor
             best_err, best_scale = err, scale.float()
         else:
             better = err < best_err
-            best_err = torch.where(better, err, best_err); best_scale = torch.where(better, scale.float(), best_scale)
+            best_err = torch.where(better, err, best_err)
+            best_scale = torch.where(better, scale.float(), best_scale)
     scale = best_scale.to(FP8)
     eff = (scale.float() / global_scale).unsqueeze(-1)
     x = torch.where(eff > 0, blocks / eff, torch.zeros_like(blocks)).clamp(-6, 6)
@@ -110,7 +116,9 @@ class FusedExpertsFp4(nn.Module):
         super().__init__()
         from vllm.model_executor.layers.quantization.utils.nvfp4_utils import swizzle_blockscale
 
-        self.gate, self.shared_expert, self.shared_expert_gate = block.gate, block.shared_expert, block.shared_expert_gate
+        self.gate = block.gate
+        self.shared_expert = block.shared_expert
+        self.shared_expert_gate = block.shared_expert_gate
         self.top_k = top_k
         t = {k: v.to(device) for k, v in prepared.items()}
         e = t["w1"].shape[0]
@@ -162,8 +170,8 @@ class FusedExpertsFp4(nn.Module):
         shared = torch.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
         return (out + shared).reshape(shape)
 
-    _ws: dict = {}
-    _ws_size: dict = {}
+    _ws: ClassVar[dict] = {}
+    _ws_size: ClassVar[dict] = {}
 
     def _workspace(self, m: int, x_dtype) -> torch.Tensor:
         """One scratch buffer per calling thread for every MoE layer (they share shapes), grown to the largest
@@ -256,7 +264,9 @@ def prepare_layer(w13, s13, w2, s2, device, imp_in=None, imp_mid=None, tok=None)
                 p, sc = quantize_search(d, g, imp)
             else:
                 p, sc = quantize(d, g)
-            out["w" + k].append(p); out["s" + k].append(sc); out["g" + k].append(g.float())
+            out["w" + k].append(p)
+            out["s" + k].append(sc)
+            out["g" + k].append(g.float())
     return {k: torch.stack(v).cpu() for k, v in out.items()}
 
 
@@ -350,7 +360,7 @@ def autotune_tactics(layer: FusedExpertsFp4, max_tokens: int = 16384) -> None:
     """
     from flashinfer.autotuner import AutoTuner, autotune
 
-    global _INFERENCE_AUTOTUNE_CTX, _TACTIC_SOURCE
+    global _INFERENCE_AUTOTUNE_CTX, _TACTIC_SOURCE  # noqa: PLW0603 - process-wide autotune state, by design
     buckets = (max_tokens,)
     env_cache = os.environ.get("PRISMYRA_NVFP4_TACTICS")
     cache = env_cache
@@ -435,7 +445,10 @@ class Fp4Linear(nn.Module):
 
         w = _dequant_fp8(fp8.weight, fp8.scale)
         g = 448.0 * 6.0 / w.abs().amax().clamp_min(1e-12)
-        packed, sc = quantize_search(w, g, importance.to(w.device) if importance is not None else None) if search else quantize(w, g)
+        if search:
+            packed, sc = quantize_search(w, g, importance.to(w.device) if importance is not None else None)
+        else:
+            packed, sc = quantize(w, g)
         self.out_features, self.in_features = w.shape
         self.weight, self.pad = pad_nvfp4_weight_for_cutlass(packed)
         self.weight_scale = swizzle_blockscale(sc)
@@ -460,7 +473,8 @@ def convert_dense(model: nn.Module) -> int:
     """Replace every Fp8Linear whose name does not match PRISMYRA_DENSE_KEEP (a regex) with Fp4Linear."""
     import re
 
-    calib = json.load(open(os.environ["PRISMYRA_NVFP4_CALIB"]))["dense_in_amax"]
+    with open(os.environ["PRISMYRA_NVFP4_CALIB"]) as f:
+        calib = json.load(f)["dense_in_amax"]
     keep = re.compile(os.environ.get("PRISMYRA_DENSE_KEEP", "^$"))
     search = os.environ.get("PRISMYRA_NVFP4_SEARCH") == "1"
     stats = _importance() if search else None
@@ -472,7 +486,10 @@ def convert_dense(model: nn.Module) -> int:
         if key not in calib:
             continue
         parent = model.get_submodule(name.rsplit(".", 1)[0])
-        imp = stats[key]["in"] / max(1.0, float(stats[key].get("tok", torch.tensor(1.0)).sum())) if stats and key in stats else None
+        if stats and key in stats:
+            imp = stats[key]["in"] / max(1.0, float(stats[key].get("tok", torch.tensor(1.0)).sum()))
+        else:
+            imp = None
         setattr(parent, name.rsplit(".", 1)[1], Fp4Linear(m, calib[key], imp, search))
         del m
         done += 1
