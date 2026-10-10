@@ -62,6 +62,18 @@ def test_choice_labels_falls_back_to_a_smaller_pool_the_tokenizer_actually_suppo
     assert labels == _LABEL_CANDIDATES[:10]
 
 
+def test_parse_item_labels_a_choice_question_past_the_26_letter_alphabet():
+    """`choice_labels`' own candidate order continues past `Z` with two-letter labels (`AA`, `AB`, ...). A
+    `choice` question with more than 26 options must actually reach and use them, not just have them exist in
+    the candidate pool `choice_labels` returns."""
+    labels = _labels(255)
+    options = [f"opt{i}" for i in range(30)]
+    item = parse_item({"kind": "choice", "state": "x", "question": "?", "options": options}, 0, labels)
+    assert item.symbols["opt26"] == "AA"
+    assert item.symbols["opt29"] == "AD"
+    assert set(item.question.choices) == set(labels[:30])
+
+
 # --------------------------------------------------------------------------- parse_item
 
 
