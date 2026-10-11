@@ -147,13 +147,34 @@ narrower group to fit at all. Verified bit-identical to the unpatched path acros
 question counts spanning both one group and more than one (4,700 probability checks, all exact) -- freeing a buffer
 sooner changes nothing about what it held.
 
-One more thing this measurement found and is recorded here rather than acted on: `cache.state_bytes`, which prices
-a gated-delta-net layer's held state at the model's own compute dtype, is pricing only half of it -- the
-convolution state is kept at that dtype, measured, but the recurrent state itself is kept in `float32` by the
-framework regardless, twice what the formula assumes. The admission budget this feeds has been conservative in
-every case measured so far purely by chance, not by this being accounted for; tightening the formula to the state's
-actual dtype is a correctness fix to admission's own arithmetic, independent of the leak this section just closed,
-and is left for whoever next touches `cache.state_bytes`.
+One more thing this measurement found: `cache.state_bytes`, which priced a gated-delta-net layer's held state at
+the model's own compute dtype, was pricing only half of the recurrent half of it. [The next section](#the-budget-
+figure-that-was-pricing-half-the-state-it-counted) is that fix.
+
+### The budget figure that was pricing half the state it counted
+
+`cache.state_bytes` prices a gated-delta-net layer's held state -- the recurrent half and the convolution half --
+at the model's own compute dtype, the same dtype the formula next to it in `cache_bytes` uses for the key-value
+cache. The convolution half really is held at that dtype, measured on the live buffer. The recurrent half is not:
+`transformers`' gated-delta-rule kernel, chunked or single-step, upcasts every operand to `float32` before folding
+a token into the state, unconditionally, whatever dtype the rest of the model runs its matmuls at -- so the live
+cache's `recurrent_states` is always `float32`, confirmed on device at every context length and question count
+tried (2,000 to 16,000 tokens, one question to thirty-two), and the same whether the rest of the model ran at
+`bfloat16` or at a quantized compute dtype. The formula was pricing it at half that width, understating a
+32-row group's held state by 0.84 GiB on the supported model -- 0.90 GiB priced against 1.74 GiB actually held.
+
+Fixed by pricing the two halves at their own dtypes rather than one shared one: the recurrent half at
+`cache.RECURRENT_STATE_DTYPE` (`float32`, a module constant rather than a multiplier, because a flat "double it"
+would have been right for a two-byte compute dtype by coincidence and wrong for a one-byte one), the convolution
+half at the model's own dtype as before. Not a numerical change to anything a kernel computes -- the live buffer was
+always `float32`; only admission's own arithmetic about it was wrong -- so every answer this engine gives is
+unaffected. Verified bit-identical to the unpatched formula's own engine across the same ten context lengths and
+ten question counts [the release fix above](#the-unrelated-climb-a-recurrent-layers-own-state) was checked against
+(4,700 probability checks, all exact), and the sweep across 22.5 GiB and 24.0 GiB from [the previous
+section](#fitting-a-long-context-and-a-wide-group-on-one-card) re-run against the corrected formula: all eighty-one
+combinations at both budgets admitted exactly the combinations they admitted before, because none of them sat
+within 0.84 GiB of either budget's own edge. The correction only ever makes admission's own account of a context
+honest; it does not, in anything measured so far, make admission refuse something it used to accept.
 
 ## Where it wins and where it loses
 

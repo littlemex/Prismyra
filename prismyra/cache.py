@@ -462,6 +462,18 @@ def cache_bytes(
     return keys_and_values + state_bytes(config, rows, dtype)
 
 
+#: The dtype a gated-delta-net layer's recurrent state is actually held in, regardless of the model's own compute
+#: dtype. Not a guess: `transformers`' chunked and single-step gated-delta-rule kernels (and the fused kernel they
+#: fall back from) upcast every operand -- query, key, value, the gate and the beta -- to `float32` before folding a
+#: token into the state, unconditionally, whatever dtype the rest of the model runs the matmuls at. The live cache's
+#: `recurrent_states` is therefore always `float32`, confirmed on device rather than assumed: a 32-row buffer on the
+#: supported model measured 2 MiB a row -- `float32`'s own width, not `bfloat16`'s -- at every context length and
+#: question count tried, and the same when the rest of the model ran its matmuls at `fp8` or `nvfp4`. The convolution
+#: window carries no such promotion and is priced at the model's own `dtype`, which is what the same measurement
+#: found for it.
+RECURRENT_STATE_DTYPE = torch.float32
+
+
 def state_bytes(config, rows: int, dtype: torch.dtype) -> int:
     """The recurrence and convolution state an open context holds, for every row of the group.
 
@@ -469,13 +481,21 @@ def state_bytes(config, rows: int, dtype: torch.dtype) -> int:
     the first branch pass, at that pass's row count. It is held memory: allocated when a context is read and kept until
     it closes, one copy per row because each row advances its own recurrence over its own tokens.
 
-    On the supported model it is about 32 MiB per row -- 1.06 MiB for each of the thirty gated delta net layers -- so a
-    group of thirty-two holds a gigabyte of it. Leaving it out made the budget wrong in both directions: the answering
-    figure absorbed the allocation and multiplied it by the group, and the reading figure divided it by the context's
-    token count and multiplied it by every later length.
+    On the supported model it is about 65 MiB per row -- 2.06 MiB for each of the twenty-seven gated delta net layers --
+    so a group of thirty-two holds nearly two gigabytes of it. Leaving it out made the budget wrong in both directions:
+    the answering figure absorbed the allocation and multiplied it by the group, and the reading figure divided it by
+    the context's token count and multiplied it by every later length.
 
-        recurrent, per row per layer  =  value heads x value dim x key dim x bytes
-        convolution, per row per layer  =  (2 x key heads x key dim + value heads x value dim) x kernel x bytes
+        recurrent, per row per layer  =  value heads x value dim x key dim x float32's own width
+        convolution, per row per layer  =  (2 x key heads x key dim + value heads x value dim) x kernel x
+                                            dtype's own width
+
+    The recurrent half is priced at `RECURRENT_STATE_DTYPE` (`float32`, always, see that constant's own docstring for
+    why), not at `dtype`: pricing it at the model's own compute dtype -- what this function did until it was measured
+    against the live buffer -- halved the recurrent half's true cost whenever that dtype was two bytes wide (`bfloat16`
+    or `float16`), and would have been wrong by a different factor at one byte (`fp8`, a quantized compute dtype), which
+    is exactly why a flat multiplier was not the fix: the two state kinds are each held at their own real dtype, and
+    each is priced at that dtype's own width rather than at a ratio borrowed from one past measurement.
     """
     decoder = getattr(config, "text_config", config)
     layer_types = list(getattr(decoder, "layer_types", []) or [])
@@ -489,9 +509,10 @@ def state_bytes(config, rows: int, dtype: torch.dtype) -> int:
     kernel = getattr(decoder, "linear_conv_kernel_dim", 0)
     if not all((value_heads, key_heads, value_dim, key_dim, kernel)):
         return 0
-    per_element = torch.empty((), dtype=dtype).element_size()
-    recurrent = value_heads * value_dim * key_dim * per_element
-    convolution = (2 * key_heads * key_dim + value_heads * value_dim) * kernel * per_element
+    recurrent_element = torch.empty((), dtype=RECURRENT_STATE_DTYPE).element_size()
+    conv_element = torch.empty((), dtype=dtype).element_size()
+    recurrent = value_heads * value_dim * key_dim * recurrent_element
+    convolution = (2 * key_heads * key_dim + value_heads * value_dim) * kernel * conv_element
     return recurrent_layers * rows * (recurrent + convolution)
 
 

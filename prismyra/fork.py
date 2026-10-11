@@ -131,12 +131,12 @@ def widen_for_branch(layer, rows: int, width: int, lane: int = 0, release: bool 
     would pay the allocation twice for nothing. A request with exactly one group never calls this layer's
     `widen_for_branch` again before its cache is dropped -- see `read_and_branch`'s own caller, which is the
     only place that knows the group count and is the only place that passes `release=True`. What this frees is
-    real: `cache.state_bytes`'s own docstring measures the recurrent half of it at twice what it assumed (the
-    framework keeps a gated-delta-net layer's recurrent state in `float32` regardless of the model's own
-    dtype, measured on the supported model as 2 MiB a row rather than the 1 MiB `state_bytes` priced it at),
-    and every one of the thirty-six layers' own `_owned` buffer is alive from this call until the whole cache
-    is dropped at the end of the request -- a one-group answer at a context long enough to need chunking pays
-    for all thirty of them at once for no reason it ever uses again.
+    real: `cache.state_bytes` now prices this at the recurrent state's own dtype (`cache.RECURRENT_STATE_DTYPE`,
+    `float32`, measured on the supported model as 2 MiB a row -- the framework keeps a gated-delta-net layer's
+    recurrent state in `float32` regardless of the model's own dtype), and every one of the thirty-six layers'
+    own `_owned` buffer is alive from this call until the whole cache is dropped at the end of the request -- a
+    one-group answer at a context long enough to need chunking pays for all thirty of them at once for no reason
+    it ever uses again.
     """
     held: dict[tuple, torch.Tensor] = {}
     for attr in ("recurrent_states", "conv_states"):

@@ -300,6 +300,45 @@ def test_the_memory_figure_counts_the_context_once():
     assert replicated / got > 5
 
 
+def test_state_bytes_prices_the_recurrent_half_at_its_own_dtype_not_the_models():
+    """`state_bytes`'s recurrent half must not move with the model's own compute dtype -- the framework holds a
+    gated-delta-net layer's recurrent state in `float32` whatever matmul dtype the rest of the model runs at
+    (measured on device: a 32-row buffer is 2 MiB a row under `bfloat16` and under `fp8` compute alike). A
+    hardcoded doubling would happen to match a two-byte model dtype and silently misprice a one-byte one; this
+    test runs the formula at three different model dtypes and checks that only the convolution half moves."""
+
+    from typing import ClassVar
+
+    from prismyra.cache import RECURRENT_STATE_DTYPE, state_bytes
+
+    class Config:
+        linear_num_value_heads = 32
+        linear_num_key_heads = 16
+        linear_value_head_dim = 128
+        linear_key_head_dim = 128
+        linear_conv_kernel_dim = 4
+        layer_types: ClassVar[list[str]] = ["full_attention"] + ["linear_attention"] * 27
+
+    rows = 32
+    recurrent_element = torch.empty((), dtype=RECURRENT_STATE_DTYPE).element_size()
+    recurrent_per_row_per_layer = 32 * 128 * 128 * recurrent_element
+
+    for model_dtype in (torch.bfloat16, torch.float16, torch.float8_e4m3fn):
+        got = state_bytes(Config(), rows, model_dtype)
+        conv_element = torch.empty((), dtype=model_dtype).element_size()
+        convolution_per_row_per_layer = (2 * 16 * 128 + 32 * 128) * 4 * conv_element
+        expected = 27 * rows * (recurrent_per_row_per_layer + convolution_per_row_per_layer)
+        assert got == expected
+
+    # The recurrent half alone (dtype held fixed) must be exactly double what pricing it at `bfloat16` -- the bug
+    # this fixes -- would have given, since `float32` is twice `bfloat16`'s width and the convolution term is
+    # identical either way at a `bfloat16` model.
+    buggy_bf16_formula = 27 * rows * ((32 * 128 * 128 + (2 * 16 * 128 + 32 * 128) * 4) * 2)
+    fixed = state_bytes(Config(), rows, torch.bfloat16)
+    assert fixed > buggy_bf16_formula
+    assert fixed - buggy_bf16_formula == 27 * rows * (32 * 128 * 128 * 2)
+
+
 def test_the_layer_records_the_row_count_it_was_actually_given():
     """A witness for the claim that a narrow group runs narrow.
 
