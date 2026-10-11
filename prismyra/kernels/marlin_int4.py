@@ -9,14 +9,21 @@ weight-only quantization -- activations stay bf16, so no calibration file of per
 The point is a checkpoint small enough for a 24 GiB Ada/Ampere card (an L4), where the ordinary FP8 routed experts
 alone are already about 27 GiB -- more than the card has, loaded whole, before any quantizing even starts
 (measured directly: `AutoModel.from_pretrained` on the plain checkpoint `torch.OutOfMemoryError`s on an L4 while
-still loading, nowhere near this file's own code). `tiny_experts()` (`kernels/nvfp4.py`, reused rather than
-duplicated) is what keeps a caller's `AutoModel.from_pretrained` from ever allocating the full-sized routed
-experts in the first place; `convert()` below separately reads each expert's *real* FP8 tensors straight off the
-original checkpoint's safetensors shards, one expert at a time, through vLLM's own `safe_open` -- lazy, so opening
-a shard costs nothing until a tensor is actually read, and nothing from one expert's read is kept once the next
-expert's starts. This is the same "one layer at a time from the host" discipline `nvfp4.py`'s own module docstring
-describes, taken one level further (one *expert*, not one *layer*) because here the one card both the FP8 source
-and the int4 destination have to fit in at once is the card this format exists for.
+still loading, nowhere near this file's own code). This file's own `tiny_experts()` is what keeps a caller's
+`AutoModel.from_pretrained` from ever allocating the full-sized routed experts in the first place -- not
+`nvfp4.py`'s own `tiny_experts()`, which patches `transformers.integrations.finegrained_fp8.FP8Experts.__init__`
+and (measured directly, on real hardware, after this file's first version silently allocated the full 256-expert
+tensors and `torch.OutOfMemoryError`'d regardless) is not the class this checkpoint's routed experts actually
+load as: `Qwen3_5MoeExperts` (`transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`), a plain, dtype-agnostic
+module that reads `config.num_experts` directly to size `gate_up_proj`/`down_proj` -- the FP8 dtype itself is
+applied to its parameters generically by the loader's own quantization machinery, not by a dedicated FP8 subclass
+nvfp4.py's `tiny_experts()` could patch instead. `convert()` below separately reads each expert's *real* FP8
+tensors straight off the original checkpoint's safetensors shards, one expert at a time, through vLLM's own
+`safe_open` -- lazy, so opening a shard costs nothing until a tensor is actually read, and nothing from one
+expert's read is kept once the next expert's starts. This is the same "one layer at a time from the host"
+discipline `nvfp4.py`'s own module docstring describes, taken one level further (one *expert*, not one *layer*)
+because here the one card both the FP8 source and the int4 destination have to fit in at once is the card this
+format exists for.
 
 The quantization recipe: each expert's FP8 blocks are restored to the values served today
 (`nvfp4._dequant_fp8`, reused rather than duplicated), then quantized round-to-nearest in groups of 128 along the
@@ -38,7 +45,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from .nvfp4 import _dequant_fp8, tiny_experts  # noqa: F401 - tiny_experts re-exported for engine.py
+from .nvfp4 import _dequant_fp8
 
 #: Along the reduction (input) dimension of each matrix, matching this checkpoint's hidden size (2048) and routed
 #: expert intermediate size (512) exactly (16 and 4 groups respectively, no remainder) -- so the Marlin thread-tile
@@ -204,6 +211,40 @@ class FusedExpertsMarlinInt4(nn.Module):
         )
         shared = torch.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
         return (out + shared).reshape(shape)
+
+
+class tiny_experts:
+    """While loading, build every `Qwen3_5MoeExperts` module with one expert of one row, so a caller's
+    `AutoModel.from_pretrained` never allocates the routed experts at full size, the way `nvfp4.tiny_experts`
+    does for the class *its* checkpoint's experts load as. Not that class: confirmed on real hardware (an L4,
+    where this file's first version silently allocated the full 256-expert tensors regardless of patching
+    `nvfp4.tiny_experts` and `torch.OutOfMemoryError`'d before any of this file's own code ran), this checkpoint's
+    routed experts are a plain `Qwen3_5MoeExperts` (`transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`),
+    not `transformers.integrations.finegrained_fp8.FP8Experts` -- a dtype-agnostic module that reads
+    `config.num_experts` directly in its own `__init__` to size `gate_up_proj`/`down_proj`
+    (`torch.empty(config.num_experts, ...)`), with the FP8 dtype itself applied to those parameters generically by
+    the loader's own quantization machinery rather than by a dedicated FP8 subclass. Shrinking `num_experts` to 1
+    on a throwaway copy of the config is therefore enough on its own, the same trade `nvfp4.tiny_experts` makes
+    for the class it patches."""
+
+    def __enter__(self):
+        import copy
+
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as m
+
+        self._m, self._init = m, m.Qwen3_5MoeExperts.__init__
+        original = self._init
+
+        def init(module, config, *args, **kwargs):
+            small = copy.copy(config)
+            small.num_experts = 1
+            original(module, small, *args, **kwargs)
+
+        m.Qwen3_5MoeExperts.__init__ = init
+        return self
+
+    def __exit__(self, *exc):
+        self._m.Qwen3_5MoeExperts.__init__ = self._init
 
 
 @torch.no_grad()
