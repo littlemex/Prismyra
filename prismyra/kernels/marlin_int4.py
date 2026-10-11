@@ -213,23 +213,65 @@ class FusedExpertsMarlinInt4(nn.Module):
         return (out + shared).reshape(shape)
 
 
+#: Substring that marks a checkpoint key as one of the routed experts' own tensors (`...mlp.experts.{i}.
+#: {gate_proj,up_proj,down_proj}.weight[_scale_inv]`), shared between `tiny_experts`'s file-reading patch below
+#: and `convert()`'s own prefix-building -- both have to agree on what "an expert key" looks like.
+EXPERT_KEY_MARKER = ".mlp.experts."
+
+
+class _ExpertFreePointer:
+    """Wraps one `safetensors.safe_open` file handle so `.keys()` never reports a routed-expert tensor.
+
+    Exists because stripping `model.safetensors.index.json`'s own `weight_map` is not enough on its own
+    (measured on real hardware: still `torch.OutOfMemoryError`'d with the index stripped). `transformers`'
+    `_load_pretrained_model` does not trust that index for *which keys a file contains* -- it opens every file
+    `checkpoint_files` names and calls `file_pointer.keys()` on it directly, folding every key the file
+    physically holds into the merged state dict, regardless of what the index declared. A checkpoint's expert
+    and non-expert tensors for one layer share one shard file here, so opening that file for its (small) kept
+    keys silently re-admits all 256 of its (large) expert ones -- the index was never wrong, the file was just
+    never asked to agree with it. Everything but `keys()` passes straight through to the real handle.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def keys(self):
+        return [k for k in self._inner.keys() if EXPERT_KEY_MARKER not in k]  # noqa: SIM118 - not a dict, a file handle
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return self._inner.__exit__(*exc)
+
+
 class tiny_experts:
-    """While loading, build every `Qwen3_5MoeExperts` module with one expert of one row, so a caller's
-    `AutoModel.from_pretrained` never allocates the routed experts at full size, the way `nvfp4.tiny_experts`
-    does for the class *its* checkpoint's experts load as. Not that class: confirmed on real hardware (an L4,
-    where this file's first version silently allocated the full 256-expert tensors regardless of patching
-    `nvfp4.tiny_experts` and `torch.OutOfMemoryError`'d before any of this file's own code ran), this checkpoint's
-    routed experts are a plain `Qwen3_5MoeExperts` (`transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`),
-    not `transformers.integrations.finegrained_fp8.FP8Experts` -- a dtype-agnostic module that reads
-    `config.num_experts` directly in its own `__init__` to size `gate_up_proj`/`down_proj`
-    (`torch.empty(config.num_experts, ...)`), with the FP8 dtype itself applied to those parameters generically by
-    the loader's own quantization machinery rather than by a dedicated FP8 subclass. Shrinking `num_experts` to 1
-    on a throwaway copy of the config is therefore enough on its own, the same trade `nvfp4.tiny_experts` makes
-    for the class it patches."""
+    """While loading, keep a caller's `AutoModel.from_pretrained` from ever allocating or reading the routed
+    experts at full size, the way `nvfp4.tiny_experts` does for the checkpoint and the loader version *it* was
+    measured against. Not the same mechanism: on real hardware (an L4), with this checkpoint, on this installed
+    `transformers`, neither half of `nvfp4.tiny_experts`'s trick held --
+
+    1. The routed experts are a plain `Qwen3_5MoeExperts` (`transformers/models/qwen3_5_moe/
+       modeling_qwen3_5_moe.py`), not `transformers.integrations.finegrained_fp8.FP8Experts` -- a dtype-agnostic
+       module that reads `config.num_experts` directly in its own `__init__` to size `gate_up_proj`/`down_proj`.
+       Patched here the same way nvfp4.tiny_experts patches the class it targets: a throwaway config copy with
+       `num_experts=1` for the one call to the real `__init__`.
+    2. A stripped `model.safetensors.index.json` is not enough to keep this installed `transformers`'
+       `_load_pretrained_model` from reading the expert tensors anyway: it opens every checkpoint file through
+       `safe_open` and folds in every key the file *physically* contains, not only the ones the index names (see
+       `_ExpertFreePointer`'s own docstring for the measured mechanism). Patched here by making
+       `transformers.modeling_utils.safe_open` return an `_ExpertFreePointer`, so `.keys()` itself never offers
+       an expert key to be read -- a stripped index is then unnecessary (this patch alone is sufficient on an
+       *un*-stripped checkpoint directory, confirmed on real hardware), though harmless to keep.
+    """
 
     def __enter__(self):
         import copy
 
+        import transformers.modeling_utils as mu
         from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as m
 
         self._m, self._init = m, m.Qwen3_5MoeExperts.__init__
@@ -241,10 +283,19 @@ class tiny_experts:
             original(module, small, *args, **kwargs)
 
         m.Qwen3_5MoeExperts.__init__ = init
+
+        self._mu = mu
+        self._safe_open = mu.safe_open
+
+        def filtered_safe_open(*args, **kwargs):
+            return _ExpertFreePointer(self._safe_open(*args, **kwargs))
+
+        mu.safe_open = filtered_safe_open
         return self
 
     def __exit__(self, *exc):
         self._m.Qwen3_5MoeExperts.__init__ = self._init
+        self._mu.safe_open = self._safe_open
 
 
 @torch.no_grad()
