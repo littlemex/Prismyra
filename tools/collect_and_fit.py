@@ -179,7 +179,7 @@ def main() -> int:
             dims=256,
             held_out_fraction=0.25,
             min_match_rate=0.7,
-            accuracy_margin=0.0,
+            min_accuracy_ratio=1.0,  # same intent as the old accuracy_margin=0.0: student >= Prismyra, exactly
             num_threads=4,
             seed=0,
             num_boost_round=100,

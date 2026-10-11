@@ -28,6 +28,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 #: The exact field set an entry must have -- no more, no fewer. Extra fields are refused rather than ignored: a
 #: silently-ignored field is how a typo (``"retain_day"``) ships for weeks before anyone notices retention was
@@ -42,8 +43,22 @@ REQUIRED_FIELDS = frozenset(
 #: this tag instead of the hashed-TF-IDF default; which builders exist is a runtime fact (an operator's own
 #: module registers one by importing it), not something this file-format module can check against, so only the
 #: type is validated here -- an unregistered name is a refusal at fit time (``prismyra.learn.features``), not at
-#: spec-load time.
-OPTIONAL_FIELDS = frozenset({"features"})
+#: spec-load time. ``"min_match_rate"`` and ``"min_accuracy_ratio"`` override, for this one tag, the two
+#: admission-condition defaults below (``DEFAULT_MIN_MATCH_RATE``, ``DEFAULT_MIN_ACCURACY_RATIO``) that
+#: ``prismyra.learn.fit.run`` otherwise applies to every tag.
+OPTIONAL_FIELDS = frozenset({"features", "min_match_rate", "min_accuracy_ratio"})
+
+#: The one place a student's admission bar is a number. ``prismyra.learn.fit.run`` reads these -- never a
+#: literal of its own -- for any tag whose entry does not set ``"min_match_rate"``/``"min_accuracy_ratio"``.
+#: 2026-10-11: lowered from the original design's 0.97/1.00 (eval accuracy at least Prismyra's own) after an
+#: operator decision that distillation's point is speed and cost, not matching a frontier model's own
+#: mistakes -- a correct, 70-150x-faster student that disagrees with Prismyra on one board in ten is a student
+#: worth shipping. Changing either number here changes the default for every tag that does not set its own; a
+#: tag that genuinely needs a stricter (or looser) bar sets ``"min_match_rate"``/``"min_accuracy_ratio"`` in its
+#: own entry instead of this file being edited for everyone.
+DEFAULT_MIN_MATCH_RATE = 0.90
+DEFAULT_MIN_ACCURACY_RATIO = 0.90
+
 
 #: The closed set of normalization rules ``tagging.normalize`` knows how to apply. Not open-ended on purpose: a
 #: rule is a few lines of string handling, and an operator who needs a new one is one PR away, not a regex they
@@ -73,6 +88,8 @@ class TagSpec:
     keep_hidden: bool
     eval_set: str
     features: str | None = None
+    min_match_rate: float = DEFAULT_MIN_MATCH_RATE
+    min_accuracy_ratio: float = DEFAULT_MIN_ACCURACY_RATIO
 
 
 @dataclass(frozen=True)
@@ -97,8 +114,17 @@ class LearnSpec:
         return None
 
 
-def _fail(path: Path, where: str, message: str) -> None:
+def _fail(path: Path, where: str, message: str) -> NoReturn:
     raise SpecError(f"{path}: {where}: {message}")
+
+
+def _check_admission_fraction(path: Path, where: str, field: str, value: object) -> float:
+    """``"min_match_rate"`` and ``"min_accuracy_ratio"`` share one shape: a number in ``(0, 1]``. ``0`` would
+    admit nothing able to clear a bound of zero items correctly, which is not a bar anyone would knowingly
+    set, and both are fractions, not counts, so neither can exceed ``1``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0.0 < value <= 1.0):
+        _fail(path, where, f"{field!r} must be a number in (0, 1], got {value!r}")
+    return float(value)
 
 
 def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
@@ -155,6 +181,14 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
         if not isinstance(features, str) or not features.strip():
             _fail(path, where, f"'features' must be a non-empty string (a registered builder's name), got {features!r}")
 
+    min_match_rate = DEFAULT_MIN_MATCH_RATE
+    if "min_match_rate" in raw:
+        min_match_rate = _check_admission_fraction(path, where, "min_match_rate", raw["min_match_rate"])
+
+    min_accuracy_ratio = DEFAULT_MIN_ACCURACY_RATIO
+    if "min_accuracy_ratio" in raw:
+        min_accuracy_ratio = _check_admission_fraction(path, where, "min_accuracy_ratio", raw["min_accuracy_ratio"])
+
     return TagSpec(
         task=task,
         question=question,
@@ -165,6 +199,8 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
         keep_hidden=keep_hidden,
         eval_set=eval_set,
         features=features,
+        min_match_rate=min_match_rate,
+        min_accuracy_ratio=min_accuracy_ratio,
     )
 
 

@@ -18,8 +18,11 @@ design.
   "eval_set": "evals/phishing-v1-gold.jsonl"}]
 ```
 
-A JSON list, one entry per tag, every field required and checked in full before the server starts
-(`prismyra.learn.spec.load_spec`; see that module for exactly what each field must be).
+A JSON list, one entry per tag, every required field checked in full before the server starts
+(`prismyra.learn.spec.load_spec`; see that module for exactly what each field must be). An entry may be
+exactly `REQUIRED_FIELDS` plus zero or more of `OPTIONAL_FIELDS`; anything else is a refusal to start.
+
+Required:
 
 | field | meaning |
 |---|---|
@@ -31,6 +34,14 @@ A JSON list, one entry per tag, every field required and checked in full before 
 | `retain_days` | how long logged experience for this tag is kept before it is deleted |
 | `keep_hidden` | whether a hidden state may be retained alongside this tag's experience (stage 1/2 never captures one; see below) |
 | `eval_set` | a path, relative to the spec file, to the tag's gold-labelled evaluation set (`prismyra.learn.fit.load_eval_set`) |
+
+Optional (omitting any of these keeps the tag meaning exactly what it meant before the field existed):
+
+| field | meaning |
+|---|---|
+| `features` | the name of a feature builder registered with `prismyra.learn.features.register_features`, used by stage 2's student instead of the hashed-TF-IDF default; an unregistered name is a refusal at fit time, not at spec-load time |
+| `min_match_rate` | overrides, for this tag only, the student-admission condition 2 bar below (default: `prismyra.learn.spec.DEFAULT_MIN_MATCH_RATE`, 0.90); a number in `(0, 1]` |
+| `min_accuracy_ratio` | overrides, for this tag only, the student-admission condition 1 bar below (default: `prismyra.learn.spec.DEFAULT_MIN_ACCURACY_RATIO`, 0.90); a number in `(0, 1]` |
 
 A request is tagged in exactly one of two ways (`prismyra.learn.tagging.tag_for`): it names a registered `task`
 directly (and still has to agree with that entry's `kind` and option set), or its `(kind, question, options)`
@@ -73,14 +84,24 @@ with one code path.
 
 A student is admitted only if **both**:
 
-1. On `eval_set` -- gold labels, not Prismyra's own -- the student's accuracy is at least Prismyra's own minus
-   `--accuracy-margin`. (Needs an `eval_set` item carrying Prismyra's own prediction, collected once, out of
-   band; this CLI never loads a model itself.)
+1. On `eval_set` -- gold labels, not Prismyra's own -- the student's accuracy is at least the tag's
+   `min_accuracy_ratio` (default 0.90) **times** Prismyra's own accuracy. (Needs an `eval_set` item carrying
+   Prismyra's own prediction, collected once, out of band; this CLI never loads a model itself.)
 2. On a held-out, de-duplicated slice of the tag's own logged experience, the one-sided 95% lower bound of the
-   student/Prismyra agreement rate clears `--min-match-rate`.
+   student/Prismyra agreement rate clears the tag's `min_match_rate` (default 0.90).
+
+Both numbers default to `prismyra.learn.spec.DEFAULT_MIN_MATCH_RATE` / `DEFAULT_MIN_ACCURACY_RATIO` -- defined
+once, there, not scattered across this script's own flags. A tag whose traffic needs a different bar sets
+`min_match_rate` and/or `min_accuracy_ratio` on its own entry (see the field table above); `--min-match-rate`
+and `--min-accuracy-ratio` additionally let an operator override either, for one run only, without editing the
+spec file (both default to unset, meaning "use the tag's own value"). Lenient on purpose: distillation's point
+is a student that is fast and cheap, not one that reproduces Prismyra's own mistakes on every single board --
+0.90/0.90 is "close enough to Prismyra, correct often enough on gold" rather than "indistinguishable from
+Prismyra".
 
 Agreement with Prismyra alone is deliberately not enough: a student that reproduces Prismyra's own mistakes has
-a high agreement rate by construction. The artifact (one JSON file, `StudentArtifact`) also reports a
+a high agreement rate by construction, which is why condition 1 is scored against `eval_set`'s gold labels, not
+against Prismyra's own answer. The artifact (one JSON file, `StudentArtifact`) also reports a
 confidence-threshold (`tau`) sweep -- answer rate versus disagreement rate -- for an operator to pick a point
 on, rather than this script picking one. **The artifact is saved, never wired into serving.** Stage 4 is what
 would do that, and it does not exist yet.

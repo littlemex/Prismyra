@@ -14,20 +14,33 @@ construction, and a gate built only from that number cannot tell "the student le
 student learned the teacher's blind spots". So two separate conditions both have to pass (section 3):
 
 1. On the tag's own ``eval_set`` -- a file of *gold*-labelled items, not teacher-labelled ones -- the student's
-   accuracy is at least Prismyra's own accuracy minus ``--accuracy-margin``. There is no live model in this
-   process to answer the eval set itself (fit.py runs on a CPU with no GPU anywhere near it, by design); an
-   eval item that carries Prismyra's own prediction already (a ``prismyra_probabilities`` field, collected once,
-   out of band, the same way the eval set's gold labels were) is scored against the student's. An eval item
-   without one still has the student's accuracy scored, but contributes nothing to the "did we beat Prismyra"
-   comparison -- see ``_score_eval``.
+   accuracy is at least the tag's ``min_accuracy_ratio`` (``prismyra.learn.spec.DEFAULT_MIN_ACCURACY_RATIO``,
+   0.90, unless the tag's own entry overrides it) times Prismyra's own accuracy. There is no live model in
+   this process to answer the eval set itself (fit.py runs on a CPU with no GPU anywhere near it, by design);
+   an eval item that carries Prismyra's own prediction already (a ``prismyra_probabilities`` field, collected
+   once, out of band, the same way the eval set's gold labels were) is scored against the student's. An eval
+   item without one still has the student's accuracy scored, but contributes nothing to the "did we beat
+   Prismyra" comparison -- see ``_score_eval``.
 2. On a held-out slice of the tag's own logged experience -- withheld from training, and de-duplicated by exact
    input text before any split happens, so one popular document cannot inflate how precisely two things that
    are both measuring that same crowd agree with each other -- the one-sided Wilson lower bound of the
-   student/Prismyra agreement rate clears ``--min-match-rate``. This is the "a point estimate is not a
-   guarantee" discipline the shared memory for this project insists on everywhere else; it is the same reasoning
-   here, inside one tag's own distillation.
+   student/Prismyra agreement rate clears the tag's ``min_match_rate``
+   (``prismyra.learn.spec.DEFAULT_MIN_MATCH_RATE``, 0.90, unless overridden). This is the "a point estimate is
+   not a guarantee" discipline the shared memory for this project insists on everywhere else; it is the same
+   reasoning here, inside one tag's own distillation.
 
 Both conditions are necessary; neither is sufficient alone, which is the point of asking for both.
+
+**Why these two numbers live in the spec, not in this script.** 2026-10-11: an operator decision ("the student
+should be fast and cheap; it does not need to make Prismyra's own exact mistake 97% of the time") lowered both
+bars from the original design's 0.97/1.00 to a single pair of defaults, 0.90/0.90
+(``prismyra.learn.spec.DEFAULT_MIN_MATCH_RATE``/``DEFAULT_MIN_ACCURACY_RATIO``) -- defined exactly once, in
+``prismyra.learn.spec``, so a future change to the bar is one edit, not a grep for every place a ``0.9`` or a
+``0.97`` was typed. A tag whose own traffic needs a different bar sets ``"min_match_rate"`` and/or
+``"min_accuracy_ratio"`` in its own spec entry (``prismyra.learn.spec.TagSpec``); this script's own
+``--min-match-rate``/``--min-accuracy-ratio`` flags are a *per-run* override on top of that (``None``, their
+default, means "use whatever the tag's own entry says"), for an operator who wants to try a different bar once
+without editing the spec file.
 
 **Why ``tau`` is reported, not chosen.** The design (section 3, citing arXiv:2501.09345) wants the answer rate
 versus error rate trade-off read directly off held-out data rather than fixed by this script -- a threshold
@@ -352,17 +365,23 @@ def run(
     backbone: str,
     dims: int = 256,
     held_out_fraction: float = 0.2,
-    min_match_rate: float = 0.97,
-    accuracy_margin: float = 0.0,
+    min_match_rate: float | None = None,
+    min_accuracy_ratio: float | None = None,
     num_threads: int = 1,
     seed: int = 0,
     num_boost_round: int = 100,
     min_data_in_leaf: int | None = None,
 ) -> StudentArtifact:
+    """``min_match_rate``/``min_accuracy_ratio`` of ``None`` (the default) means "use this tag's own spec
+    value" (``tag.min_match_rate``/``tag.min_accuracy_ratio``, themselves ``prismyra.learn.spec``'s
+    ``DEFAULT_MIN_MATCH_RATE``/``DEFAULT_MIN_ACCURACY_RATIO`` unless the tag's entry overrides them). Passing
+    either explicitly is a one-off, this-run-only override on top of that -- see the module docstring."""
     spec = load_spec(spec_path)
     tag = spec.by_task(task)
     if tag is None:
         raise FitError(f"{spec_path}: no entry for task {task!r}")
+    effective_min_match_rate = tag.min_match_rate if min_match_rate is None else min_match_rate
+    effective_min_accuracy_ratio = tag.min_accuracy_ratio if min_accuracy_ratio is None else min_accuracy_ratio
 
     root = Path(log_dir) if log_dir is not None else Path(spec_path).parent / "experience"
     all_experiences = dedup(list(_iter_experiences(root, task)))
@@ -388,6 +407,12 @@ def run(
         "train_n": len(train),
         "held_out_n": len(held_out),
         "deduped_n": len(all_experiences),
+        # The bar this run was actually judged against -- never implicit, since both numbers can now come
+        # from three places (the tag's own spec entry, this call's own override, or spec.py's defaults).
+        "admission_thresholds": {
+            "min_match_rate": effective_min_match_rate,
+            "min_accuracy_ratio": effective_min_accuracy_ratio,
+        },
     }
 
     eval_path = Path(tag.eval_set)
@@ -399,11 +424,13 @@ def run(
         eval_metrics = _score_eval(eval_items, predict_fn)
         metrics["eval"] = eval_metrics
         if "prismyra_accuracy" in eval_metrics:
-            condition_1 = eval_metrics["student_accuracy"] >= eval_metrics["prismyra_accuracy"] - accuracy_margin
+            required_accuracy = effective_min_accuracy_ratio * eval_metrics["prismyra_accuracy"]
+            condition_1 = eval_metrics["student_accuracy"] >= required_accuracy
             if not condition_1:
                 reasons.append(
-                    f"eval_set: student accuracy {eval_metrics['student_accuracy']:.4f} is below Prismyra's "
-                    f"{eval_metrics['prismyra_accuracy']:.4f} minus margin {accuracy_margin}"
+                    f"eval_set: student accuracy {eval_metrics['student_accuracy']:.4f} is below "
+                    f"{effective_min_accuracy_ratio} x Prismyra's {eval_metrics['prismyra_accuracy']:.4f} "
+                    f"= {required_accuracy:.4f}"
                 )
         else:
             reasons.append(f"eval_set {eval_path} has no item with 'prismyra_probabilities'; condition 1 unmet")
@@ -423,11 +450,11 @@ def run(
         "rate": (agree / len(held_out)) if held_out else 0.0,
         "lower_bound_95": lower_bound,
     }
-    condition_2 = len(held_out) > 0 and lower_bound >= min_match_rate
+    condition_2 = len(held_out) > 0 and lower_bound >= effective_min_match_rate
     if not condition_2:
         reasons.append(
             f"held-out agreement lower bound {lower_bound:.4f} (n={len(held_out)}) is below "
-            f"min_match_rate {min_match_rate}"
+            f"min_match_rate {effective_min_match_rate}"
         )
 
     metrics["tau_sweep"] = tau_sweep(held_out, predict_fn)
@@ -460,8 +487,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backbone", required=True, help="the model id these experiences were collected under")
     parser.add_argument("--dims", type=int, default=256)
     parser.add_argument("--held-out-fraction", type=float, default=0.2)
-    parser.add_argument("--min-match-rate", type=float, default=0.97)
-    parser.add_argument("--accuracy-margin", type=float, default=0.0)
+    parser.add_argument(
+        "--min-match-rate",
+        type=float,
+        default=None,
+        help="override, for this run only, the tag's own 'min_match_rate' (prismyra.learn.spec.TagSpec) -- "
+        "the default (unset) is to use the tag's spec value, itself DEFAULT_MIN_MATCH_RATE (0.90) unless "
+        "the tag's own entry overrides it",
+    )
+    parser.add_argument(
+        "--min-accuracy-ratio",
+        type=float,
+        default=None,
+        help="override, for this run only, the tag's own 'min_accuracy_ratio' (prismyra.learn.spec.TagSpec) "
+        "-- the default (unset) is to use the tag's spec value, itself DEFAULT_MIN_ACCURACY_RATIO (0.90) "
+        "unless the tag's own entry overrides it",
+    )
     parser.add_argument("--num-threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-boost-round", type=int, default=100)
@@ -491,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
         dims=args.dims,
         held_out_fraction=args.held_out_fraction,
         min_match_rate=args.min_match_rate,
-        accuracy_margin=args.accuracy_margin,
+        min_accuracy_ratio=args.min_accuracy_ratio,
         num_threads=args.num_threads,
         seed=args.seed,
         num_boost_round=args.num_boost_round,

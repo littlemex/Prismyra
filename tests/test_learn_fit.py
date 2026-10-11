@@ -226,7 +226,7 @@ def test_run_admits_a_student_that_beats_prismyra_and_agrees_on_held_out(tmp_pat
         dims=128,
         held_out_fraction=0.25,
         min_match_rate=0.5,
-        accuracy_margin=0.5,  # generous: an easy fixture, not a claim about a real tag's bar
+        min_accuracy_ratio=0.5,  # generous: an easy fixture, not a claim about a real tag's bar
         num_threads=1,
         seed=0,
         num_boost_round=30,
@@ -239,6 +239,143 @@ def test_run_admits_a_student_that_beats_prismyra_and_agrees_on_held_out(tmp_pat
     assert artifact.backbone == "stub/model"
     assert "held_out_agreement" in artifact.metrics
     assert "tau_sweep" in artifact.metrics
+
+
+def _write_eval_set(path, rows):
+    with path.open("w") as fh:
+        for context, p_positive, _ in rows:
+            gold = "positive" if p_positive > 0.5 else "negative"
+            fh.write(
+                json.dumps(
+                    {
+                        "context": context,
+                        "gold": gold,
+                        "options": ["negative", "positive"],
+                        "prismyra_probabilities": {"negative": 1 - p_positive, "positive": p_positive},
+                    }
+                )
+                + "\n"
+            )
+
+
+# --------------------------------------------------------------------------- 2026-10-11: the admission bar
+# (min_match_rate/min_accuracy_ratio) moved from this script's own CLI defaults into the tag's spec entry,
+# with spec.py's DEFAULT_MIN_MATCH_RATE/DEFAULT_MIN_ACCURACY_RATIO (0.90/0.90) as the single fallback. These
+# tests are about *which number run() actually used*, not about distillation accuracy -- the fixture is the
+# same easy, agreeing-with-gold dataset the test above uses for exactly that reason.
+
+
+def test_run_uses_the_tags_own_admission_overrides_when_the_caller_passes_none(tmp_path):
+    # The tag's own entry sets a bar neither spec.py's defaults nor a hand-picked override would clear by
+    # accident (min_accuracy_ratio=0.5 is far more lenient than the 0.90 default; min_match_rate=0.5 likewise)
+    # -- if run() silently fell back to spec.py's 0.90/0.90 instead of reading the tag, this fixture (an easy,
+    # 60-row toy) would not reliably admit at the stricter bar, and the test would start failing.
+    spec_path, spec = make_spec(tmp_path, retain_days=30, min_match_rate=0.5, min_accuracy_ratio=0.5)
+    tag = spec.by_task(TASK)
+    assert tag.min_match_rate == 0.5
+    assert tag.min_accuracy_ratio == 0.5
+    write_experience(tmp_path, spec, synthetic_rows(60))
+    eval_path = tmp_path / "eval.jsonl"
+    _write_eval_set(eval_path, synthetic_rows(15))
+
+    artifact = run(
+        spec_path=spec_path,
+        task=TASK,
+        log_dir=None,
+        package_version="0.0.0-test",
+        backbone="stub/model",
+        dims=128,
+        held_out_fraction=0.25,
+        # min_match_rate / min_accuracy_ratio deliberately omitted: run()'s own default (None) must mean
+        # "use the tag's own spec value", not spec.py's module-level default.
+        num_threads=1,
+        seed=0,
+        num_boost_round=30,
+        min_data_in_leaf=2,
+    )
+    assert artifact.admitted, artifact.reasons
+    assert artifact.metrics["admission_thresholds"] == {"min_match_rate": 0.5, "min_accuracy_ratio": 0.5}
+
+
+def test_run_falls_back_to_the_module_default_when_the_tag_has_no_override(tmp_path):
+    spec_path, spec = make_spec(tmp_path, retain_days=30)
+    tag = spec.by_task(TASK)
+    assert tag.min_match_rate == 0.90
+    assert tag.min_accuracy_ratio == 0.90
+    write_experience(tmp_path, spec, synthetic_rows(60))
+    eval_path = tmp_path / "eval.jsonl"
+    _write_eval_set(eval_path, synthetic_rows(15))
+
+    artifact = run(
+        spec_path=spec_path,
+        task=TASK,
+        log_dir=None,
+        package_version="0",
+        backbone="stub/model",
+        dims=128,
+        held_out_fraction=0.25,
+        num_threads=1,
+        seed=0,
+        num_boost_round=30,
+        min_data_in_leaf=2,
+    )
+    assert artifact.metrics["admission_thresholds"] == {"min_match_rate": 0.90, "min_accuracy_ratio": 0.90}
+
+
+def test_run_rejects_when_the_tags_own_bar_is_not_met(tmp_path):
+    # A bar no 15-row toy eval set can be expected to clear exactly (every item would have to be correct),
+    # set on the tag itself rather than passed to run() -- this is "the spec's own number governs", not "an
+    # explicit kwarg governs" (that path is covered by test_run_admits_... above, which always passes one).
+    spec_path, spec = make_spec(tmp_path, retain_days=30, min_match_rate=0.999, min_accuracy_ratio=1.0)
+    write_experience(tmp_path, spec, synthetic_rows(60))
+    eval_path = tmp_path / "eval.jsonl"
+    _write_eval_set(eval_path, synthetic_rows(15))
+
+    artifact = run(
+        spec_path=spec_path,
+        task=TASK,
+        log_dir=None,
+        package_version="0",
+        backbone="stub/model",
+        dims=128,
+        held_out_fraction=0.25,
+        num_threads=1,
+        seed=0,
+        num_boost_round=30,
+        min_data_in_leaf=2,
+    )
+    assert not artifact.admitted
+    assert any("min_match_rate" in r for r in artifact.reasons)
+
+
+def test_run_kwarg_overrides_the_tags_own_min_match_rate(tmp_path):
+    # The tag asks for a strict bar; the caller explicitly overrides it for this one run. The override, not
+    # the tag's own entry, must be what run() actually judged against.
+    spec_path, spec = make_spec(tmp_path, retain_days=30, min_match_rate=0.999)
+    write_experience(tmp_path, spec, synthetic_rows(60))
+    eval_path = tmp_path / "eval.jsonl"
+    _write_eval_set(eval_path, synthetic_rows(15))
+
+    artifact = run(
+        spec_path=spec_path,
+        task=TASK,
+        log_dir=None,
+        package_version="0",
+        backbone="stub/model",
+        dims=128,
+        held_out_fraction=0.25,
+        min_match_rate=0.0,  # explicit override beats the tag's own 0.999
+        num_threads=1,
+        seed=0,
+        num_boost_round=30,
+        min_data_in_leaf=2,
+    )
+    assert artifact.metrics["admission_thresholds"]["min_match_rate"] == 0.0
+    # min_match_rate=0.0 means condition 2 clears unconditionally; the tag's own 0.999 would not have.
+    assert (
+        artifact.metrics["held_out_agreement"]["lower_bound_95"]
+        >= artifact.metrics["admission_thresholds"]["min_match_rate"]
+    )
 
 
 def test_run_refuses_admission_without_an_eval_set(tmp_path):
@@ -364,7 +501,7 @@ def test_run_admits_a_structured_feature_student_and_round_trips_the_artifact(tm
         dims=128,  # unused by the structured branch, kept only as metadata
         held_out_fraction=0.25,
         min_match_rate=0.5,
-        accuracy_margin=0.5,
+        min_accuracy_ratio=0.5,
         num_threads=1,
         seed=0,
         num_boost_round=30,

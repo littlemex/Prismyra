@@ -151,3 +151,64 @@ def test_an_empty_features_name_is_refused(tmp_path):
 def test_a_non_string_features_name_is_refused(tmp_path):
     with pytest.raises(SpecError, match="'features'"):
         load_spec(write(tmp_path, [{**ENTRY, "features": 1}]))
+
+
+# --------------------------------------------------------------------------- the optional admission-condition
+# overrides, "min_match_rate" and "min_accuracy_ratio" (2026-10-11: student admission loosened to 0.90/0.90)
+
+
+def test_an_entry_without_admission_overrides_gets_the_module_defaults(tmp_path):
+    import prismyra.learn.spec as spec_module
+
+    spec = load_spec(write(tmp_path, [ENTRY]))
+    t = spec.tags[0]
+    assert t.min_match_rate == spec_module.DEFAULT_MIN_MATCH_RATE
+    assert t.min_accuracy_ratio == spec_module.DEFAULT_MIN_ACCURACY_RATIO
+    # The defaults themselves are the single place these numbers are decided -- pin their value so a change
+    # to spec.py's constants is a deliberate edit here too, not a silent drift this test stops noticing.
+    assert spec_module.DEFAULT_MIN_MATCH_RATE == 0.90
+    assert spec_module.DEFAULT_MIN_ACCURACY_RATIO == 0.90
+
+
+def test_an_entry_can_override_min_match_rate_independently(tmp_path):
+    spec = load_spec(write(tmp_path, [{**ENTRY, "min_match_rate": 0.97}]))
+    t = spec.tags[0]
+    assert t.min_match_rate == 0.97
+    # Overriding one does not change the other's default.
+    import prismyra.learn.spec as spec_module
+
+    assert t.min_accuracy_ratio == spec_module.DEFAULT_MIN_ACCURACY_RATIO
+
+
+def test_an_entry_can_override_min_accuracy_ratio_independently(tmp_path):
+    spec = load_spec(write(tmp_path, [{**ENTRY, "min_accuracy_ratio": 1.0}]))
+    t = spec.tags[0]
+    assert t.min_accuracy_ratio == 1.0
+    # Overriding one does not change the other's default.
+    import prismyra.learn.spec as spec_module
+
+    assert t.min_match_rate == spec_module.DEFAULT_MIN_MATCH_RATE
+
+
+def test_an_entry_can_override_both_admission_fields_at_once(tmp_path):
+    spec = load_spec(write(tmp_path, [{**ENTRY, "min_match_rate": 0.95, "min_accuracy_ratio": 0.80}]))
+    t = spec.tags[0]
+    assert t.min_match_rate == 0.95
+    assert t.min_accuracy_ratio == 0.80
+
+
+@pytest.mark.parametrize("bad", [0, -0.1, 1.1, True, "0.9"])
+def test_a_bad_min_match_rate_is_refused(tmp_path, bad):
+    with pytest.raises(SpecError, match="'min_match_rate'"):
+        load_spec(write(tmp_path, [{**ENTRY, "min_match_rate": bad}]))
+
+
+@pytest.mark.parametrize("bad", [0, -0.1, 1.1, True, "0.9"])
+def test_a_bad_min_accuracy_ratio_is_refused(tmp_path, bad):
+    with pytest.raises(SpecError, match="'min_accuracy_ratio'"):
+        load_spec(write(tmp_path, [{**ENTRY, "min_accuracy_ratio": bad}]))
+
+
+def test_min_match_rate_of_exactly_one_is_allowed(tmp_path):
+    spec = load_spec(write(tmp_path, [{**ENTRY, "min_match_rate": 1.0}]))
+    assert spec.tags[0].min_match_rate == 1.0
