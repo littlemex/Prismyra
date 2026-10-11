@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.7
+
+An optional, off-by-default learning layer lets an operator register a closed, versioned
+vocabulary of decision tags and have a request tagged only on an exact, normalized match --
+never by the document itself. Without `--learn-spec`, this layer is never imported and the
+serving path makes exactly the comparisons it always made; with it, a tagged request's
+experience is logged in the background, after the response has already been sent, through a
+bounded queue that drops rather than blocks a request.
+
+`python -m prismyra.learn.fit` trains a small, deterministic LightGBM model offline from a
+tag's logged experience. The default input goes through a hashed-TF-IDF representation; a tag
+may instead register a hand-written feature builder for structured input (such as a flattened
+game-board state), which reached a materially higher accuracy and agreement with the teacher at
+every training-set size tried, already ahead of the hashed default's best result at the
+smallest size tried. A student is admitted only if its accuracy on a gold-labelled evaluation
+set clears a configurable fraction of the teacher's own accuracy on that same set, and its
+one-sided confidence lower bound on held-out agreement with the teacher clears a configurable
+threshold; both bars default to 90% and either can be overridden per tag.
+
+`recipes/decision-lora` now mixes two licence-clear, public dataset families (sentiment, and
+causal/multi-step reasoning) into the training pool at a small, fixed fraction, closing a
+measured gap on sentiment judgments against a comparable general-purpose model with no measured
+regression on the project's production-safety item set or any other held-out item at the
+confidence levels used. An earlier attempt at a larger mixed-in fraction improved sentiment by
+more but also regressed the production-safety set; halving the fraction kept the sentiment gain
+and removed the regression. The reasoning gain pointed the same direction but did not reach
+significance at the row counts tried.
+
 ## 0.4.6
 
 The 22.5 GiB budget that fell short of the 16,000-token, 32-question case by a small margin in
