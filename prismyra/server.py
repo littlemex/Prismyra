@@ -26,6 +26,7 @@ half-built version of them away. In-process callers that want follow-ups use `Pr
 import argparse
 import base64
 import dataclasses
+import json
 import uuid
 from typing import Any, Literal
 
@@ -169,6 +170,73 @@ def _restore_ids(result: Result, id_map: dict[str, str]) -> Result:
     )
 
 
+def _log_tagged_questions(learn_hook, context: str, questions: list[Question], result: Result) -> None:
+    """`prismyra.learn`'s whole footprint on `/ask`: one `tag(...)` comparison per question, and -- only for a
+    question that matches a registered tag -- queue the experience. Called from a `BackgroundTasks` callback, so
+    this runs after the HTTP response has already been written to the socket; see `create_app`'s own docstring
+    for why that is where the design's "`learn_spec` が無ければ何もしない" contract draws the line.
+
+    `h` is not captured here, or anywhere in stage 1/2 (DISTILL-RL-DESIGN-v2.md section 7 lists this as
+    undecided): a tag's `keep_hidden` is validated and stored on every experience record regardless, ready for
+    the stage that needs it, but nothing on this path reads a hidden state. Capturing it would mean wrapping
+    `engine.ask` in `heads.record_hidden` on a path shared with every other caller's request -- including ones
+    `--batcher` has merged into the same pass -- for a feature stage 2's own student does not use (section 3:
+    "特徴は入力だけから作る", input alone, never `h`). Deferred, not forgotten.
+    """
+    if learn_hook is None:
+        return
+    for q in questions:
+        answer = result.answers.get(q.id)
+        if answer is None:
+            continue
+        tag = learn_hook.tag(task=None, question=q.prompt, options=q.options, kind=q.kind)
+        if tag is not None:
+            learn_hook.submit(
+                tag,
+                context=context,
+                question=q.prompt,
+                options=q.options,
+                kind=q.kind,
+                probabilities=answer.probabilities,
+                answered_by=answer.read_by or "prismyra",
+            )
+
+
+def _log_tagged_decisions(learn_hook, raw_items: list[dict], responses: list[dict]) -> None:
+    """The `/v1/decide` twin of `_log_tagged_questions`, one `tag(...)` comparison per item, in the same
+    `BackgroundTasks` callback style and under the same `h`-is-not-captured-here note.
+
+    `raw_items` and `responses` are `decide_mod.decide_many`'s own input and output, in the same order (its own
+    docstring: "Returns the responses in the caller's own order") -- `zip` is what pairs a wire item with the
+    answer it produced without re-deriving which `ask()` group it fell into.
+
+    `state` is turned back into text with the same two rules `decide._state_to_context` applies (a string as-is,
+    a dict as `json.dumps`) rather than by calling that private function from here: the list form it refuses is
+    unreachable by this point, because `decide_many` already raised `DecideError` for it before any response
+    existed to log.
+    """
+    if learn_hook is None:
+        return
+    for raw, response in zip(raw_items, responses, strict=True):
+        question = str(raw.get("question", ""))
+        options = response["options"]
+        kind = raw["kind"]
+        tag = learn_hook.tag(task=raw.get("task"), question=question, options=options, kind=kind)
+        if tag is None:
+            continue
+        state = raw.get("state", "")
+        context = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
+        learn_hook.submit(
+            tag,
+            context=context,
+            question=question,
+            options=options,
+            kind=kind,
+            probabilities=dict(zip(options, response["probabilities"], strict=True)),
+            answered_by="prismyra",
+        )
+
+
 #: Hard limits on one request. An endpoint with none lets a single caller hold the device for as long as it likes, and
 #: the failure arrives as everyone else's latency rather than as that caller's error. The context limit is in tokens,
 #: not characters, because that is what both costs are a function of -- and a character count is a proxy that varies
@@ -197,6 +265,10 @@ def create_app(
     batcher: bool = False,
     linger_ms: float | None = None,
     lanes: int = 1,
+    learn_spec: str | None = None,
+    learn_log_dir: str | None = None,
+    learn_backend: str = "local",
+    learn_max_queue: int = 10_000,
     **engine_kwargs,
 ):
     """A FastAPI application with the engine and its worker already running.
@@ -216,10 +288,19 @@ def create_app(
     `batcher` requires the paged storage (`Batcher.__init__` refuses without it), so it is set to `True` here when
     the caller has not already said otherwise -- there is no CLI flag for `paged` on its own, and a caller passing
     `batcher=True` plainly wants the one precondition it has.
+
+    **`learn_spec`** turns on `prismyra.learn` (DISTILL-RL-DESIGN-v2.md stage 1/2): registered tags, a bounded
+    experience log, and later an offline-trained student -- see that package's own docstring. `None` (the
+    default) means `prismyra.learn` is never imported and nothing below changes shape: the request handlers
+    still make exactly the comparisons they always did, because `learn_hook is None` short-circuits every site
+    that would otherwise touch it. A path, and the module loads, a `LearnHook` is built, and every `/ask` and
+    `/v1/decide` request pays one extra comparison (`learn_hook.tag(...)`, pure Python, no device) to find out
+    whether it is one of the registered tags; only a tagged request pays anything past that, and what it pays is
+    a `BackgroundTasks` callback that runs after the response has already been sent (see the two handlers below).
     """
     from contextlib import asynccontextmanager
 
-    from fastapi import FastAPI, HTTPException
+    from fastapi import BackgroundTasks, FastAPI, HTTPException
     from pydantic import BaseModel, Field
 
     from . import Prismyra, __version__
@@ -240,12 +321,29 @@ def create_app(
         text_batcher = Batcher(engine, max_queue=max_queue, linger_ms=linger_ms, lanes=lanes).start()
         batcher_capacity = _batcher_capacity(engine)
 
+    # The single branch `learn_spec is None` guards for the whole module: nothing under `prismyra.learn` is
+    # imported, and `learn_hook` stays `None`, until an operator has actually named a spec.
+    learn_hook = None
+    if learn_spec is not None:
+        from .learn.hook import LearnHook
+
+        learn_hook = LearnHook(
+            learn_spec,
+            package_version=__version__,
+            backbone=model,
+            log_dir=learn_log_dir,
+            backend=learn_backend,
+            max_queue=learn_max_queue,
+        )
+
     @asynccontextmanager
     async def lifespan(_):
         yield
         worker.stop()
         if text_batcher is not None:
             text_batcher.stop()
+        if learn_hook is not None:
+            learn_hook.stop()
 
     class QuestionIn(BaseModel):
         id: str | None = None
@@ -278,6 +376,11 @@ def create_app(
         #: so a caller can match a response item to the request item that produced it without relying on list order,
         #: and it is what `merged_with` names the other items in a group by.
         id: str | None = None
+        #: Not part of JEV's protocol either, and not echoed back. Names one of `prismyra.learn`'s registered
+        #: tags directly (DISTILL-RL-DESIGN-v2.md section 1's "task を名指し" path) rather than relying on this
+        #: item's `question`/`options`/`kind` matching a spec entry's own wording exactly. Ignored, at no cost,
+        #: by a server started without `--learn-spec`.
+        task: str | None = None
 
     app = FastAPI(
         title="prismyra",
@@ -287,7 +390,7 @@ def create_app(
     )
 
     @app.post("/ask")
-    def ask(body: AskIn) -> dict:
+    def ask(body: AskIn, background_tasks: BackgroundTasks) -> dict:
         # Refused before admission, so an oversized request costs the queue nothing. 413 rather than 422: the request
         # is well formed, there is just too much of it. Tokenising to find out is cheap next to what admitting it
         # costs.
@@ -349,10 +452,12 @@ def create_app(
         except PrismyraError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         result = _restore_ids(job.result, id_map) if id_map is not None else job.result
+        if learn_hook is not None:
+            background_tasks.add_task(_log_tagged_questions, learn_hook, body.context, questions, result)
         return as_json(with_queue_time(result, job.queue_ms))
 
     @app.post("/v1/decide")
-    def decide(body: DecideIn | list[DecideIn]) -> dict:
+    def decide(body: DecideIn | list[DecideIn], background_tasks: BackgroundTasks) -> dict:
         """A JEV-compatible read-out (see `prismyra.decide`'s own module docstring for the contract and why
         a `choice` question is always relabelled). The body is a single JEV-shaped decision -- answered and
         returned exactly as JEV's own `/v1/decide` would shape one -- or a JSON array of them, Prismyra's own
@@ -389,6 +494,8 @@ def create_app(
         except PrismyraError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
 
+        if learn_hook is not None:
+            background_tasks.add_task(_log_tagged_decisions, learn_hook, raw_items, responses)
         if single:
             return responses[0]
         return {"results": responses, "num_model_requests": num_requests}
@@ -402,11 +509,16 @@ def create_app(
         out = {"engine": engine.stats(), "queue": worker.stats()}
         if text_batcher is not None:
             out["batcher"] = text_batcher.stats()
+        if learn_hook is not None:
+            # "ログの件数、捨てた数、queue の深さ" (DISTILL-RL-DESIGN-v2.md section 3) -- absent entirely when
+            # `--learn-spec` was not given, the same way `batcher` above is.
+            out["learn"] = learn_hook.stats()
         return out
 
     app.state.engine = engine
     app.state.worker = worker
     app.state.batcher = text_batcher
+    app.state.learn_hook = learn_hook
     return app
 
 
@@ -468,6 +580,34 @@ def main(argv: list[str] | None = None) -> int:
         help="with --batcher, how many independent pass pipelines run under one Batcher; more than one lets a "
         "second pass start while the first is still running, at the cost of a second shelf's own device memory",
     )
+    parser.add_argument(
+        "--learn-spec",
+        default=None,
+        help="a JSON spec of registered tags (see prismyra.learn.spec); turns on stage 1/2 of "
+        "DISTILL-RL-DESIGN-v2.md -- a tagged /ask or /v1/decide request is logged for later offline student "
+        "training. Off by default: not passing this imports nothing under prismyra.learn and changes nothing "
+        "else about how a request is answered.",
+    )
+    parser.add_argument(
+        "--learn-log-dir",
+        default=None,
+        help="where tagged experience is written, one JSONL file per (tag, UTC date); default is an "
+        "'experience' directory next to --learn-spec",
+    )
+    parser.add_argument(
+        "--learn-backend",
+        default="local",
+        choices=("local", "ray"),
+        help="'local' (default): one bounded queue and one background thread in this process. 'ray': the same "
+        "log, run inside a Ray actor -- only this choice imports ray",
+    )
+    parser.add_argument(
+        "--learn-max-queue",
+        type=int,
+        default=10_000,
+        help="how many tagged experiences may wait to be written before a newly-arriving one is dropped and "
+        "counted rather than ever slowing down a response",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -489,6 +629,10 @@ def main(argv: list[str] | None = None) -> int:
         batcher=args.batcher,
         linger_ms=args.linger_ms,
         lanes=args.lanes,
+        learn_spec=args.learn_spec,
+        learn_log_dir=args.learn_log_dir,
+        learn_backend=args.learn_backend,
+        learn_max_queue=args.learn_max_queue,
     )
     uvicorn.run(app, host=args.host, port=args.port)
     return 0

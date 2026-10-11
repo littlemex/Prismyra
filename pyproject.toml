@@ -59,6 +59,11 @@ server = [
 # fastapi and httpx are dev dependencies so CI can exercise the server over real HTTP. Without that, a
 # mistake in how the request body is declared passes every unit test and fails every request.
 dev = ["pytest>=8.0", "ruff==0.16.8", "mypy>=1.11", "fastapi>=0.115", "httpx>=0.27", "pillow>=10.0"]
+# `prismyra.learn.fit` (DISTILL-RL-DESIGN-v2.md stage 2, the offline student). Not a dependency of the library
+# or of the server: `--learn-spec` logs experience with none of this installed, and only running the fit CLI by
+# hand needs it. LightGBM's own determinism contract (`deterministic=True`) is documented as same-build,
+# same-instruction-set-only, which is exactly why it was chosen over CatBoost here -- see `prismyra/learn/fit.py`.
+learn = ["lightgbm>=4.0"]
 
 [project.scripts]
 prismyra-bench = "prismyra.bench:main"
