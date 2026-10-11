@@ -26,6 +26,14 @@ That is a claim too, and it is proved rather than trusted: every bucket is repla
 length it serves and compared bit for bit with the eager read of the same tokens, and a bucket that differs in any bit
 is not kept.
 
+One lookup is not an island: the input embedding, when it is lazy (`PRISMYRA_EMBED_TOKENS=lazy`, `embed.make_lazy`),
+is a host-side gather too, but it is the pass's very *first* op, before any capture of this bucket has begun -- there
+is no earlier piece to end a capture after. So it is not captured at all. It is gathered eagerly, every warm-up and
+every replay, into a static buffer at a fixed address, and the recorded steps are taken with that buffer
+(`inputs_embeds=`) rather than with the ids themselves (`input_ids=`), which the framework's own forward treats as
+interchangeable -- skipping its internal call to the same embedding. A lookup copies rows; it does not compute from
+them, so which op reads which address does not change a bit of what ends up in it.
+
 Three more properties make a recording valid across requests, and each is checked rather than assumed:
 
 * **a fresh state every time.** Each recording is taken from a cache that has never been read, so a replay starts the
@@ -201,7 +209,16 @@ class _Recorder:
 # --------------------------------------------------------------------------- recordings
 @dataclass
 class Bucket:
-    """One recorded read: its pieces and islands in order, and the static tensors it reads and writes."""
+    """One recorded read: its pieces and islands in order, and the static tensors it reads and writes.
+
+    ``embeds``/``embed_module`` are set only when the input embedding is lazy (``PRISMYRA_EMBED_TOKENS=lazy``,
+    `embed.make_lazy`). The embedding lookup is then the one step this file does not record at all -- not an
+    island (which ends and resumes a capture mid-pass), but a step taken entirely *before* `_Recorder.begin` is
+    first called for this bucket, exactly like the fact of row count the capture never sees. ``ids`` is still kept:
+    it is the int64 staging buffer `replay` writes a request's real tokens into, which `embed_module` then gathers
+    eagerly, off the stream any capture ever runs on, into ``embeds`` -- the tensor the recorded steps actually
+    read, at a fixed address they were captured against. See `record_bucket` and `replay`.
+    """
 
     length: int
     steps: list
@@ -209,6 +226,8 @@ class Bucket:
     at: torch.Tensor
     hidden: torch.Tensor
     replays: int = 0
+    embeds: torch.Tensor | None = None
+    embed_module: nn.Module | None = None
 
     @property
     def islands(self) -> int:
@@ -271,12 +290,44 @@ def fresh(cache) -> None:
 
 
 def record_bucket(
-    engine, cache, islands: Islands, length: int, pad_id: int, pool, side: torch.cuda.Stream
+    engine,
+    cache,
+    islands: Islands,
+    length: int,
+    pad_id: int,
+    pool,
+    side: torch.cuda.Stream,
+    embed_module: nn.Module | None = None,
 ) -> tuple[Bucket | None, str | None]:
-    """Record the one-pass read at one bucket length, or return why it could not be."""
+    """Record the one-pass read at one bucket length, or return why it could not be.
+
+    `embed_module` is given only when the input embedding is lazy. The gather it does (`embed.make_lazy`'s
+    `_lazy_forward`: a host-side index into pinned memory, then a copy back to the device) is host-bound the same
+    way the row-dependent islands are, but it cannot be *recorded* as one: an island ends a capture and resumes it
+    around a piece in the *middle* of a pass, while the embedding lookup is the pass's first op, before anything
+    has been captured yet. So it is not captured at all -- gathered eagerly into `embeds`, a static buffer at a
+    fixed address, before `_Recorder.begin` is ever called for this bucket -- and the recorded steps are taken
+    with `inputs_embeds=embeds` rather than `input_ids=ids`, which skips the model's own `embed_tokens` call
+    entirely (`kernels.decoder_fusion.wrapped_forward`: ``if inputs_embeds is None: inputs_embeds =
+    self.embed_tokens(input_ids)``). A lookup is a copy, not a computation (`embed.py`'s module docstring), so the
+    rows this gather places in `embeds` are the same bits `embed_tokens(ids)` would have placed there; everything
+    downstream is exactly the graph this file already records and proves without lazy embedding.
+    """
     device = engine.torch_device
     ids = torch.full((1, length), pad_id, dtype=torch.long, device=device)
     at = torch.zeros(1, dtype=torch.long, device=device)
+    embeds = torch.zeros((1, length, engine.hidden_size), dtype=engine.dtype, device=device) if embed_module else None
+
+    def gather() -> None:
+        # Eager, off whatever stream recording runs on -- see the module's own paragraph on why a captured
+        # version of this crashes rather than merely answers unsped-up. Writes in place (`copy_`), not an
+        # assignment, so `embeds` keeps the address the capture below will read from for the bucket's life.
+        # Both asserts are the one invariant `embeds`'s own construction above already ties them to (`embeds`
+        # is built exactly when `embed_module` is given) -- mypy does not carry that across this closure, so it
+        # is stated again rather than silenced.
+        assert embeds is not None
+        assert embed_module is not None
+        embeds.copy_(embed_module(ids))
 
     def run() -> torch.Tensor:
         # The same pinned MoE tile `engine._read_one_pass` uses for a bucket this recording never reaches
@@ -288,7 +339,10 @@ def record_bucket(
         from .kernels import onepass_moe_tuning
 
         with onepass_moe_tuning.scope():
-            out = engine.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
+            if embeds is not None:
+                out = engine.backbone(inputs_embeds=embeds, use_cache=True, past_key_values=cache)
+            else:
+                out = engine.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
         last = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
         return last[0].index_select(0, at)
 
@@ -298,9 +352,13 @@ def record_bucket(
         with torch.inference_mode(), torch.cuda.stream(side):
             for _ in range(WARMUPS):
                 fresh(cache)
+                if embeds is not None:
+                    gather()
                 run()
             torch.cuda.synchronize(device)
             fresh(cache)
+            if embeds is not None:
+                gather()
             _Active.recorder = recorder
             try:
                 recorder.begin()
@@ -317,7 +375,12 @@ def record_bucket(
         torch.cuda.synchronize(device)
     except Exception as e:  # noqa: BLE001 - any failure means the eager path, which is always available
         return None, f"{type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}"
-    return Bucket(length=length, steps=recorder.steps, ids=ids, at=at, hidden=hidden), None
+    return (
+        Bucket(
+            length=length, steps=recorder.steps, ids=ids, at=at, hidden=hidden, embeds=embeds, embed_module=embed_module
+        ),
+        None,
+    )
 
 
 def replay(bucket: Bucket, ids: torch.Tensor, pad_id: int) -> torch.Tensor:
@@ -327,6 +390,13 @@ def replay(bucket: Bucket, ids: torch.Tensor, pad_id: int) -> torch.Tensor:
     bucket.ids[:, real:].fill_(pad_id)
     bucket.at.fill_(real - 1)
     with torch.inference_mode():
+        if bucket.embeds is not None:
+            # The two-stage replay a lazy input embedding needs: gather eagerly, off the recording entirely, into
+            # the fixed address the capture reads from, *then* play the recorded steps -- see `record_bucket`.
+            # `bucket.embed_module` is set exactly when `bucket.embeds` is (`record_bucket`'s own construction);
+            # restated for mypy, which does not carry that tie across the two fields.
+            assert bucket.embed_module is not None
+            bucket.embeds.copy_(bucket.embed_module(bucket.ids))
         for step in bucket.steps:
             if isinstance(step, tuple):
                 fn, x, out = step
@@ -356,8 +426,13 @@ def prove(engine, bucket: Bucket, lengths, pad_id: int, eager) -> float:
     return worst
 
 
-def record_all(engine, pad_id: int, eager, lengths=BUCKETS) -> OnePassGraphs:
-    """Record and prove every bucket. One that fails either is declined and named, and its lengths run eagerly."""
+def record_all(engine, pad_id: int, eager, lengths=BUCKETS, embed_module: nn.Module | None = None) -> OnePassGraphs:
+    """Record and prove every bucket. One that fails either is declined and named, and its lengths run eagerly.
+
+    `embed_module` is given only by a caller whose input embedding is lazy (`PRISMYRA_EMBED_TOKENS=lazy`); every
+    bucket is then recorded and proved the two-stage way `record_bucket`/`replay` describe, instead of being
+    skipped outright the way an earlier round of this file did.
+    """
     from .cache import build_cache
     from .fork import WIDTHS
 
@@ -382,7 +457,7 @@ def record_all(engine, pad_id: int, eager, lengths=BUCKETS) -> OnePassGraphs:
     side = torch.cuda.Stream(device=device)
     below = 0
     for length in lengths:
-        bucket, why = record_bucket(engine, held.cache, held.shared, length, pad_id, pool, side)
+        bucket, why = record_bucket(engine, held.cache, held.shared, length, pad_id, pool, side, embed_module)
         held.growth[length] = torch.cuda.memory_reserved(device) - reserved - sum(held.growth.values())
         if bucket is None:
             held.declined[length] = why or "unknown"

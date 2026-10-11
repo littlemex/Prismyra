@@ -19,7 +19,7 @@ import torch
 if TYPE_CHECKING:  # pragma: no cover - the framework's cache type, for the annotation only
     from transformers.cache_utils import Cache
 
-from . import interleave, kernels, onepass, varlen
+from . import chunking, interleave, kernels, onepass, varlen
 from .cache import build_cache, cache_bytes, join_bytes_per_token
 from .calibration import Calibration
 from .fork import (
@@ -648,6 +648,37 @@ class Prismyra:
         if not on_cuda:
             self.backbone.to(self.torch_device)
 
+        # Experimental: keep the input-embedding matrix off the device too, selected with
+        # PRISMYRA_EMBED_TOKENS=lazy. See `embed.make_lazy`'s module docstring; this is the input-side counterpart
+        # to PRISMYRA_LM_HEAD=lazy above and is independent of it (either, both, or neither may be set).
+        #
+        # Measured on real hardware (RTX PRO 4500, `/Users/akazawt/tmp/smr/air/RUN-q2.md` and `RUN-q3.md`,
+        # 2026-10-10): a lazy input embedding is NOT a drop-in substitute for the resident one the way the output
+        # embedding is. The output embedding is only ever read *after* the one-pass CUDA graph below finishes
+        # replaying (it scores the already-produced hidden state), but the input embedding is the *first op inside
+        # the captured forward* -- `embed_tokens(input_ids)` runs before any decoder layer. A capture that reaches
+        # a host-side gather and a device<->host copy mid-capture is invalid CUDA (reproduced on 2 of 2 fresh-process
+        # attempts: an empty recorded graph, then a crash in the next bucket's unrelated setup code). Two earlier
+        # rounds (RUN-q2.md, RUN-q3.md) responded by disabling the one-pass recording outright whenever this flag
+        # is set -- correct answers, no graph replay, 73-87% slower at short lengths than the default.
+        #
+        # Fixed here (`RUN-q4.md`, 2026-10-10) by not treating the gather as something a capture ever has to see at
+        # all: `self._lazy_embed_module`, below, is handed to `onepass.record_all`, which gathers it eagerly into a
+        # static buffer *before* each bucket's capture begins and records every bucket with `inputs_embeds=` that
+        # buffer rather than `input_ids=`. See `onepass.record_bucket`'s own docstring for why this is bit-identical
+        # rather than merely close. The branch-pass recording a few hundred lines down (`_run_recorded`) is left
+        # disabled by this flag, same as before -- out of this round's scope, and RUN-q3.md's section 1.5 found it
+        # never fires under this engine's default (`paged=False`) configuration anyway.
+        self._lazy_embed_tokens = on_cuda and os.environ.get("PRISMYRA_EMBED_TOKENS") == "lazy"
+        self._lazy_embed_module = None
+        if self._lazy_embed_tokens:
+            from .embed import make_lazy as _make_embedding_lazy
+
+            text_model = self.backbone.language_model if hasattr(self.backbone, "language_model") else self.backbone
+            embedding = text_model.get_input_embeddings()
+            _make_embedding_lazy(embedding)
+            self._lazy_embed_module = embedding
+
         decoder = getattr(self.config, "text_config", self.config)
         self.hidden_size = decoder.hidden_size
         self.applied = (
@@ -728,7 +759,11 @@ class Prismyra:
                     f"batch-invariant mode not available ({e}); open_batch/Batcher/read_and_branch may still "
                     "move an answer by who else shares the pass"
                 )
-        self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype)
+        # Experimental: keep the output-embedding matrix off the device, selected with `PRISMYRA_LM_HEAD=lazy`.
+        # See `readout.load_unembedding`'s `lazy` parameter: measured to free 0.947 GiB on a 36-layer checkpoint's
+        # vocabulary with no change to any answer (`/Users/akazawt/tmp/smr/air/RUN-q1.md`, 2026-10-10).
+        lazy_lm_head = os.environ.get("PRISMYRA_LM_HEAD") == "lazy"
+        self.unembedding = load_unembedding(model, self.hidden_size, self.device, self.dtype, lazy=lazy_lm_head)
         # Off unless asked for. It is a change to what a probability means, and whether it is an improvement is a
         # measured question rather than an obvious one -- `evals/run.py` compares the two.
         self.calibration = Calibration() if calibrate else None
@@ -750,8 +785,13 @@ class Prismyra:
         if wanted:
             if not on_cuda:
                 raise PrismyraError(f"short_graphs records CUDA graphs and this engine is on {self.device}")
+            # See the PRISMYRA_EMBED_TOKENS=lazy comment above: `embed_module` makes every bucket's capture skip
+            # the gather entirely rather than try and fail to record it, so lazy embedding no longer has to be
+            # excluded here the way it did before this round.
             if not (calibrate or paged):
-                self._one_pass = onepass.record_all(self, self._pad_id(), self._read_one_pass)
+                self._one_pass = onepass.record_all(
+                    self, self._pad_id(), self._read_one_pass, embed_module=self._lazy_embed_module
+                )
         # The one-pass path's own routed-expert tile (`kernels.onepass_moe_tuning`) is a construction-time file
         # load keyed on this process's device name, not a swap `kernels.apply`'s own `Applied` already reports --
         # recorded here, unconditionally, so "did the pin actually load this time" is answered by `engine.applied`/
@@ -1500,10 +1540,12 @@ class Prismyra:
         answering = self.answering_bytes(context_tokens)
         reading = self.reading_bytes(context_tokens)
         wanted = held + max(answering, reading)
-        free, total = torch.cuda.mem_get_info(self.torch_device)
+        free, total = chunking.visible_free(self.torch_device)
         # The device's free memory is not what is available. The allocator keeps a pool it has already taken from the
         # device and can hand out without asking again, and loading these weights leaves that pool large -- so asking
         # the device alone refused an 18,000-token context that had 9 GiB waiting for it inside the process.
+        # `visible_free` is also where a process capped tighter than the device (real or
+        # `set_per_process_memory_fraction`-simulated) gets corrected for -- see that function's own docstring.
         spare = torch.cuda.memory_reserved(self.torch_device) - torch.cuda.memory_allocated(self.torch_device)
         # Less what the one-pass recordings hold: their private pool is reserved and mostly unallocated between
         # replays, and none of it can be handed to a read. The figure is the whole growth of the reservation while they
@@ -1561,7 +1603,16 @@ class Prismyra:
             if pad_ids.shape[1] > 0:
                 return self._read_padded(encoded, pad_ids, lengths)
         cache, room = self._claim_cache(encoded.tokens, group=group)
-        self.backbone(input_ids=encoded.input_ids, use_cache=True, past_key_values=cache, **encoded.media)
+        # Chunked, in `chunking.CHUNK_TOKENS`-sized pieces, when the document is long enough and this device has
+        # little enough room to spare for a one-shot read (`chunking.should_chunk`'s own docstring). Never for
+        # media: the offset computed below is a fact about having just read the *whole* context in one forward,
+        # and chunking that has not been measured.
+        boundary = 0 if encoded.has_media else chunking.chunk_boundary(encoded.tokens)
+        if boundary and chunking.should_chunk(self, encoded.tokens):
+            chunking.read_chunked(self, cache, encoded.input_ids, boundary)
+        else:
+            boundary = 0
+        self.backbone(input_ids=encoded.input_ids[:, boundary:], use_cache=True, past_key_values=cache, **encoded.media)
         # Read after the forward, not before: the offset is something the model works out while reading the context.
         position_from = position_offset(self.backbone, encoded.tokens) if encoded.has_media else encoded.tokens
         # The fork's state buffers are allocated here rather than on the first branch pass, and the reason is the budget
@@ -2452,7 +2503,16 @@ class Prismyra:
         # always takes the eager path -- the concurrency this lane exists for is between lanes' eager passes, which
         # does not need graphs at all; the cost given up is lane 0's already-measured graphs economics (judged not
         # worth paying for and so rarely paid for even on lane 0 in practice).
-        if not self.graphs or self.torch_device.type != "cuda" or not homogeneous or lane != 0:
+        # `self._lazy_embed_tokens`: see the PRISMYRA_EMBED_TOKENS=lazy comment in `__init__` -- a branch-pass
+        # recording would capture the same host-side gather at the same first op (`embed_tokens(ids)`) as the
+        # one-pass recording this condition's sibling already excludes it from, for the same reason.
+        if (
+            not self.graphs
+            or self.torch_device.type != "cuda"
+            or not homogeneous
+            or lane != 0
+            or self._lazy_embed_tokens
+        ):
             fork()
             return run(ids, positions)
 

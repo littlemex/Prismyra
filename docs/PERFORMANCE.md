@@ -89,6 +89,53 @@ of those instead overstates the cache by 8x or 16x.
 by `ceil(questions / group)`. `Prismyra.cache_bytes(tokens)` reports the figure for a given configuration, and
 `open_context` refuses a context that will not fit rather than letting the allocator refuse it.
 
+### A process capped tighter than its device
+
+`torch.cuda.mem_get_info` answers for the device, not for the process asking. A process given a software fraction of
+a card smaller than the whole of it (`torch.cuda.set_per_process_memory_fraction`, the documented way to run under a
+budget smaller than the physical device -- a smaller real card simulated for testing, or a share of a larger one in
+a multi-tenant deployment) has that fraction enforced by the allocator, which refuses an allocation past it with no
+warning either `should_chunk` or admission (`Prismyra._check_fits`) had the chance to give, because both read
+`mem_get_info` directly and it kept answering for the whole device throughout. Measured directly: a 16,000-token
+context answered for 32 questions at once reached a peak within a few hundred MiB of the same pass's peak with no
+cap at all on the same card, confirming neither check had seen the cap. `chunking.visible_free` corrects both for
+`get_per_process_memory_fraction`; a process with no fraction set (the default) is unaffected.
+
+### Fitting a long context and a wide group on one card
+
+On the NVFP4 checkpoint's card (32 GiB of RTX PRO 4500, a budget set to 22.5 and to 24 GiB to stand in for a smaller
+one), a 16,000-token context together with 32 questions at once needs more than the default group (32) can hold in
+22.5 GiB even with the correction above. [The join's per-row copy](#the-second-copy-of-the-join) is gone now --
+`cache.ForkLayer.branch_read` shares the context's whole pages across every row instead of copying them per row,
+the same page-table mechanism `paged.PagedForkLayer` hands the attention kernel -- and what it bought is smaller
+than hoped and real anyway. Measured directly (`torch.cuda.memory_allocated` either side of the call, every
+attention layer, this width and length): the per-layer transient the join used to cost fell from 0.98 GiB to 0.06
+GiB, a reduction the removal predicts almost exactly. The *overall* peak barely moved, because that transient was
+never what set it -- a second, unrelated climb in held memory across the nine attention layers (present whatever
+the question count, including two) is the larger term at this length, and this change does not touch it. At group
+32 and 22.5 GiB the pass still runs out of memory, 22.18 GiB peak against a 22.50 GiB budget, bit-identical to
+before the change but closer to the line. At 24 GiB, group 32 now fits the full sweep up to 24,000 context tokens
+and 64 questions where it used to need the context's own one-time read forced through `chunking` to clear 24 GiB by
+0.23 GiB -- the ordinary, unforced path now carries 1.48 GiB free at the headline length. Building the engine with
+a narrower group still closes the 22.5 GiB gap, and now with more room either side of it: `group=16` leaves 0.71
+GiB free at 22.5 GiB (was 0.32 before this change) and `group=8` leaves 1.20 GiB (was 1.03). Verified bit-identical
+to `group=32` across five context lengths and seven question counts straddling every group boundary (35/35 cases,
+`torch.equal` on the full probability output) -- unaffected by this change, since nothing about how a group is
+split moved. What narrowing the group still costs: for a question count the narrower group now has to answer in
+more than one pass, every pass after the first falls back to the two-pass path (`ask()`'s own docstring, above)
+rather than the layer-interleaved one -- for 32 questions at this context length, `group=16` now measures +6.1%
+median latency against the same engine at `group=32` (was +11.9%), roughly half the earlier cost for the same
+capacity. A question count that already fit one pass at the narrower group (16 or fewer) is unaffected. At `group=
+32` itself, where a 16,000-token, 32-question pass fits at all (24 GiB, or 22.5 GiB with a shorter context or fewer
+questions), it answers 6.4% *faster* than before this change, not merely within the no-regression bound measured
+elsewhere in this document -- removing a transient that was never freed between the allocator asking for the next
+layer's and the one after it is cheaper even where it was never the peak.
+
+The unrelated climb this change did not touch -- held memory rising across the nine attention layers of one branch
+pass, independent of the question count, first noticed by its absence of correlation with the row count rather than
+by name -- is the next thing worth measuring directly rather than inferring from what removing the join's copy
+failed to move.
+
 ## Where it wins and where it loses
 
 | questions | Prismyra | vLLM |
@@ -919,11 +966,13 @@ changes the traffic and not the peak. The change is a long-context one, and the 
 Answers are unchanged, and not within a tolerance: the kernel is handed the same bytes in the same order. All 137 device
 tests pass.
 
-What remains of the join is one copy per layer per row, 2,048 bytes per context token per row, and removing it is what
-a page table would be for. Two cheaper things come first and neither is done: a scratch buffer the join is written into
-rather than allocated per layer, and running rows through attention in chunks so the buffer is bounded by the chunk. The
-first trades transient memory for held memory, which is the figure the storage work bought in the first place, so it
-needs measuring rather than assuming.
+What remained of the join was one copy per layer per row, 2,048 bytes per context token per row, and removing it is
+what a page table is for -- `cache.ForkLayer.branch_read` now builds one, the same mechanism `paged.PagedForkLayer`
+hands the kernel: the context's whole pages are a view, shared by every row's table rather than copied into it, and
+each row privately holds only its copy of the context's own partial last page (bounded by the page size, not the
+context length) followed by its own tokens. See
+[Fitting a long context and a wide group on one card](#fitting-a-long-context-and-a-wide-group-on-one-card) for what
+that bought and did not.
 
 ## Against a serving engine
 

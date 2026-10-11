@@ -7,19 +7,39 @@ The design rests on one asymmetry:
   share storage.
 
 `ForkLayer` stores each of those where it belongs. The context sits in one row and every branch reads it; each
-branch's own tokens sit in its own row of a much shorter buffer. A read hands the attention kernel the two joined
-together, which costs a copy that lives for one layer and is freed before the next -- 222 MiB at 3,040 tokens and a
-group of 32, against 2.17 GiB that used to be held for as long as the context was open.
+branch's own tokens sit in its own row of a much shorter buffer.
 
-**Why a transient copy rather than a page table.** The kernel can be handed a page table naming shared pages, which
-would remove the copy as well. A path doing that was written and deleted -- it was never wired to anything, so its
-measurements were this path compared with itself, and docs/PERFORMANCE.md says so at length. What this file does
-instead is join, which is **bit-identical to replicating** -- the same bytes in the same order -- and store the join
-token-major so the kernel's own reshape is a view rather than a second copy of the whole thing.
+**The read used to join them.** A read handed the attention kernel one dense tensor per row, `context + that row's
+own tokens` concatenated -- bit-identical to replicating the context, but still a copy proportional to `rows x
+context_tokens`, freed before the next layer's but allocated again for it: 0.978 GiB at 16,000 context tokens and a
+group of 32, on top of the 2.17 GiB the join itself replaced. See `docs/PERFORMANCE.md`, "the second copy of the
+join" and the paragraph after it -- the two cheaper things that come before a page table, and this is the page table.
+
+**The read now shares a page table instead**, the same mechanism `paged.PagedForkLayer` hands the kernel, with one
+asymmetry: this layer only ever holds one document, so there is no pool, no admission and no release -- the pages are
+built fresh from this layer's own two buffers each time a branch reads them (`branch_read`, below). Slicing the
+context's whole pages (`shared_pages`, `context_length // BLOCK`) out of storage is a **view**, not a copy -- no
+bytes move to take it. What a row owns privately is its copy of the context's *partial* last page (at most `BLOCK -
+1` tokens, copied once per row rather than the whole context) followed by its own tokens -- bounded by the page
+size, not by the context length, which is most of the saving. The rest of the saving, and the reason the view above
+is not the end of the story: the kernel still needs one tensor it can index by one table, so the shared view and the
+private pages are concatenated into one -- the cat copies the shared pages, but **once per read, not once per row**,
+which is the term this change removes. What a branch pass now allocates transiently is `context_tokens` once plus
+`rows x (page + branch)`, against `rows x context_tokens` before.
+
+**Why this was not done from the start.** A page-table path was written once for a *different* file (the pool
+`paged.py` holds today), was never wired to anything, and was deleted -- `docs/PERFORMANCE.md`, "the paged path that
+never ran". Reusing `paged.PagedForkLayer`'s own pool wholesale for a layer that only ever holds one document would
+have carried its admission/release bookkeeping for nothing to admit or release, so this file borrows the page
+*arithmetic* (`BLOCK`) and the kernel's calling convention, not the pool class. `pages_read` and
+`ForkLayer.reads_served` exist for the reason the paged path's own witnesses exist: a flag that is wired and a flag
+that only looks wired cost a round of measurement once, and the defence is a counter the code that would have done
+the work has to increment.
 
 What it costs, measured on the supported model at 3,040 context tokens and a group of 32: an open context held 2.17
 GiB and now holds 0.37 GiB, a factor of 5.9. At 20,000 tokens the factor is 18, because the shared part stops being
-copied and the per-branch part does not grow with the context.
+copied and the per-branch part does not grow with the context. See `docs/PERFORMANCE.md` for what the *read*, as
+opposed to the hold, costs after this change.
 
 Neither of the framework's two cache families fits: the dynamic one grows by concatenation, so every request allocates
 new tensors; the static one insists the batch it was allocated for is the batch every write arrives at, and here the
@@ -51,12 +71,30 @@ class ForkLayer(CacheLayerMixin):
     #: silently start cloning a paged layer's buffers if the attribute ever moved.
     holds_attention = True
 
+    #: False, explicitly: this layer shares the paged branch read's page-table mechanism (`branch_read`, below) but
+    #: not its pool, admission or `stats()`'s `"storage"` label -- it only ever holds one document, so none of that
+    #: has anything to do. `graphs.py` and `engine.py` read this attribute to tell the two apart; leaving it to
+    #: `getattr(..., False)`'s default would make that true by accident rather than by a line a reader can find.
+    paged = False
+
+    #: Branch reads this class has served, in this process, across every instance -- the paged pool's own
+    #: `reads_served` has one for the same reason: the first page-table path this package wrote reported itself
+    #: installed and never ran, and the fix was a counter the code that would have done the work has to increment.
+    #: See `branch_read`.
+    reads_served = 0
+
     def __init__(self, max_cache_len: int, max_batch_size: int = 1, max_branch_len: int = 512, **_: object):
         super().__init__()
         self.max_cache_len = max_cache_len
         self.max_batch_size = max_batch_size
         #: How long a branch's own run of tokens may be. The context takes the rest of `max_cache_len`.
         self.max_branch_len = max_branch_len
+        #: Pages one row's private region holds: its copy of the context's worst-case partial last page
+        #: (`BLOCK - 1` tokens) plus room for its own tokens, rounded up. Sized for the worst case rather than for a
+        #: particular context's own remainder, like `paged.Pool.private_pages`, so a row's buffer is the same shape
+        #: whatever context opens next -- `_allocate` runs once and the actual remainder is only known once a context
+        #: is read.
+        self.private_pages = -(-(BLOCK - 1 + max_branch_len) // BLOCK)
         # The same number twice, for two consumers. The tensor is mutated in place rather than replaced, so anything
         # holding a reference to it keeps seeing the current value. The integer exists because the framework asks for
         # the length on the *host* during the forward pass, and reading it off the tensor there is a device-to-host
@@ -74,9 +112,17 @@ class ForkLayer(CacheLayerMixin):
         self.writing_branches = False
         self.keys: torch.Tensor | None = None
         self.values: torch.Tensor | None = None
-        #: One row per branch, `max_branch_len` long. Short, so replicating it is cheap in a way the context is not.
+        #: One row per branch, `self.private_pages * BLOCK` long -- a few tokens more than `max_branch_len`, the room
+        #: a row's copy of the context's partial last page needs. Short either way, so replicating it is cheap in a
+        #: way the context is not.
         self.branch_keys: torch.Tensor | None = None
         self.branch_values: torch.Tensor | None = None
+        #: Set once, when the first group's `begin_branches()` fixes `context_length`: how many of the context's
+        #: tokens fall short of a whole page, and so are copied rather than shared. `None` before that, so a read
+        #: before any branch has begun is a bug rather than a read of stale zeros.
+        self._remainder: int | None = None
+        #: How many branch reads this layer has actually served. Per instance, beside the class-level counter above.
+        self.pages_read = 0
         #: How many rows the last branch write actually carried. A witness, not state: a flag that reported one thing
         #: and did another is what cost this package a whole round of measurement, so a claim about the row count a
         #: pass used is checked against what the layer received rather than against what the caller meant to pass.
@@ -108,8 +154,10 @@ class ForkLayer(CacheLayerMixin):
         # One row for the context. It used to be `max_batch_size` rows of the same bytes.
         self.keys = torch.zeros((1, context_room, heads, head_dim), dtype=dtype, device=device)
         self.values = torch.zeros_like(self.keys)
+        # `self.private_pages * BLOCK` tokens, not `max_branch_len`: a few tokens of headroom for the context's
+        # partial last page, which this row's own tokens sit after rather than displace. See `branch_read`.
         self.branch_keys = torch.zeros(
-            (self.max_batch_size, self.max_branch_len, heads, head_dim), dtype=dtype, device=device
+            (self.max_batch_size, self.private_pages * BLOCK, heads, head_dim), dtype=dtype, device=device
         )
         self.branch_values = torch.zeros_like(self.branch_keys)
         self.cumulative_length = self.cumulative_length.to(device)
@@ -119,13 +167,16 @@ class ForkLayer(CacheLayerMixin):
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *_, **__):
         """A one-row write is the context; a full-batch write is the branches.
 
-        Returns keys and values in the framework's head-major layout either way, which is not an incidental
-        convenience. The model's own attention is the fallback when the borrowed kernel is unavailable and it takes
-        tensors in that layout, so a layer that returned anything else would not fall back, it would fail on the first
-        cached forward.
+        The context write returns keys and values in the framework's head-major layout, a **view** of token-major
+        storage so the borrowed kernel's `key.transpose(1, 2).reshape(...)` gets the storage back and reshapes it for
+        free rather than copying it. The model's own attention is the fallback when the borrowed kernel is
+        unavailable and it takes tensors in that layout too, so a context write that returned anything else would not
+        fall back, it would fail on the first cached forward.
 
-        What is returned is a **view** of token-major storage, so the borrowed kernel's
-        `key.transpose(1, 2).reshape(...)` gets the storage back and reshapes it for free rather than copying it.
+        The branch write returns nothing contiguous, `(None, None)`, because there is nothing contiguous: each row's
+        own tokens sit in a buffer the context's pages are not part of, and the two are only joined -- as a page
+        table, not a copy -- in `branch_read`. Returning the branch buffer alone would be a plausible-looking lie: it
+        is this group's tokens and not the context before them.
         """
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
@@ -140,7 +191,8 @@ class ForkLayer(CacheLayerMixin):
             return self._write_context(key_states, value_states, count)
         if rows > self.max_batch_size:
             raise ValueError(f"this layer holds {self.max_batch_size} branch rows and was given {rows}")
-        return self._write_branches(key_states, value_states, count, rows)
+        self._write_branches(key_states, value_states, count, rows)
+        return None, None
 
     def _write_context(self, key_states: torch.Tensor, value_states: torch.Tensor, count: int):
         """Into the single shared row, and the branches read it from there rather than being given a copy.
@@ -163,42 +215,29 @@ class ForkLayer(CacheLayerMixin):
             self.values[:, : self._host_length].transpose(1, 2),
         )
 
-    def _write_branches(self, key_states: torch.Tensor, value_states: torch.Tensor, count: int, rows: int):
-        """Into each branch's own row, then joined with the context for the read.
+    def _write_branches(self, key_states: torch.Tensor, value_states: torch.Tensor, count: int, rows: int) -> None:
+        """Into each branch's own row, at an offset measured from the context's length, not from the position the
+        tokens carry. Those two stop being equal as soon as an image is in the context -- the model's three-axis
+        positions advance by a grid rather than by a token -- and using a position here would write past what was
+        ever filled.
 
-        Fewer rows than the layer holds is allowed and is not a special case: the buffers were sized for the widest
-        group, and a group of three uses three of their rows. It matters because the join is per row -- so a narrow
-        group copies the context three times rather than thirty-two, and at a long context that is most of what the
-        pass costs. See docs/PERFORMANCE.md for the measurement that made this worth doing.
-
-        The offset is measured from the context's length, not from the position the tokens carry. Those two stop being
-        equal as soon as an image is in the context -- the model's three-axis positions advance by a grid rather than
-        by a token -- and using a position here would write past what was ever filled.
+        Written past `self._remainder`: the first `_remainder` slots of this row's buffer hold its copy of the
+        context's partial last page, made once by `begin_branches`, and a branch's own tokens come after that copy
+        rather than displacing it. `branch_read` is what reads the two as one run.
         """
-        assert self.keys is not None and self.values is not None
         assert self.branch_keys is not None and self.branch_values is not None
+        assert self._remainder is not None, "begin_branches() must run before the first branch write"
         at = self._host_length - self.context_length
         if at + count > self.max_branch_len:
             raise ValueError(
                 f"a branch of {at + count} tokens does not fit in {self.max_branch_len}; the widest branch is what "
                 f"this buffer was sized for"
             )
-        self.branch_keys[:rows, at : at + count] = key_states.transpose(1, 2)
-        self.branch_values[:rows, at : at + count] = value_states.transpose(1, 2)
+        start = self._remainder + at
+        self.branch_keys[:rows, start : start + count] = key_states.transpose(1, 2)
+        self.branch_values[:rows, start : start + count] = value_states.transpose(1, 2)
         self.last_branch_rows = rows
         self._advance(count)
-
-        used = self._host_length - self.context_length
-        # Joined for this layer's read and dropped before the next layer runs. `expand` costs nothing; the copy is the
-        # `cat`, and it is the price of keeping this bit-identical to holding the rows separately. Token-major, so the
-        # result is what the kernel reads and the transposed view below is what the fallback reads.
-        keys = torch.cat(
-            (self.keys[:, : self.context_length].expand(rows, -1, -1, -1), self.branch_keys[:rows, :used]), dim=1
-        )
-        values = torch.cat(
-            (self.values[:, : self.context_length].expand(rows, -1, -1, -1), self.branch_values[:rows, :used]), dim=1
-        )
-        return keys.transpose(1, 2), values.transpose(1, 2)
 
     def _advance(self, count: int) -> None:
         self._host_length += count
@@ -209,10 +248,90 @@ class ForkLayer(CacheLayerMixin):
 
         Called rather than inferred. The first call fixes where the context ended, and later calls -- one per group --
         are harmless, which is what lets `fork.restore_and_fork` call it without knowing whether it is the first.
+
+        The first call also copies the context's partial last page (`remainder` tokens, fewer than `BLOCK`) into
+        every row's buffer -- not just the rows the first group happens to use, because a later group can use more
+        of them and `_write_branches` never revisits this copy. Bounded by `BLOCK - 1` tokens per row, not by the
+        context's length, which is the entire difference between this and the join it replaces. There is nothing to
+        copy, and nothing to redo on a later group's `rewind_to`, because `context_length` -- and so the remainder --
+        never changes once fixed: this layer holds one context for as long as it is open.
         """
-        if not self.writing_branches:
-            self.context_length = self._host_length
-            self.writing_branches = True
+        if self.writing_branches:
+            return
+        assert self.keys is not None and self.values is not None
+        assert self.branch_keys is not None and self.branch_values is not None
+        self.context_length = self._host_length
+        self._remainder = self.context_length % BLOCK
+        if self._remainder:
+            shared = self.context_length - self._remainder
+            self.branch_keys[:, : self._remainder] = self.keys[:, shared : self.context_length].expand(
+                self.max_batch_size, -1, -1, -1
+            )
+            self.branch_values[:, : self._remainder] = self.values[:, shared : self.context_length].expand(
+                self.max_batch_size, -1, -1, -1
+            )
+        self.writing_branches = True
+
+    # ---------------------------------------------------------------- the branch read
+    def branch_read(
+        self, rows: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """The context's whole pages shared by every row, this row's own private pages, and the table naming both --
+        the same four things `paged.PagedForkLayer.paged_read` hands the kernel, built fresh from this layer's own
+        two buffers rather than from a pool, because this layer only ever holds one document.
+
+        **The shared part is a view.** `self.keys[:, : shared_pages * BLOCK]` is a prefix of storage that is already
+        token-major and already one row, so slicing and reshaping it costs nothing -- the same bytes every row's
+        table names, read once by the kernel however many rows name it. **The private part is this row's own
+        buffer**, reshaped the same way and just as free: `branch_keys` was allocated `self.private_pages * BLOCK`
+        wide for exactly this reshape. Joining the two into one tensor the kernel can index by a single table still
+        costs one copy -- `cat` along the page axis -- but its size is `shared_pages` once, not `shared_pages x
+        rows`: the term this file used to pay for every row is gone, and what is left is bounded by `rows x
+        private_pages`, which does not grow with the context.
+
+        `rows` narrows the table to the group being answered, same as `PagedForkLayer.paged_read`. The bound
+        (`capacity`) is every row's own page count, a constant whatever this context's actual remainder is --
+        `seqused_k`, not the shape, is what tells the kernel where a row's real tokens end.
+        """
+        assert self.keys is not None and self.values is not None
+        assert self.branch_keys is not None and self.branch_values is not None
+        assert self._remainder is not None, "begin_branches() must run before the first branch read"
+        take = self.max_batch_size if rows is None else rows
+        if take > self.max_batch_size:
+            raise ValueError(f"this layer holds {self.max_batch_size} rows and a read asked for {take}")
+
+        ForkLayer.reads_served += 1
+        self.pages_read += 1
+
+        shared_pages = self.context_length // BLOCK
+        used = self._host_length - self.context_length
+        seqused_len = self.context_length + used
+        private = self.private_pages
+
+        # `self.keys[0]` is already `(context_room, heads, dim)`, token-major; slicing its leading (token) axis to a
+        # whole number of pages and reshaping is a view, because the token axis is the outermost one left.
+        context_pages = self.keys[0, : shared_pages * BLOCK].view(shared_pages, BLOCK, *self.keys.shape[2:])
+        value_context_pages = self.values[0, : shared_pages * BLOCK].view(shared_pages, BLOCK, *self.values.shape[2:])
+        # `branch_keys[:take]` slices the outermost axis only, so it stays contiguous and the reshape that follows is
+        # a view too -- the same reason `context_pages` above is one.
+        branch_pages = self.branch_keys[:take].reshape(take * private, BLOCK, *self.branch_keys.shape[2:])
+        value_branch_pages = self.branch_values[:take].reshape(take * private, BLOCK, *self.branch_values.shape[2:])
+
+        keys = torch.cat((context_pages, branch_pages), dim=0)
+        values = torch.cat((value_context_pages, value_branch_pages), dim=0)
+        # Row r's table: the shared pages (every row names the same ones), then that row's own slice of the private
+        # region, which starts right after the shared pages in the tensor `cat` just built. Built as device
+        # arithmetic rather than a Python list of lists converted with `device=`: this runs once per attention
+        # layer per branch read, and a host round trip there is both a sync point and a bit of host-side garbage
+        # neither the pool nor the join needed.
+        device = self.keys.device
+        shared_idx = torch.arange(shared_pages, device=device, dtype=torch.int32).expand(take, -1)
+        row_first = shared_pages + torch.arange(take, device=device, dtype=torch.int32) * private
+        private_idx = row_first.unsqueeze(1) + torch.arange(private, device=device, dtype=torch.int32)
+        table = torch.cat((shared_idx, private_idx), dim=1)
+        seqused = torch.full((take,), seqused_len, dtype=torch.int32, device=device)
+        capacity = (shared_pages + private) * BLOCK
+        return keys, values, table, seqused, capacity
 
     # ---------------------------------------------------------------- the rest of the contract
     def get_seq_length(self) -> int:
@@ -240,6 +359,7 @@ class ForkLayer(CacheLayerMixin):
             self.cumulative_length.zero_()
             self._host_length = 0
             self.context_length = 0
+            self._remainder = None
             self.writing_branches = False
 
     def rewind_to(self, length: int) -> None:
@@ -301,8 +421,8 @@ def cache_bytes(
     context length, so they do not grow with it -- but they are replicated per branch and are the floor this cannot go
     below.
 
-    What this does not count is the transient join: one layer's context and branch rows concatenated for the read, 222
-    MiB at those sizes, allocated and freed inside a layer rather than held.
+    What this does not count is the transient read: a page table naming the context's shared pages plus each row's
+    own private ones, built fresh (and freed) inside each layer rather than held. See `ForkLayer.branch_read`.
 
     `paged` asks for the page pool's figure instead, which is a different and much larger number at short contexts. See
     the branch below.
@@ -331,7 +451,11 @@ def cache_bytes(
         pages = -(-context_room // BLOCK) + rows + rows * private
         slots = pages * BLOCK
     else:
-        slots = context_room + rows * max_branch_len
+        # `ForkLayer`'s own branch buffer is `ForkLayer.private_pages * BLOCK` tokens wide per row, the same rounding
+        # the paged pool above uses -- a few tokens more than `max_branch_len`, the room a row's copy of the
+        # context's partial last page needs. See `ForkLayer.branch_read`.
+        private = -(-(BLOCK - 1 + max_branch_len) // BLOCK)
+        slots = context_room + rows * private * BLOCK
     keys_and_values = 2 * attention_layers * heads * head_dim * slots * per_element
     # The thirty recurrent layers hold state too, one copy per row, and leaving it out understated an open context by a
     # gigabyte at the default group. See `state_bytes`.
