@@ -320,13 +320,16 @@ class ForkLayer(CacheLayerMixin):
         keys = torch.cat((context_pages, branch_pages), dim=0)
         values = torch.cat((value_context_pages, value_branch_pages), dim=0)
         # Row r's table: the shared pages (every row names the same ones), then that row's own slice of the private
-        # region, which starts right after the shared pages in the tensor `cat` just built.
-        rows_table = []
-        for r in range(take):
-            first = shared_pages + r * private
-            rows_table.append(list(range(shared_pages)) + list(range(first, first + private)))
-        table = torch.tensor(rows_table, dtype=torch.int32, device=self.keys.device)
-        seqused = torch.full((take,), seqused_len, dtype=torch.int32, device=self.keys.device)
+        # region, which starts right after the shared pages in the tensor `cat` just built. Built as device
+        # arithmetic rather than a Python list of lists converted with `device=`: this runs once per attention
+        # layer per branch read, and a host round trip there is both a sync point and a bit of host-side garbage
+        # neither the pool nor the join needed.
+        device = self.keys.device
+        shared_idx = torch.arange(shared_pages, device=device, dtype=torch.int32).expand(take, -1)
+        row_first = shared_pages + torch.arange(take, device=device, dtype=torch.int32) * private
+        private_idx = row_first.unsqueeze(1) + torch.arange(private, device=device, dtype=torch.int32)
+        table = torch.cat((shared_idx, private_idx), dim=1)
+        seqused = torch.full((take,), seqused_len, dtype=torch.int32, device=device)
         capacity = (shared_pages + private) * BLOCK
         return keys, values, table, seqused, capacity
 
