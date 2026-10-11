@@ -48,7 +48,7 @@ from pathlib import Path
 import numpy as np
 
 from .experience import Experience
-from .features import HashingTfidf, tokenize
+from .features import HashingTfidf, Vectorizer
 from .spec import TagSpec, load_spec
 
 
@@ -164,6 +164,8 @@ class StudentArtifact:
     admitted: bool
     reasons: tuple[str, ...]
     metrics: dict
+    features: str | None = None
+    feature_names: tuple[str, ...] | None = None
 
     def to_json(self) -> dict:
         return {
@@ -180,10 +182,13 @@ class StudentArtifact:
             "admitted": self.admitted,
             "reasons": list(self.reasons),
             "metrics": self.metrics,
+            "features": self.features,
+            "feature_names": list(self.feature_names) if self.feature_names is not None else None,
         }
 
     @staticmethod
     def from_json(raw: dict) -> StudentArtifact:
+        feature_names = raw.get("feature_names")
         return StudentArtifact(
             tag=raw["tag"],
             spec_version=raw["spec_version"],
@@ -198,18 +203,22 @@ class StudentArtifact:
             admitted=raw["admitted"],
             reasons=tuple(raw["reasons"]),
             metrics=raw["metrics"],
+            features=raw.get("features"),
+            feature_names=tuple(feature_names) if feature_names is not None else None,
         )
 
-    def vectorizer(self) -> HashingTfidf:
-        return HashingTfidf(dims=self.dims, idf=self.idf)
+    def vectorizer(self) -> Vectorizer:
+        if self.features is None:
+            return Vectorizer(features_name=None, hashing=HashingTfidf(dims=self.dims, idf=self.idf), names=None)
+        return Vectorizer(features_name=self.features, hashing=None, names=self.feature_names)
 
-    def predict_proba(self, context: str) -> dict[str, float]:
+    def predict_proba(self, context: str, question: str = "") -> dict[str, float]:
         """Load-bearing for a later stage, not for stage 1/2: given this exact artifact, reproduce the
         probabilities it would assign a new input, without touching training again."""
         import lightgbm as lgb
 
         booster = lgb.Booster(model_str=self.model_text)
-        vec = self.vectorizer().transform(tokenize(context))
+        vec = self.vectorizer().transform(context, question)
         (probs,) = booster.predict(np.asarray([vec], dtype=np.float64))
         return dict(zip(self.options, (float(p) for p in probs), strict=True))
 
@@ -264,12 +273,12 @@ def tau_sweep(held_out: list[Experience], predict_fn, taus=None) -> list[dict]:
     return rows
 
 
-def _soft_rows(experiences: list[Experience], options: tuple[str, ...], vectorizer: HashingTfidf):
+def _soft_rows(experiences: list[Experience], options: tuple[str, ...], vectorizer: Vectorizer):
     x_rows: list[list[float]] = []
     y_rows: list[int] = []
     w_rows: list[float] = []
     for e in experiences:
-        vec = vectorizer.transform(tokenize(e.context))
+        vec = vectorizer.transform(e.context, getattr(e, "question", ""))
         for i, opt in enumerate(options):
             p = e.probabilities.get(opt, 0.0)
             if p <= 0.0:
@@ -302,11 +311,15 @@ def fit_student(
     predicts the majority class; passing a smaller value is how a caller fits something meaningful on a tag
     that is still young, with the obvious cost (section 3's own admission conditions exist precisely to catch
     it) that a stump fit on little data is also the one most likely to fail them.
+
+    The feature scheme comes from ``tag.features``: `None` (no entry wrote a ``"features"`` field) fits the
+    hashed-TF-IDF default exactly as before this field existed; a name fits whatever `register_features`
+    registered under it, and a name nothing registered is a loud `FeatureError`, not a silent fallback.
     """
     import lightgbm as lgb
 
-    corpus = [tokenize(e.context) for e in train]
-    vectorizer = HashingTfidf.fit(corpus, dims)
+    records = [(e.context, e.question) for e in train]
+    vectorizer = Vectorizer.fit(records, features_name=tag.features, dims=dims)
     x_rows, y_rows, w_rows = _soft_rows(train, tag.options, vectorizer)
     if not x_rows:
         raise FitError(f"tag {tag.task!r} has no trainable experience (0 rows after soft-label expansion)")
@@ -366,7 +379,7 @@ def run(
     )
 
     def predict_fn(context: str) -> dict[str, float]:
-        vec = vectorizer.transform(tokenize(context))
+        vec = vectorizer.transform(context, tag.question)
         (probs,) = booster.predict(np.asarray([vec], dtype=np.float64))
         return dict(zip(tag.options, (float(p) for p in probs), strict=True))
 
@@ -427,12 +440,14 @@ def run(
         options=tag.options,
         kind=tag.kind,
         dims=dims,
-        idf=vectorizer.idf,
+        idf=vectorizer.hashing.idf if vectorizer.hashing is not None else (),
         model_text=booster.model_to_string(),
         created_at=time.time(),
         admitted=condition_1 and condition_2,
         reasons=tuple(reasons),
         metrics=metrics,
+        features=tag.features,
+        feature_names=vectorizer.names,
     )
 
 

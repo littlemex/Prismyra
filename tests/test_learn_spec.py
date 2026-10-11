@@ -128,3 +128,26 @@ def test_two_entries_with_the_same_normalized_shape_are_refused(tmp_path):
 def test_an_empty_spec_loads_with_no_tags(tmp_path):
     spec = load_spec(write(tmp_path, []))
     assert spec.tags == ()
+
+
+# --------------------------------------------------------------------------- the optional "features" field
+
+
+def test_an_entry_without_features_defaults_to_none(tmp_path):
+    spec = load_spec(write(tmp_path, [ENTRY]))
+    assert spec.tags[0].features is None
+
+
+def test_an_entry_with_a_features_name_keeps_it(tmp_path):
+    spec = load_spec(write(tmp_path, [{**ENTRY, "features": "snake_board_v1"}]))
+    assert spec.tags[0].features == "snake_board_v1"
+
+
+def test_an_empty_features_name_is_refused(tmp_path):
+    with pytest.raises(SpecError, match="'features'"):
+        load_spec(write(tmp_path, [{**ENTRY, "features": ""}]))
+
+
+def test_a_non_string_features_name_is_refused(tmp_path):
+    with pytest.raises(SpecError, match="'features'"):
+        load_spec(write(tmp_path, [{**ENTRY, "features": 1}]))

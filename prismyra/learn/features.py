@@ -13,6 +13,17 @@ hashed, IDF-weighted bag of those tokens turns a variable-length token list into
 needs: see `HashingTfidf`, fitted once over the training corpus and then applied unchanged to everything else,
 including a live request's input at serving time (stage 4, not built here, but the artifact this produces
 already carries what that would need).
+
+A tag can ask for a different feature scheme instead of hashed TF-IDF, by naming one in its spec entry's
+``features`` field (``prismyra.learn.spec.TagSpec.features``). "Different" means: a hand-written function from
+input (document, question) to a dict of named, numeric features, registered once under that name with
+``register_features`` -- a game's own board state turned into "is this direction safe", "how many cells can it
+still reach" and so on, rather than a bag of hashed JSON tokens that never represents a board's connectivity at
+all (learn2's own learning-curve finding, RUN-learn2.md section 7: hashed tokens have no way to carry "which
+cells are reachable from here"). The registration mechanism itself is kept deliberately small -- a name, a
+function, nothing else -- because *what* a tag's structured features should be is a per-tag, per-domain decision
+this module has no business making; `Vectorizer` only needs to know that a name resolves to *some* function
+shaped like one, and that calling it twice on the same input gives the same dict back.
 """
 
 from __future__ import annotations
@@ -21,7 +32,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
@@ -102,3 +113,85 @@ class HashingTfidf:
         n_docs = len(corpus) or 1
         idf = tuple(math.log((n_docs + 1) / (doc_count[i] + 1)) + 1.0 for i in range(dims))
         return HashingTfidf(dims=dims, idf=idf)
+
+
+#: ``(document, question) -> {feature name: numeric value}``. The whole shape a registered feature builder
+#: has to have. ``question`` exists because the design (section 3) describes the input as "文書と質問", not
+#: "文書" alone, even though every builder written so far ignores it (a tag's question text is a constant
+#: within that tag's own training set -- see this module's own docstring on why `tokenize` never looks at it
+#: either); a builder for a tag whose single context is asked more than one differently-shaped question would
+#: be the first to actually need it.
+FeatureFn = Callable[[str, str], dict[str, float]]
+
+
+class FeatureError(Exception):
+    """A spec names a feature builder (`TagSpec.features`) that nothing has registered yet, or two different
+    functions tried to register under the same name. Raised at *use* time (inside `Vectorizer.fit`, inside
+    `fit.py`'s `run()`), never at spec-load time -- `spec.load_spec` validates that `features` is a string;
+    whether that string is actually registered depends on which modules the caller has imported, which a
+    file-format module cannot know in advance.
+    """
+
+
+_FEATURE_BUILDERS: dict[str, FeatureFn] = {}
+
+
+def register_features(name: str, fn: FeatureFn) -> None:
+    """The entire registration mechanism, on purpose: a name maps to one function. Registering the same name
+    with the same function object twice (a module imported more than once, which `register_snake_board_v1`-style
+    call-at-import-time modules do every time something else imports them) is a no-op, not an error -- only a
+    second, *different* function trying to claim a name already taken is refused, the same "a typo ships
+    silently" concern `spec.py`'s own duplicate checks exist for.
+    """
+    existing = _FEATURE_BUILDERS.get(name)
+    if existing is not None and existing is not fn:
+        raise FeatureError(f"a feature builder named {name!r} is already registered")
+    _FEATURE_BUILDERS[name] = fn
+
+
+def get_feature_builder(name: str) -> FeatureFn:
+    try:
+        return _FEATURE_BUILDERS[name]
+    except KeyError:
+        registered = sorted(_FEATURE_BUILDERS)
+        raise FeatureError(f"no feature builder named {name!r} is registered (registered: {registered})") from None
+
+
+@dataclass(frozen=True)
+class Vectorizer:
+    """One tag's chosen way of turning (document, question) into a fixed-width numeric vector -- either the
+    hashed-TF-IDF default (``features_name is None``, ``hashing`` set: today's only behaviour, unchanged by any
+    of this) or a registered structured-feature builder (``features_name`` set, ``names`` fixing the column
+    order). Exactly one of ``hashing``/``names`` is set, matching which branch ``features_name`` picked.
+
+    Column order for the structured branch is fixed once, at `fit`, from the *first* training record's keys --
+    a builder is expected to return the same key set on every call (its docstring's contract, not this class's
+    to enforce), and a later call whose dict is missing a key seen at fit time contributes 0.0 for that column
+    rather than raising, the same tolerance `HashingTfidf.transform` already has for a token it never saw.
+    """
+
+    features_name: str | None
+    hashing: HashingTfidf | None
+    names: tuple[str, ...] | None
+
+    def transform(self, context: str, question: str = "") -> list[float]:
+        if self.features_name is None:
+            assert self.hashing is not None
+            return self.hashing.transform(tokenize(context))
+        assert self.names is not None
+        fn = get_feature_builder(self.features_name)
+        values = fn(context, question)
+        return [float(values.get(name, 0.0)) for name in self.names]
+
+    @staticmethod
+    def fit(records: list[tuple[str, str]], *, features_name: str | None, dims: int) -> Vectorizer:
+        """``records`` is a list of ``(context, question)`` pairs from the training set -- the hashed branch
+        only ever looks at the ``context`` half (fitting IDF over the training corpus, same as before this
+        class existed); the structured branch calls the registered builder once, on the first record, purely
+        to learn its fixed set of output keys."""
+        if features_name is None:
+            corpus = [tokenize(context) for context, _ in records]
+            return Vectorizer(features_name=None, hashing=HashingTfidf.fit(corpus, dims), names=None)
+        fn = get_feature_builder(features_name)
+        names = tuple(sorted(fn(*records[0]).keys())) if records else ()
+        return Vectorizer(features_name=features_name, hashing=None, names=names)

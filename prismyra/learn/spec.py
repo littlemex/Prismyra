@@ -36,6 +36,15 @@ REQUIRED_FIELDS = frozenset(
     {"task", "question", "options", "kind", "normalize", "retain_days", "keep_hidden", "eval_set"}
 )
 
+#: Fields an entry may have in addition to ``REQUIRED_FIELDS``, checked when present but never required --
+#: an existing spec file with none of these keeps meaning exactly what it meant before. ``"features"`` names a
+#: registered feature builder (``prismyra.learn.features.register_features``) stage 2's student should use for
+#: this tag instead of the hashed-TF-IDF default; which builders exist is a runtime fact (an operator's own
+#: module registers one by importing it), not something this file-format module can check against, so only the
+#: type is validated here -- an unregistered name is a refusal at fit time (``prismyra.learn.features``), not at
+#: spec-load time.
+OPTIONAL_FIELDS = frozenset({"features"})
+
 #: The closed set of normalization rules ``tagging.normalize`` knows how to apply. Not open-ended on purpose: a
 #: rule is a few lines of string handling, and an operator who needs a new one is one PR away, not a regex they
 #: hand-type into a JSON file where a mistake fails silently at match time instead of loudly at load time.
@@ -63,6 +72,7 @@ class TagSpec:
     retain_days: int
     keep_hidden: bool
     eval_set: str
+    features: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,11 +106,12 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
     if not isinstance(raw, dict):
         _fail(path, where, f"must be a JSON object, got {type(raw).__name__}")
     missing = REQUIRED_FIELDS - raw.keys()
-    extra = raw.keys() - REQUIRED_FIELDS
+    extra = raw.keys() - REQUIRED_FIELDS - OPTIONAL_FIELDS
     if missing:
         _fail(path, where, f"missing field(s): {sorted(missing)}")
     if extra:
-        _fail(path, where, f"unknown field(s): {sorted(extra)} -- the allowed fields are {sorted(REQUIRED_FIELDS)}")
+        allowed = sorted(REQUIRED_FIELDS | OPTIONAL_FIELDS)
+        _fail(path, where, f"unknown field(s): {sorted(extra)} -- the allowed fields are {allowed}")
 
     task = raw["task"]
     if not isinstance(task, str) or not task.strip():
@@ -138,6 +149,12 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
     if not isinstance(eval_set, str) or not eval_set.strip():
         _fail(path, where, f"'eval_set' must be a non-empty string (a path), got {eval_set!r}")
 
+    features: str | None = None
+    if "features" in raw:
+        features = raw["features"]
+        if not isinstance(features, str) or not features.strip():
+            _fail(path, where, f"'features' must be a non-empty string (a registered builder's name), got {features!r}")
+
     return TagSpec(
         task=task,
         question=question,
@@ -147,6 +164,7 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
         retain_days=retain_days,
         keep_hidden=keep_hidden,
         eval_set=eval_set,
+        features=features,
     )
 
 

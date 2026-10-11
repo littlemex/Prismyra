@@ -293,3 +293,103 @@ def test_the_student_artifact_round_trips_through_json_and_predicts(tmp_path):
     probs = restored.predict_proba("this is amazing news item 0")
     assert set(probs) == {"negative", "positive"}
     assert abs(sum(probs.values()) - 1.0) < 1e-6
+
+
+# --------------------------------------------------------------------------- a tag that names a registered,
+# structured feature builder instead of the hashed-TF-IDF default (learn3)
+
+
+def _word_count_v1(context: str, question: str) -> dict[str, float]:
+    words = context.split()
+    return {
+        "n_words": float(len(words)),
+        "n_positive_words": float(sum(1 for w in words if w.strip(".,!") in POSITIVE_WORDS)),
+        "n_negative_words": float(sum(1 for w in words if w.strip(".,!") in NEGATIVE_WORDS)),
+    }
+
+
+def _register_word_count_features():
+    # A module-level function, not one freshly defined per call: `register_features` is a no-op for the
+    # *same* function object registered twice (every test in this file that needs this tag calls this), but
+    # would (rightly) refuse a second, different function trying to claim the same name.
+    from prismyra.learn.features import register_features
+
+    register_features("word-count-v1", _word_count_v1)
+    return _word_count_v1
+
+
+def test_fit_student_honours_a_tags_registered_features_field(tmp_path):
+    _register_word_count_features()
+    _spec_path, spec = make_spec(tmp_path, features="word-count-v1")
+    tag = spec.by_task(TASK)
+    assert tag.features == "word-count-v1"
+    train = [_exp(spec, ctx, p, i) for i, (ctx, p, _) in enumerate(synthetic_rows(20))]
+
+    from prismyra.learn.fit import fit_student
+
+    _booster, vectorizer = fit_student(tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10)
+    assert vectorizer.features_name == "word-count-v1"
+    assert vectorizer.hashing is None
+    assert vectorizer.names == ("n_negative_words", "n_positive_words", "n_words")
+
+
+def test_run_admits_a_structured_feature_student_and_round_trips_the_artifact(tmp_path):
+    _register_word_count_features()
+    spec_path, spec = make_spec(tmp_path, features="word-count-v1")
+    rows = synthetic_rows(60)
+    write_experience(tmp_path, spec, rows)
+
+    eval_path = tmp_path / "eval.jsonl"
+    with eval_path.open("w") as fh:
+        for context, p_positive, _ in synthetic_rows(15):
+            gold = "positive" if p_positive > 0.5 else "negative"
+            fh.write(
+                json.dumps(
+                    {
+                        "context": context,
+                        "gold": gold,
+                        "options": ["negative", "positive"],
+                        "prismyra_probabilities": {"negative": 1 - p_positive, "positive": p_positive},
+                    }
+                )
+                + "\n"
+            )
+
+    artifact = run(
+        spec_path=spec_path,
+        task=TASK,
+        log_dir=None,
+        package_version="0.0.0-test",
+        backbone="stub/model",
+        dims=128,  # unused by the structured branch, kept only as metadata
+        held_out_fraction=0.25,
+        min_match_rate=0.5,
+        accuracy_margin=0.5,
+        num_threads=1,
+        seed=0,
+        num_boost_round=30,
+        min_data_in_leaf=2,
+    )
+    assert artifact.features == "word-count-v1"
+    assert artifact.feature_names == ("n_negative_words", "n_positive_words", "n_words")
+    assert artifact.admitted, artifact.reasons
+
+    from prismyra.learn.fit import StudentArtifact
+
+    restored = StudentArtifact.from_json(json.loads(json.dumps(artifact.to_json())))
+    assert restored == artifact
+    probs = restored.predict_proba("this is amazing news item 0")
+    assert set(probs) == {"negative", "positive"}
+    assert abs(sum(probs.values()) - 1.0) < 1e-6
+
+
+def test_fit_student_raises_on_an_unregistered_features_name(tmp_path):
+    _spec_path, spec = make_spec(tmp_path, features="definitely-not-registered-v1")
+    tag = spec.by_task(TASK)
+    train = [_exp(spec, ctx, p, i) for i, (ctx, p, _) in enumerate(synthetic_rows(5))]
+
+    from prismyra.learn.features import FeatureError
+    from prismyra.learn.fit import fit_student
+
+    with pytest.raises(FeatureError, match="no feature builder named"):
+        fit_student(tag, train=train, dims=16, num_threads=1, seed=0, num_boost_round=5)
