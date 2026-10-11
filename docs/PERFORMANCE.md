@@ -104,37 +104,77 @@ cap at all on the same card, confirming neither check had seen the cap. `chunkin
 ### Fitting a long context and a wide group on one card
 
 On the NVFP4 checkpoint's card (32 GiB of RTX PRO 4500, a budget set to 22.5 and to 24 GiB to stand in for a smaller
-one), a 16,000-token context together with 32 questions at once needs more than the default group (32) can hold in
-22.5 GiB even with the correction above. [The join's per-row copy](#the-second-copy-of-the-join) is gone now --
-`cache.ForkLayer.branch_read` shares the context's whole pages across every row instead of copying them per row,
-the same page-table mechanism `paged.PagedForkLayer` hands the attention kernel -- and what it bought is smaller
-than hoped and real anyway. Measured directly (`torch.cuda.memory_allocated` either side of the call, every
-attention layer, this width and length): the per-layer transient the join used to cost fell from 0.98 GiB to 0.06
-GiB, a reduction the removal predicts almost exactly. The *overall* peak barely moved, because that transient was
-never what set it -- a second, unrelated climb in held memory across the nine attention layers (present whatever
-the question count, including two) is the larger term at this length, and this change does not touch it. At group
-32 and 22.5 GiB the pass still runs out of memory, 22.18 GiB peak against a 22.50 GiB budget, bit-identical to
-before the change but closer to the line. At 24 GiB, group 32 now fits the full sweep up to 24,000 context tokens
-and 64 questions where it used to need the context's own one-time read forced through `chunking` to clear 24 GiB by
-0.23 GiB -- the ordinary, unforced path now carries 1.48 GiB free at the headline length. Building the engine with
-a narrower group still closes the 22.5 GiB gap, and now with more room either side of it: `group=16` leaves 0.71
-GiB free at 22.5 GiB (was 0.32 before this change) and `group=8` leaves 1.20 GiB (was 1.03). Verified bit-identical
-to `group=32` across five context lengths and seven question counts straddling every group boundary (35/35 cases,
-`torch.equal` on the full probability output) -- unaffected by this change, since nothing about how a group is
-split moved. What narrowing the group still costs: for a question count the narrower group now has to answer in
-more than one pass, every pass after the first falls back to the two-pass path (`ask()`'s own docstring, above)
-rather than the layer-interleaved one -- for 32 questions at this context length, `group=16` now measures +6.1%
-median latency against the same engine at `group=32` (was +11.9%), roughly half the earlier cost for the same
-capacity. A question count that already fit one pass at the narrower group (16 or fewer) is unaffected. At `group=
-32` itself, where a 16,000-token, 32-question pass fits at all (24 GiB, or 22.5 GiB with a shorter context or fewer
-questions), it answers 6.4% *faster* than before this change, not merely within the no-regression bound measured
-elsewhere in this document -- removing a transient that was never freed between the allocator asking for the next
-layer's and the one after it is cheaper even where it was never the peak.
+one), a 16,000-token context together with 32 questions at once used to need more than the default group (32) could
+hold in 22.5 GiB. Two changes closed that gap, both leaving the default group untouched. [The join's per-row
+copy](#the-second-copy-of-the-join) is gone -- `cache.ForkLayer.branch_read` shares the context's whole pages
+across every row instead of copying them per row, the same page-table mechanism `paged.PagedForkLayer` hands the
+attention kernel. Measured directly (`torch.cuda.memory_allocated` either side of the call, every attention layer,
+this width and length): the per-layer transient the join used to cost fell from 0.98 GiB to 0.06 GiB, a reduction
+the removal predicts almost exactly -- real, but on its own not what set the overall peak at this length. [A second,
+larger climb in held memory](#the-unrelated-climb-a-recurrent-layers-own-state) across the thirty-six-layer pass,
+present whatever the question count, was the larger term, and closing it (below) is what actually moved the peak:
+16,000 tokens and 32 questions now runs at 21.17 GiB reserved against a 22.50 GiB budget, group 32 unchanged, with
+1.33 GiB to spare where it used to run out of memory a few hundred megabytes short. At 24 GiB, group 32 now fits the
+full sweep up to 24,000 context tokens and 64 questions, where it used to need the context's own one-time read
+forced through `chunking` to clear 24 GiB by 0.23 GiB. Measured against the same engine at `group=32` before either
+change, 16,000 tokens and 32 questions now answers 0.8% slower with the 22.5 GiB budget
+in force -- inside the no-regression bound, and without the two-pass fallback a narrower group used to need for any
+question count past the group's own width. (Building the engine with a narrower group still works, is still
+bit-identical -- 35/35 cases verified, `torch.equal` on the full probability output, across five context lengths and
+seven question counts straddling every group boundary -- and still carries the two-pass fallback's own cost for a
+question count that does not fit one group; it is no longer what the headline case needs.)
 
-The unrelated climb this change did not touch -- held memory rising across the nine attention layers of one branch
-pass, independent of the question count, first noticed by its absence of correlation with the row count rather than
-by name -- is the next thing worth measuring directly rather than inferring from what removing the join's copy
-failed to move.
+### The unrelated climb: a recurrent layer's own state
+
+Held memory rising steadily across the thirty-six-layer pass, independent of the question count, turned out to
+come from a different place than the join entirely: the recurrent layers' own state. `fork._owned` gives each
+gated-delta-net layer a buffer sized for the engine's own `group` (every row the construction-time default
+allows), not for how many rows the request in hand actually has, and keeps it on the
+layer, address and all, until the whole cache is dropped -- correct and worth its keep when a second branch group is
+still coming for this same cache and will read that same layer's buffer again at the same address a moment later
+(measured elsewhere in this document at 33.4 ms replayed against 109 ms built fresh), wasted when there is no second
+group, which a request whose question count already fits one group never has. Measured directly (`torch.cuda.
+memory_allocated` immediately before each of the thirty-six layers' own first call, this width and length): every
+gated-delta-net layer added about 68 MiB that a full-attention layer never did, and it never came back until the
+cache itself did at the end of the request -- 1.74 GiB total held for a request that read every one of those layers
+exactly once. `interleave.read_and_branch` now tells `fork.widen_for_branch` to free a layer's buffer the moment
+that layer's own branch forward is done whenever the caller already knows (`ask()`'s own `len(groups) == 1`) that no
+second group is coming for this cache -- a multi-group request is untouched, since `only_group` is only ever `True`
+when there will not be one. The climb that used to add 2.19 GiB from the first layer to the last now adds 0.45 GiB,
+and the overall peak at 16,000 tokens and 32 questions fell from 23.69 to 22.02 GiB -- enough that group 32, the
+construction-time default, now fits the headline case at 22.5 GiB with 1.33 GiB to spare, where it used to need a
+narrower group to fit at all. Verified bit-identical to the unpatched path across ten context lengths and ten
+question counts spanning both one group and more than one (4,700 probability checks, all exact) -- freeing a buffer
+sooner changes nothing about what it held.
+
+One more thing this measurement found: `cache.state_bytes`, which priced a gated-delta-net layer's held state at
+the model's own compute dtype, was pricing only half of the recurrent half of it. [The next section](#the-budget-
+figure-that-was-pricing-half-the-state-it-counted) is that fix.
+
+### The budget figure that was pricing half the state it counted
+
+`cache.state_bytes` prices a gated-delta-net layer's held state -- the recurrent half and the convolution half --
+at the model's own compute dtype, the same dtype the formula next to it in `cache_bytes` uses for the key-value
+cache. The convolution half really is held at that dtype, measured on the live buffer. The recurrent half is not:
+`transformers`' gated-delta-rule kernel, chunked or single-step, upcasts every operand to `float32` before folding
+a token into the state, unconditionally, whatever dtype the rest of the model runs its matmuls at -- so the live
+cache's `recurrent_states` is always `float32`, confirmed on device at every context length and question count
+tried (2,000 to 16,000 tokens, one question to thirty-two), and the same whether the rest of the model ran at
+`bfloat16` or at a quantized compute dtype. The formula was pricing it at half that width, understating a
+32-row group's held state by 0.84 GiB on the supported model -- 0.90 GiB priced against 1.74 GiB actually held.
+
+Fixed by pricing the two halves at their own dtypes rather than one shared one: the recurrent half at
+`cache.RECURRENT_STATE_DTYPE` (`float32`, a module constant rather than a multiplier, because a flat "double it"
+would have been right for a two-byte compute dtype by coincidence and wrong for a one-byte one), the convolution
+half at the model's own dtype as before. Not a numerical change to anything a kernel computes -- the live buffer was
+always `float32`; only admission's own arithmetic about it was wrong -- so every answer this engine gives is
+unaffected. Verified bit-identical to the unpatched formula's own engine across the same ten context lengths and
+ten question counts [the release fix above](#the-unrelated-climb-a-recurrent-layers-own-state) was checked against
+(4,700 probability checks, all exact), and the sweep across 22.5 GiB and 24.0 GiB from [the previous
+section](#fitting-a-long-context-and-a-wide-group-on-one-card) re-run against the corrected formula: all eighty-one
+combinations at both budgets admitted exactly the combinations they admitted before, because none of them sat
+within 0.84 GiB of either budget's own edge. The correction only ever makes admission's own account of a context
+honest; it does not, in anything measured so far, make admission refuse something it used to accept.
 
 ## Where it wins and where it loses
 
@@ -972,7 +1012,8 @@ hands the kernel: the context's whole pages are a view, shared by every row's ta
 each row privately holds only its copy of the context's own partial last page (bounded by the page size, not the
 context length) followed by its own tokens. See
 [Fitting a long context and a wide group on one card](#fitting-a-long-context-and-a-wide-group-on-one-card) for what
-that bought and did not.
+that bought on its own, and [the recurrent layer's own state](#the-unrelated-climb-a-recurrent-layers-own-state) for
+the larger term it took a second change to close.
 
 ## Against a serving engine
 

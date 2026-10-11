@@ -1171,7 +1171,13 @@ class Prismyra:
             try:
                 by_index: dict[int, torch.Tensor] = {}
                 hidden0, prefill = interleave.read_and_branch(
-                    self, encoded, first_texts, width=first_width, group=effective_group, padded_rows=first_padded
+                    self,
+                    encoded,
+                    first_texts,
+                    width=first_width,
+                    group=effective_group,
+                    padded_rows=first_padded,
+                    only_group=len(groups) == 1,
                 )
                 scored0 = self.heads.apply(
                     hidden0,

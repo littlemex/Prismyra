@@ -104,7 +104,7 @@ def snapshot(cache) -> dict:
 
 
 @contextmanager
-def widen_for_branch(layer, rows: int, width: int, lane: int = 0):
+def widen_for_branch(layer, rows: int, width: int, lane: int = 0, release: bool = False):
     """Give one recurrent layer's just-written context state to `rows` branch rows, for exactly the call this
     wraps -- the layer-interleaved fork. The per-layer analogue of `restore_and_fork`'s own
     widening, with one difference: there is no snapshot here. What is widened is whatever this layer holds
@@ -122,6 +122,21 @@ def widen_for_branch(layer, rows: int, width: int, lane: int = 0):
     `begin_branches()`, called once per layer by the caller, already does the equivalent job for keys and
     values from the write order alone, and nothing needs to be undone afterwards -- see that method's own
     docstring.
+
+    `release`: drop this layer's `_owned` buffer (the full `width`-row allocation, not the one-row tensor
+    restored below) on exit instead of leaving it cached on the layer for a second branch group to reuse. The
+    caller's own job to decide, because only it knows whether a second group is coming for this request: a
+    request with more than one group needs this layer's buffer again, at the same address, moments later
+    (`_claim_cache`'s own docstring measured that replay at 33.4 ms against 109 eagerly), so clearing it there
+    would pay the allocation twice for nothing. A request with exactly one group never calls this layer's
+    `widen_for_branch` again before its cache is dropped -- see `read_and_branch`'s own caller, which is the
+    only place that knows the group count and is the only place that passes `release=True`. What this frees is
+    real: `cache.state_bytes` now prices this at the recurrent state's own dtype (`cache.RECURRENT_STATE_DTYPE`,
+    `float32`, measured on the supported model as 2 MiB a row -- the framework keeps a gated-delta-net layer's
+    recurrent state in `float32` regardless of the model's own dtype), and every one of the thirty-six layers'
+    own `_owned` buffer is alive from this call until the whole cache is dropped at the end of the request -- a
+    one-group answer at a context long enough to need chunking pays for all thirty of them at once for no reason
+    it ever uses again.
     """
     held: dict[tuple, torch.Tensor] = {}
     for attr in ("recurrent_states", "conv_states"):
@@ -145,6 +160,11 @@ def widen_for_branch(layer, rows: int, width: int, lane: int = 0):
             for k in list(d.keys()):
                 if (attr, k) in held:
                     d[k] = held[(attr, k)]
+        if release:
+            store = getattr(layer, OWNED if lane == 0 else f"{OWNED}_{lane}", None)
+            if isinstance(store, dict):
+                for attr, k in list(held.keys()):
+                    store.pop((attr, k), None)
 
 
 @contextmanager

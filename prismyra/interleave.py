@@ -43,13 +43,22 @@ from . import chunking, varlen
 from .fork import Prefill, build_suffixes, pick, snapshot_bytes, snapshot_layer, widen_for_branch, widen_for_branch_many
 
 
-def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, padded_rows: int):
+def read_and_branch(
+    engine, encoded, texts: list[str], width: int, group: int, padded_rows: int, only_group: bool = False
+):
     """Read `encoded`'s context and answer `texts` (one branch group) in one layer-interleaved pass.
 
     `width` and `padded_rows` are the caller's own (`engine._packed_groups` / `engine._round_rows`): this
     function does not repeat that decision, so a document answered partly through this path and partly through
     `engine._branch` (a second group, or a caller that falls back) sees the identical padding both times --
     `_round_rows`'s own docstring is why a mismatch there would move an answer rather than raise.
+
+    `only_group`: the caller's own knowledge that this request has exactly one group (`len(groups) == 1` in
+    `Prismyra._ask_interleaved`, the one caller) -- nothing later in this same request will call a recurrent
+    layer's `fork.widen_for_branch` again. Passed straight through as `release` so each gated-delta-net layer's
+    full-group-width recurrent and convolution buffer is freed the moment this layer's own branch forward is
+    done rather than held until the whole cache is dropped at the end of the request -- see that function's
+    own docstring for what this is worth and why a multi-group request must not set it.
 
     Returns `(hidden, prefill)`. `hidden` is `(len(texts), hidden_size)`, read at each row's own last real token
     -- the same shape and, `torch.equal`-gated, the same values `engine._branch` gives for this
@@ -112,7 +121,7 @@ def read_and_branch(engine, encoded, texts: list[str], width: int, group: int, p
             # tensors with a wider view -- so a second branch group's fork later sees the one-row context
             # tensors, not this group's `padded_rows`-wide ones.
             snap[i] = snapshot_layer(layer_cache)
-            with widen_for_branch(layer_cache, padded_rows, group), varlen.branching():
+            with widen_for_branch(layer_cache, padded_rows, group, release=only_group), varlen.branching():
                 out_branch = decoder_layer.linear_attn(normed_branch, cache_params=cache, attention_mask=None)
         else:
             out_ctx, _ = decoder_layer.self_attn(
