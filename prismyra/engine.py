@@ -632,12 +632,15 @@ class Prismyra:
         # experts are never loaded; `tiny_experts` makes the framework's loader accept the missing keys). Converted
         # here, before `kernels.apply` below, so the adapter below finds `FusedExpertsFp4` already in place and
         # only has to recognise it rather than build it.
+        #
         # Experimental: routed experts in W4A16 (int4 weights, bf16 activations), selected with
-        # PRISMYRA_EXPERTS=int4_marlin (prismyra/kernels/marlin_int4.py). Unlike NVFP4 above, `model` stays the
-        # ordinary FP8 checkpoint -- this is a weight-only quantization converted straight from the FP8 experts
-        # already in memory, so there is no stripped-checkpoint index for `tiny_experts` to patch around and no
-        # calibration file to read. The point is a card too small for the FP8 experts (24 GiB), so this path is
-        # tried on top of a normal load rather than a load the NVFP4 path's `tiny_experts` trims in advance.
+        # PRISMYRA_EXPERTS=int4_marlin (prismyra/kernels/marlin_int4.py). `model` must likewise be a checkpoint
+        # whose index leaves the routed-expert weights out, for the same reason NVFP4's does: the ordinary FP8
+        # experts alone (about 27 GiB on this checkpoint) do not fit beside a quantizer's own transient buffers
+        # on the card this format exists for -- `tiny_experts` keeps `AutoModel.from_pretrained` from ever
+        # allocating them at full size. `PRISMYRA_INT4_MARLIN_CHECKPOINT` names the *original*, un-stripped
+        # checkpoint `marlin_int4.convert()` reads each expert's real FP8 tensors from directly (one expert at a
+        # time, through vLLM's own `safe_open`), independent of what `model` itself points at.
         use_int4_marlin_experts = os.environ.get("PRISMYRA_EXPERTS") == "int4_marlin" and on_cuda and fast_kernels
         use_nvfp4_experts = os.environ.get("PRISMYRA_EXPERTS") == "nvfp4" and on_cuda and fast_kernels
         if use_nvfp4_experts:
@@ -647,15 +650,22 @@ class Prismyra:
                 self.backbone = AutoModel.from_pretrained(model, dtype=self.dtype, device_map=self.device)
             decoder_cfg = getattr(self.config, "text_config", self.config)
             _nvfp4.convert(self.backbone, decoder_cfg.num_experts_per_tok, self.torch_device)
+        elif use_int4_marlin_experts:
+            from .kernels import marlin_int4 as _int4
+
+            with _int4.tiny_experts():
+                self.backbone = AutoModel.from_pretrained(model, dtype=self.dtype, device_map=self.device)
+            decoder_cfg = getattr(self.config, "text_config", self.config)
+            _int4.convert(
+                self.backbone,
+                decoder_cfg.num_experts_per_tok,
+                self.torch_device,
+                os.environ["PRISMYRA_INT4_MARLIN_CHECKPOINT"],
+            )
         else:
             self.backbone = AutoModel.from_pretrained(
                 model, dtype=self.dtype, device_map=self.device if on_cuda else None
             )
-            if use_int4_marlin_experts:
-                from .kernels import marlin_int4 as _int4
-
-                decoder_cfg = getattr(self.config, "text_config", self.config)
-                _int4.convert(self.backbone, decoder_cfg.num_experts_per_tok, self.torch_device)
         self.backbone.eval()
         if not on_cuda:
             self.backbone.to(self.torch_device)
