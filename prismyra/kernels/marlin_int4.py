@@ -173,8 +173,13 @@ class FusedExpertsMarlinInt4(nn.Module):
                     flush=True,
                 )
 
-        self.w1 = gptq_marlin_moe_repack(packed1, hidden, gate_up_n, 4)
-        self.w2 = gptq_marlin_moe_repack(packed2, intermediate, hidden, 4)
+        # `perm`: the GPTQ activation-order (`desc_act`/`g_idx`) sort indices, empty here because this file's own
+        # RTN quantization never reorders groups (`vllm`'s own convention for "no act_order", measured against
+        # `oracle/int_wna16.py`'s own caller: `torch.empty((num_experts, 0), dtype=torch.int32)`, not an identity
+        # permutation).
+        no_g_idx = torch.empty((num_experts, 0), dtype=torch.int32, device=device)
+        self.w1 = gptq_marlin_moe_repack(packed1, no_g_idx, hidden, gate_up_n, 4)
+        self.w2 = gptq_marlin_moe_repack(packed2, no_g_idx, intermediate, hidden, 4)
         self.w1_scale = marlin_moe_permute_scales(scale1, hidden, gate_up_n, GROUP_SIZE)
         self.w2_scale = marlin_moe_permute_scales(scale2, intermediate, hidden, GROUP_SIZE)
         del packed1, scale1, packed2, scale2
