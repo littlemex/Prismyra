@@ -374,6 +374,69 @@ def test_a_branch_read_actually_ran():
     assert ForkLayer.reads_served == before + 1
 
 
+def test_kv_fp8_off_by_default_and_leaves_storage_at_the_compute_dtype(monkeypatch: pytest.MonkeyPatch):
+    """The flag's own docstring (`ForkLayer.kv_fp8`) promises the default path costs nothing and changes nothing.
+    Read at construction time, so this has to unset the variable before building the layer -- a stray value left by
+    an earlier test in the same process is exactly the kind of thing `held.kv_fp8` exists to make visible rather
+    than silently inherited."""
+    monkeypatch.delenv("PRISMYRA_KV_FP8", raising=False)
+    held = layer(rows=4, context=20, branch=8)
+    assert held.kv_fp8 is False
+    assert held.keys is not None and held.keys.dtype == torch.float32
+    assert held.key_scale is None and held.value_scale is None
+
+
+def test_kv_fp8_on_stores_float8_and_round_trips_within_the_format_s_own_tolerance(monkeypatch: pytest.MonkeyPatch):
+    """`PRISMYRA_KV_FP8=1` -- storage narrows to `float8_e4m3fn` and a context read (both the one `update()` hands
+    back immediately and the one a later `branch_read` reconstructs from the shared pages) must still recover
+    values close to what was written, not merely *some* number: a packing or scale mistake does not crash, it
+    answers with a plausible-looking wrong number, which is why this compares against the real input rather than
+    only checking that the dtype changed."""
+    monkeypatch.setenv("PRISMYRA_KV_FP8", "1")
+    held = layer(rows=4, context=32, branch=8)
+    assert held.kv_fp8 is True
+    assert held.keys is not None and held.keys.dtype == torch.float8_e4m3fn
+    assert held.key_scale is not None and held.key_scale.dtype == torch.float32
+
+    generator = torch.Generator().manual_seed(0)
+    context = torch.randn(1, 2, 32, 3, generator=generator) * 3.0  # realistic spread, not the 0..N test fixture
+    returned_k, returned_v = held.update(context, context * -1.0)
+    assert returned_k is not None and returned_v is not None
+    rel_error = (returned_k.float() - context).abs().max() / context.abs().max().clamp_min(1e-6)
+    assert rel_error < 2**-3, f"the immediate context-pass read moved {rel_error:.3e} relative, more than fp8 allows"
+
+    held.begin_branches()
+    gathered_keys, gathered_values, k_len = gathered(held, rows=4)
+    assert k_len == 32
+    rel_error_branch = (gathered_keys[0].float() - context[0]).abs().max() / context.abs().max().clamp_min(1e-6)
+    assert rel_error_branch < 2**-3, f"a branch read moved {rel_error_branch:.3e} relative, more than fp8 allows"
+    assert torch.equal(gathered_values, -gathered_keys), "value was written as -key, and fp8 rounds both the same"
+
+
+def test_kv_fp8_branch_reads_are_self_deterministic(monkeypatch: pytest.MonkeyPatch):
+    """The quantity this project will not compromise on: calling `branch_read` twice on the same cache must return
+    bit-identical tensors, even though the stored bytes are no longer the model's own compute dtype. There is
+    nothing random or order-dependent in a dequantize, so this is a pure-function property, not a statistical one."""
+    monkeypatch.setenv("PRISMYRA_KV_FP8", "1")
+    held = layer(rows=4, context=20, branch=8)
+    with_context(held)
+    first_keys, first_values, _ = gathered(held, rows=4)
+    second_keys, second_values, _ = gathered(held, rows=4)
+    assert torch.equal(first_keys, second_keys)
+    assert torch.equal(first_values, second_values)
+
+
+def test_kv_fp8_branch_buffers_stay_at_the_compute_dtype(monkeypatch: pytest.MonkeyPatch):
+    """Only the context's own buffers narrow; `branch_keys`/`branch_values` -- each branch's own short, private run
+    of tokens, read once rather than once per question -- are not worth compressing and this project's own
+    docstring on `kv_fp8` says so. If a future change ever narrowed them too, every `branch_read` assertion above
+    would still pass (both sides would round the same way), so this is the one check that would actually catch it."""
+    monkeypatch.setenv("PRISMYRA_KV_FP8", "1")
+    held = layer(rows=4, context=20, branch=8)
+    assert held.branch_keys is not None and held.branch_keys.dtype == torch.float32
+    assert held.branch_values is not None and held.branch_values.dtype == torch.float32
+
+
 def test_slicing_the_context_into_whole_pages_is_a_view_not_a_copy():
     """Most of the saving, asserted directly on the step that makes it possible.
 

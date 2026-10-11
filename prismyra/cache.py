@@ -48,10 +48,30 @@ context arrives as one row and the branches as many. See docs/FORK.md.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from transformers.cache_utils import CacheLayerMixin
 
 from .paged import BLOCK
+
+#: `torch.float8_e4m3fn`'s largest finite magnitude -- the same constant `kernels/nvfp4.py` clamps every NVFP4
+#: scale against, kept here rather than imported so this file has no dependency on that module's own conventions
+#: (NVFP4's scale is per 16-value block of a *weight*; this one is per *token* of a context's key or value, a
+#: different quantity measured for a different reason).
+FP8_MAX = 448.0
+
+
+def _quantize_kv(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Token-major `(1, count, heads, dim)` in the model's own compute dtype -> `(float8_e4m3fn code, float32
+    per-token scale)`. One scale per token, over every head and dim element together, not one per tensor or one
+    per head: a token's key (or value) is the smallest unit this layer ever reads or writes, and a per-token
+    scale costs four bytes a token a layer -- negligible beside the bytes the four-to-one code itself saves at
+    any context worth quantizing."""
+    amax = x.float().abs().amax(dim=(-1, -2), keepdim=True).clamp_min(1e-12)
+    scale = amax / FP8_MAX
+    code = (x.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return code, scale
 
 
 class ForkLayer(CacheLayerMixin):
@@ -112,6 +132,19 @@ class ForkLayer(CacheLayerMixin):
         self.writing_branches = False
         self.keys: torch.Tensor | None = None
         self.values: torch.Tensor | None = None
+        #: Experimental, PRISMYRA_KV_FP8=1 (prismyra/kernels, no module of its own -- the storage change lives here,
+        #: beside the buffers it changes the dtype of). Only the **context's** keys and values -- `self.keys`,
+        #: `self.values` below -- ever go through this: they are read once per branch for as long as this context
+        #: stays open (every question asked against it), where `branch_keys`/`branch_values` are short and read once
+        #: each. One per-token scale apiece, in `self.key_scale`/`self.value_scale`, set only when this is on.
+        #:
+        #: Not accounted for in `cache_bytes()`/`state_bytes()` below: admission still prices this layer's context at
+        #: the model's own compute dtype's width, which is the safe direction (it under-states how much actually
+        #: fits rather than over-states it) but means this flag's capacity gain is not yet visible to admission's own
+        #: arithmetic -- a caller has to measure the real gain directly, which is what this round's own record does.
+        self.kv_fp8 = os.environ.get("PRISMYRA_KV_FP8") == "1"
+        self.key_scale: torch.Tensor | None = None
+        self.value_scale: torch.Tensor | None = None
         #: One row per branch, `self.private_pages * BLOCK` long -- a few tokens more than `max_branch_len`, the room
         #: a row's copy of the context's partial last page needs. Short either way, so replicating it is cheap in a
         #: way the context is not.
@@ -152,8 +185,12 @@ class ForkLayer(CacheLayerMixin):
         self.device, self.dtype = device, dtype
         context_room = max(1, self.max_cache_len - self.max_branch_len)
         # One row for the context. It used to be `max_batch_size` rows of the same bytes.
-        self.keys = torch.zeros((1, context_room, heads, head_dim), dtype=dtype, device=device)
+        store_dtype = torch.float8_e4m3fn if self.kv_fp8 else dtype
+        self.keys = torch.zeros((1, context_room, heads, head_dim), dtype=store_dtype, device=device)
         self.values = torch.zeros_like(self.keys)
+        if self.kv_fp8:
+            self.key_scale = torch.ones((1, context_room, 1, 1), dtype=torch.float32, device=device)
+            self.value_scale = torch.ones_like(self.key_scale)
         # `self.private_pages * BLOCK` tokens, not `max_branch_len`: a few tokens of headroom for the context's
         # partial last page, which this row's own tokens sit after rather than displace. See `branch_read`.
         self.branch_keys = torch.zeros(
@@ -194,6 +231,19 @@ class ForkLayer(CacheLayerMixin):
         self._write_branches(key_states, value_states, count, rows)
         return None, None
 
+    def _materialize(self, raw: torch.Tensor, scale: torch.Tensor | None) -> torch.Tensor:
+        """`raw` back in this layer's own compute dtype. `scale` is `None` exactly when `kv_fp8` is off, and then
+        this returns `raw` unchanged -- the identity this method must be for the default path to cost nothing and
+        change nothing: every call site below passes `None` there, so a reader can see the whole fp8 feature by
+        reading where `None` turns into a real scale rather than by diffing every read site against what it used to
+        return. With a scale, this is a copy (`raw.float() * scale`), not a view: that is the cost this layer's own
+        docstring on `self.kv_fp8` already names -- a context's whole pages used to reach `branch_read`'s caller
+        for free (storage already in the right dtype and layout), and now cost one dequantize apiece, every time a
+        branch reads them, in exchange for the context no longer holding four bytes a number at rest."""
+        if scale is None:
+            return raw
+        return (raw.float() * scale).to(self.dtype)
+
     def _write_context(self, key_states: torch.Tensor, value_states: torch.Tensor, count: int):
         """Into the single shared row, and the branches read it from there rather than being given a copy.
 
@@ -207,9 +257,24 @@ class ForkLayer(CacheLayerMixin):
                 f"a context of {start + count} tokens does not fit: this layer holds {self.keys.shape[1]} context "
                 f"tokens beside {self.max_branch_len} for each branch"
             )
-        self.keys[:, start : start + count] = key_states.transpose(1, 2)
-        self.values[:, start : start + count] = value_states.transpose(1, 2)
+        k_tm = key_states.transpose(1, 2)
+        v_tm = value_states.transpose(1, 2)
+        if self.kv_fp8:
+            assert self.key_scale is not None and self.value_scale is not None
+            k_code, k_scale = _quantize_kv(k_tm)
+            v_code, v_scale = _quantize_kv(v_tm)
+            self.keys[:, start : start + count] = k_code
+            self.values[:, start : start + count] = v_code
+            self.key_scale[:, start : start + count] = k_scale
+            self.value_scale[:, start : start + count] = v_scale
+        else:
+            self.keys[:, start : start + count] = k_tm
+            self.values[:, start : start + count] = v_tm
         self._advance(count)
+        if self.kv_fp8:
+            k_out = self._materialize(self.keys[:, : self._host_length], self.key_scale[:, : self._host_length])
+            v_out = self._materialize(self.values[:, : self._host_length], self.value_scale[:, : self._host_length])
+            return k_out.transpose(1, 2), v_out.transpose(1, 2)
         return (
             self.keys[:, : self._host_length].transpose(1, 2),
             self.values[:, : self._host_length].transpose(1, 2),
@@ -264,12 +329,20 @@ class ForkLayer(CacheLayerMixin):
         self._remainder = self.context_length % BLOCK
         if self._remainder:
             shared = self.context_length - self._remainder
-            self.branch_keys[:, : self._remainder] = self.keys[:, shared : self.context_length].expand(
-                self.max_batch_size, -1, -1, -1
+            # `branch_keys`/`branch_values` are always this layer's compute dtype (never fp8, see `self.kv_fp8`'s
+            # own docstring) -- a plain slice of fp8 storage assigned straight into them would reinterpret the
+            # quantized code as a number, not undo the quantization, so this tail must go through `_materialize`
+            # (`None` -- unchanged -- exactly when `kv_fp8` is off, same as every other read site below).
+            k_tail = self._materialize(
+                self.keys[:, shared : self.context_length],
+                self.key_scale[:, shared : self.context_length] if self.kv_fp8 else None,
             )
-            self.branch_values[:, : self._remainder] = self.values[:, shared : self.context_length].expand(
-                self.max_batch_size, -1, -1, -1
+            v_tail = self._materialize(
+                self.values[:, shared : self.context_length],
+                self.value_scale[:, shared : self.context_length] if self.kv_fp8 else None,
             )
+            self.branch_keys[:, : self._remainder] = k_tail.expand(self.max_batch_size, -1, -1, -1)
+            self.branch_values[:, : self._remainder] = v_tail.expand(self.max_batch_size, -1, -1, -1)
         self.writing_branches = True
 
     # ---------------------------------------------------------------- the branch read
@@ -309,9 +382,22 @@ class ForkLayer(CacheLayerMixin):
         private = self.private_pages
 
         # `self.keys[0]` is already `(context_room, heads, dim)`, token-major; slicing its leading (token) axis to a
-        # whole number of pages and reshaping is a view, because the token axis is the outermost one left.
-        context_pages = self.keys[0, : shared_pages * BLOCK].view(shared_pages, BLOCK, *self.keys.shape[2:])
-        value_context_pages = self.values[0, : shared_pages * BLOCK].view(shared_pages, BLOCK, *self.values.shape[2:])
+        # whole number of pages and reshaping is a view, because the token axis is the outermost one left --
+        # unless `kv_fp8` is on, in which case `_materialize` below turns it into a copy (its own docstring has the
+        # cost this trades for the context no longer sitting at rest in the model's wider compute dtype).
+        context_pages_raw = self.keys[0, : shared_pages * BLOCK].view(shared_pages, BLOCK, *self.keys.shape[2:])
+        value_context_pages_raw = self.values[0, : shared_pages * BLOCK].view(
+            shared_pages, BLOCK, *self.values.shape[2:]
+        )
+        if self.kv_fp8:
+            assert self.key_scale is not None and self.value_scale is not None
+            k_scale_pages = self.key_scale[0, : shared_pages * BLOCK].view(shared_pages, BLOCK, 1, 1)
+            v_scale_pages = self.value_scale[0, : shared_pages * BLOCK].view(shared_pages, BLOCK, 1, 1)
+            context_pages = self._materialize(context_pages_raw, k_scale_pages)
+            value_context_pages = self._materialize(value_context_pages_raw, v_scale_pages)
+        else:
+            context_pages = context_pages_raw
+            value_context_pages = value_context_pages_raw
         # `branch_keys[:take]` slices the outermost axis only, so it stays contiguous and the reshape that follows is
         # a view too -- the same reason `context_pages` above is one.
         branch_pages = self.branch_keys[:take].reshape(take * private, BLOCK, *self.branch_keys.shape[2:])
