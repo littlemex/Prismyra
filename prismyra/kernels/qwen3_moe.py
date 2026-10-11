@@ -1136,14 +1136,17 @@ class Qwen3MoeAdapter:
 
         if have_vllm:
             # `engine.py` converts the routed experts to NVFP4 (prismyra/kernels/nvfp4.py, PRISMYRA_EXPERTS=nvfp4)
-            # before this adapter runs, so that path's modules are `FusedExpertsFp4` already. Counting them here
-            # rather than swapping again keeps this adapter the one place that reports whether the routed-expert
-            # replacement happened, whichever format it ran in.
+            # or to W4A16 Marlin (prismyra/kernels/marlin_int4.py, PRISMYRA_EXPERTS=int4_marlin) before this adapter
+            # runs, so that path's modules are already `FusedExpertsFp4`/`FusedExpertsMarlinInt4`. Counting them
+            # here rather than swapping again keeps this adapter the one place that reports whether the
+            # routed-expert replacement happened, whichever format it ran in.
             already_nvfp4 = sum(1 for m in text.modules() if type(m).__name__ == "FusedExpertsFp4")
+            already_int4_marlin = sum(1 for m in text.modules() if type(m).__name__ == "FusedExpertsMarlinInt4")
             applied.swaps.append(
                 Swap(
                     "routed_experts",
                     already_nvfp4
+                    or already_int4_marlin
                     or _swap_children(
                         text, "Qwen3_5MoeSparseMoeBlock", lambda m: FusedExperts(m, decoder.num_experts_per_tok)
                     ),
@@ -1152,6 +1155,10 @@ class Qwen3MoeAdapter:
             )
             if already_nvfp4:
                 applied.notes.append("the routed experts are NVFP4 (experimental, PRISMYRA_EXPERTS=nvfp4)")
+            if already_int4_marlin:
+                applied.notes.append(
+                    "the routed experts are W4A16 Marlin int4 (experimental, PRISMYRA_EXPERTS=int4_marlin)"
+                )
             applied.swaps.append(
                 Swap(
                     "attention",
