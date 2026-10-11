@@ -353,3 +353,36 @@ Three different shapes of result, not one verdict:
 this comparison's text-only questions never use); d1-3B holds about 6 GiB on either card, light enough to run
 several copies beside everything else on one GPU. Pick on this axis is a question about how many other things
 need to share the card, not about the model's own ability to answer questions.
+
+## Weak-category mixture: sentiment and causal/multi-step reasoning
+
+A held-out panel of public benchmarks this checkpoint had never been evaluated on before turned up two
+judgment types it loses on against a comparable general-purpose model: sentiment classification and
+causal/multi-step reasoning. Looking at the trained families, neither type has a match -- the checkpoint
+had never seen a training example of either, while the judgment types it ties or wins on each have at
+least one matching family in the trained pool.
+
+`build_weak_category_mixture.py` adds four licence-clear public datasets covering the two missing types
+(financial and general-tweet sentiment; causal and social-situation multi-step reasoning) and mixes them
+into an existing pool at a small, fixed fraction. The fraction matters more than it looks: mixing the same
+four families in at roughly 7% with no other change measurably improved sentiment but also regressed a
+production-safety set this checkpoint is not allowed to regress on, concentrated on the items closest to
+the new rows in topic or already closest to a 50/50 call before training -- not a data leak, but ordinary
+interference from the one thing the new rows lacked that every row in the existing pool has: a
+self-distillation target holding the step toward the model's own prior output as well as toward the label.
+Halving the fraction, with nothing else changed, removed the regression and kept the sentiment gain.
+
+Measured on 400 held-out sentiment questions and 400 held-out causal/multi-step-reasoning questions (two
+public benchmarks the mixture never trained on), against the base checkpoint, paired sign test:
+
+| mixed-in fraction | sentiment (400) | reasoning (400) | production-safety set, no item clearly regressed? |
+|---|---|---|---|
+| ~7.4% | **significant gain** (p < 0.01 before correction) | gain, not significant | **no** -- one item's paired 95% CI fell entirely below zero |
+| ~4.0% | **significant gain** (p < 0.01, Holm-corrected across both types) | gain, not significant | **yes** -- no item's CI fell entirely below zero |
+
+The reasoning gain was in the right direction at both fractions but did not clear significance either
+time; the sentiment gain held at both fractions, and only the smaller one kept the production-safety set
+clean. A paired bootstrap over 14 production and held-out items, each compared against the base
+checkpoint, found zero items with a confidence interval entirely below zero at the smaller fraction,
+against one at the larger fraction -- the same comparison, same items, same statistics, differing only in
+how much of the new data was mixed in.
