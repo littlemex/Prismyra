@@ -1461,3 +1461,41 @@ comparing two different request widths and calling the difference novelty rather
 `tests/test_gpu.py::test_a_first_seen_context_costs_no_more_than_a_repeated_one` pins the invariant this way rather
 than as an equality: it asserts a first-seen document costs no more than a repeated one at a matched width, with
 room for ordinary run-to-run noise, not that the two are identical to the millisecond.
+
+## Two more-aggressive quantizations, measured on real hardware
+
+Both experimental, both `PRISMYRA_EXPERTS`/`PRISMYRA_KV_FP8`-gated, both measured on the production 5-set (RACE
+579, BoolQ 400, bury7k 157, bury10k 157, Kev 764 -- 2,057 questions) against the shipped checkpoint, with a
+problem-level sign test per set.
+
+**W4A16 Marlin routed experts (`PRISMYRA_EXPERTS=int4_marlin`, `kernels/marlin_int4.py`).** The point is a card
+too small for the FP8 experts at all: `fp8-36l`'s routed experts alone are about 27 GiB, which does not fit an L4
+(24 GiB) even to load, before any quantizing starts (`torch.OutOfMemoryError`, measured). Converted straight from
+the checkpoint's own FP8 shards (group-wise RTN, group_size=128, `uint4b8`), the model's static footprint on a
+real L4 is **18.85 GiB** allocated (vs. ~32 GiB for the FP8 original), and a real L4 answers correctly end to end.
+Accuracy against the FP8 original on the production 5-set: pooled **+0.15 pt** (91.10% vs. 90.96%), no set's sign
+test survives Holm correction in either direction -- within the project's own "under a point is noise" bar.
+Capacity on the real L4 (`group=8`): every (context, questions) combination up to 12,000 tokens fits; 16,000
+tokens does not ("needs 1.1 GiB to hold and 1.4 GiB for reading it, and 1.9 GiB of 22.0 GiB is available").
+Speed (one process, L4, warmed): 1 question median 151.5 ms, 8 questions median 202.3 ms -- there is no FP8-on-L4
+number to compare against, because FP8 does not load there at all.
+
+**This path does not meet the project's determinism bar and should not ship as is.** The same question asked
+six times in the same process, same engine, same weights, returned six different probability vectors (e.g.
+0.99825, 0.99827, 0.99848, 0.99827, 0.99836, 0.99823 for the top option) -- a decision-stable but bit-unstable
+drift of order 1e-4 relative, confirmed on real hardware, not a measurement artefact. The cause has not been
+isolated to a specific kernel internal in this round (vLLM's own `fused_marlin_moe` does not expose a
+deterministic-reduction switch the way the NVFP4 path's `PRISMYRA_NVFP4_FUSED_FINALIZE` does); fixing it is the
+next round's first task before this path is a candidate for anything beyond measurement.
+
+**KV cache in FP8 (`PRISMYRA_KV_FP8=1`, `prismyra/cache.py`).** Only the nine full-attention layers' *context*
+buffer narrows to `float8_e4m3fn` with one float32 scale per token (the recurrent layers' own state and every
+branch's short tail are untouched). Unlike the Marlin path, this **is** bit-deterministic: the same question
+asked six times in the same process returned the identical probability vector all six times. Accuracy against
+the bf16-KV original on the production 5-set: pooled **-0.15 pt** (90.81% vs. 90.96%), again no set survives
+Holm correction. Measured memory saving (`nvfp4-36l`, RTX PRO 4500, real card, no simulated cap): 16,000 tokens
+x 32 questions peaks 0.30 GiB lower (22.32 vs 22.62 GiB); 32,000 x 32 peaks 0.57 GiB lower (22.67 vs 23.24 GiB) --
+real but modest, because only 9 of the 36 layers hold any KV at all and `cache_bytes()`'s own admission estimate
+is not updated to credit this saving (see `prismyra/cache.py`'s own note on `ForkLayer.kv_fp8`), so admission is
+conservative rather than wrong about what fits. No measurable speed cost on the full 2,057-question pass (90s vs
+92s). Full measurement record: `/Users/akazawt/tmp/smr/air/RUN-quant1.md`.
