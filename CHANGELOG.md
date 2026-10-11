@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.6
+
+The 22.5 GiB budget that fell short of the 16,000-token, 32-question case by a small margin in
+the previous release now fits it at the engine's full default width, with no narrower,
+slower configuration needed.
+
+- A gated-delta-net layer's branch-pass state buffer, sized at the engine's full group width, is
+  now freed the moment a request that only needs one such group is done reading it, instead of
+  being held until the whole cache drops. This removes a steady climb in held memory across a
+  long pass; on the supported checkpoint, that climb used to add about 2.2 GiB from the first
+  layer read to the last and now adds about 0.45 GiB. A multi-group request is unaffected by this
+  change and keeps the prior behaviour.
+- The formula admission uses to budget that same layer's held state priced its recurrent half at
+  the model's own compute dtype, but the framework always keeps that half in `float32` regardless
+  of the model's dtype, so the formula was pricing it at half its real width. The fix prices each
+  half at its own dtype instead of a flat multiplier, which stays correct whatever dtype the model
+  computes at. This is a correction to admission's own arithmetic only; every answer this engine
+  gives is unaffected and bit-identical to the version before this change.
+
 ## 0.4.5
 
 A 16,000-token context and 32 questions at once now fit on a 24 GiB class card with no extra
