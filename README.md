@@ -366,9 +366,9 @@ the FP8 weights to 4-bit floating point) for a card the 36- and 40-layer FP8 che
 | checkpoint | layers | card | Hugging Face |
 |---|---|---|---|
 | `prismyra-decision-qwen3.6-35b-a3b-fp8-40l` | 40 | any this project's kernels support | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-40l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-40l) |
-| `prismyra-decision-qwen3.6-35b-a3b-fp8-36l` | 36 | any this project's kernels support | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l) (revision `9d7cd0bc` as of this release; the 40- and 32-layer checkpoints are not re-pinned this round) |
+| `prismyra-decision-qwen3.6-35b-a3b-fp8-36l` | 36 | any this project's kernels support | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l) (revision `57a7076e` as of this release; the 40- and 32-layer checkpoints are not re-pinned this round) |
 | `prismyra-decision-qwen3.6-35b-a3b-fp8-32l` | 32 | any this project's kernels support, including the one below | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-32l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-32l) |
-| `prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l) (revision `719db987` as of this release) |
+| `prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l) (revision `53291b60` as of this release) |
 
 The 36-layer FP8 checkpoint is the one to start with on a card the 36- and 40-layer FP8 checkpoints both fit on: on
 the five sets it is measured against it ties or clears every bar the 40-layer checkpoint does, while running faster.
