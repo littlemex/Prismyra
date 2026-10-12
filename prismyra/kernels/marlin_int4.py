@@ -1,10 +1,28 @@
-"""Routed experts in W4A16 (4-bit weights, bf16 activations), on vLLM's Marlin MoE kernel. Experimental.
+"""Routed experts in W4A16 (4-bit weights, bf16 activations). Experimental.
 
 Selected with `PRISMYRA_EXPERTS=int4_marlin` and `model` pointed at a checkpoint directory whose index leaves the
 routed-expert weights out (`PRISMYRA_INT4_MARLIN_CHECKPOINT` names the *original* checkpoint `convert()` reads the
 real FP8 expert tensors from -- the same split `kernels/nvfp4.py` makes between the stripped checkpoint a caller
 loads and the file its own `prepare_layer`/`convert` read the real weights from). Unlike the NVFP4 path, this is a
 weight-only quantization -- activations stay bf16, so no calibration file of per-layer input maxima is needed.
+
+**Not vLLM's `fused_marlin_moe` CUDA kernel** (RUN-quant2.md section 1): the first round of this feature
+(`RUN-quant1.md` section 3-3) measured that kernel's answer changing on every repeated, identical ask -- not from
+`use_atomic_add` (hardcoded `False` at every one of this kernel's own call sites, in both the dev vLLM checkout and
+the actual installed 0.27.1 wheel; confirmed by reading both) and not from a workspace reused stale across calls
+(every call allocates a fresh, zeroed scratch buffer; confirmed by reading `marlin_make_workspace_new` and by the
+fact that *replaying the same captured CUDA graph* -- same kernel, same addresses, same inputs, nothing left to
+vary -- still produced a different number each time). What is left is the kernel's own split-K design: with this
+few tokens routed to any one of 256 experts, the number of independent output tiles is far smaller than an L4's 58
+SMs, so the kernel always cooperatively splits one tile's reduction across many threadblocks and combines the
+partial sums through a global-memory lock, whose number of participants (and therefore its floating-point summation
+order) this file could only shrink, not remove, through the kernel's own public knobs (`thread_k`/`thread_n`/
+`blocks_per_sm`): the smallest config this file could ask for still launches at least one threadblock per SM, which
+on an L4 is already more threadblocks than this shape has independent tiles. So this file does not call that kernel
+at all. It stores the weights exactly as compact (packed 4-bit integers plus one scale per group of 128, the same
+bytes `quantize()` below has always produced) and, every forward, dequantizes *only the experts a reader's own
+tokens actually route to* back to bf16 and runs them through a plain `torch.matmul` -- the same reduction every
+other bf16 projection in this project already answers through, with no cooperative cross-threadblock step to race.
 
 The point is a checkpoint small enough for a 24 GiB Ada/Ampere card (an L4), where the ordinary FP8 routed experts
 alone are already about 27 GiB -- more than the card has, loaded whole, before any quantizing even starts
@@ -32,8 +50,9 @@ biased by 8, which needs no stored zero point. Packing into the AutoGPTQ int32 l
 is vLLM's own tested code (`quantize_weights`/`pack_rows`), not reimplemented here: the risk this project's own
 record (`RUN-q3.md` section 5) calls out explicitly -- "getting the bit order of the packing wrong even once
 produces a wrong answer without crashing" -- is the risk of writing that packing by hand, which this file does
-not do. `gptq_marlin_moe_repack`/`marlin_moe_permute_scales` turn that AutoGPTQ layout into the Marlin kernel's
-own tile layout, again vLLM's own code.
+not do. The forward pass below unpacks the same way, `pack_rows`' own loop run backwards one slot at a time
+(`_unpack_rows`): no Marlin tile layout is ever produced, so there is no `gptq_marlin_moe_repack`/
+`marlin_moe_permute_scales` step to call.
 """
 
 from __future__ import annotations
@@ -43,23 +62,52 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .nvfp4 import _dequant_fp8
 
 #: Along the reduction (input) dimension of each matrix, matching this checkpoint's hidden size (2048) and routed
-#: expert intermediate size (512) exactly (16 and 4 groups respectively, no remainder) -- so the Marlin thread-tile
-#: padding `marlin_moe_padded_intermediate` would otherwise add never applies to this checkpoint; the forward below
-#: still calls `fused_marlin_moe` the same way a padded checkpoint would, pad or no pad is a fact about the
-#: checkpoint's own shapes, not about this file's own correctness.
+#: expert intermediate size (512) exactly (16 and 4 groups respectively, no remainder).
 GROUP_SIZE = 128
 
-#: W4A16 compute runs the activations through unmodified (no `marlin_quant_input` call site in this file at all;
-#: `fused_marlin_moe`'s own `input_dtype=None` default is what selects that path), so the per-group scale and the
-#: packed weight only ever meet a bf16 input tensor. Keeping the scale itself in bf16, the model's own compute dtype,
-#: is the natural reading of "weight-only": the only quantity this file invents is the weight's int4 code, and the
-#: scale that undoes it should round the same way everything else in a bf16 forward pass does.
+#: W4A16 compute runs the activations through unmodified, so the per-group scale and the dequantized weight only
+#: ever meet a bf16 input tensor. Keeping the scale itself in bf16, the model's own compute dtype, is the natural
+#: reading of "weight-only": the only quantity this file invents is the weight's int4 code, and the scale that
+#: undoes it should round the same way everything else in a bf16 forward pass does.
 SCALE_DTYPE = torch.bfloat16
+
+
+def _unpack_rows(packed: torch.Tensor, num_bits: int, size_k: int, size_n: int) -> torch.Tensor:
+    """Inverse of vLLM's `pack_rows` (`quant_utils.py`): `(size_k // pack_factor, size_n)` int32 -> `(size_k,
+    size_n)` int32 codes in `[0, 2**num_bits)`. vLLM ships `pack_rows`' mirror image for columns (`unpack_cols`)
+    but not for rows, so this file writes the row version itself -- the same loop as `unpack_cols`, shifted to
+    split along dim 0 instead of dim 1, which is what `pack_rows` itself packs along (`q_res |= q_w[i::pack_factor,
+    :] << num_bits * i`, this function's own loop body run in reverse, one slot at a time rather than hand-derived).
+    """
+    pack_factor = 32 // num_bits
+    assert packed.shape == (size_k // pack_factor, size_n)
+    mask = (1 << num_bits) - 1
+    out = torch.empty((size_k, size_n), dtype=torch.int32, device=packed.device)
+    rest = packed
+    for i in range(pack_factor):
+        out[i::pack_factor, :] = rest & mask
+        rest = rest >> num_bits
+    return out
+
+
+def _dequant_int4(packed: torch.Tensor, scale: torch.Tensor, size_k: int, size_n: int) -> torch.Tensor:
+    """One expert's `(size_k, size_n)` dense bf16 weight, from this file's own packed `uint4b8` code plus its
+    per-group scale -- the plain-matmul-shaped counterpart of `quantize()`, called for one expert at a time so the
+    dense result (16x the packed size) only ever exists for however many experts a single forward's own tokens
+    actually route to, never for all of them at once.
+    """
+    codes = _unpack_rows(packed, 4, size_k, size_n)
+    # `uint4b8`: the stored code is the signed value plus 8 (vLLM's own bias-8 convention, `quantize()`'s own
+    # docstring), so undoing it is `code - 8`, not a lookup table.
+    groups = size_k // GROUP_SIZE
+    signed = (codes.view(groups, GROUP_SIZE, size_n).to(SCALE_DTYPE) - 8.0) * scale.view(groups, 1, size_n)
+    return signed.reshape(size_k, size_n)
 
 
 def quantize(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -67,8 +115,8 @@ def quantize(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     Round-to-nearest, symmetric, group_size=128, `uint4b8` (vLLM's bias-8 convention: packable 0..15 with no
     separate zero point). `w` is `nn.Linear`-shaped (out_features, in_features); GPTQ's own convention is
-    (K, N) = (in_features, out_features), the transpose, which is what every function called here expects and
-    what `pack_rows`/`gptq_marlin_moe_repack` below assume without re-checking.
+    (K, N) = (in_features, out_features), the transpose, which is what `pack_rows`/`_unpack_rows` and
+    `_dequant_int4` below all assume without re-checking.
     """
     from vllm.model_executor.layers.quantization.utils.quant_utils import pack_rows, quantize_weights
     from vllm.scalar_type import scalar_types
@@ -128,17 +176,16 @@ class FusedExpertsMarlinInt4(nn.Module):
         device,
     ):
         super().__init__()
-        from vllm._custom_ops import gptq_marlin_moe_repack
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import marlin_moe_permute_scales
-        from vllm.scalar_type import scalar_types
 
         self.gate = block.gate
         self.shared_expert = block.shared_expert
         self.shared_expert_gate = block.shared_expert_gate
         self.top_k = top_k
-        self.quant_type_id = scalar_types.uint4b8.id
+        self.hidden = hidden
+        self.intermediate = intermediate
+        self.gate_up_n = 2 * intermediate
 
-        gate_up_n = 2 * intermediate
+        gate_up_n = self.gate_up_n
         prefix = f"model.language_model.layers.{layer}.mlp.experts."
         packed1 = torch.empty(num_experts, hidden // 8, gate_up_n, dtype=torch.int32, device=device)
         scale1 = torch.empty(num_experts, hidden // GROUP_SIZE, gate_up_n, dtype=SCALE_DTYPE, device=device)
@@ -173,22 +220,17 @@ class FusedExpertsMarlinInt4(nn.Module):
                     flush=True,
                 )
 
-        # `perm`: the GPTQ activation-order (`desc_act`/`g_idx`) sort indices, empty here because this file's own
-        # RTN quantization never reorders groups (`vllm`'s own convention for "no act_order", measured against
-        # `oracle/int_wna16.py`'s own caller: `torch.empty((num_experts, 0), dtype=torch.int32)`, not an identity
-        # permutation).
-        no_g_idx = torch.empty((num_experts, 0), dtype=torch.int32, device=device)
-        self.w1 = gptq_marlin_moe_repack(packed1, no_g_idx, hidden, gate_up_n, 4)
-        self.w2 = gptq_marlin_moe_repack(packed2, no_g_idx, intermediate, hidden, 4)
-        self.w1_scale = marlin_moe_permute_scales(scale1, hidden, gate_up_n, GROUP_SIZE)
-        self.w2_scale = marlin_moe_permute_scales(scale2, intermediate, hidden, GROUP_SIZE)
-        del packed1, scale1, packed2, scale2
+        # No `gptq_marlin_moe_repack`/`marlin_moe_permute_scales` step: see the module docstring for why this file
+        # keeps the plain AutoGPTQ-packed layout `quantize()` already produces, rather than Marlin's tile layout.
+        self.w1 = packed1
+        self.w2 = packed2
+        self.w1_scale = scale1
+        self.w2_scale = scale2
         if hasattr(block, "experts"):
             del block.experts
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_topk
-        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
 
         from .qwen3_moe import _ROUTER_LINEAR
 
@@ -196,24 +238,34 @@ class FusedExpertsMarlinInt4(nn.Module):
         x = hidden_states.reshape(-1, shape[-1])
         if not x.is_contiguous():
             x = x.contiguous()
-        # Same reasoning and the same fix as `FusedExpertsFp4.forward`'s own comment: calling `self.gate(x)` whole
-        # would recompute the softmax/top-k `fused_topk` already does, and would run the router's plain `F.linear`
-        # outside the row-count-invariant kernel this project's companion/qn determinism guarantee needs there.
         linear = _ROUTER_LINEAR or torch.nn.functional.linear
         logits = linear(x, self.gate.weight)
         weights, ids = fused_topk(x, logits, self.top_k, renormalize=True)[:2]
-        out = fused_marlin_moe(
-            x,
-            self.w1,
-            self.w2,
-            None,
-            None,
-            self.w1_scale,
-            self.w2_scale,
-            weights.float(),
-            ids,
-            self.quant_type_id,
-        )
+
+        # Flatten the (tokens, top_k) grid of (expert, weight) pairs the same way `ids.reshape(-1)`'s own row-major
+        # order does, so `flat_rows[p]` is always the token `flat_ids[p]`/`flat_weights[p]` belong to.
+        n_tokens = x.size(0)
+        flat_ids = ids.reshape(-1)
+        flat_weights = weights.reshape(-1).to(x.dtype)
+        flat_rows = torch.arange(n_tokens, device=x.device).repeat_interleave(self.top_k)
+
+        out = torch.zeros_like(x)
+        # Only the experts this call's own tokens actually route to are ever dequantized -- `torch.unique` is
+        # sorted by default, so this loop (and therefore the sequence of writes into `out`) runs in the same order
+        # on every call with the same routing, independent of which physical order CUDA happens to schedule
+        # anything in (the property `fused_marlin_moe`'s own split-K reduction could not give; see the module
+        # docstring).
+        for e in flat_ids.unique(sorted=True).tolist():
+            mask = flat_ids == e
+            rows = flat_rows[mask]
+            row_weights = flat_weights[mask].unsqueeze(-1)
+            xin = x.index_select(0, rows)
+            w1 = _dequant_int4(self.w1[e], self.w1_scale[e], self.hidden, self.gate_up_n)
+            w2 = _dequant_int4(self.w2[e], self.w2_scale[e], self.intermediate, self.hidden)
+            gate, up = (xin @ w1).chunk(2, dim=-1)
+            down = (F.silu(gate) * up) @ w2
+            out.index_add_(0, rows, down * row_weights)
+
         shared = torch.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
         return (out + shared).reshape(shape)
 

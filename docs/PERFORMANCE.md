@@ -1468,25 +1468,56 @@ Both experimental, both `PRISMYRA_EXPERTS`/`PRISMYRA_KV_FP8`-gated, both measure
 579, BoolQ 400, bury7k 157, bury10k 157, Kev 764 -- 2,057 questions) against the shipped checkpoint, with a
 problem-level sign test per set.
 
-**W4A16 Marlin routed experts (`PRISMYRA_EXPERTS=int4_marlin`, `kernels/marlin_int4.py`).** The point is a card
+**W4A16 int4 routed experts (`PRISMYRA_EXPERTS=int4_marlin`, `kernels/marlin_int4.py`).** The point is a card
 too small for the FP8 experts at all: `fp8-36l`'s routed experts alone are about 27 GiB, which does not fit an L4
 (24 GiB) even to load, before any quantizing starts (`torch.OutOfMemoryError`, measured). Converted straight from
 the checkpoint's own FP8 shards (group-wise RTN, group_size=128, `uint4b8`), the model's static footprint on a
-real L4 is **18.85 GiB** allocated (vs. ~32 GiB for the FP8 original), and a real L4 answers correctly end to end.
-Accuracy against the FP8 original on the production 5-set: pooled **+0.15 pt** (91.10% vs. 90.96%), no set's sign
-test survives Holm correction in either direction -- within the project's own "under a point is noise" bar.
-Capacity on the real L4 (`group=8`): every (context, questions) combination up to 12,000 tokens fits; 16,000
-tokens does not ("needs 1.1 GiB to hold and 1.4 GiB for reading it, and 1.9 GiB of 22.0 GiB is available").
-Speed (one process, L4, warmed): 1 question median 151.5 ms, 8 questions median 202.3 ms -- there is no FP8-on-L4
-number to compare against, because FP8 does not load there at all.
+real L4 is **18.79 GiB** allocated (vs. ~32 GiB for the FP8 original), and a real L4 answers correctly end to end.
 
-**This path does not meet the project's determinism bar and should not ship as is.** The same question asked
-six times in the same process, same engine, same weights, returned six different probability vectors (e.g.
-0.99825, 0.99827, 0.99848, 0.99827, 0.99836, 0.99823 for the top option) -- a decision-stable but bit-unstable
-drift of order 1e-4 relative, confirmed on real hardware, not a measurement artefact. The cause has not been
-isolated to a specific kernel internal in this round (vLLM's own `fused_marlin_moe` does not expose a
-deterministic-reduction switch the way the NVFP4 path's `PRISMYRA_NVFP4_FUSED_FINALIZE` does); fixing it is the
-next round's first task before this path is a candidate for anything beyond measurement.
+**An earlier version of this path (its first round) called vLLM's own `fused_marlin_moe` CUDA kernel and did not
+meet this project's determinism bar: the same question asked six times in the same process, same engine, same
+weights, returned six different probability vectors.** The cause is that kernel's own split-K design: with this
+few tokens routed to any one of 256 experts, the number of independent output tiles a card this small produces
+is far below an L4's SM count (58), so the kernel always cooperatively splits one tile's reduction across many
+threadblocks and combines the partial sums through a global-memory lock -- not `use_atomic_add` (hardcoded
+`False` at every one of that kernel's own call sites, confirmed by reading both a development vLLM checkout and
+the installed 0.27.1 wheel) and not a workspace reused stale across calls (every call allocates a fresh, zeroed
+scratch buffer, confirmed by reading `marlin_make_workspace_new`, and confirmed again because *replaying the same
+captured CUDA graph* -- same kernel, same addresses, same inputs -- still produced a different number each time).
+The kernel's own public knobs (`thread_k`/`thread_n`/`blocks_per_sm`) could only shrink the number of
+threadblocks sharing one tile's reduction, not remove the sharing itself, because the smallest configuration they
+allow still launches one threadblock per SM, and an L4 already has more SMs than this shape has independent
+tiles (measured: forcing the smallest configuration reduced six repeated answers from six distinct values to
+four, not one).
+
+**This round's fix does not call that kernel at all.** `marlin_int4.py` now dequantizes, every forward, only the
+experts a reader's own tokens actually route to (one to a few dozen of 256) back to bf16 and runs them through a
+plain `torch.matmul` -- the same reduction every other bf16 projection in this project already answers through,
+with no cooperative cross-threadblock step to race. The weights stay stored exactly as compact as before (packed
+4-bit integers plus one scale per group of 128); only the forward pass's own compute path changed. Measured on
+real hardware: the same question asked six times in the same process now returns the identical probability vector
+all six times (bit for bit); a second, independent process launch returns the same values the first did; and the
+same question asked alongside two, then three different companions (and reordered among them) returns the same
+answer for every companion count from two upward -- the one remaining gap, question-count=1 differing from
+question-count>=2, is a pre-existing, project-wide residual this project's own `_enable_batch_invariance` already
+tracks (`audit_sm120.py`'s "global" mode: 72/4,392 non-exact, "100% question-count=1") and was measured, on the
+unquantized FP8 baseline with the same two questions, to be exactly the same shape -- not something this round's
+change introduced.
+
+Accuracy against the FP8 original on the production 5-set, re-measured against this round's dense-dequant
+forward: pooled **-0.05 pt** (90.91% vs. 90.96%), no set's sign test survives Holm correction in either
+direction -- within the project's own "under a point is noise" bar, and consistent with the first round's
+Marlin-kernel measurement (+0.15 pt, a different run, same noise band).
+
+**The fix costs speed, and the cost is large.** Avoiding the fused kernel means a Python loop issuing many small
+matmuls per layer instead of one kernel launch per layer; measured on the real L4 (`group=8`, one process, six
+repeats): 1 question median 5,608 ms (vs. 151.5 ms for the Marlin-kernel version, about 37x slower), 16 questions
+median 8,636 ms, 64 questions median 6,213 ms (64 running faster than 16 is a real, repeated measurement, not a
+typo; the likely reason -- more rows landing on the same expert as the question count grows with this round's
+near-identical synthetic question text, better amortizing each matmul's launch overhead -- was not verified
+further this round). Capacity and memory are otherwise unaffected (static allocated 18.79 GiB, materially the
+same as the Marlin-kernel version's 18.85 GiB -- this round's change removes the Marlin tile-layout padding,
+which is why it is not larger). Full measurement record: `/Users/akazawt/tmp/smr/air/RUN-quant2.md`.
 
 **KV cache in FP8 (`PRISMYRA_KV_FP8=1`, `prismyra/cache.py`).** Only the nine full-attention layers' *context*
 buffer narrows to `float8_e4m3fn` with one float32 scale per token (the recurrent layers' own state and every
@@ -1498,4 +1529,14 @@ x 32 questions peaks 0.30 GiB lower (22.32 vs 22.62 GiB); 32,000 x 32 peaks 0.57
 real but modest, because only 9 of the 36 layers hold any KV at all and `cache_bytes()`'s own admission estimate
 is not updated to credit this saving (see `prismyra/cache.py`'s own note on `ForkLayer.kv_fp8`), so admission is
 conservative rather than wrong about what fits. No measurable speed cost on the full 2,057-question pass (90s vs
-92s). Full measurement record: `/Users/akazawt/tmp/smr/air/RUN-quant1.md`.
+92s).
+
+**Capacity table, with the real per-process memory cap (`torch.cuda.set_per_process_memory_fraction`, the same
+method and the same context-length/question-count grid as this project's own 81-combination tables, `GROUP=32`
+unchanged).** Starting the sweep from a small context and working up to a large one, with no dedicated warm-up
+call, is what actually calibrates admission's own cost estimate -- a single small warm-up call tried in the
+first round was not enough. At the real 22.5 GiB cap, KV FP8 newly fits five combinations that do not fit
+without it: 12,000 and 16,000 tokens x {48, 64} questions, and 20,000 tokens x 1 question. At 24.0 GiB, it newly
+fits one: 28,000 tokens x 1 question. Zero combinations that fit without KV FP8 stop fitting with it, at either
+cap. Full measurement record and raw sweep JSON: `/Users/akazawt/tmp/smr/air/RUN-quant2.md`,
+`/Users/akazawt/tmp/smr/quant2-results/`.
