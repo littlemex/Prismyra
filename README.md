@@ -451,6 +451,7 @@ replaces, nothing else.
 | [docs/KERNELS.md](docs/KERNELS.md) | Each replacement, what it is worth, and what was rejected |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | How the numbers were measured and how to reproduce them |
 | [docs/ACCURACY.md](docs/ACCURACY.md) | Whether the answers are right, on public labels, and where they are not |
+| [docs/DATA_PROVENANCE.md](docs/DATA_PROVENANCE.md) | Every training source and teacher model behind the shipped adapter, and its licence |
 | [recipes/decision-lora/](recipes/decision-lora/) | Training the read-out itself, and folding the adapter into the checkpoint before serving |
 | [examples/tetris/](examples/tetris/) | A decision loop, where the representation was worth more than anything in the engine |
 
