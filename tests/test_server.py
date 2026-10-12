@@ -3,11 +3,34 @@ carries what a stored answer needs."""
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from prismyra import Boolean, Choice
 from prismyra.schema import Answer, QuestionError, Result, Timing
-from prismyra.server import as_json, build_questions, with_queue_time
+from prismyra.server import as_json, build_questions, main, with_queue_time
+
+
+def test_main_sets_the_expandable_segments_allocator_default_before_parsing_fails_on_help(monkeypatch):
+    """`main` sets `PYTORCH_CUDA_ALLOC_CONF` before `create_app`/`Prismyra(...)` runs -- the earliest point in this
+    CLI's own control flow still certain to run before the process's first CUDA allocation (see
+    docs/PERFORMANCE.md's "The gap between reserved and allocated"). `--help` exits via `argparse` before reaching
+    `create_app`, which is what makes this checkable without a device or a model: the `SystemExit` it raises proves
+    the setting already happened, further up in `main`, by the time this test's own code resumes."""
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    assert os.environ.get("PYTORCH_CUDA_ALLOC_CONF") == "expandable_segments:True"
+
+
+def test_main_does_not_override_a_callers_own_allocator_choice(monkeypatch):
+    """`setdefault`, not an unconditional set: an embedding caller's own `PYTORCH_CUDA_ALLOC_CONF` (set for its own
+    reasons, before this module's `main` ever runs) is kept rather than replaced."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    assert os.environ.get("PYTORCH_CUDA_ALLOC_CONF") == "max_split_size_mb:128"
 
 
 def test_each_kind_survives_the_wire():

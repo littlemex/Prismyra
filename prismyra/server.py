@@ -27,6 +27,7 @@ import argparse
 import base64
 import dataclasses
 import json
+import os
 import uuid
 from typing import Any, Literal
 
@@ -523,6 +524,21 @@ def create_app(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The caching allocator's default segment behaviour leaves a gap between what torch has reserved from the
+    # driver and what the engine actually has allocated -- 0.7-1.4 GiB of it on this process's own measurements
+    # (nvfp4-36l, RTX PRO 4500, 4,028-16,036 token contexts; perf1, 2026-10-12), growing with context length because
+    # a longer read's larger, more varied allocation sizes fragment a fixed-size-segment arena more. `torch`'s own
+    # `expandable_segments` allocator mode (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) lets one segment grow
+    # instead of handing out a new one per distinct size, which measured bit-identical answers at every width tested
+    # (it changes only which virtual addresses hold a tensor, never a tensor's value) and a speed difference that
+    # stayed within the two decimal places of noise every other width in this project's own speed-measurement
+    # discipline already treats as not a difference (-0.14% to +0.24% across six 1/16/64-question, 4k/16k-token
+    # combinations). `setdefault` so a caller's own `PYTORCH_CUDA_ALLOC_CONF` is not overridden, and set here rather
+    # than at import time because the allocator reads the environment lazily, on the process's first CUDA
+    # allocation -- which for this CLI is inside `create_app` below, well after this line runs, but might already
+    # have happened if some other, earlier import touched the device first in a process that embeds this module
+    # rather than running it as `prismyra-serve`.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     parser = argparse.ArgumentParser(prog="prismyra-serve")
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B-FP8")
     parser.add_argument("--host", default="127.0.0.1")

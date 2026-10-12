@@ -176,6 +176,29 @@ combinations at both budgets admitted exactly the combinations they admitted bef
 within 0.84 GiB of either budget's own edge. The correction only ever makes admission's own account of a context
 honest; it does not, in anything measured so far, make admission refuse something it used to accept.
 
+### The gap between reserved and allocated
+
+Admission's own figures above are about what the engine actually asks for -- `allocated`. A card can refuse a
+request before it reaches that figure if the caching allocator's own bookkeeping, `reserved`, is already close to
+the device's edge: torch's default allocator hands out a new, differently-sized memory segment per distinct
+allocation size it has not already got a free segment for, rather than growing one segment to fit, and a serving
+process whose allocation sizes vary with context length and question count (every number in this document) keeps
+asking for new sizes. Measured on the supported NVFP4 checkpoint (RTX PRO 4500, six combinations of 1/16/64
+questions and 4,028/16,036 tokens, `prismyra-serve`'s own default settings otherwise unchanged): `reserved` ran
+0.75-1.42 GiB above `allocated`, growing with context length because a longer read's wider range of transient
+sizes fragments a fixed-segment-size arena more than a short one's does.
+
+Setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` -- torch's own allocator mode that lets one segment grow
+to the size a request needs instead of handing out a new, separately-sized one -- closed 0.75-1.42 GiB of that gap
+at every one of the six combinations, with no measured effect on `allocated` itself (the actual tensors are
+unchanged in count, size, and address *contents* -- only which virtual addresses back them moves) and a speed
+difference that stayed within -0.14% to +0.24%, inside the noise this project's own measurement discipline already
+treats six-combination, non-alternating comparisons as unable to resolve. Because the setting only changes how the
+allocator sub-allocates virtual memory and never what a kernel computes, every answer is bit-identical by
+construction, not merely by having been checked at these six combinations. `prismyra-serve`'s own entry point now
+sets this (via `setdefault`, so a caller's own choice is kept) before constructing the engine, the earliest point in
+the CLI's own control flow at which it is still certain to run before the process's first CUDA allocation.
+
 ## Where it wins and where it loses
 
 | questions | Prismyra | vLLM |
