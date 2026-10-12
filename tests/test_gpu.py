@@ -91,11 +91,23 @@ def questions(n: int) -> list[Boolean]:
 #: questions produced would fail on the hundred-and-first without anything having regressed, and the guard that
 #: actually matters is the assertion that the decision did not change.
 #:
-#: Used by tests on the plain, unpaged `engine` fixture (no `paged=True`, so `_enable_batch_invariance` never runs
-#: for it -- see `Prismyra.__init__`) and by `test_lanes_two_decisions_under_a_burst_do_not_move` (a different,
-#: borderline-question sensitivity its own docstring argues against folding into a row-count bound). Not used by
-#: the `engine_paged` row-count tests below any more -- those carry the guarantee and have their own, measured,
-#: much tighter bounds (`COMPANION_MOVEMENT_PAGED_ROWS`, `COMPANION_MOVEMENT_ROW_COUNT`) instead of this one.
+#: Used by tests on the plain, unpaged `engine` fixture. Stale note corrected here (confirmed on real hardware,
+#: both supported cards, 2026-10-12): `_enable_batch_invariance` is **not** skipped for this fixture -- `Prismyra.
+#: __init__` claims it unconditionally for every CUDA engine regardless of `paged`/`interleaved_fork`, which is
+#: exactly why `ask()` with two or more questions already measures bit-exact against a companion (`tests/
+#: test_gpu.py`'s own `engine_paged` suite, and `tools/audit_sm120.py`'s companion/question-count matrix, both
+#: 0 non-exact). This bound is not standing in for missing dispatcher protection, then: it is measuring a
+#: different, structural gap the dispatcher cannot close -- a single question asked through `ask()` takes the
+#: one-pass shortcut (`_ask_in_one_pass`, context and question read together in one `FlashAttention-2` call),
+#: while the same question asked through `open_context(...).ask(...)` here always forks (a separate branch pass).
+#: Two or more questions never reach the one-pass shortcut at all (`ask`'s own `len(questions) == 1` guard), so
+#: they do not carry this gap -- `COMPANION_MOVEMENT_ROW_COUNT`/`COMPANION_MOVEMENT_PAGED_ROWS` below bound a real
+#: companion/row-count effect inside the forked path, which this constant does not. See `PAGED_VS_JOINED_MOVEMENT`,
+#: below, for the same one-pass/forked gap measured on the `paged` flag specifically rather than on `open_context`.
+#: Also used by `test_lanes_two_decisions_under_a_burst_do_not_move` (a different, borderline-question sensitivity
+#: its own docstring argues against folding into a row-count bound). Not used by the `engine_paged` row-count
+#: tests below any more -- those carry the guarantee and have their own, measured, much tighter bounds
+#: (`COMPANION_MOVEMENT_PAGED_ROWS`, `COMPANION_MOVEMENT_ROW_COUNT`) instead of this one.
 COMPANION_MOVEMENT = 0.3
 
 #: How far a probability may move on a *paged* engine (the one `_enable_batch_invariance`
