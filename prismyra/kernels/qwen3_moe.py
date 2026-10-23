@@ -281,6 +281,27 @@ class _ProjectionSlot(nn.Module):
     Rows above `FUSION_MAX_ROWS` skip the group entirely: this slot calls its own `original` (the separate
     `Fp8Linear` `_fuse_pair` found and verified), independently of its siblings. Nothing to coordinate -- every
     slot in the group sees the same `x` and so takes the same branch on the same call, without needing to agree.
+
+    `force_separate`, once set on every slot in `order` (`nvfp4.convert_dense` is the one caller that does this),
+    skips the row-count check above and always takes the `original` branch -- found necessary on real hardware:
+    `nvfp4.convert_dense()` replaces one slot's own `original` (an `Fp8Linear`) with an `Fp4Linear` in place, but
+    has no reach into `fused` (a `_FusedDenseProjection` built once, at `_fuse_pair` time, by concatenating the
+    *pre-conversion* `Fp8Linear` weights) or into any sibling slot. Left alone, the *same* real rows then answer
+    through two different quantisations depending only on how many companion rows share the call: `.fused`'s
+    stale FP8 weights at `rows <= FUSION_MAX_ROWS`, the newly converted `.original`'s NVFP4 weights above it --
+    measured directly (RTX PRO 4500): 500 real rows alone (FP8, `.fused`) against the identical 500 rows plus 20
+    zero-padded companions (NVFP4, `.original`) moved by 1.797 absolute probability-space units, 12.7% relative,
+    at exactly the 512/513-row boundary and nowhere else -- not the subtle GEMM-reduction-order residual this
+    project calls the companion effect everywhere else, but two genuinely different weights answering the same
+    question. This is the mechanism behind a companion-invariance break seen whenever any one of the three fused
+    groups (self_attn's q/k/v, the gated delta net's in_proj_qkv/in_proj_z, the shared expert's gate/up) has a
+    converted member, and, once `self_attn`'s own group is converted, a paged-vs-joined break too (paged branch
+    passes stay within `FUSION_MAX_ROWS`; a joined, context-sized pass almost never does). `convert_dense` cannot
+    repair `fused` itself without re-deriving a second, NVFP4 version of the combined matmul this class does not
+    otherwise need; flagging the whole group "always separate" once any one of its members is no longer FP8 is
+    the smaller, correct fix -- it costs the group's fused-matmul speed benefit (one combined matmul becomes
+    `len(order)` separate ones, every slot already pays this on every call wider than `FUSION_MAX_ROWS`) but
+    never again answers a converted projection's own rows through its unconverted sibling's stale weights.
     """
 
     def __init__(self, fused: _FusedDenseProjection, index: int, order: list[_ProjectionSlot], original: Fp8Linear):
@@ -291,11 +312,12 @@ class _ProjectionSlot(nn.Module):
         self.original = original
         self.in_features = fused.in_features
         self.out_features = fused.sizes[index]
+        self.force_separate = False
         self._local = threading.local()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         rows = x.numel() // x.shape[-1]
-        if rows > FUSION_MAX_ROWS:
+        if self.force_separate or rows > FUSION_MAX_ROWS:
             return self.original(x)
         if self is self.order[0]:
             parts = self.fused(x)

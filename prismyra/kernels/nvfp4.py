@@ -472,6 +472,14 @@ class tiny_experts:
         self._fp8.FP8Experts.__init__ = self._init
 
 
+#: A static read of vLLM's SM120 NVFP4 GEMM kernel (`cutlass_fp4_gemm_dispatch`) once raised a hypothesis
+#: that its own row count `m`'s `mp2 = max(16, next_pow_2(m)) <= 256` CUTLASS config switch could explain a
+#: companion-invariance break seen downstream of this class. Measured directly and ruled out (RTX PRO 4500, a
+#: lone `Fp4Linear` fed a fixed row with 0 to 8,191 companion rows at realistic and synthetic shapes alike):
+#: the real row's own output is bit-exact across the entire sweep, including every value either side of
+#: 256/257 and at three different positions within a 512-row call. The kernel itself is already row-count
+#: invariant on this hardware; see `kernels.qwen3_moe._ProjectionSlot.force_separate` for the mechanism this
+#: project confirmed instead.
 class Fp4Linear(nn.Module):
     """A dense FP8 projection re-quantised to NVFP4 (weights and activations), on vLLM's CUTLASS FP4 GEMM.
     Experimental: PRISMYRA_DENSE=nvfp4. Activation scale from the calibration file's `dense_in_amax`."""
@@ -515,7 +523,7 @@ def convert_dense(model: nn.Module, engine: object | None = None) -> int:
 
     Pass the `Prismyra` instance `model` came from as `engine` whenever one exists. Without it, a single question
     asked after this call can return NaN forever, on documents that have nothing to do with each other and nothing
-    to do with this call's own regex -- found on real hardware (RTX PRO 4500, `nanfix_repro.py`), traced with a
+    to do with this call's own regex -- found on real hardware (RTX PRO 4500), traced with a
     forward hook on every `nn.Module` plus a byte-exact snapshot of every weight, both of which came back clean on
     the call that goes wrong. Neither caught anything because the real culprit never runs either one.
 
@@ -529,16 +537,15 @@ def convert_dense(model: nn.Module, engine: object | None = None) -> int:
     else writes there, every later reply to one of the stale buckets reads whatever that something else left
     behind. A short question asked right after `convert_dense()` still reads back something plausible, because
     the freed bytes have not been touched yet; measured on real hardware, three repeats of one long document
-    (`qlite_bench.py`'s own speed-measurement document, or `nanfix_bisect.py`'s synthetic one past about 2,020
-    tokens) is enough eager allocator churn to land a later allocation on that exact address, and the next short
-    question -- unrelated in content, length and KEEP regex -- comes back NaN and stays that way. Dropping
-    `engine._one_pass` here is what the fix below does: every one-pass call afterward takes the eager path
-    (`engine._read_one_pass`), which builds its own cache fresh and holds no address this function could make
-    stale. Re-recording instead of dropping would keep the speed this mechanism is for, but costs one warm-up and
-    two proving replays per bucket (`onepass.WARMUPS`, `onepass.PROVING_REPLAYS`) against weights this function has
-    typically already finished touching once per process -- left for whoever wires this into `engine.py` for real,
-    since a benchmark harness calling this function for the first time this round (`RUN-quant-strong.md`,
-    `RUN-quant-lite.md`) is the only caller today and pays once per run either way.
+    (a document past about 2,020 tokens) is enough eager allocator churn to land a later allocation on that exact
+    address, and the next short question -- unrelated in content, length and KEEP regex -- comes back NaN and
+    stays that way. Dropping `engine._one_pass` here is what the fix below does: every one-pass call afterward
+    takes the eager path (`engine._read_one_pass`), which builds its own cache fresh and holds no address this
+    function could make stale. Re-recording instead of dropping would keep the speed this mechanism is for, but
+    costs one warm-up and two proving replays per bucket (`onepass.WARMUPS`, `onepass.PROVING_REPLAYS`) against
+    weights this function has typically already finished touching once per process -- left for whoever wires this
+    into `engine.py` for real, since a benchmark harness calling this function directly, on an engine whose
+    one-pass buckets already exist, is the only caller today and pays once per run either way.
     """
     import re
 
@@ -557,10 +564,8 @@ def convert_dense(model: nn.Module, engine: object | None = None) -> int:
         # `FlashAttention(inner=...)` wraps every self_attn projection so its real name carries an extra `.inner.`
         # segment (`language_model.layers.N.self_attn.inner.q_proj`). The calibration file's keys are written
         # before either wrapper is applied, so neither variant matches `calib` without stripping it back off.
-        # Found on real hardware (RUN-quant-strong.md 3.3: `.original`; RUN-quant-lite.md 2.1: `.inner`) -- without
-        # both, self_attn converts 0/36 regardless of PRISMYRA_DENSE_KEEP, and GDN's in_proj_qkv/in_proj_z convert
-        # 0 of their 24. Carried over from both teams' local-only fixes (never upstreamed) since this task cannot
-        # reproduce or fix the dense-NVFP4 state poison at all if convert_dense never converts anything.
+        # Found on real hardware -- without stripping both, self_attn converts 0/36 regardless of
+        # PRISMYRA_DENSE_KEEP, and GDN's in_proj_qkv/in_proj_z convert 0 of their 24.
         key = key.replace(".inner.", ".")
         if key.endswith(".original"):
             key = key[: -len(".original")]
@@ -573,6 +578,17 @@ def convert_dense(model: nn.Module, engine: object | None = None) -> int:
             imp = None
         setattr(parent, name.rsplit(".", 1)[1], Fp4Linear(m, calib[key], imp, search))
         del m
+        if type(parent).__name__ == "_ProjectionSlot":
+            # `parent` is the slot whose `original` this call just replaced -- found necessary on real
+            # hardware: `parent.fused` (a `_FusedDenseProjection` built once, at `dense_fusion` time, from
+            # every sibling's pre-conversion Fp8Linear weights) is not touched by the `setattr` above and
+            # goes on answering `rows <= FUSION_MAX_ROWS` with those stale FP8 weights, while the
+            # now-converted `original` answers wider calls in NVFP4 -- the same real rows moving by 12.7%
+            # (measured) purely on how many companion rows share the call. `_ProjectionSlot.force_separate`'s
+            # own docstring has the full measurement and the reason this is set on every slot in `order`
+            # (shared by the whole group), not just this one.
+            for slot in parent.order:
+                slot.force_separate = True
         done += 1
         if os.environ.get("PRISMYRA_NVFP4_DEBUG") and done % 25 == 0:
             print("dense", done, round(torch.cuda.memory_allocated() / 2**30, 2), flush=True)

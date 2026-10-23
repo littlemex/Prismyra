@@ -784,7 +784,7 @@ class Prismyra:
         #
         # Called here -- after `kernels.apply` above, which is what turns these modules into the `Fp8Linear`
         # instances `convert_dense` looks for, and before the one-pass recordings just below -- and nowhere else,
-        # on purpose. Measured on real hardware (RUN-nanfix.md 11-12節, this same ordering fixed the bug there):
+        # on purpose. Measured on real hardware (this same ordering fixed the bug there):
         # a one-pass bucket recorded *before* `convert_dense` runs bakes in the *address* of whatever `Fp8Linear`
         # weight tensor its capture read; `convert_dense`'s `del m` on that same module then drops the only
         # reference to that tensor, freeing the allocator to hand the address to something unrelated the next time
