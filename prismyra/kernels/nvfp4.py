@@ -510,8 +510,36 @@ class Fp4Linear(nn.Module):
 
 
 @torch.no_grad()
-def convert_dense(model: nn.Module) -> int:
-    """Replace every Fp8Linear whose name does not match PRISMYRA_DENSE_KEEP (a regex) with Fp4Linear."""
+def convert_dense(model: nn.Module, engine: object | None = None) -> int:
+    """Replace every Fp8Linear whose name does not match PRISMYRA_DENSE_KEEP (a regex) with Fp4Linear.
+
+    Pass the `Prismyra` instance `model` came from as `engine` whenever one exists. Without it, a single question
+    asked after this call can return NaN forever, on documents that have nothing to do with each other and nothing
+    to do with this call's own regex -- found on real hardware (RTX PRO 4500, `nanfix_repro.py`), traced with a
+    forward hook on every `nn.Module` plus a byte-exact snapshot of every weight, both of which came back clean on
+    the call that goes wrong. Neither caught anything because the real culprit never runs either one.
+
+    `Prismyra.__init__` records a CUDA graph per one-pass length bucket (`onepass.record_all`, 64 to 2,048 tokens)
+    before this function is ever called, and a single short question keeps answering through a replay of one of
+    those buckets for as long as the engine lives (`engine._ask_in_one_pass`, `onepass.replay`) -- a replay calls
+    no Python `forward()`, which is why a hook on every module sees nothing. Each recording bakes in the *address*
+    of every weight tensor the capture read, `self_attn`'s and `shared_expert`'s Fp8Linear weights among them. The
+    `setattr(...)` below replaces exactly those modules and `del m` drops the only reference their old weight
+    tensors had, so the allocator is free to hand that address to the next thing that asks -- and once something
+    else writes there, every later reply to one of the stale buckets reads whatever that something else left
+    behind. A short question asked right after `convert_dense()` still reads back something plausible, because
+    the freed bytes have not been touched yet; measured on real hardware, three repeats of one long document
+    (`qlite_bench.py`'s own speed-measurement document, or `nanfix_bisect.py`'s synthetic one past about 2,020
+    tokens) is enough eager allocator churn to land a later allocation on that exact address, and the next short
+    question -- unrelated in content, length and KEEP regex -- comes back NaN and stays that way. Dropping
+    `engine._one_pass` here is what the fix below does: every one-pass call afterward takes the eager path
+    (`engine._read_one_pass`), which builds its own cache fresh and holds no address this function could make
+    stale. Re-recording instead of dropping would keep the speed this mechanism is for, but costs one warm-up and
+    two proving replays per bucket (`onepass.WARMUPS`, `onepass.PROVING_REPLAYS`) against weights this function has
+    typically already finished touching once per process -- left for whoever wires this into `engine.py` for real,
+    since a benchmark harness calling this function for the first time this round (`RUN-quant-strong.md`,
+    `RUN-quant-lite.md`) is the only caller today and pays once per run either way.
+    """
     import re
 
     with open(os.environ["PRISMYRA_NVFP4_CALIB"]) as f:
@@ -524,6 +552,18 @@ def convert_dense(model: nn.Module) -> int:
         if type(m).__name__ != "Fp8Linear" or keep.search(name):
             continue
         key = name[name.index("language_model.") :] if "language_model." in name else name
+        # `dense_fusion`'s `_ProjectionSlot` wraps some dense projections (GDN's in_proj_qkv/in_proj_z, the shared
+        # expert's gate_proj/up_proj) so the real Fp8Linear sits one level deeper as `<name>.original`, and
+        # `FlashAttention(inner=...)` wraps every self_attn projection so its real name carries an extra `.inner.`
+        # segment (`language_model.layers.N.self_attn.inner.q_proj`). The calibration file's keys are written
+        # before either wrapper is applied, so neither variant matches `calib` without stripping it back off.
+        # Found on real hardware (RUN-quant-strong.md 3.3: `.original`; RUN-quant-lite.md 2.1: `.inner`) -- without
+        # both, self_attn converts 0/36 regardless of PRISMYRA_DENSE_KEEP, and GDN's in_proj_qkv/in_proj_z convert
+        # 0 of their 24. Carried over from both teams' local-only fixes (never upstreamed) since this task cannot
+        # reproduce or fix the dense-NVFP4 state poison at all if convert_dense never converts anything.
+        key = key.replace(".inner.", ".")
+        if key.endswith(".original"):
+            key = key[: -len(".original")]
         if key not in calib:
             continue
         parent = model.get_submodule(name.rsplit(".", 1)[0])
@@ -537,4 +577,11 @@ def convert_dense(model: nn.Module) -> int:
         if os.environ.get("PRISMYRA_NVFP4_DEBUG") and done % 25 == 0:
             print("dense", done, round(torch.cuda.memory_allocated() / 2**30, 2), flush=True)
     torch.cuda.empty_cache()
+    if done and engine is not None and getattr(engine, "_one_pass", None) is not None:
+        # See this function's own docstring: every one-pass bucket recorded before this call holds the address of
+        # a weight tensor `del m` (above) may just have dropped, and keeping those recordings around is what turns
+        # one later eager allocation into every later short question answering NaN. Only worth doing when `done`
+        # actually replaced something -- a KEEP regex that matched everything leaves no stale address behind, and
+        # `engine` costs its caller nothing to pass when there is nothing to invalidate.
+        engine._one_pass = None
     return done
