@@ -360,29 +360,19 @@ Two more checkpoints, from the training line described in
 [`docs/DATA_PROVENANCE.md`](../../docs/DATA_PROVENANCE.md#v050-a-commercially-clear-training-line-prismyra-decision-35b-a3b-fp8-revision-3c88c546-prismyra-decision-35b-a3b-nvfp4-revision-9d08c9b4):
 `prismyra-decision-35b-a3b-fp8` and `prismyra-decision-35b-a3b-nvfp4`, called `fp8` and `nvfp4` below to tell them
 apart from the `-36l` checkpoint above. Measured on the identical 2,057 questions across the same five sets as the
-section above, against `fp8-36l`'s current revision (the section above's own checkpoint, called `fp8-36l` below to
-keep it apart from this line by name, not by anything about the checkpoint itself) and against `JEV-27B-VL`;
-`d1-3B`'s row below is the section above's own number, reused rather than re-measured this round. Scoring: sign
-test per set, matched question by question, Holm-corrected across the five sets in one family; "tie" means the
-Holm-corrected p-value is at or above 0.05.
+section above. Scoring throughout this section: sign test per set, matched question by question, Holm-corrected
+across the five sets in one family; "tie" means the Holm-corrected p-value is at or above 0.05.
 
-**Two more decision models were published after this round's measurement and are not in any table below**:
-`autotrust/JEV-35B` (and its `JEV-35B-NVFP4` sibling), `autotrust/GEV-26B-Decide`, and
-`autotrust/AutoTrust-JEV-27B-v1.1`. Comparing this line against them is still to be measured; the `JEV-27B-VL`
-rows below are against the same older checkpoint the section above uses, not against any of these four.
+This section has three subsections, each its own self-contained measurement round -- read the heading before
+reading a number, since `fp8` and `nvfp4`'s own figures differ slightly between them (run-to-run noise on this
+benchmark, consistent with the "tie" result the quantisation-difference table below reports in both rounds):
+against `fp8-36l` (the previous line, not re-measured since), against `JEV-27B-VL` (an earlier round, kept for
+the record), and against `JEV-35B`/`JEV-35B-NVFP4` (the current round). Two more models this project tried to
+include in the current round, `autotrust/GEV-26B-Decide` and `autotrust/AutoTrust-JEV-27B-v1.1`, could not be
+served in this project's environment and are not measured anywhere in this comparison -- this reports what ran,
+not every model that exists.
 
-**Accuracy, pooled over the five sets (2,057 questions):**
-
-| set | `fp8` (v0.5.0) | `nvfp4` (v0.5.0) | `fp8-36l` (previous line) | JEV-27B-VL | d1-3B |
-|---|---:|---:|---:|---:|---:|
-| RACE (579) | 95.16% | 95.34% | 96.55% | 96.37% | ~90.2% [reused] |
-| BoolQ (400) | 90.00% | 90.75% | 90.50% | 90.25% | ~85.8% [reused] |
-| RACE buried ~7k (157) | 89.17% | 89.81% | 94.90% | 93.63% | ~79.6% [reused] |
-| RACE buried ~10k (157) | 89.81% | 91.72% | 93.63% | 91.08% | ~77.7% [reused] |
-| Kev transfer-v4 (764) | 84.03% | 82.98% | 87.30% | 79.97% | ~77.9% [reused] |
-| **pooled, 2,057** | **89.16%** | **89.16%** | **91.59%** | 88.48% | 83.08-83.13% [reused] |
-
-**Against `fp8-36l` (the previous, non-commercial-trained line):**
+### Against `fp8-36l`, the previous line
 
 | set | `fp8` − `fp8-36l` | Holm p | `nvfp4` − `fp8-36l` | Holm p |
 |---|---:|---:|---:|---:|
@@ -393,14 +383,20 @@ rows below are against the same older checkpoint the section above uses, not aga
 | Kev transfer-v4 (764) | -3.27 | **0.0068 (loses)** | -4.32 | **0.0001 (loses)** |
 | **pooled** | **-2.43pt** | | **-2.43pt** | |
 
-Both checkpoints in this line lose to `fp8-36l` on the long-buried-context set and on Kev, and tie it on the
-other three; read plainly, that is two losses and three ties each, not an across-the-board loss. This line's
-adapter is trained only on sources confirmed clear for commercial use and for training a derivative model (see
-`docs/DATA_PROVENANCE.md`); the pooled 2.43-point gap above is that restriction's measured cost on this benchmark.
+(`fp8` pools to 89.16%, `nvfp4` to 89.16%, `fp8-36l` to 91.59%, on this round's 2,057 questions.) Both
+checkpoints in this line lose to `fp8-36l` on the long-buried-context set and on Kev, and tie it on the other
+three; read plainly, that is two losses and three ties each, not an across-the-board loss. This line's adapter is
+trained only on sources confirmed clear for commercial use and for training a derivative model (see
+`docs/DATA_PROVENANCE.md`); the pooled 2.43-point gap above is that restriction's measured cost on this
+benchmark.
 
-**Against JEV-27B-VL:**
+### Against JEV-27B-VL (an earlier round, kept for the record)
 
-| set | `fp8` − JEV | Holm p | `nvfp4` − JEV | Holm p |
+`autotrust/JEV-35B` is a newer model from the same vendor; see the next subsection for a comparison against it,
+measured in a later round against `fp8` and `nvfp4` remeasured the same day as JEV-35B itself. The numbers below
+are from the earlier round and are not reused there.
+
+| set | `fp8` − JEV-27B-VL | Holm p | `nvfp4` − JEV-27B-VL | Holm p |
 |---|---:|---:|---:|---:|
 | RACE (579) | -1.21 | 0.3249 (tie) | -1.04 | 0.4719 (tie) |
 | BoolQ (400) | -0.25 | 1.0000 (tie) | +0.50 | 1.0000 (tie) |
@@ -409,39 +405,20 @@ adapter is trained only on sources confirmed clear for commercial use and for tr
 | Kev transfer-v4 (764) | +4.06 | **0.0428 (wins)** | +3.01 | 0.2806 (tie) |
 | **pooled** | **+0.68pt** | | **+0.68pt** | |
 
-Read this plainly: `fp8`'s point estimate is behind JEV-27B-VL on four of the five sets (RACE, BoolQ, and both
-buried sets), and the Holm correction only clears 0.05 on the fifth, Kev -- the largest set (764 of 2,057
-questions), which is why the pooled number is positive. `nvfp4` is weaker still: none of its five per-set
-comparisons against JEV-27B-VL clears the Holm bar, including Kev (p = 0.2806). Neither v0.5.0 checkpoint has the
-clear, Holm-significant lead over JEV-27B-VL that `fp8-36l` has above (Kev, p < 0.0001); what both keep from that
-lead is the pooled sign, not its earlier size.
+(`fp8` and `nvfp4` both pooled to 89.16% in this earlier round; JEV-27B-VL pooled to 88.48%; d1-3B, not
+re-measured either round, pools to 83.08-83.13% on the earlier round's own report.) Read this plainly: `fp8`'s
+point estimate is behind JEV-27B-VL on four of the five sets (RACE, BoolQ, and both buried sets), and the Holm
+correction only clears 0.05 on the fifth, Kev -- the largest set (764 of 2,057 questions), which is why the
+pooled number is positive. `nvfp4` is weaker still: none of its five per-set comparisons against JEV-27B-VL
+clears the Holm bar, including Kev (p = 0.2806).
 
-**`fp8` against `nvfp4` (the quantisation difference within v0.5.0 only):**
-
-| set | diff(pt) | Holm p |
-|---|---:|---:|
-| RACE (579) | -0.17 | 1.0000 (tie) |
-| BoolQ (400) | -0.75 | 0.8503 (tie) |
-| RACE buried ~7k (157) | -0.64 | 1.0000 (tie) |
-| RACE buried ~10k (157) | -1.91 | 0.8503 (tie) |
-| Kev transfer-v4 (764) | +1.05 | 0.8503 (tie) |
-
-No set clears the Holm bar either way; the two quantisations of this line are statistically indistinguishable on
-this benchmark. Both pool to 89.16% exactly -- a coincidence of this one run, not something the scoring forces.
-
-**Probability quality** (2,057 questions, lower is better for both):
+**Probability quality, speed and determinism against JEV-27B-VL** (same earlier round; lower is better for
+Brier and ECE):
 
 | | `fp8` | `nvfp4` | `fp8-36l` | JEV-27B-VL | d1-3B |
 |---|---:|---:|---:|---:|---:|
 | Brier | 0.1631 | 0.1620 | **0.1347** | 0.1742 | 0.234-0.235 [reused] |
 | ECE (15 bins) | 0.0282 | **0.0217** | 0.0422 | 0.0373 | 0.025-0.027 [reused] |
-
-`fp8-36l` keeps the best Brier score of the five measured this round; `nvfp4` has the best ECE of those four
-(d1-3B's reused 0.025-0.027 is close but not lower). Both v0.5.0 checkpoints beat JEV-27B-VL on both measures.
-
-**Speed** (one document, 3,446 tokens by each checkpoint's own tokenizer -- `compare_jev_d1.py`'s
-`--target-tokens 3401` default, counted slightly differently per tokenizer, the same effect the section above
-notes for d1-3B; 2 warm-up calls then median of 7):
 
 | questions | `fp8` (L40S) | `nvfp4` (RTX PRO 4500) | `fp8-36l` (L40S) | JEV-27B-VL (L40S) | d1-3B (RTX PRO 4500) | d1-3B (L40S) |
 |---|---:|---:|---:|---:|---:|---:|
@@ -449,28 +426,141 @@ notes for d1-3B; 2 warm-up calls then median of 7):
 | 16 | 217.8 ms | 188.6 ms | 219.6 ms | 1,573.3 ms | 203.1 ms [reused] | 130.1 ms [reused] |
 | 64 | 305.3 ms | 272.3 ms | 306.2 ms | 6,346.0 ms | 298.6 ms [reused] | 190.5 ms [reused] |
 
-The `fp8` / `fp8-36l` / JEV-27B-VL columns are one same-day, same-GPU (L40S) measurement; `nvfp4` is its own
-separate same-day session on an RTX PRO 4500, not interleaved with the L40S session. d1-3B's two columns are
-carried over from an earlier round, not re-measured this round. At one question, `fp8`, `fp8-36l` and JEV-27B-VL
-are within 2% of each other -- under this project's own 5% bar for calling something a real difference. At 16 and
-64 questions, JEV-27B-VL is 7-21x slower than either Prismyra checkpoint, for the same structural reason as the
-section above: its own API answers one decision per call and pays for the document again every time.
+At one question, `fp8`, `fp8-36l` and JEV-27B-VL are within 2% of each other on this round -- under this
+project's own 5% bar for calling something a real difference. At 16 and 64 questions, JEV-27B-VL is 7-21x
+slower than either Prismyra checkpoint: its own `/v1/decide` answers one decision per call and pays for the
+document again every time, a design limit this project's own checkpoints do not share. JEV-27B-VL is also not
+bit-deterministic, measured once in an earlier round and not independently re-tested since.
 
-**Determinism**: JEV-27B-VL is not bit-deterministic; this is the same finding as the section above, reused from
-that round's measurement and not independently re-tested this round.
+### Against JEV-35B and JEV-35B-NVFP4 (current round)
 
-**Reproducing this comparison**: the speed half is
-[`benchmarks/compare_jev_d1.py`](../../benchmarks/compare_jev_d1.py), run once per checkpoint
-(`--model littlemex/prismyra-decision-35b-a3b-fp8`, and so on for the others; the two competitors are measured
-through their own serving code, as the script's own docstring explains). The accuracy half scores each item the
-same way as the section above: the predicted option is the argmax of the probabilities this engine's `/ask` or
-`/v1/decide` returns over the question's declared options, checked against the item's gold label; the five sets
-are compared pairwise by matching on item and question id, a sign test per set, with a Holm correction across the
-five sets in one family. Brier is the mean squared distance from the one-hot gold label over all options; ECE
-bins predictions into 15 confidence buckets and takes the weighted mean gap between each bucket's average
-confidence and its average accuracy. RACE and BoolQ are public (`race`, `boolq` on Hugging Face); the two
-buried-context sets and Kev transfer-v4 are this project's own held-out construction and are not bundled in this
-repository.
+`autotrust/JEV-35B` (a fine-tune of `Qwen/Qwen3.5-35B-A3B`) and its NVFP4 sibling, measured the way each
+checkpoint's own card documents reading a decision (its `/v1/decide` request shape, applied directly rather
+than over HTTP), against `fp8` and `nvfp4` remeasured the same day. **A hardware note before the numbers**:
+JEV-35B's own card states it needs one GPU with 80 GB or more; it does not fit one 46 GB L40S, so it was served
+across two L40S with vLLM's tensor-parallel splitting (`--tensor-parallel-size 2`) -- the same bf16 weights,
+sharded across two GPUs, not a different quantisation. `fp8` ran on one L40S; `nvfp4` and JEV-35B-NVFP4 each ran
+on one RTX PRO 4500. The speed table below is what each checkpoint needed to serve its own published format, not
+a GPU-count-matched comparison.
+
+| set | `fp8` | `nvfp4` | JEV-35B (bf16) | JEV-35B-NVFP4 |
+|---|---:|---:|---:|---:|
+| RACE (579) | 95.68% | 95.16% | 96.55% | 93.96% |
+| BoolQ (400) | 90.50% | 89.75% | 90.75% | 87.25% |
+| RACE buried ~7k (157) | 89.17% | 89.81% | 94.27% | 81.53% |
+| RACE buried ~10k (157) | 89.81% | 91.08% | 93.63% | 82.17% |
+| Kev transfer-v4 (764) | 83.25% | 83.12% | 78.80% | 69.76% |
+| **pooled, 2,057** | **89.11%** | **88.92%** | **88.43%** | **81.82%** |
+
+**`fp8` against JEV-35B:**
+
+| set | diff(pt) | Holm p |
+|---|---:|---:|
+| RACE (579) | -0.86 | 0.2633 (tie) |
+| BoolQ (400) | -0.25 | 0.8527 (tie) |
+| RACE buried ~7k (157) | -5.10 | **0.0456 (loses)** |
+| RACE buried ~10k (157) | -3.82 | 0.2498 (tie) |
+| Kev transfer-v4 (764) | +4.45 | **0.0307 (wins)** |
+| **pooled** | **+0.68pt** | |
+
+The same structure as the earlier round's result against JEV-27B-VL above: `fp8` loses the long-buried-context
+set, wins the largest set (Kev), and ties the other three. The competitor's model changed; the shape of this
+line's result against it did not.
+
+**`nvfp4` against JEV-35B-NVFP4:**
+
+| set | diff(pt) | Holm p |
+|---|---:|---:|
+| RACE (579) | +1.21 | 0.0825 (tie) |
+| BoolQ (400) | +2.50 | 0.0825 (tie) |
+| RACE buried ~7k (157) | +8.28 | **0.0086 (wins)** |
+| RACE buried ~10k (157) | +8.92 | **0.0019 (wins)** |
+| Kev transfer-v4 (764) | +13.35 | **0.0000 (wins)** |
+| **pooled** | **+7.10pt** | |
+
+`nvfp4` wins three of five sets outright here, a clearly different result from the near-tie against JEV-35B's
+own bf16 weights above. The reason is JEV-35B-NVFP4 itself, not `nvfp4` improving: measured head to head, bf16
+JEV-35B beats its own NVFP4 sibling on **every one of the five sets**, all Holm-significant (+2.59 to +12.74pt,
+pooled +6.61pt) -- a quantisation cost on this benchmark with no counterpart in this project's own fp8-to-nvfp4
+comparison, which ties on every set both this round and the earlier one (+0.19pt pooled here, +0.00pt pooled in
+the earlier round; see the two-row table below).
+
+| set | `fp8` − `nvfp4` (this round) | Holm p |
+|---|---:|---:|
+| RACE (579) | +0.52 | 1.0000 (tie) |
+| BoolQ (400) | +0.75 | 0.4163 (tie) |
+| RACE buried ~7k (157) | -0.64 | 1.0000 (tie) |
+| RACE buried ~10k (157) | -1.27 | 1.0000 (tie) |
+| Kev transfer-v4 (764) | +0.13 | 1.0000 (tie) |
+| **pooled** | **+0.19pt** | |
+
+JEV-35B-NVFP4's weakness is not only accuracy. The same input, asked 11 times in one process, returned **8
+different probability pairs** (range 0.453-0.640 on the chosen option's own probability) -- `fp8`, `nvfp4` and
+JEV-35B (bf16) each returned the identical value all 11 times. Two restarts of the process gave matching answers
+for all four checkpoints, including JEV-35B-NVFP4, but with the same-process result above, one matching pair of
+restarts does not establish that this checkpoint is actually reproducible rather than coincidentally close on
+that one probe.
+
+**Probability quality** (2,057 questions, lower is better for both):
+
+| | `fp8` | `nvfp4` | JEV-35B | JEV-35B-NVFP4 |
+|---|---:|---:|---:|---:|
+| Brier | 0.1633 | 0.1610 | **0.1598** | 0.2528 |
+| ECE (15 bins) | 0.0255 | 0.0208 | **0.0194** | 0.0546 |
+
+JEV-35B (bf16) has the best Brier and ECE of the four; JEV-35B-NVFP4 has the worst of both by a wide margin,
+consistent with its accuracy and determinism results above.
+
+**Speed** (one document, 3,446 tokens by each checkpoint's own tokenizer, 2 warm-up calls then median of 7):
+
+| questions | `fp8` (1x L40S) | `nvfp4` (1x RTX PRO 4500) | JEV-35B (2x L40S, TP=2) | JEV-35B-NVFP4 (1x RTX PRO 4500) |
+|---|---:|---:|---:|---:|
+| 1 | 150.8 ms | 177.2 ms | **99.2 ms** | **82.3 ms** |
+| 16 | **252.3 ms** | **211.6 ms** | 688.6 ms | 412.5 ms |
+| 64 | **369.4 ms** | **302.1 ms** | 2,759.2 ms | 1,675.1 ms |
+
+**At one question, the JEV-35B family is faster.** At 16 and 64 questions, both Prismyra checkpoints are
+faster, by a widening margin (JEV-35B takes 2.76 seconds at 64 questions against `fp8`'s 0.37). This round
+answers several questions about the same document in one batched call rather than one call per question -- a
+different implementation than JEV-27B-VL's one-call-per-decision API above -- yet JEV-35B's own time still grows
+close to linearly with the number of questions, where this project's own checkpoints do not; this round did not
+trace that difference to a specific cause.
+
+**Long context.** This project's engine allocates a fixed token budget at start-up; `fp8` and `nvfp4` both
+answer one question about a 65,536-token document correctly, and both refuse a 128,726-token document
+(`a context of 128726 tokens is longer than this engine allocates for (65536)`) -- a configured limit, not a
+model-capacity ceiling, and neither checkpoint was measured past it this round. JEV-35B and JEV-35B-NVFP4's own
+cards state native support to 262,144 tokens; at 65,536 tokens, on 175 sampled questions across three Decision
+RULER tasks (simple and harder needle retrieval, and multi-variable tracking):
+
+| task | `fp8` | JEV-35B | JEV-35B-NVFP4 |
+|---|---:|---:|---:|
+| needle retrieval, simple (25) | 100.0% | 100.0% | 100.0% |
+| needle retrieval, harder (25) | 100.0% | 100.0% | 100.0% |
+| variable tracking (125) | 63.2% | **94.4%** | 48.0% |
+
+(`nvfp4`'s own 65,536-token result is not comparable here: on the 32 GB card it ran on, the first question in a
+session succeeds but every later one in the same process fails on memory, so only one question was scored --
+not a quantisation accuracy result, a single card's memory ceiling at this context length.) The two simple
+retrieval tasks are saturated for every model measured; variable tracking is where they separate, and JEV-35B
+(bf16) is clearly ahead of `fp8` there (94.4% against 63.2%), which is itself clearly ahead of JEV-35B-NVFP4
+(48.0%) -- the same bf16-beats-its-own-nvfp4-sibling pattern as the production benchmark above. On a further
+sample of 16 question-parts from Decision LCR (real documents of roughly 88,000-122,000 tokens, built from
+`ArtificialAnalysis/AA-LCR`'s own extracted text, scored per part rather than by this benchmark's own official
+all-or-nothing rule, so not comparable to a published Decision LCR score), JEV-35B scores 62.5% and
+JEV-35B-NVFP4 56.2%; `fp8` and `nvfp4` were not measured here, for the same budget reason as above.
+
+**Reproducing this comparison**: the accuracy and long-context halves score each item the same way as the
+earlier-round subsection above (argmax of the returned probabilities against the gold label; sign test per set
+with a Holm correction across the family being compared; Brier as mean squared distance from the one-hot gold
+label; ECE from 15 confidence bins). The speed half follows the same method as
+[`benchmarks/compare_jev_d1.py`](../../benchmarks/compare_jev_d1.py) (2 warm-up calls, median of 7, a filler
+document built to a target token count); JEV-35B's own `/v1/decide` request shape and tensor-parallel serving
+requirement mean this round's harness calls its weights directly through its own documented API rather than
+through that script unmodified. RACE and BoolQ are public (`race`, `boolq` on Hugging Face); the two
+buried-context sets, Kev transfer-v4, and the Decision RULER and Decision LCR samples drawn from them are this
+project's own held-out construction or a third-party long-context suite assembled locally, and are not bundled
+in this repository.
 
 ## Weak-category mixture: sentiment and causal/multi-step reasoning
 

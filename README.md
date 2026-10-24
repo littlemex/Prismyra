@@ -375,9 +375,10 @@ for training a derivative model -- see [docs/DATA_PROVENANCE.md](docs/DATA_PROVE
 is and is not, each checkpoint's own Hugging Face card for the accuracy and speed trade-off against the line
 above, and
 [recipes/decision-lora/README.md's own comparison](recipes/decision-lora/README.md#the-commercially-clear-line-v050-against-the-same-five-sets)
-for how this line fares against `autotrust/JEV-27B-VL` and `LiquidAI/d1-3B`, the same two outside models the line
-above is measured against (two newer competitors, `autotrust/JEV-35B` and `autotrust/GEV-26B-Decide`, are not yet
-in that comparison). This line does not replace the checkpoints above, which remain available:
+for how this line fares against `autotrust/JEV-27B-VL`, `LiquidAI/d1-3B`, and the newer `autotrust/JEV-35B` and
+`JEV-35B-NVFP4` (two further models from that family, `autotrust/GEV-26B-Decide` and
+`autotrust/AutoTrust-JEV-27B-v1.1`, could not be served in this project's environment and are not in that
+comparison). This line does not replace the checkpoints above, which remain available:
 
 | checkpoint | layers | card | Hugging Face |
 |---|---|---|---|
