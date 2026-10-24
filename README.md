@@ -370,6 +370,16 @@ the FP8 weights to 4-bit floating point) for a card the 36- and 40-layer FP8 che
 | `prismyra-decision-qwen3.6-35b-a3b-fp8-32l` | 32 | any this project's kernels support, including the one below | [littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-32l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-32l) |
 | `prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l](https://huggingface.co/littlemex/prismyra-decision-qwen3.6-35b-a3b-nvfp4-36l) (revision `53291b60` as of this release) |
 
+A second, separate line of two checkpoints trains its adapter only on data confirmed clear for commercial use and
+for training a derivative model -- see [docs/DATA_PROVENANCE.md](docs/DATA_PROVENANCE.md) for what that line's pool
+is and is not, and each checkpoint's own Hugging Face card for the accuracy and speed trade-off against the line
+above. This line does not replace the checkpoints above, which remain available:
+
+| checkpoint | layers | card | Hugging Face |
+|---|---|---|---|
+| `prismyra-decision-35b-a3b-fp8` | 36 | any this project's kernels support | [littlemex/prismyra-decision-35b-a3b-fp8](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-fp8) (revision `3c88c546` as of this release) |
+| `prismyra-decision-35b-a3b-nvfp4` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-35b-a3b-nvfp4](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-nvfp4) (revision `9d08c9b4` as of this release; primary checkpoint for this line) |
+
 The 36-layer FP8 checkpoint is the one to start with on a card the 36- and 40-layer FP8 checkpoints both fit on: on
 the five sets it is measured against it ties or clears every bar the 40-layer checkpoint does, while running faster.
 The 32-layer checkpoint is faster still, fits a smaller card than the other two FP8 checkpoints, and beats both

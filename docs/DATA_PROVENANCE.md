@@ -104,3 +104,97 @@ already baked into the training pool this round built on. No output of a closed,
 A handful of smaller legacy families (TREC, Yahoo Answers Topics, QNLI, and `tweet_eval`'s `offensive` config) were
 not individually re-verified against a primary licence source in this pass; treat them as unaudited rather than as
 confirmed either way until someone checks them directly.
+
+## v0.5.0: a commercially-clear training line (`prismyra-decision-35b-a3b-fp8` revision `3c88c546`, `prismyra-decision-35b-a3b-nvfp4` revision `9d08c9b4`)
+
+Starting with this round, the project ships a second checkpoint line whose adapter is trained from the unmodified
+base model using only sources confirmed clear for commercial use and for training a derivative model. This section
+documents that line's pool end to end, rather than describing only what changed, because the pool is a fresh build
+and the "additive" convention above does not apply to it.
+
+Three sources that were part of every earlier round's pool are not used here at all, because they carry
+research-only terms: **RACE** (custom, non-commercial -- CMU's own data agreement), **SciQ** (CC-BY-NC-3.0), and
+**DREAM** (custom, non-commercial -- "intended for non-commercial research purpose only"). A fourth,
+**social_i_qa**, is not used because its own Hugging Face card carries no licence field at all and this project
+could not independently confirm the commercial-use claim made on it by the earlier cards. Where these sources
+previously trained a capability, self-authored synthetic data (below) covers the gap instead.
+
+### Sources already documented above, reused for this line
+
+Same dataset, same licence as already recorded earlier in this page; only the row counts differ.
+
+| Family | Source | Licence (SPDX) |
+|---|---|---|
+| CommonsenseQA rows | `tau/commonsense_qa` | MIT |
+| AQuA-RAT rows | `deepmind/aqua_rat` | Apache-2.0 |
+| MMLU / MMLU auxiliary-train rows | `cais/mmlu` | MIT |
+| Cosmos QA rows | `allenai/cosmos_qa` | CC-BY-4.0 |
+| ARC rows | `allenai/ai2_arc` | CC-BY-SA-4.0 |
+| QuALITY rows | `nyu-mll/quality` | CC-BY-4.0 |
+| HotpotQA (comparison slice) rows | `hotpotqa/hotpot_qa` | CC-BY-SA-4.0 |
+| BIG-bench logical-deduction rows | BIG-bench (`logical_deduction` task) | Apache-2.0 |
+| BoolQ rows | `google/boolq` | CC-BY-SA-3.0 |
+| Financial-news sentiment rows | `zeroshot/twitter-financial-news-sentiment` | MIT |
+| General-tweet sentiment rows | `cardiffnlp/tweet_eval` (`sentiment` config only) | CC-BY-3.0 |
+| Causal reasoning rows | `pkavumba/balanced-copa` | CC-BY-4.0 |
+| Intent classification rows | `clinc/clinc_oos`, `PolyAI/banking77` | CC-BY-3.0, CC-BY-4.0 |
+
+### New sources for this line
+
+| Family | Source | Licence (SPDX) | Licence text | Commercial use |
+|---|---|---|---|---|
+| Emotion valence | [`google-research-datasets/go_emotions`](https://huggingface.co/datasets/google-research-datasets/go_emotions) | Apache-2.0 | dataset card metadata | yes |
+| Rule-based logical reasoning | [`tasksource/ruletaker`](https://huggingface.co/datasets/tasksource/ruletaker) | Apache-2.0 | dataset card metadata | yes |
+| bAbI-style reasoning (17 sub-tasks) | [`tasksource/babi_nli`](https://huggingface.co/datasets/tasksource/babi_nli) | the card's own tag is the unqualified `bsd` | dataset card metadata; the upstream bAbI project (Meta/Facebook) is BSD-3-Clause, not restated with a clause count on this card | yes |
+| Sentence-composition QA | [`allenai/qasc`](https://huggingface.co/datasets/allenai/qasc) | CC-BY-4.0 | dataset card / project page | yes (attribution required) |
+| Qualitative-relationship reasoning | [`allenai/quartz`](https://huggingface.co/datasets/allenai/quartz) | CC-BY-4.0 | dataset card body text | yes (attribution required) |
+| Poem sentiment | [`google-research-datasets/poem_sentiment`](https://huggingface.co/datasets/google-research-datasets/poem_sentiment) | CC-BY-4.0 | dataset card / project page | yes (attribution required) |
+| Wikipedia-derived long-document reading and topic questions | [`wikimedia/wikipedia`](https://huggingface.co/datasets/wikimedia/wikipedia) (`20231101.en`), with DeepSeek V3.2 authoring the question and Kimi K3 blind-verifying it | CC-BY-SA-4.0 | Wikimedia's own terms of use | yes (share-alike: a redistributed *copy* of the source text must carry the same licence; this does not require releasing the model weights under CC-BY-SA, and the source text itself is not reproduced in the released weights) |
+
+**Confirmed in a follow-up check against the primary licence text:**
+
+| Family | Source | Note |
+|---|---|---|
+| Causal-reasoning rows (e-CARE) | e-CARE ([waste-wood/e-CARE](https://github.com/waste-wood/e-CARE); Hugging Face reuploads `12ml/e-CARE`, `sjcfr/e-care`) | MIT, from the original repository's `LICENSE` file (Copyright (c) 2022 HIT-SCIR); commercial use permitted. Human labels only (the dataset's own answer); no teacher output is used for these rows. 1,244 rows. |
+| QNLI (via GLUE) | `nyu-mll/glue` (`qnli` config), a reformulation of SQuAD v1.1 | CC-BY-SA-4.0, from SQuAD's own licence statement ([SQuAD explorer](https://rajpurkar.github.io/SQuAD-explorer/): "distributed under the CC BY-SA 4.0 license"); commercial use permitted, and share-alike applies to redistributed copies of the data, not to model weights. 13 rows. |
+
+### Self-authored synthetic replacements
+
+These rows carry no third-party text; DeepSeek V3.2 authors the scenario, question and options (or, for the code
+family, the function and its input), and Kimi K3 performs a blind second check before a row is kept. Licence: n/a
+(not third-party data); commercial use: yes.
+
+| Family | Replaces | What it covers |
+|---|---|---|
+| Social-situation commonsense (self-authored) | `social_i_qa` (dropped, licence not independently confirmed) | social-situation reasoning, same question shape as the dropped source |
+| Dialogue reading comprehension (self-authored) | DREAM (dropped, non-commercial) | multi-turn dialogue reading comprehension |
+| Code-output tracing, execution-verified | an early version of this same family that this project found to be 22.3% wrong (gold decided by two models agreeing, not by running the code); superseded by running the self-authored function in a sandboxed subprocess and keeping only rows where four independent runs agree with the stated output | predicting a function's return value for a given input |
+| Tool-use response selection (self-authored) | no prior source (new capability for this project) | choosing the correct tool call among invented, schema-described alternatives |
+
+### Self-distillation
+
+As in earlier rounds, every row's distillation target is this project's own model, not a third party's -- but for
+this line specifically, the signal comes from the clean, unmodified 40-layer base checkpoint, read on inputs from
+this line's own commercially-clear pool. No earlier adapter (all of which were trained in part on the research-only
+sources this line excludes) is used as a teacher, starting point, or initialization anywhere in this line.
+
+### Calibration data (NVFP4 quantisation)
+
+The NVFP4 activation-maxima calibration file for this line was measured on rows drawn from this line's own
+commercially-clear pool, not reused from any earlier round's calibration file.
+
+### Teacher models
+
+Only Kimi K3 and DeepSeek V3.2 are used anywhere in this line's data, for scenario/question authoring and blind
+verification as described above and in the per-family rows. **No output from a closed, proprietary model --
+Claude, GPT, or any other model whose weights or terms are not publicly available -- was used anywhere in this
+line's training data.** No generated rationale or free text from either teacher model is reproduced in either
+checkpoint's weights or in either Hugging Face card.
+
+### Licence summary for this line
+
+Every source behind this line's adapter is licensed for
+commercial use and for training a derivative model, with no restriction on redistributing the resulting weights.
+RACE, SciQ, DREAM and social_i_qa -- all four non-commercial or unconfirmed in earlier rounds' pools -- are not used
+in this line at all; DREAM and social_i_qa's roles are covered by self-authored synthetic data instead, and RACE and
+SciQ's roles are not directly replaced (see each checkpoint's own card for where that shows up in evaluation).
