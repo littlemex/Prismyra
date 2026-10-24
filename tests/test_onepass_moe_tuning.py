@@ -89,7 +89,15 @@ def test_scope_restores_the_override_even_if_the_block_raises(monkeypatch):
     import sys
     import types
 
+    # `import vllm.model_executor.layers.fused_moe` resolves every dotted segment through `sys.modules`, not
+    # only the leaf: on a machine with no real `vllm` installed (this project's own CPU test job, which
+    # installs `[dev]` but not `[fast]`), faking only the leaf still tries to import the real, absent `vllm`
+    # package to resolve its parent and fails with `ModuleNotFoundError` before `scope()`'s own code runs at
+    # all -- every ancestor package needs its own fake entry too.
     fake_moe = types.SimpleNamespace(_config=None)
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.model_executor", types.ModuleType("vllm.model_executor"))
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers", types.ModuleType("vllm.model_executor.layers"))
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe", fake_moe)
     monkeypatch.setattr(m, "_PINNED", {"BLOCK_SIZE_M": 64})
 
