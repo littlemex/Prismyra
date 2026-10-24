@@ -521,6 +521,17 @@ class Fp4Linear(nn.Module):
 def convert_dense(model: nn.Module, engine: object | None = None) -> int:
     """Replace every Fp8Linear whose name does not match PRISMYRA_DENSE_KEEP (a regex) with Fp4Linear.
 
+    `PRISMYRA_DENSE_KEEP` defaults to `"linear_attn"` -- the gated delta net's projections stay on FP8, only
+    `self_attn` and `shared_expert` convert. This is the one regex this project has measured to keep every
+    determinism guarantee `tools/audit_sm120.py` checks (companion-invariance, paged-vs-joined, all closed to
+    bit-exact on real hardware) *and* clear this project's own accuracy CI on every one of its four measured
+    benchmark files. Converting any part of the gated delta net too (an empty `PRISMYRA_DENSE_KEEP`, or a regex
+    that excludes less than `"linear_attn"` does) answers every bit-exactness check the same way but has been
+    measured to fail that accuracy CI on at least one of the four files every time it was tried -- a real
+    accuracy cost of quantising the gated delta net's own projections, not an artefact of the determinism bugs
+    this module used to have. A caller who wants that trade for the extra speed it brings must ask for it by
+    name, with this cost already on record rather than discovered later.
+
     Pass the `Prismyra` instance `model` came from as `engine` whenever one exists. Without it, a single question
     asked after this call can return NaN forever, on documents that have nothing to do with each other and nothing
     to do with this call's own regex -- found on real hardware (RTX PRO 4500), traced with a
@@ -551,7 +562,7 @@ def convert_dense(model: nn.Module, engine: object | None = None) -> int:
 
     with open(os.environ["PRISMYRA_NVFP4_CALIB"]) as f:
         calib = json.load(f)["dense_in_amax"]
-    keep = re.compile(os.environ.get("PRISMYRA_DENSE_KEEP", "^$"))
+    keep = re.compile(os.environ.get("PRISMYRA_DENSE_KEEP", "linear_attn"))
     search = os.environ.get("PRISMYRA_NVFP4_SEARCH") == "1"
     stats = _importance() if search else None
     done = 0

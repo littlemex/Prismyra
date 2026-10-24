@@ -778,9 +778,10 @@ class Prismyra:
         # Experimental: dense (self_attn/shared_expert/linear_attn) projections in NVFP4 too, selected with
         # `PRISMYRA_DENSE=nvfp4` -- the same "=nvfp4" convention `PRISMYRA_EXPERTS` already uses for the routed
         # experts above, kept separate because converting dense and converting experts are independent choices
-        # (either, both, or neither). `PRISMYRA_DENSE_KEEP` (a regex, default `"^$"` -- nothing kept, so every
-        # dense projection converts) still means exactly what `convert_dense`'s own docstring says: a name that
-        # matches it is left on `Fp8Linear`.
+        # (either, both, or neither). `PRISMYRA_DENSE_KEEP` (a regex, default `"linear_attn"` -- the gated delta
+        # net's own projections are kept on FP8, see `convert_dense`'s own docstring for why that default and not
+        # a wider one) still means exactly what `convert_dense`'s own docstring says: a name that matches it is
+        # left on `Fp8Linear`.
         #
         # Called here -- after `kernels.apply` above, which is what turns these modules into the `Fp8Linear`
         # instances `convert_dense` looks for, and before the one-pass recordings just below -- and nowhere else,
