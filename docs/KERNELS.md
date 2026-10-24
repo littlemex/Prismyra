@@ -360,6 +360,64 @@ per device, fusion mode, and thread, so normally once per process) rather than o
 See [docs/PERFORMANCE.md's settings table](PERFORMANCE.md#four-speed-settings-one-that-risks-the-answer) for
 `interleaved_fork` and `wide_group`, the two flags that change how a multi-question request reaches these kernels.
 
+## Dense projections in NVFP4 (Blackwell only, experimental)
+
+`PRISMYRA_DENSE=nvfp4` is the same idea as `PRISMYRA_EXPERTS=nvfp4` above, applied to the other half of a
+layer's weight: the dense projections (`self_attn`'s q/k/v, the gated delta net's in_proj_qkv/in_proj_z, a
+shared expert's gate/up) that `kernels.apply()` has already turned into `Fp8Linear`. `prismyra.kernels.nvfp4
+.convert_dense()` re-quantises every one whose name does not match `PRISMYRA_DENSE_KEEP` (a regex) to `Fp4Linear`,
+reading each projection's activation maximum from the same calibration file `PRISMYRA_EXPERTS=nvfp4` needs
+(`PRISMYRA_NVFP4_CALIB`, the `dense_in_amax` key). `Prismyra.__init__` calls it once, right after `kernels.apply()`
+and right before the one-pass CUDA graph buckets are recorded -- that order matters and is covered below.
+
+Independent of the routed-expert path: either, both, or neither may be set, and converting dense projections
+needs no `PRISMYRA_NVFP4_EXPERTS` side file of its own.
+
+**What it costs and saves.** Measured on an RTX PRO 4500, one-question requests at 1k/4k/16k tokens of context:
+converting `self_attn` and `shared_expert` alone is 4.4-6.3% faster than the FP8 baseline at every context
+length measured; converting every dense projection including the gated delta net's is faster still
+(15.6-19.4%), because that group is the larger share of a layer's dense weight. Static device memory moves by
+under 2% either way (the dense projections are a small fraction of a 36-layer checkpoint's weight next to the
+routed experts) -- this setting is for speed, not for fitting a checkpoint onto a smaller card the way
+`PRISMYRA_EXPERTS=nvfp4` is. These figures are all taken at a prefill-sized row count, well above
+`FUSION_MAX_ROWS` (512) on every cell measured, so they are unaffected by whether the fusion-invariance fix
+below is in place -- that fix's own cost is confined to calls at or under 512 rows (a converted group's own
+fused-matmul benefit, measured separately in this project's history at 2.6-17% depending on the group) and has
+not been re-measured directly against this release.
+
+**The determinism promise holds for every regex, once two bugs are fixed.** Converting a dense projection used
+to risk two different failures, both closed in this release and both regression-tested in `tests/test_gpu.py`:
+
+- a one-pass CUDA graph recorded before conversion keeps the address of a weight tensor conversion then frees,
+  and enough allocator churn afterward can make a later, unrelated question answer NaN forever. Closed by
+  calling `convert_dense()` before any one-pass bucket is recorded, and, independently, by having `convert_dense()`
+  drop any bucket already recorded when it is handed the engine that recorded them.
+- `self_attn`, the gated delta net and a shared expert's gate/up each fuse their own projections into one
+  matmul for calls at or under 512 rows (`FUSION_MAX_ROWS`, see "Fusing the projections that share an input"
+  above) -- a fusion built once from the *pre-conversion* FP8 weights, which conversion did not reach. Left
+  alone, the same real rows answered through two different quantisations depending only on how many companion
+  rows shared the call: FP8 at 512 rows or under, NVFP4 above it, measured to move a probability by 1.797
+  absolute units (12.7% relative) at exactly that boundary. Closed by forcing every slot in a group off the
+  fused branch for good, once any one of its members is no longer FP8.
+
+With both fixed, `tools/audit_sm120.py`'s companion-invariance sweep (4,392 checks) comes back fully bit-exact
+for every `PRISMYRA_DENSE_KEEP` regex measured, where it used to fail on 888 of them for every regex that
+converted any part of a fused group. Its paged-vs-joined sweep (2,448 checks) comes back at the same 24
+non-exact entries the default (no dense NVFP4) path already has -- a pre-existing, unrelated residual this round
+did not introduce and does not close -- rather than at the 2,385 non-exact entries converting `self_attn` used
+to add on top of that residual.
+
+**Accuracy does not hold for every regex, and this is a real cost rather than a leftover from the two bugs
+above.** Across four held-out accuracy sets, converting any part of the gated delta net's own projections failed
+this project's own bootstrapped accuracy-CI check (the interval sitting entirely below zero) on at least one set
+every time it was tried, by 1.6-2.1 points. Converting only `self_attn` and `shared_expert` -- the gated delta
+net stays on FP8 -- passed on all four sets, every time, with the largest movement in either direction under 0.6
+points. This is why `PRISMYRA_DENSE_KEEP` defaults to `"linear_attn"` rather than to an empty regex that would
+convert everything: it is the one setting this project has measured to keep its determinism promise *and* its
+accuracy bar at the same time. A caller who wants the gated delta net's own extra speed can still ask for it,
+by narrowing or clearing `PRISMYRA_DENSE_KEEP`, with this accuracy cost already on record rather than discovered
+after the fact.
+
 ## Measured and rejected
 
 Recorded because they are cheap to re-propose:

@@ -386,6 +386,14 @@ before that conversion -- measured through a different serving path than the one
 that caveat. The same page covers how the NVFP4 checkpoint is loaded (`PRISMYRA_EXPERTS=nvfp4` plus the two side
 files it needs) and what it costs in speed.
 
+A second, independent Blackwell-only setting, `PRISMYRA_DENSE=nvfp4`, re-quantises the dense projections
+(`self_attn`, the gated delta net, a shared expert's gate/up) the same way, for speed rather than for fitting a
+smaller card: 4-6% faster measured on an RTX PRO 4500 with its default `PRISMYRA_DENSE_KEEP`, which keeps the
+gated delta net on FP8 because converting it, while just as deterministic, measurably failed this project's own
+accuracy bar on held-out sets every time it was tried. See
+[docs/KERNELS.md](docs/KERNELS.md#dense-projections-in-nvfp4-blackwell-only-experimental) for the figures, the
+determinism fixes behind them, and that accuracy trade-off in full.
+
 ## Performance
 
 The cost model, at about 5,000 context tokens:
