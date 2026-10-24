@@ -1585,6 +1585,29 @@ class Prismyra:
         if self._one_pass is not None:
             spare -= self._one_pass.held_bytes
         free += max(0, spare)
+        if wanted >= free and time.monotonic() >= self._reclaim_cooldown_until:
+            # The prediction above (`visible_free()` plus `spare`) assumes every reserved-but-unallocated byte is
+            # already usable for the next allocation. Measured false on a 32 GiB card: the first read after this
+            # engine loaded grew `reserved` by 7.5 GiB to answer one transient allocation (confirmed with a CUDA
+            # allocator OOM-and-retry warning in the log), released that memory back to the *allocator* when the
+            # read finished (`allocated` returned to exactly its pre-read value), but never released it back to
+            # the *driver* -- `empty_cache()` is what does that, and nothing in this method called it, so
+            # `mem_get_info` kept reporting the pre-reclaim low number on every later question and refused a
+            # context no smaller than the one that had just been answered. `_run_recorded`'s own margin check
+            # carries the identical confirm-with-`empty_cache()`-and-re-read fix for the same reason (see
+            # `RECLAIM_COOLDOWN_S`'s docstring); this shares that check's cooldown state rather than its own, so a
+            # tight stretch does not pay the synchronisation cost once per margin check and once more here.
+            started = time.perf_counter()
+            torch.cuda.empty_cache()
+            self._empty_cache_calls += 1
+            self._empty_cache_ms += (time.perf_counter() - started) * 1e3
+            free, total = chunking.visible_free(self.torch_device)
+            spare = torch.cuda.memory_reserved(self.torch_device) - torch.cuda.memory_allocated(self.torch_device)
+            if self._one_pass is not None:
+                spare -= self._one_pass.held_bytes
+            free += max(0, spare)
+            if wanted >= free:
+                self._reclaim_cooldown_until = time.monotonic() + RECLAIM_COOLDOWN_S
         if wanted >= free:
             phase = "reading it" if reading >= answering else f"answering at group={self.group}"
             work = max(answering, reading)
