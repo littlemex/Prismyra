@@ -171,6 +171,7 @@ class FusedExpertsFp4(nn.Module):
 
     _ws: ClassVar[dict] = {}
     _ws_size: ClassVar[dict] = {}
+    _ws_retired: ClassVar[dict] = {}
 
     def _workspace(self, m: int, x_dtype) -> torch.Tensor:
         """One scratch buffer per calling thread for every MoE layer (they share shapes), grown to the largest
@@ -193,6 +194,21 @@ class FusedExpertsFp4(nn.Module):
         explicit `lane` parameter because nothing from `Batcher`'s own `lane` plumbing (`fork.py`, `engine.py`)
         reaches this deep into the model's forward pass; each lane is a dedicated, long-lived worker thread, so
         its identity is already a correct and available proxy for "which lane".
+
+        Grown **without ever discarding a superseded buffer**, for a reason that has nothing to do with this
+        call itself: a one-pass bucket (`onepass.record_bucket`) or a branch-pass recording (`graphs.record`)
+        may capture this call inside a CUDA graph, which bakes in the buffer's address rather than keeping the
+        tensor alive at it. `record_all` takes its buckets smallest first, and a shorter bucket's recording can
+        be captured and proved *before* a longer bucket's warm-up asks for a bigger buffer here -- at which
+        point the old reply was "drop the small one, allocate a new big one", which frees exactly the address
+        the shorter bucket's already-proved graph reads at replay. Nothing re-proves a bucket after a later,
+        bigger one runs, so that corruption was never caught by `record_all`'s own proving loop, and this is the
+        same shape of bug `convert_dense`'s `engine` parameter fixed for the dense NVFP4 path (`del` on a
+        tensor a recording's address still points at) -- here the dict slot plays `del`'s part. The fix is the
+        same medicine: once a key's buffer would be replaced, keep the one being replaced reachable for the rest
+        of the process (`_ws_retired`) instead of letting the allocator hand its address to something else.
+        Retired generations are rare (growth settles once every row-count bucket has been seen once) and each is
+        bounded by `WORKSPACE_CAP`, so this is not an unbounded leak in practice.
         """
         from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
 
@@ -215,7 +231,12 @@ class FusedExpertsFp4(nn.Module):
             return None  # rare very large calls (the autotune sweep) keep the kernel's own scratch
         buf = FusedExpertsFp4._ws.get(key)
         if buf is None or buf.numel() < size:
-            FusedExpertsFp4._ws[key] = None
+            if buf is not None:
+                # Keep it reachable rather than `= None`-ing the only reference: a CUDA graph recorded against
+                # this buffer's address (above) does not keep the tensor alive, only the address, so dropping the
+                # last Python reference here is what let the allocator reuse -- and silently corrupt -- an
+                # already-proved recording's memory.
+                FusedExpertsFp4._ws_retired.setdefault(key, []).append(buf)
             # Zero-initialized at allocation: this buffer is reused across calls (keyed by device, fusion mode,
             # and thread), so an uninitialized first allocation would leak this process's own CUDA allocator
             # history -- not the kernel's own output -- into the answer. Paid at each key's first allocation
