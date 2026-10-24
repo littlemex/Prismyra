@@ -354,6 +354,124 @@ this comparison's text-only questions never use); d1-3B holds about 6 GiB on eit
 several copies beside everything else on one GPU. Pick on this axis is a question about how many other things
 need to share the card, not about the model's own ability to answer questions.
 
+## The commercially-clear line (v0.5.0) against the same five sets
+
+Two more checkpoints, from the training line described in
+[`docs/DATA_PROVENANCE.md`](../../docs/DATA_PROVENANCE.md#v050-a-commercially-clear-training-line-prismyra-decision-35b-a3b-fp8-revision-3c88c546-prismyra-decision-35b-a3b-nvfp4-revision-9d08c9b4):
+`prismyra-decision-35b-a3b-fp8` and `prismyra-decision-35b-a3b-nvfp4`, called `fp8` and `nvfp4` below to tell them
+apart from the `-36l` checkpoint above. Measured on the identical 2,057 questions across the same five sets as the
+section above, against `fp8-36l`'s current revision (the section above's own checkpoint, called `fp8-36l` below to
+keep it apart from this line by name, not by anything about the checkpoint itself) and against `JEV-27B-VL`;
+`d1-3B`'s row below is the section above's own number, reused rather than re-measured this round. Scoring: sign
+test per set, matched question by question, Holm-corrected across the five sets in one family; "tie" means the
+Holm-corrected p-value is at or above 0.05.
+
+**Two more decision models were published after this round's measurement and are not in any table below**:
+`autotrust/JEV-35B` (and its `JEV-35B-NVFP4` sibling), `autotrust/GEV-26B-Decide`, and
+`autotrust/AutoTrust-JEV-27B-v1.1`. Comparing this line against them is still to be measured; the `JEV-27B-VL`
+rows below are against the same older checkpoint the section above uses, not against any of these four.
+
+**Accuracy, pooled over the five sets (2,057 questions):**
+
+| set | `fp8` (v0.5.0) | `nvfp4` (v0.5.0) | `fp8-36l` (previous line) | JEV-27B-VL | d1-3B |
+|---|---:|---:|---:|---:|---:|
+| RACE (579) | 95.16% | 95.34% | 96.55% | 96.37% | ~90.2% [reused] |
+| BoolQ (400) | 90.00% | 90.75% | 90.50% | 90.25% | ~85.8% [reused] |
+| RACE buried ~7k (157) | 89.17% | 89.81% | 94.90% | 93.63% | ~79.6% [reused] |
+| RACE buried ~10k (157) | 89.81% | 91.72% | 93.63% | 91.08% | ~77.7% [reused] |
+| Kev transfer-v4 (764) | 84.03% | 82.98% | 87.30% | 79.97% | ~77.9% [reused] |
+| **pooled, 2,057** | **89.16%** | **89.16%** | **91.59%** | 88.48% | 83.08-83.13% [reused] |
+
+**Against `fp8-36l` (the previous, non-commercial-trained line):**
+
+| set | `fp8` − `fp8-36l` | Holm p | `nvfp4` − `fp8-36l` | Holm p |
+|---|---:|---:|---:|---:|
+| RACE (579) | -1.38 | 0.0975 (tie) | -1.21 | 0.2121 (tie) |
+| BoolQ (400) | -0.50 | 0.6374 (tie) | +0.25 | 0.8772 (tie) |
+| RACE buried ~7k (157) | -5.73 | **0.0266 (loses)** | -5.10 | **0.0456 (loses)** |
+| RACE buried ~10k (157) | -3.82 | 0.2176 (tie) | -1.91 | 0.8772 (tie) |
+| Kev transfer-v4 (764) | -3.27 | **0.0068 (loses)** | -4.32 | **0.0001 (loses)** |
+| **pooled** | **-2.43pt** | | **-2.43pt** | |
+
+Both checkpoints in this line lose to `fp8-36l` on the long-buried-context set and on Kev, and tie it on the
+other three; read plainly, that is two losses and three ties each, not an across-the-board loss. This line's
+adapter is trained only on sources confirmed clear for commercial use and for training a derivative model (see
+`docs/DATA_PROVENANCE.md`); the pooled 2.43-point gap above is that restriction's measured cost on this benchmark.
+
+**Against JEV-27B-VL:**
+
+| set | `fp8` − JEV | Holm p | `nvfp4` − JEV | Holm p |
+|---|---:|---:|---:|---:|
+| RACE (579) | -1.21 | 0.3249 (tie) | -1.04 | 0.4719 (tie) |
+| BoolQ (400) | -0.25 | 1.0000 (tie) | +0.50 | 1.0000 (tie) |
+| RACE buried ~7k (157) | -4.46 | 0.2088 (tie) | -3.82 | 0.3331 (tie) |
+| RACE buried ~10k (157) | -1.27 | 1.0000 (tie) | +0.64 | 1.0000 (tie) |
+| Kev transfer-v4 (764) | +4.06 | **0.0428 (wins)** | +3.01 | 0.2806 (tie) |
+| **pooled** | **+0.68pt** | | **+0.68pt** | |
+
+Read this plainly: `fp8`'s point estimate is behind JEV-27B-VL on four of the five sets (RACE, BoolQ, and both
+buried sets), and the Holm correction only clears 0.05 on the fifth, Kev -- the largest set (764 of 2,057
+questions), which is why the pooled number is positive. `nvfp4` is weaker still: none of its five per-set
+comparisons against JEV-27B-VL clears the Holm bar, including Kev (p = 0.2806). Neither v0.5.0 checkpoint has the
+clear, Holm-significant lead over JEV-27B-VL that `fp8-36l` has above (Kev, p < 0.0001); what both keep from that
+lead is the pooled sign, not its earlier size.
+
+**`fp8` against `nvfp4` (the quantisation difference within v0.5.0 only):**
+
+| set | diff(pt) | Holm p |
+|---|---:|---:|
+| RACE (579) | -0.17 | 1.0000 (tie) |
+| BoolQ (400) | -0.75 | 0.8503 (tie) |
+| RACE buried ~7k (157) | -0.64 | 1.0000 (tie) |
+| RACE buried ~10k (157) | -1.91 | 0.8503 (tie) |
+| Kev transfer-v4 (764) | +1.05 | 0.8503 (tie) |
+
+No set clears the Holm bar either way; the two quantisations of this line are statistically indistinguishable on
+this benchmark. Both pool to 89.16% exactly -- a coincidence of this one run, not something the scoring forces.
+
+**Probability quality** (2,057 questions, lower is better for both):
+
+| | `fp8` | `nvfp4` | `fp8-36l` | JEV-27B-VL | d1-3B |
+|---|---:|---:|---:|---:|---:|
+| Brier | 0.1631 | 0.1620 | **0.1347** | 0.1742 | 0.234-0.235 [reused] |
+| ECE (15 bins) | 0.0282 | **0.0217** | 0.0422 | 0.0373 | 0.025-0.027 [reused] |
+
+`fp8-36l` keeps the best Brier score of the five measured this round; `nvfp4` has the best ECE of those four
+(d1-3B's reused 0.025-0.027 is close but not lower). Both v0.5.0 checkpoints beat JEV-27B-VL on both measures.
+
+**Speed** (one document, 3,446 tokens by each checkpoint's own tokenizer -- `compare_jev_d1.py`'s
+`--target-tokens 3401` default, counted slightly differently per tokenizer, the same effect the section above
+notes for d1-3B; 2 warm-up calls then median of 7):
+
+| questions | `fp8` (L40S) | `nvfp4` (RTX PRO 4500) | `fp8-36l` (L40S) | JEV-27B-VL (L40S) | d1-3B (RTX PRO 4500) | d1-3B (L40S) |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 152.8 ms | 154.8 ms | 153.6 ms | 156.2 ms | 159.3 ms [reused] | 98.1 ms [reused] |
+| 16 | 217.8 ms | 188.6 ms | 219.6 ms | 1,573.3 ms | 203.1 ms [reused] | 130.1 ms [reused] |
+| 64 | 305.3 ms | 272.3 ms | 306.2 ms | 6,346.0 ms | 298.6 ms [reused] | 190.5 ms [reused] |
+
+The `fp8` / `fp8-36l` / JEV-27B-VL columns are one same-day, same-GPU (L40S) measurement; `nvfp4` is its own
+separate same-day session on an RTX PRO 4500, not interleaved with the L40S session. d1-3B's two columns are
+carried over from an earlier round, not re-measured this round. At one question, `fp8`, `fp8-36l` and JEV-27B-VL
+are within 2% of each other -- under this project's own 5% bar for calling something a real difference. At 16 and
+64 questions, JEV-27B-VL is 7-21x slower than either Prismyra checkpoint, for the same structural reason as the
+section above: its own API answers one decision per call and pays for the document again every time.
+
+**Determinism**: JEV-27B-VL is not bit-deterministic; this is the same finding as the section above, reused from
+that round's measurement and not independently re-tested this round.
+
+**Reproducing this comparison**: the speed half is
+[`benchmarks/compare_jev_d1.py`](../../benchmarks/compare_jev_d1.py), run once per checkpoint
+(`--model littlemex/prismyra-decision-35b-a3b-fp8`, and so on for the others; the two competitors are measured
+through their own serving code, as the script's own docstring explains). The accuracy half scores each item the
+same way as the section above: the predicted option is the argmax of the probabilities this engine's `/ask` or
+`/v1/decide` returns over the question's declared options, checked against the item's gold label; the five sets
+are compared pairwise by matching on item and question id, a sign test per set, with a Holm correction across the
+five sets in one family. Brier is the mean squared distance from the one-hot gold label over all options; ECE
+bins predictions into 15 confidence buckets and takes the weighted mean gap between each bucket's average
+confidence and its average accuracy. RACE and BoolQ are public (`race`, `boolq` on Hugging Face); the two
+buried-context sets and Kev transfer-v4 are this project's own held-out construction and are not bundled in this
+repository.
+
 ## Weak-category mixture: sentiment and causal/multi-step reasoning
 
 A held-out panel of public benchmarks this checkpoint had never been evaluated on before turned up two
