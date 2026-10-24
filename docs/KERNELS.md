@@ -360,6 +360,52 @@ per device, fusion mode, and thread, so normally once per process) rather than o
 See [docs/PERFORMANCE.md's settings table](PERFORMANCE.md#four-speed-settings-one-that-risks-the-answer) for
 `interleaved_fork` and `wide_group`, the two flags that change how a multi-question request reaches these kernels.
 
+## The one-pass path's own routed-expert tile needed a table for a second card
+
+`kernels/onepass_moe_tuning.py` ships one more pinned table of the same shape `kernels/fp8_tuning.py` already
+ships for the dense-FP8 matmul: a single, fixed MoE tile for the one-pass path only
+(`Prismyra._ask_in_one_pass`/`_read_one_pass`, a single question with no companion), keyed by card
+(`pinned/onepass_moe_configs/<device>.json`), read once at construction and checked by `--require-kernels` the
+same way every other borrowed-kernel assumption in `Prismyra.__init__` is: a card with no file for this table
+still answers without the flag, but refuses to start with it, naming this exact table in the error
+(`onepass_moe_pin: no pinned one-pass MoE tile for '<device>'`).
+
+That file shipped for the L40S from the day this mechanism was added; nothing shipped one for the RTX PRO 4500
+(sm_120), so `--require-kernels` refused to start there from that same day, for every checkpoint that reaches
+this card's one-pass path with `self._borrowed_kernel` true -- which `PRISMYRA_DENSE=nvfp4`'s own wiring
+(the section below) made this project's first *recommended* RTX PRO 4500 launch command actually reach, for
+the first time, only once that wiring shipped. Measured directly rather than assumed to transfer from the
+L40S file: `tools/pin_onepass_moe.py` reads the loaded checkpoint's own routed-expert GEMM shapes and queries
+vLLM's `get_default_config` across every one-pass row count this project's buckets or a real document's
+one-pass read reaches (64 to 16,384) with `VLLM_BATCH_INVARIANT` unset; on the RTX PRO 4500, exactly as on the
+L40S, that function returns one identical dict for every M above 64 -- CUDA, this generation's
+`get_default_config`, does not branch on `N`/`K`/device at all once block-quantised FP8 decides which arm of
+`M` it takes, so a plain CUDA second card agreeing with the first is not a coincidence specific to these two
+cards, but it was still measured on real hardware rather than assumed, the same way every other table in this
+document was. The two shipped files are byte-identical (`tests/test_onepass_moe_tuning.py` asserts this, so a
+future edit to either is a deliberate change, not silent drift).
+
+**What this fix does and does not change.** `--require-kernels` now starts on the RTX PRO 4500 for every
+checkpoint that previously tripped this check, this project's own `nvfp4` line included. Whether starting
+*answers faster* depends on which routed-expert path a checkpoint actually runs: the tile this table supplies
+is read by vLLM's triton fused-MoE kernel, the FP8 routed-expert path's own kernel -- the ~17% figure the
+refusal message itself quotes is this project's own prior measurement of that path, on the L40S, with FP8
+routed experts actually running it. `PRISMYRA_EXPERTS=nvfp4` (the section above) replaces that kernel outright
+with a separate CUTLASS kernel tuned by `autotune_tactics()`, which does not read this table or
+`VLLM_BATCH_INVARIANT` at all (checked: zero references in `kernels/nvfp4.py`) -- so for `prismyra-decision-
+35b-a3b-nvfp4`, whose routed experts are NVFP4, this fix's measured effect is the startup check passing, not a
+speed change on that checkpoint's own routed-expert call. Measured directly on the RTX PRO 4500 (this
+checkpoint, `PRISMYRA_DENSE=nvfp4`/`PRISMYRA_DENSE_KEEP='self_attn|shared_expert'`, one already-built engine,
+`PRISMYRA_ONEPASS_MOE_PIN` toggled rather than rebuilt, alternating on/off twice per cell, 1/16/64 questions at
+1k/4k/16k tokens of context): every cell moved by 0.14-0.40%, in the same direction regardless of question
+count -- including 16 and 64 questions, which take the forked path and never reach this table at all by
+construction, the clearest sign that the whole 0.14-0.40% is measurement order, not the tile. Well under this
+project's own 5% bar for calling something a real change, and consistent with the code-level finding above:
+this specific checkpoint's own routed-expert speed does not move. A checkpoint that still runs the FP8
+routed-expert path on this card (`PRISMYRA_EXPERTS` unset) is expected to see the up-to-17% figure instead,
+by the same reasoning that figure was measured against in the first place, but that case was not separately
+re-measured here.
+
 ## Dense projections in NVFP4 (Blackwell only, experimental)
 
 `PRISMYRA_DENSE=nvfp4` is the same idea as `PRISMYRA_EXPERTS=nvfp4` above, applied to the other half of a
