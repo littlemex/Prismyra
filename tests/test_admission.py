@@ -7,12 +7,14 @@ since budgeting only the held cache is what let a context be admitted and then r
 
 from __future__ import annotations
 
+import time
+
 import pytest
 import torch
 
 from prismyra import chunking
 from prismyra.cache import join_bytes_per_token
-from prismyra.engine import ANSWERING_MARGIN, WIDTHS, Prismyra, row_constant
+from prismyra.engine import ANSWERING_MARGIN, RECLAIM_COOLDOWN_S, WIDTHS, Prismyra, PrismyraError, row_constant
 
 
 class Config:
@@ -200,3 +202,123 @@ def test_visible_free_resolves_an_indexless_device_to_the_current_one(monkeypatc
     monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", fraction)
     chunking.visible_free(torch.device("cuda"))
     assert seen_index["value"] == 0
+
+
+class FittingFake:
+    """A bare engine with only what `_check_fits` reads directly, for exercising its reclaim-and-recheck branch --
+    added after a real 32 GiB card measurement (`_check_fits`'s own comment on the fix) -- without the arithmetic
+    `cache_bytes`/`answering_bytes`/`reading_bytes` the tests above already cover. Fixed costs, chosen by the
+    test, stand in for a model shape no assertion here needs.
+    """
+
+    group = 32
+    torch_device = torch.device("cuda", 0)
+    _one_pass = None
+
+    def __init__(self, held: int, answering: int, reading: int):
+        self._held, self._answering, self._reading = held, answering, reading
+        self._reclaim_cooldown_until = 0.0
+        self._empty_cache_calls = 0
+        self._empty_cache_ms = 0.0
+
+    def cache_bytes(self, context_tokens: int) -> int:
+        return self._held
+
+    def answering_bytes(self, context_tokens: int) -> int:
+        return self._answering
+
+    def reading_bytes(self, context_tokens: int) -> int:
+        return self._reading
+
+    def budget_is_evidenced(self, questions: int | None = None) -> bool:
+        return True
+
+    _check_fits = Prismyra._check_fits
+
+
+def _two_valued(monkeypatch, name, before, after):
+    """Patch `torch.cuda.<name>` to answer `before` the first time and `after` every time afterwards -- the shape
+    every test below needs: one number for the state admission finds before a reclaim, a second for the state
+    `empty_cache()` is meant to have left behind."""
+    calls = {"n": 0}
+
+    def fn(*_a, **_k):
+        calls["n"] += 1
+        return before if calls["n"] == 1 else after
+
+    monkeypatch.setattr(torch.cuda, name, fn)
+    return calls
+
+
+def test_check_fits_reclaims_and_admits_when_the_reclaim_recovers_enough(monkeypatch):
+    """The bug this branch fixes: a context refused on the raw `mem_get_info`/`spare` prediction can still fit once
+    `empty_cache()` actually returns the allocator's idle pool to the driver. Free starts 1 GiB under the 8 GiB
+    wanted and `empty_cache()` is simulated to free the 7.5 GiB a real 32 GiB card measurement found stuck in
+    `reserved`, which is more than enough; admission must retry its own check with the post-`empty_cache` numbers
+    rather than the ones that triggered it, and must not raise."""
+    fake = FittingFake(held=3 * 2**30, answering=0, reading=5 * 2**30)  # wanted = 8 GiB
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda index: 1.0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    _two_valued(monkeypatch, "mem_get_info", before=(1 * 2**30, 32 * 2**30), after=(8 * 2**30, 32 * 2**30))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 2 * 2**30)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+
+    fake._check_fits(63_207)  # does not raise
+
+    assert fake._empty_cache_calls == 1
+
+
+def test_check_fits_still_refuses_when_the_reclaim_does_not_help(monkeypatch):
+    """A genuinely tight device: `empty_cache()` is tried once (it is cheap next to refusing work that would have
+    OOM'd for real), but the free figure does not move, so admission still refuses -- and refuses using the
+    post-reclaim numbers, not stale ones, since a caller reading the message should see what is true right now."""
+    fake = FittingFake(held=3 * 2**30, answering=0, reading=5 * 2**30)  # wanted = 8 GiB
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda index: 1.0)
+    calls = {"n": 0}
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1 * 2**30, 32 * 2**30))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 2 * 2**30)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+
+    with pytest.raises(PrismyraError, match=r"3\.0 GiB of 32\.0 GiB is available"):
+        fake._check_fits(63_207)
+
+    assert calls["n"] == 1, "a genuinely tight device is still worth one confirm -- the cheap direction to be wrong in"
+    assert fake._empty_cache_calls == 1
+    assert fake._reclaim_cooldown_until > time.monotonic(), "a confirmed-tight reclaim should start the cooldown"
+
+
+def test_check_fits_does_not_retry_the_reclaim_within_the_cooldown(monkeypatch):
+    """`RECLAIM_COOLDOWN_S` is shared with `_run_recorded`'s own margin check for the same reason it exists there:
+    the `empty_cache()` call is a real CUDA synchronisation, and a tight stretch must not pay for it on every
+    single admission while free memory stays provably stuck at the same low number."""
+    fake = FittingFake(held=3 * 2**30, answering=0, reading=5 * 2**30)
+    fake._reclaim_cooldown_until = time.monotonic() + RECLAIM_COOLDOWN_S
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda index: 1.0)
+    calls = {"n": 0}
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1 * 2**30, 32 * 2**30))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 2 * 2**30)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+
+    with pytest.raises(PrismyraError):
+        fake._check_fits(63_207)
+
+    assert calls["n"] == 0, "the cooldown from an earlier confirmed-tight reclaim was not honoured"
+
+
+def test_check_fits_admits_outright_when_there_is_already_enough_free(monkeypatch):
+    """The common case this branch must not slow down or touch: when the first, unconfirmed prediction already
+    shows enough room, `empty_cache()` is never called at all."""
+    fake = FittingFake(held=3 * 2**30, answering=0, reading=5 * 2**30)
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda index: 1.0)
+    calls = {"n": 0}
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (9 * 2**30, 32 * 2**30))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+
+    fake._check_fits(63_207)  # does not raise
+
+    assert calls["n"] == 0
+    assert fake._empty_cache_calls == 0
