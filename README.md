@@ -372,8 +372,13 @@ the FP8 weights to 4-bit floating point) for a card the 36- and 40-layer FP8 che
 
 A second, separate line of two checkpoints trains its adapter only on data confirmed clear for commercial use and
 for training a derivative model -- see [docs/DATA_PROVENANCE.md](docs/DATA_PROVENANCE.md) for what that line's pool
-is and is not, and each checkpoint's own Hugging Face card for the accuracy and speed trade-off against the line
-above. This line does not replace the checkpoints above, which remain available:
+is and is not, each checkpoint's own Hugging Face card for the accuracy and speed trade-off against the line
+above, and
+[recipes/decision-lora/README.md's own comparison](recipes/decision-lora/README.md#the-commercially-clear-line-v050-against-the-same-five-sets)
+for how this line fares against `autotrust/JEV-27B-VL`, `LiquidAI/d1-3B`, and the newer `autotrust/JEV-35B` and
+`JEV-35B-NVFP4` (two further models from that family, `autotrust/GEV-26B-Decide` and
+`autotrust/AutoTrust-JEV-27B-v1.1`, could not be served in this project's environment and are not in that
+comparison). This line does not replace the checkpoints above, which remain available:
 
 | checkpoint | layers | card | Hugging Face |
 |---|---|---|---|
