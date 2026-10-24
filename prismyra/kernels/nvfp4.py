@@ -472,6 +472,14 @@ class tiny_experts:
         self._fp8.FP8Experts.__init__ = self._init
 
 
+#: A static read of vLLM's SM120 NVFP4 GEMM kernel (`cutlass_fp4_gemm_dispatch`) once raised a hypothesis
+#: that its own row count `m`'s `mp2 = max(16, next_pow_2(m)) <= 256` CUTLASS config switch could explain a
+#: companion-invariance break seen downstream of this class. Measured directly and ruled out (RTX PRO 4500, a
+#: lone `Fp4Linear` fed a fixed row with 0 to 8,191 companion rows at realistic and synthetic shapes alike):
+#: the real row's own output is bit-exact across the entire sweep, including every value either side of
+#: 256/257 and at three different positions within a 512-row call. The kernel itself is already row-count
+#: invariant on this hardware; see `kernels.qwen3_moe._ProjectionSlot.force_separate` for the mechanism this
+#: project confirmed instead.
 class Fp4Linear(nn.Module):
     """A dense FP8 projection re-quantised to NVFP4 (weights and activations), on vLLM's CUTLASS FP4 GEMM.
     Experimental: PRISMYRA_DENSE=nvfp4. Activation scale from the calibration file's `dense_in_amax`."""
@@ -510,13 +518,51 @@ class Fp4Linear(nn.Module):
 
 
 @torch.no_grad()
-def convert_dense(model: nn.Module) -> int:
-    """Replace every Fp8Linear whose name does not match PRISMYRA_DENSE_KEEP (a regex) with Fp4Linear."""
+def convert_dense(model: nn.Module, engine: object | None = None) -> int:
+    """Replace every Fp8Linear whose name does not match PRISMYRA_DENSE_KEEP (a regex) with Fp4Linear.
+
+    `PRISMYRA_DENSE_KEEP` defaults to `"linear_attn"` -- the gated delta net's projections stay on FP8, only
+    `self_attn` and `shared_expert` convert. This is the one regex this project has measured to keep every
+    determinism guarantee `tools/audit_sm120.py` checks (companion-invariance, paged-vs-joined, all closed to
+    bit-exact on real hardware) *and* clear this project's own accuracy CI on every one of its four measured
+    benchmark files. Converting any part of the gated delta net too (an empty `PRISMYRA_DENSE_KEEP`, or a regex
+    that excludes less than `"linear_attn"` does) answers every bit-exactness check the same way but has been
+    measured to fail that accuracy CI on at least one of the four files every time it was tried -- a real
+    accuracy cost of quantising the gated delta net's own projections, not an artefact of the determinism bugs
+    this module used to have. A caller who wants that trade for the extra speed it brings must ask for it by
+    name, with this cost already on record rather than discovered later.
+
+    Pass the `Prismyra` instance `model` came from as `engine` whenever one exists. Without it, a single question
+    asked after this call can return NaN forever, on documents that have nothing to do with each other and nothing
+    to do with this call's own regex -- found on real hardware (RTX PRO 4500), traced with a
+    forward hook on every `nn.Module` plus a byte-exact snapshot of every weight, both of which came back clean on
+    the call that goes wrong. Neither caught anything because the real culprit never runs either one.
+
+    `Prismyra.__init__` records a CUDA graph per one-pass length bucket (`onepass.record_all`, 64 to 2,048 tokens)
+    before this function is ever called, and a single short question keeps answering through a replay of one of
+    those buckets for as long as the engine lives (`engine._ask_in_one_pass`, `onepass.replay`) -- a replay calls
+    no Python `forward()`, which is why a hook on every module sees nothing. Each recording bakes in the *address*
+    of every weight tensor the capture read, `self_attn`'s and `shared_expert`'s Fp8Linear weights among them. The
+    `setattr(...)` below replaces exactly those modules and `del m` drops the only reference their old weight
+    tensors had, so the allocator is free to hand that address to the next thing that asks -- and once something
+    else writes there, every later reply to one of the stale buckets reads whatever that something else left
+    behind. A short question asked right after `convert_dense()` still reads back something plausible, because
+    the freed bytes have not been touched yet; measured on real hardware, three repeats of one long document
+    (a document past about 2,020 tokens) is enough eager allocator churn to land a later allocation on that exact
+    address, and the next short question -- unrelated in content, length and KEEP regex -- comes back NaN and
+    stays that way. Dropping `engine._one_pass` here is what the fix below does: every one-pass call afterward
+    takes the eager path (`engine._read_one_pass`), which builds its own cache fresh and holds no address this
+    function could make stale. Re-recording instead of dropping would keep the speed this mechanism is for, but
+    costs one warm-up and two proving replays per bucket (`onepass.WARMUPS`, `onepass.PROVING_REPLAYS`) against
+    weights this function has typically already finished touching once per process -- left for whoever wires this
+    into `engine.py` for real, since a benchmark harness calling this function directly, on an engine whose
+    one-pass buckets already exist, is the only caller today and pays once per run either way.
+    """
     import re
 
     with open(os.environ["PRISMYRA_NVFP4_CALIB"]) as f:
         calib = json.load(f)["dense_in_amax"]
-    keep = re.compile(os.environ.get("PRISMYRA_DENSE_KEEP", "^$"))
+    keep = re.compile(os.environ.get("PRISMYRA_DENSE_KEEP", "linear_attn"))
     search = os.environ.get("PRISMYRA_NVFP4_SEARCH") == "1"
     stats = _importance() if search else None
     done = 0
@@ -524,6 +570,16 @@ def convert_dense(model: nn.Module) -> int:
         if type(m).__name__ != "Fp8Linear" or keep.search(name):
             continue
         key = name[name.index("language_model.") :] if "language_model." in name else name
+        # `dense_fusion`'s `_ProjectionSlot` wraps some dense projections (GDN's in_proj_qkv/in_proj_z, the shared
+        # expert's gate_proj/up_proj) so the real Fp8Linear sits one level deeper as `<name>.original`, and
+        # `FlashAttention(inner=...)` wraps every self_attn projection so its real name carries an extra `.inner.`
+        # segment (`language_model.layers.N.self_attn.inner.q_proj`). The calibration file's keys are written
+        # before either wrapper is applied, so neither variant matches `calib` without stripping it back off.
+        # Found on real hardware -- without stripping both, self_attn converts 0/36 regardless of
+        # PRISMYRA_DENSE_KEEP, and GDN's in_proj_qkv/in_proj_z convert 0 of their 24.
+        key = key.replace(".inner.", ".")
+        if key.endswith(".original"):
+            key = key[: -len(".original")]
         if key not in calib:
             continue
         parent = model.get_submodule(name.rsplit(".", 1)[0])
@@ -533,8 +589,26 @@ def convert_dense(model: nn.Module) -> int:
             imp = None
         setattr(parent, name.rsplit(".", 1)[1], Fp4Linear(m, calib[key], imp, search))
         del m
+        if type(parent).__name__ == "_ProjectionSlot":
+            # `parent` is the slot whose `original` this call just replaced -- found necessary on real
+            # hardware: `parent.fused` (a `_FusedDenseProjection` built once, at `dense_fusion` time, from
+            # every sibling's pre-conversion Fp8Linear weights) is not touched by the `setattr` above and
+            # goes on answering `rows <= FUSION_MAX_ROWS` with those stale FP8 weights, while the
+            # now-converted `original` answers wider calls in NVFP4 -- the same real rows moving by 12.7%
+            # (measured) purely on how many companion rows share the call. `_ProjectionSlot.force_separate`'s
+            # own docstring has the full measurement and the reason this is set on every slot in `order`
+            # (shared by the whole group), not just this one.
+            for slot in parent.order:
+                slot.force_separate = True
         done += 1
         if os.environ.get("PRISMYRA_NVFP4_DEBUG") and done % 25 == 0:
             print("dense", done, round(torch.cuda.memory_allocated() / 2**30, 2), flush=True)
     torch.cuda.empty_cache()
+    if done and engine is not None and getattr(engine, "_one_pass", None) is not None:
+        # See this function's own docstring: every one-pass bucket recorded before this call holds the address of
+        # a weight tensor `del m` (above) may just have dropped, and keeping those recordings around is what turns
+        # one later eager allocation into every later short question answering NaN. Only worth doing when `done`
+        # actually replaced something -- a KEEP regex that matched everything leaves no stale address behind, and
+        # `engine` costs its caller nothing to pass when there is nothing to invalidate.
+        engine._one_pass = None
     return done

@@ -775,6 +775,32 @@ class Prismyra:
         #: Learned read-outs registered by option list (see `prismyra.heads`). A question whose options match none of
         #: them is read from the output embedding exactly as without heads.
         self.heads = Heads(heads, self.hidden_size, self.device)
+        # Experimental: dense (self_attn/shared_expert/linear_attn) projections in NVFP4 too, selected with
+        # `PRISMYRA_DENSE=nvfp4` -- the same "=nvfp4" convention `PRISMYRA_EXPERTS` already uses for the routed
+        # experts above, kept separate because converting dense and converting experts are independent choices
+        # (either, both, or neither). `PRISMYRA_DENSE_KEEP` (a regex, default `"linear_attn"` -- the gated delta
+        # net's own projections are kept on FP8, see `convert_dense`'s own docstring for why that default and not
+        # a wider one) still means exactly what `convert_dense`'s own docstring says: a name that matches it is
+        # left on `Fp8Linear`.
+        #
+        # Called here -- after `kernels.apply` above, which is what turns these modules into the `Fp8Linear`
+        # instances `convert_dense` looks for, and before the one-pass recordings just below -- and nowhere else,
+        # on purpose. Measured on real hardware (this same ordering fixed the bug there):
+        # a one-pass bucket recorded *before* `convert_dense` runs bakes in the *address* of whatever `Fp8Linear`
+        # weight tensor its capture read; `convert_dense`'s `del m` on that same module then drops the only
+        # reference to that tensor, freeing the allocator to hand the address to something unrelated the next time
+        # a long document runs, after which every later reply to that bucket reads whatever landed there and comes
+        # back NaN. Recording after conversion instead means every capture only ever reads the `Fp4Linear` weights
+        # that are actually going to answer every later question, so there is nothing left for `convert_dense` to
+        # invalidate -- `self._one_pass` does not exist yet at this point in `__init__` (`getattr(self,
+        # "_one_pass", None)` inside `convert_dense` reads the attribute's absence as `None`, matching the state a
+        # freshly-converted engine with no prior recording is actually in), so passing `engine=self` here is a
+        # no-op rather than a correctness requirement -- kept anyway, so a future caller that moves this call is
+        # not silently relying on construction order to keep it safe.
+        if os.environ.get("PRISMYRA_DENSE") == "nvfp4" and on_cuda and fast_kernels:
+            from .kernels import nvfp4 as _nvfp4
+
+            _nvfp4.convert_dense(self.backbone, engine=self)
         #: The one-pass read of a short request, recorded per length bucket. On by default wherever the one-pass path
         #: is the path a single question takes -- CUDA with the borrowed kernels, no calibration, no paged storage --
         #: because that read is host-bound at short lengths and a replay removes the wait (docs/PERFORMANCE.md). The

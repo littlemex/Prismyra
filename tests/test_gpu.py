@@ -15,11 +15,20 @@ Run with:
 
     pytest -m gpu                                    # needs the weights
     PRISMYRA_TEST_MODEL=<repo> pytest -m gpu         # against another checkpoint
+
+The two `test_dense_nvfp4_*` tests at the end of this file are a second, experimental layer: dense (self_attn/
+shared_expert/linear_attn) projections re-quantised to NVFP4, each building its own engine rather than sharing
+the plain `engine` fixture above (see their own module-level comment for why). They skip, rather than fail,
+without a Blackwell card's NVFP4 kernels and a calibration file:
+
+    PRISMYRA_NVFP4_CALIB=<calibration.json> [PRISMYRA_NVFP4_TEST_MODEL=<repo>] \\
+        pytest -m gpu tests/test_gpu.py -k dense_nvfp4
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -1931,3 +1940,126 @@ def test_a_headed_question_replays_exactly_as_it_reads_eagerly(engine, tmp_path)
     finally:
         engine.heads = saved
         engine._one_pass = original
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Dense projections in NVFP4 (PRISMYRA_DENSE=nvfp4, experimental). Two regression tests for bugs
+# `prismyra.kernels.nvfp4.convert_dense` itself used to have, both only reachable with a Blackwell card's NVFP4
+# kernels and a calibration file -- so both skip, rather than fail, without `PRISMYRA_NVFP4_CALIB` and the
+# packages `convert_dense`'s own caller needs. Each builds its own engine (`PRISMYRA_NVFP4_TEST_MODEL`, the same
+# env var `test_nvfp4.py`'s own GPU test already uses, falling back to this file's own `MODEL`) rather than
+# sharing this file's `engine` fixture: `convert_dense` destroys the `Fp8Linear` modules it replaces (`del m`),
+# so running it on `engine` would leave every later test in this file holding whatever it converted. The second
+# copy of the weights that costs is the same one `test_padding_a_batch_does_not_reach_an_answer` above already
+# pays for and skips on, rather than fails, when the card has no room for it.
+
+
+def _dense_nvfp4_engine(**kwargs):
+    """A fresh engine for the dense-NVFP4 tests below, or a skip -- never a failure -- when the calibration file,
+    the NVFP4 kernels, or room for a second copy of the weights beside this file's own `engine` fixture is not
+    there."""
+    if not os.environ.get("PRISMYRA_NVFP4_CALIB"):
+        pytest.skip("set PRISMYRA_NVFP4_CALIB to exercise prismyra.kernels.nvfp4.convert_dense")
+    try:
+        import flashinfer  # noqa: F401
+    except ImportError as e:
+        pytest.skip(f"NVFP4 kernels are not importable on this build: {e}")
+    model = os.environ.get("PRISMYRA_NVFP4_TEST_MODEL") or MODEL
+    try:
+        return Prismyra(model, **kwargs)
+    except torch.OutOfMemoryError:
+        pytest.skip("no room for a second copy of the weights beside this file's own `engine` fixture")
+
+
+def test_dense_nvfp4_state_does_not_poison_after_a_long_document():
+    """A one-pass bucket recorded *before* `convert_dense()` runs bakes in the address of the `Fp8Linear` weight
+    tensor its capture read; `convert_dense()`'s own `del m` on that module then frees it, and enough allocator
+    churn afterward lands a later allocation on that exact address -- after which the bucket's every later replay
+    answers from unrelated memory, NaN included, forever. `PRISMYRA_DENSE=nvfp4`'s own construction-time wiring
+    (`Prismyra.__init__`) never hits this: it calls `convert_dense()` before any bucket is recorded, so there is
+    nothing stale yet. This test instead calls `convert_dense()` the way the benchmark harness that first found
+    the bug did -- directly, on an engine whose buckets already exist -- which is exactly what `convert_dense()`'s
+    own `engine=` parameter and its `engine._one_pass = None` line defend against, regardless of who calls it or
+    when.
+
+    The "long document" stays within the one-pass path's own 2,048-token bucket cap by design, and the churn this
+    test depends on comes from asking it more than one question instead: `ask()` only ever reaches the one-pass
+    replay path at question count one (see `PAGED_VS_JOINED_MOVEMENT`'s own comment, above), so a multi-question
+    request takes the forked/branch path regardless of its token count, and that path is what makes the real
+    allocations and frees the bug needs. Three repeats, long enough to reproduce the corruption on real hardware
+    without the fix and short enough to run quickly with it.
+    """
+    from prismyra.kernels.nvfp4 import convert_dense
+
+    engine = _dense_nvfp4_engine()
+    if not engine.stats()["short_graphs"]:
+        pytest.skip("one-pass recordings are not taken on this engine")
+
+    control = [Boolean(id="ctrl", prompt="Is there a thirty day limit?")]
+    many = questions(32)
+    long_but_bucketed = " ".join([CONTEXT] * 8)  # well under the 2,048-token one-pass cap; see the docstring above
+    # for why the question count, not the token count, is what forces this call off the one-pass replay path.
+
+    n_converted = convert_dense(engine.backbone, engine=engine)
+    if n_converted == 0:
+        pytest.skip("PRISMYRA_NVFP4_CALIB matched no dense projection on this checkpoint")
+
+    first = engine.ask(CONTEXT, control)
+    for _ in range(3):
+        engine.ask(long_but_bucketed, many)
+    last = engine.ask(CONTEXT, control)
+
+    for result in (first, last):
+        for p in result["ctrl"].probabilities.values():
+            assert not math.isnan(p), result["ctrl"].probabilities
+    assert first["ctrl"].probabilities == last["ctrl"].probabilities
+
+
+def test_dense_nvfp4_fusion_group_is_row_count_invariant():
+    """`convert_dense()` used to replace a `_ProjectionSlot`'s own `.original` with an `Fp4Linear` but never touch
+    `.fused` (a `_FusedDenseProjection` built once, at `dense_fusion` time, from every sibling's *pre-conversion*
+    `Fp8Linear` weights) -- so the same real rows answered through two different quantisations depending only on
+    how many companion rows shared the call: `.fused`'s stale FP8 at `rows <= FUSION_MAX_ROWS` (512), the newly
+    converted `.original`'s NVFP4 above it. Measured on real hardware at exactly the 512/513-row boundary: 1.797
+    absolute probability-space units, 12.7% relative, and nowhere else. `force_separate`
+    (`prismyra.kernels.qwen3_moe`) is the fix: once any slot in a fused group converts, every slot in that group
+    always takes `.original`, so `.fused`'s stale weights are never read again by that group at any row count.
+
+    Probes the converted slot directly, with synthetic rows, rather than through `ask()`: a *branch* pass is
+    bucketed to one of `fork.WIDTHS` (32 to 512) and so can never itself exceed `FUSION_MAX_ROWS` by construction,
+    and a *context* pass that does is bound to the input's whole token count, not to a row count chosen for this
+    comparison -- neither lets this test hold "the same real row" fixed while choosing exactly 512 and exactly
+    513 rows the way a direct call does. The rows themselves do not need to come from a real document for this:
+    the property under test is that `_ProjectionSlot.forward` answers the same fixed input the same way whatever
+    else shares the call, not that the model's output for this particular input is meaningful.
+    """
+    from prismyra.kernels.nvfp4 import Fp4Linear, convert_dense
+    from prismyra.kernels.qwen3_moe import FUSION_MAX_ROWS, _ProjectionSlot
+
+    engine = _dense_nvfp4_engine()
+    n_converted = convert_dense(engine.backbone, engine=engine)
+    if n_converted == 0:
+        pytest.skip("PRISMYRA_NVFP4_CALIB matched no dense projection on this checkpoint")
+
+    target = None
+    for _, m in engine.backbone.named_modules():
+        if isinstance(m, _ProjectionSlot) and isinstance(m.original, Fp4Linear):
+            target = m
+            break
+    if target is None:
+        pytest.skip("no fused dense-projection group on this checkpoint had a converted sibling")
+    assert target.force_separate, "a converted sibling must force the whole group off the fused branch"
+
+    device = target.original.weight.device
+    g = torch.Generator(device="cpu").manual_seed(777)
+    real = torch.randn(FUSION_MAX_ROWS, target.in_features, generator=g).to(device).to(torch.bfloat16)
+    gc = torch.Generator(device="cpu").manual_seed(888)
+    companions = torch.randn(20, target.in_features, generator=gc).to(device).to(torch.bfloat16)
+
+    with torch.inference_mode():
+        alone = target(real)  # exactly FUSION_MAX_ROWS rows
+        with_companions = target(torch.cat([real, companions], dim=0))[:FUSION_MAX_ROWS]  # FUSION_MAX_ROWS + 20
+        at_boundary = target(torch.cat([real, companions[:1]], dim=0))[:FUSION_MAX_ROWS]  # FUSION_MAX_ROWS + 1
+
+    assert torch.equal(alone, with_companions)
+    assert torch.equal(alone, at_boundary)
