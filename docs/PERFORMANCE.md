@@ -578,6 +578,34 @@ closed:
   path, and routing a solo `paged=True` question through it would make `ask()`'s own question-count-1 answer
   disagree with `open_batch`'s -- exactly the companion/question-count matrix above already measures bit-exact
   (4,392/4,392) -- trading that closed guarantee for this one. Not pursued.
+* **The 8-RACE-document bound above does not generalize, and this project no longer claims it does.** Measured
+  the same way (`prismyra-serve --require-kernels --batcher`'s single-question HTTP request against the library
+  call, `paged=True` against `paged=False`, one real request per question) over the project's own 1,893-question
+  development set and a 300-question stratified sample of a separate 10,000-question set: 1.69% of the
+  development set's answers flip decision (32/1,893, L40S), largest probability move 0.266046 -- 6.6x the bound
+  above -- and 8.08% of the development set's questions move past `PAGED_VS_JOINED_MOVEMENT` (0.04) outright. The
+  flip rate does not concentrate on one input shape: boolean questions flip at 1.71% (12/700), multiple-choice at
+  1.68% (20/1,193); 2/4/6-option questions flip at 1.71%/1.65%/2.0%; the four context-length quartiles exceed the
+  bound at 13.1%/7.4%/4.2%/7.6% (the longest quartile is not the worst). That spread across every axis measured is
+  what makes this a diffuse numerical difference across the whole computation rather than a bug isolable to one
+  family, kind, option count or length -- nothing in this round's reading of `engine.py`/`server.py` points to a
+  single line that is wrong, and a diffuse cause is not the signature a local fix would close. Net accuracy over
+  the same 1,893 questions does not move measurably between the two (88.48% joined, 88.70% paged, +0.21 points,
+  sign test p=0.58).
+  **What this project promises past this point, and why it stops there**: a question's chosen answer does not
+  depend on anything but its own content and which of these two storages read it -- not on a companion, not on a
+  server restart, not on what else is queued at the same time (`--batcher` reproduces its own answers exactly
+  across five repeats run alongside eight threads of unrelated traffic) -- and the two storages' aggregate
+  accuracy is indistinguishable on a 1,893-question sample. It does **not** promise that any one question's
+  answer, or its probability, agrees between the two storages past the 8-RACE-document bound measured above; that
+  bound, and the "zero decision flips" next to it, describe 8 RACE documents, not every document. Loosening
+  `PAGED_VS_JOINED_MOVEMENT` to cover the development-set measurement would buy a number (0.27, rounded up) that
+  is itself only one more sample away from being wrong again, for a claim this project is not in a position to
+  make at any sample size -- the gap has no accuracy cost worth the claim (see the net-accuracy figure above), so
+  the constant stays a regression guard for the fixture it was measured on, not a reissued bound on every
+  document; the promise this project actually keeps is the aggregate-accuracy and reproducibility one in this
+  paragraph, see `tests/test_gpu.py::PAGED_VS_JOINED_MOVEMENT` for where that is written down next to the test it
+  bounds.
 * **Question counts above 1: now closed too.** Once there was more than one question, `ask()` no longer reached
   `_ask_in_one_pass` at all, and a second mechanism (`interleaved_fork`'s fused context-and-first-branch-group pass,
   and any later group through plain `_branch`) joined the one-pass-specific gap above with a much larger one: the

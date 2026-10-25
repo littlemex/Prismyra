@@ -13,7 +13,11 @@ python evals/run.py --task unfair_tos --limit 250 --seed 7 --methods readout,thr
 ## What is compared
 
 **readout** is what this package does: one traversal of the context, then one row per question, scoring the declared
-options at the branch's final position.
+options at the branch's final position. Every figure below is scored through the library call (`engine.ask()`,
+`paged=False`, `evals/run.py`'s own construction), not through `prismyra-serve --batcher` -- the two disagree on a
+single question's exact answer at a measured, nonzero rate without moving aggregate accuracy
+([docs/PERFORMANCE.md](PERFORMANCE.md#a-shelf-answers-like-ask), the README's own Quickstart), so a figure on this
+page is not automatically what a `--batcher` server returns for the same question.
 
 **generate** is the same weights and the same prompt, generating the answer and reading the text, once per question.
 Deliberately not a second serving engine: a second process cannot hold a second copy of these weights on one card, and a

@@ -28,6 +28,16 @@ curl -s localhost:8000/ask -H 'content-type: application/json' -d '{
  "model":"littlemex/prismyra-decision-qwen3.6-35b-a3b-fp8-36l","scoring_version":1,"context_tokens":17}
 ```
 
+A single-question request like the one above reads through a different computation with `--batcher` than without
+it or than the library call below: `--batcher` always pages (`prismyra.schedule.Batcher` refuses without it),
+which answers one question with a separate branch pass against a page pool (`unified_attention`) instead of the
+single-pass read `paged=False` gives it. Measured on this project's own 1,893-question development set, one real
+HTTP request per question: 1.69% of answers flip decision between the two (largest probability move 0.266046);
+aggregate accuracy does not move measurably (+0.21 points, not significant). Drop `--batcher` (or call the
+library directly) when one question's answer needs to agree with the library call to the bit; keep it when
+answering many documents at once is worth more than that agreement -- see
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md#a-shelf-answers-like-ask) for the full measurement.
+
 `POST /v1/decide` answers the same question through autotrust's JEV-27B request shape (`kind`/`state`/
 `question`/`options`), for a caller already built against JEV's API -- see
 [docs/DECIDE.md](docs/DECIDE.md) for the full contract:
@@ -436,6 +446,10 @@ prismyra-bench compare --against benchmarks/results/qwen3_6_35b_a3b_fp8__rtx_pro
 ```
 
 `compare` exits non-zero on any point more than ten per cent slower. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+Every accuracy figure in this project -- the comparison below, [docs/ACCURACY.md](docs/ACCURACY.md) and each
+checkpoint's own model card -- is measured through the library call (`engine.ask()`, `paged=False`), not through
+`prismyra-serve --batcher`; see the Quickstart above for what moves between the two on a single question.
 
 **Against two other decision models**, `autotrust/JEV-27B-VL` and `LiquidAI/d1-3B`: `fp8-36l` ties or beats both
 on accuracy on every one of five sets measured, and answers 6-17x faster than JEV-27B-VL once more than one

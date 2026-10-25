@@ -189,6 +189,17 @@ COMPANION_MOVEMENT_ROW_COUNT = 0.0125
 #: the L40S, but it reopens the companion-count residual (FA2's `num_splits` heuristic, "72/4,392" in the v0.4.0
 #: release notes) `unified_attention` was adopted to close, and on the RTX PRO 4500 it barely moves this gap at all
 #: (0.002609 to 0.002478) -- the cause is not attention-kernel choice alone on that card.
+#:
+#: **This bound, and the "zero decision flips" measured alongside it, describe 8 RACE documents -- not every
+#: document.** A 1,893-question development set, scored the same way (one real HTTP request per question,
+#: `--batcher` against the library call), moves past this bound on 8.08% of its questions, with a 1.69%
+#: decision-flip rate and a largest move of 0.266046 -- see `docs/PERFORMANCE.md`'s "`paged` as a constructor
+#: flag" bullet for the full breakdown and for what this project promises instead of a universal per-question
+#: bound: reproducibility and fork isolation (unaffected), and aggregate accuracy indistinguishable between the
+#: two storages (also unaffected, +0.21 points, not significant) -- not that any one real document's answer
+#: agrees with the other storage's past this fixture. This constant is kept at 0.04 as a regression guard for the
+#: fixture `test_paged_and_joined_agree_within_measured_bound_for_one_question` runs below, not reissued as a
+#: claim that holds for arbitrary content.
 PAGED_VS_JOINED_MOVEMENT = 0.04
 
 #: The smallest answer to "how many seconds" that still shows the clip's timing reached the model. Five, not six.
