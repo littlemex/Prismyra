@@ -198,3 +198,44 @@ commercial use and for training a derivative model, with no restriction on redis
 RACE, SciQ, DREAM and social_i_qa -- all four non-commercial or unconfirmed in earlier rounds' pools -- are not used
 in this line at all; DREAM and social_i_qa's roles are covered by self-authored synthetic data instead, and RACE and
 SciQ's roles are not directly replaced (see each checkpoint's own card for where that shows up in evaluation).
+
+## v0.5.1: long-document variable tracking and fact chaining (`prismyra-decision-35b-a3b-fp8` revision `556e7094`)
+
+This revision adds two new training families on top of the v0.5.0 line's pool above, both aimed at a long-document
+weakness that line's own evaluation showed plainly. Neither family uses a third-party dataset of pre-written
+questions; both are generated end to end by a program this project wrote, with the correct answer decided
+mechanically by that same program rather than by any model.
+
+### New sources for this revision
+
+| Family | What it covers | Source of the document text | Licence (SPDX) | Commercial use |
+|---|---|---|---|---|
+| Variable tracking | Following several independent chains of variable reassignment through a long document and identifying which variable currently holds a stated value | Filler paragraphs drawn from [`wikimedia/wikipedia`](https://huggingface.co/datasets/wikimedia/wikipedia) (already listed above for this line), with the variable-chain text itself authored by this project's own generator, not drawn from Wikipedia | CC-BY-SA-4.0 for the filler text (Wikimedia's own terms of use; share-alike applies to a redistributed *copy* of the source text, not to the released model weights, and the source text itself is not reproduced in the weights) | yes |
+| Fact chaining | Following a chain of transfer records in the reverse direction (where a fact currently on record originally came from) through a long document | Same filler pool as Variable tracking, same generator, same licence terms | CC-BY-SA-4.0 (filler only, as above) | yes |
+
+Every row in both families is checked by the generator itself, not accepted on trust: every clue sentence and
+every answer-choice string the row's correctness depends on must appear verbatim in the assembled document, checked
+line by line, and a row that fails this check is discarded rather than kept. No teacher model is called for either
+family, and no row in either family carries a distillation signal (see Self-distillation below for why that is a
+deliberate choice, not an oversight). This project independently checked that the documents these two families
+generate do not overlap the project's own long-context evaluation data (no exact document match, no 80-character
+substring match across a stratified sample, and no generated variable or location name appearing verbatim in the
+evaluation data).
+
+### Self-distillation (updated for this revision)
+
+As with every other row in this line's pool, the two new families above carry no distillation signal at all --
+their correctness comes only from the generator, as described above. For every other row already documented under
+v0.5.0, the distillation target changes with this revision: it is no longer the clean, unmodified base checkpoint,
+but this project's own previously shipped checkpoint (this same repository's v0.5.0 revision), read on the same
+commercially-clear inputs. This is still this project's own model's output, not a third party's and not an earlier
+research-trained checkpoint's; it simply moves the reference point from before this line started to the most recent
+link in this line's own chain.
+
+### Licence summary for this revision
+
+Both new families add no new third-party dataset: the only external text they use (Wikipedia filler paragraphs) was
+already part of this line's licence accounting under v0.5.0, and the variable-tracking and fact-chaining content
+built around that filler is this project's own generated text, not sourced from anywhere. Every source behind this
+revision's adapter remains licensed for commercial use and for training a derivative model, with no restriction on
+redistributing the resulting weights.

@@ -378,11 +378,14 @@ above, and
 for how this line fares against `autotrust/JEV-27B-VL`, `LiquidAI/d1-3B`, and the newer `autotrust/JEV-35B` and
 `JEV-35B-NVFP4` (two further models from that family, `autotrust/GEV-26B-Decide` and
 `autotrust/AutoTrust-JEV-27B-v1.1`, could not be served in this project's environment and are not in that
-comparison). This line does not replace the checkpoints above, which remain available:
+comparison). The FP8 checkpoint's latest revision adds training data for long-document variable tracking and fact
+chaining -- see [docs/DATA_PROVENANCE.md](docs/DATA_PROVENANCE.md#v051-long-document-variable-tracking-and-fact-chaining-prismyra-decision-35b-a3b-fp8-revision-556e7094)
+and that checkpoint's own card for what changed and what it measured. This line does not replace the checkpoints
+above, which remain available:
 
 | checkpoint | layers | card | Hugging Face |
 |---|---|---|---|
-| `prismyra-decision-35b-a3b-fp8` | 36 | any this project's kernels support | [littlemex/prismyra-decision-35b-a3b-fp8](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-fp8) (revision `3c88c546` as of this release) |
+| `prismyra-decision-35b-a3b-fp8` | 36 | any this project's kernels support | [littlemex/prismyra-decision-35b-a3b-fp8](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-fp8) (revision `556e7094` as of this release; previous revision `cb99f138` stays reachable in the same repository's history) |
 | `prismyra-decision-35b-a3b-nvfp4` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-35b-a3b-nvfp4](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-nvfp4) (revision `9d08c9b4` as of this release; primary checkpoint for this line) |
 
 The 36-layer FP8 checkpoint is the one to start with on a card the 36- and 40-layer FP8 checkpoints both fit on: on
