@@ -116,4 +116,6 @@ This goes through the same single-worker queue `/ask` uses when `--batcher` is o
 `prismyra.schedule.Batcher`: the saving here is merging *one request's own* decisions sharing a state, which
 needs nothing more than the queue already serialising access to the device. Batching *across* different
 callers' requests is `Batcher`'s own job (see the top-level README's "The scheduler" section), and `/v1/decide`
-does not route through it.
+does not route through it -- so the paged-vs-joined gap `--batcher` opens for `/ask`
+([docs/PERFORMANCE.md](PERFORMANCE.md#a-shelf-answers-like-ask), the README's own Quickstart) does not reach
+`/v1/decide`, with `--batcher` on or off.
