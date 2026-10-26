@@ -42,6 +42,32 @@ from pathlib import Path
 
 from .spec import LearnSpec, TagSpec, load_spec
 
+#: The BLAS backends `fit.run`'s own numpy usage can be built against. Not LightGBM's own thread pool
+#: (`--num-threads`, read directly by `fit.run` as its own `num_threads` parameter) -- these are a *second*,
+#: independent source of threads, picked by numpy's BLAS backend (OpenBLAS/MKL) the first time it
+#: initialises, before `fit.run` is ever called and regardless of what it is told. Measured on real
+#: hardware: with only `--num-threads 1` set and these left at their OS default (every core on the box),
+#: one fit call drove roughly half of a 48-core machine's cores above 20% utilisation at once -- exactly
+#: the CPU contention `cap_blas_threads` exists to prevent.
+_BLAS_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+def cap_blas_threads(num_threads: int) -> None:
+    """Must run before `numpy` (and so before `lightgbm`, and before `fit.run`) is imported anywhere in this
+    process -- a BLAS backend reads these once, at its own import time, and setting them afterwards has no
+    effect. `main` calls this immediately after parsing arguments, before any of its own `import lightgbm`/
+    `import prismyra` lines. `os.environ.setdefault`, not a flat assignment: an operator who has already set
+    one of these for their own reasons keeps that choice.
+    """
+    for var in _BLAS_THREAD_ENV_VARS:
+        os.environ.setdefault(var, str(num_threads))
+
 
 class IdleError(Exception):
     """A configuration problem found before any polling started -- a bad spec, a tag with no router, an
@@ -295,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
         "--stop-after", type=int, default=None, help="number of polls, for a smoke test; default: forever"
     )
     args = parser.parse_args(argv)
+    cap_blas_threads(args.num_threads)
 
     try:
         import lightgbm  # noqa: F401
