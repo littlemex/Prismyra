@@ -65,6 +65,7 @@ def read_and_branch(
     one group. `prefill` is this document's usual `Prefill`, snapshot included, built one layer at a time as the
     loop below runs rather than by a separate `fork.snapshot(cache)` call afterwards.
     """
+    engine._require_branch_kernel()
     text_model = engine.backbone.language_model if hasattr(engine.backbone, "language_model") else engine.backbone
     layers = text_model.layers
     device = engine.device
@@ -219,6 +220,7 @@ def read_and_branch_shelf(engine, shelf, context: str, texts: list[str], width: 
     """
     from .engine import Shelved, _forget_recurrent_state
 
+    engine._require_branch_kernel()
     text_model = engine.backbone.language_model if hasattr(engine.backbone, "language_model") else engine.backbone
     layers = text_model.layers
     device = engine.device
@@ -418,6 +420,7 @@ def read_and_branch_shelf_many(
     """
     from .engine import Shelved, _forget_recurrent_state
 
+    engine._require_branch_kernel()
     text_model = engine.backbone.language_model if hasattr(engine.backbone, "language_model") else engine.backbone
     layers = text_model.layers
     device = engine.device

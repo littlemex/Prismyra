@@ -254,9 +254,16 @@ def part_b(args) -> dict:
     # Two concurrent closed-loop clients so the worker's own queue depth stays above 0 continuously --
     # `prismyra.learn.idle.is_busy`'s own floor (`max_queue_depth=0`, the default) should then never see
     # an idle poll.
-    # qcount=1: see RUN-learn-router.md for why counts above 1 could not be used in this environment (a
-    # pre-existing, unrelated engine/transformers incompatibility in the multi-question branch path, not
-    # touched by this change). Two concurrent closed-loop clients still keep the worker's queue non-empty.
+    # qcount=1: this part's default model (`--model`, `Qwen/Qwen3-0.6B`) has no borrowed-kernel adapter
+    # (`kernels.qwen3_moe.Qwen3MoeAdapter.supports` wants a `Qwen3_5Moe*` architecture), and every branch pass
+    # -- any question count above one -- needs that kernel; `engine.py`'s `_require_branch_kernel` now refuses
+    # a multi-question `/ask` against a model like this one with a clear `PrismyraError` (HTTP 422) rather than
+    # the `transformers.integrations.sdpa_attention` `AttributeError` this used to crash into, but the refusal
+    # is still a refusal -- see RUN-branch-bug.md. This part only needs the worker's queue kept non-empty, which
+    # does not need more than one question per request, so it stays at `qcount=1` regardless; a run that wants
+    # 16/64 at this part should pass `--model` naming a checkpoint the adapter recognises (e.g. this project's
+    # own `littlemex/prismyra-decision-35b-a3b-fp8`), not switch this part off this count. Two concurrent
+    # closed-loop clients still keep the worker's queue non-empty.
     threads = [
         threading.Thread(target=load_worker, args=(base_url, 1, stop_event, samples), daemon=True) for _ in range(2)
     ]
