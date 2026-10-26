@@ -49,6 +49,7 @@ from .schema import (
     Result,
     Timing,
 )
+from .temperature import GroupedTemperature
 
 #: The widest group of questions one traversal may carry. A group of questions is answered in one pass and a request
 #: with more than this is answered in several; a request with fewer uses only as many rows as it has questions, which
@@ -447,6 +448,7 @@ class Prismyra:
         paged: bool = False,
         short_graphs: bool | None = None,
         heads: str | list | None = None,
+        calibrate_temperature: str | list | None = None,
         pin_autotune: bool = True,
         wide_group: bool = False,
         interleaved_fork: bool = True,
@@ -775,6 +777,11 @@ class Prismyra:
         #: Learned read-outs registered by option list (see `prismyra.heads`). A question whose options match none of
         #: them is read from the output embedding exactly as without heads.
         self.heads = Heads(heads, self.hidden_size, self.device)
+        #: Off unless asked for, the same convention `heads` just above uses. `prismyra.temperature.
+        #: GroupedTemperature` for what it does and `docs/CALIBRATION.md` for which option counts this round
+        #: measured and chose to ship, and on what data. A question whose option count has no entry is read at
+        #: T=1 -- untouched -- so an engine built without this stays bit-identical to one built before it existed.
+        self.temperature = GroupedTemperature(calibrate_temperature)
         # Experimental: dense (self_attn/shared_expert/linear_attn) projections in NVFP4 too, selected with
         # `PRISMYRA_DENSE=nvfp4` -- the same "=nvfp4" convention `PRISMYRA_EXPERTS` already uses for the routed
         # experts above, kept separate because converting dense and converting experts are independent choices
@@ -1205,10 +1212,17 @@ class Prismyra:
                     padded_rows=first_padded,
                     only_group=len(groups) == 1,
                 )
+                first_options: list[Sequence[str]] = [questions[i].options for i in first_members]
                 scored0 = self.heads.apply(
                     hidden0,
-                    [questions[i].options for i in first_members],
-                    score(hidden0, self.unembedding, [token_ids[i] for i in first_members], None),
+                    first_options,
+                    score(
+                        hidden0,
+                        self.unembedding,
+                        [token_ids[i] for i in first_members],
+                        None,
+                        self._temperatures_for(first_options),
+                    ),
                 )
                 by_index.update(zip(first_members, scored0, strict=True))
                 for n, (members, group_width) in enumerate(groups[1:], start=1):
@@ -1220,10 +1234,17 @@ class Prismyra:
                         if _round_rows(len(m), prefill.group or self.group) == padded and w == group_width
                     )
                     hidden = self._branch(prefill, chunk, len(chunk), group_width, remaining=same_shape_left)
+                    members_options: list[Sequence[str]] = [questions[i].options for i in members]
                     scored = self.heads.apply(
                         hidden,
-                        [questions[i].options for i in members],
-                        score(hidden, self.unembedding, [token_ids[i] for i in members], None),
+                        members_options,
+                        score(
+                            hidden,
+                            self.unembedding,
+                            [token_ids[i] for i in members],
+                            None,
+                            self._temperatures_for(members_options),
+                        ),
                     )
                     by_index.update(zip(members, scored, strict=True))
                 probabilities = [by_index[i] for i in range(len(questions))]
@@ -1290,8 +1311,11 @@ class Prismyra:
                 hidden, handle, shelved = interleave.read_and_branch_shelf(
                     self, shelf, context, texts, width=width, padded_rows=padded_rows
                 )
+                shelf_options: list[Sequence[str]] = [q.options for q in questions]
                 scored = self.heads.apply(
-                    hidden, [q.options for q in questions], score(hidden, self.unembedding, token_ids, None)
+                    hidden,
+                    shelf_options,
+                    score(hidden, self.unembedding, token_ids, None, self._temperatures_for(shelf_options)),
                 )
             except torch.OutOfMemoryError as e:
                 raise PrismyraError(
@@ -1371,7 +1395,9 @@ class Prismyra:
                 )
                 token_ids = [p.token_ids for plans in plans_per_doc for p in plans]
                 options: list[Sequence[str]] = [q.options for qs in questions_per_doc for q in qs]
-                scored = self.heads.apply(hidden, options, score(hidden, self.unembedding, token_ids, None))
+                scored = self.heads.apply(
+                    hidden, options, score(hidden, self.unembedding, token_ids, None, self._temperatures_for(options))
+                )
             except torch.OutOfMemoryError as e:
                 raise PrismyraError(
                     f"ran out of memory reading and answering {len(contexts)} fresh documents in one "
@@ -1439,7 +1465,15 @@ class Prismyra:
                     else:
                         hidden = self._read_one_pass(ids)
                     (probabilities,) = self.heads.apply(
-                        hidden, [question.options], score(hidden, self.unembedding, [planned.token_ids], None)
+                        hidden,
+                        [question.options],
+                        score(
+                            hidden,
+                            self.unembedding,
+                            [planned.token_ids],
+                            None,
+                            self._temperatures_for([question.options]),
+                        ),
                     )
                     values = probabilities.tolist()
                     del hidden, ids
@@ -2014,8 +2048,11 @@ class Prismyra:
         with self._lock_for(lane), self._stream_for(lane), torch.inference_mode():
             try:
                 hidden = self._branch_across(prefills, counts, rows_for, [p.text for p in plans], width, lane=lane)
-                read = score(hidden, self.unembedding, [p.token_ids for p in plans], None)
-                probabilities = self.heads.apply(hidden, [q.options for q in flat], read)
+                flat_options: list[Sequence[str]] = [q.options for q in flat]
+                read = score(
+                    hidden, self.unembedding, [p.token_ids for p in plans], None, self._temperatures_for(flat_options)
+                )
+                probabilities = self.heads.apply(hidden, flat_options, read)
             finally:
                 # Whether it answered or raised, no row is set up to read anything now, so a document nobody is
                 # reading can be dropped. In a `finally`: a failed pass must not leave a shelf unable to drop anything.
@@ -2179,14 +2216,16 @@ class Prismyra:
                         if _round_rows(len(m), prefill.group or self.group) == padded and w == group_width
                     )
                     hidden = self._branch(prefill, chunk, len(chunk), group_width, remaining=same_shape_left)
+                    members_options: list[Sequence[str]] = [questions[i].options for i in members]
                     scored = self.heads.apply(
                         hidden,
-                        [questions[i].options for i in members],
+                        members_options,
                         score(
                             hidden,
                             self.unembedding,
                             [token_ids[i] for i in members],
                             [priors[i] for i in members] if priors else None,
+                            self._temperatures_for(members_options),
                         ),
                     )
                     by_index.update(zip(members, scored, strict=True))
@@ -2285,6 +2324,16 @@ class Prismyra:
             return round_width(widest)
         except TooWide as e:
             raise PrismyraError(str(e)) from e
+
+    def _temperatures_for(self, options: list) -> list[float] | None:
+        """The per-row divisor `readout.score` applies before its softmax, aligned to `options` the same way
+        `priors` is aligned to the questions it corrects. `None` -- not a list of 1.0s -- when `self.temperature`
+        holds no spec at all, so `score` skips the division entirely and an engine built without
+        `calibrate_temperature=` costs nothing extra and returns exactly what it always has.
+        """
+        if not self.temperature:
+            return None
+        return [self.temperature.for_options(o) for o in options]
 
     def _packed_groups(self, plans: list, width: int, group: int | None = None) -> list[tuple[list[int], int]]:
         """Which questions share a branch pass, and how wide each pass is.

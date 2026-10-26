@@ -150,6 +150,14 @@ which measured temperatures of 1.3 to 1.5 halving the same error. `prismyra.Temp
 deliberately separate from `prismyra.Thresholds`: a threshold moves where a decision changes, which is what a rare class
 needs, and a temperature moves no decision at all.
 
+That one scalar is fitted and applied by a *caller*, after `ask()` has already answered -- it never touches the
+engine's own read-out. `docs/CALIBRATION.md` covers the other place this package tried the same idea: wired into
+the engine itself (`Prismyra(..., calibrate_temperature=...)`), one scalar per option count instead of one for
+everything, and off by default. A single scalar measured the way this page's table does -- one task, one split --
+does not survive 5-fold cross-validation on this package's own five-set production benchmark; a correction
+restricted to the one option count that benchmark has enough of does, by a small amount, and that page says
+exactly how small and what did not generalise to an unrelated held-out set.
+
 ## Speed is entirely a question of how many questions share a context
 
 Measured in the same runs, against that same unbatched generation loop:

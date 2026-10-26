@@ -233,6 +233,7 @@ def score(
     unembedding: torch.Tensor,
     token_ids: list[list[int]],
     priors: list[torch.Tensor] | None = None,
+    temperatures: list[float] | None = None,
 ) -> list[torch.Tensor]:
     """Per question, a probability over its declared options.
 
@@ -243,10 +244,21 @@ def score(
     With `priors`, each question's scores have its prior subtracted first. See `calibration` for what that is and what
     it is worth. The short version: some option tokens are likelier than others before the context is read at all, and
     subtracting that leaves what the context contributed.
+
+    With `temperatures`, each question's (prior-corrected) scores are divided by its own positive scalar before the
+    softmax -- see `prismyra.temperature.GroupedTemperature`. Dividing every option's score in a row by the same
+    positive number cannot change which one is largest, so this cannot change an answer, only the number attached to
+    it. `None` (the default, and what every caller got before this parameter existed) skips the division and the
+    `zip` below entirely, so an engine built without `calibrate_temperature=` pays nothing extra and returns the
+    exact tensors it always has.
     """
     scores = logits_for(hidden, unembedding, token_ids)
     if priors is not None:
         if len(priors) != len(scores):
             raise ValueError(f"{len(priors)} priors against {len(scores)} questions")
         scores = [row - prior.to(row.device, row.dtype) for row, prior in zip(scores, priors, strict=True)]
+    if temperatures is not None:
+        if len(temperatures) != len(scores):
+            raise ValueError(f"{len(temperatures)} temperatures against {len(scores)} questions")
+        scores = [row / t for row, t in zip(scores, temperatures, strict=True)]
     return [torch.softmax(row, dim=-1) for row in scores]

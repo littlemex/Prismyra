@@ -129,3 +129,65 @@ def test_rescoring_an_answer_keeps_its_decision_and_changes_its_numbers():
     assert rescored.value is answer.value
     assert rescored.probabilities["yes"] < answer.probabilities["yes"]
     assert sum(rescored.probabilities.values()) == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- GroupedTemperature
+from prismyra.temperature import GroupedTemperature  # noqa: E402
+
+
+def test_no_spec_is_empty_and_leaves_every_option_count_untouched():
+    gt = GroupedTemperature(None)
+    assert not gt
+    assert gt.for_options(["a", "b", "c", "d"]) == 1.0
+    assert gt.for_options(["yes", "no"]) == 1.0
+
+
+def test_a_spec_entry_is_looked_up_by_option_count_not_by_which_options():
+    gt = GroupedTemperature([{"nchoices": 4, "temperature": 0.9111, "fit_on": "unit test"}])
+    assert gt
+    assert gt.for_options(["a", "b", "c", "d"]) == pytest.approx(0.9111)
+    assert gt.for_options(["w", "x", "y", "z"]) == pytest.approx(0.9111)  # same count, different options
+    assert gt.for_options(["yes", "no"]) == 1.0  # 2-choice has no entry: untouched
+    assert gt.for_options(["a", "b", "c", "d", "e"]) == 1.0  # 5-choice has no entry: untouched
+
+
+def test_extra_fields_in_an_entry_are_kept_for_a_human_and_never_consumed():
+    """A spec entry is allowed to carry provenance (fit_on, fit_date, validated_by, ...); only nchoices and
+    temperature are read."""
+    gt = GroupedTemperature(
+        [{"nchoices": 2, "temperature": 1.05, "fit_on": "BoolQ", "fit_date": "2026-10-27", "notes": "irrelevant"}]
+    )
+    assert gt.for_options(["yes", "no"]) == pytest.approx(1.05)
+
+
+def test_a_non_positive_temperature_in_a_spec_is_refused():
+    with pytest.raises(PrismyraError, match="must be positive"):
+        GroupedTemperature([{"nchoices": 4, "temperature": 0.0}])
+    with pytest.raises(PrismyraError, match="must be positive"):
+        GroupedTemperature([{"nchoices": 4, "temperature": -1.0}])
+
+
+def test_a_spec_declaring_the_same_option_count_twice_is_refused():
+    with pytest.raises(PrismyraError, match="twice"):
+        GroupedTemperature([{"nchoices": 4, "temperature": 0.9}, {"nchoices": 4, "temperature": 1.1}])
+
+
+def test_a_spec_can_be_loaded_from_a_json_file(tmp_path):
+    import json
+
+    path = tmp_path / "calibration_temperature.json"
+    path.write_text(json.dumps([{"nchoices": 4, "temperature": 0.9111}]))
+    gt = GroupedTemperature(path)
+    assert gt.for_options(["a", "b", "c", "d"]) == pytest.approx(0.9111)
+
+
+def test_the_shipped_spec_is_valid_and_matches_the_measured_candidate():
+    """The spec `Prismyra` ships (`prismyra/calibration_temperature.json`) is exactly the one candidate
+    docs/CALIBRATION.md's 5-fold cross-validation found to survive: 4-choice questions only."""
+    import json
+    from pathlib import Path
+
+    spec_path = Path(__file__).resolve().parent.parent / "prismyra" / "calibration_temperature.json"
+    gt = GroupedTemperature(json.loads(spec_path.read_text()))
+    assert set(gt.by_nchoices) == {4}
+    assert gt.by_nchoices[4] == pytest.approx(0.9111)

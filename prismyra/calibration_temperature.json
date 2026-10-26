@@ -1,0 +1,10 @@
+[
+  {
+    "nchoices": 4,
+    "temperature": 0.9111,
+    "fit_on": "round11c (v0.5.1 fp8) answers on the 2,057-question production set (RACE150/BoolQ400/bury7k/bury10k/Kev), restricted to the 1,101 4-choice rows. Fitted with prismyra.temperature.Temperature.fit (grid search minimising negative log likelihood) on all 1,101 rows.",
+    "validated_by": "5-fold cross-validation over the full 2,057-row pooled set: pooled ECE 0.0179 -> 0.0162 (10-bin), Brier 0.1633 -> 0.1634, argmax unchanged on every row. A single global temperature and per-kind/per-tag temperatures were also measured and did not survive the same cross-validation (pooled ECE got worse, 0.0179 -> 0.0184-0.0203); see docs/CALIBRATION.md for the full comparison and why only this one ships.",
+    "fit_date": "2026-10-27",
+    "source_data": "/Users/akazawt/tmp/smr/cmpr2-wt/results/v050fp8/{race150,boolq400,bury7k,bury10k,kev}.jsonl (RUN-compare-r2.md's score8 output, reused rather than re-run)"
+  }
+]
