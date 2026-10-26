@@ -2,6 +2,12 @@
 
 Read one context once, then answer many typed questions about it.
 
+The commercially-clear line ([`prismyra-decision-35b-a3b-fp8`](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-fp8),
+[`-nvfp4`](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-nvfp4)) trains its adapter only on data
+licensed for commercial use and for training a derivative model, with every teacher signal in that data coming
+only from openly-weighted models or this project's own output -- see
+[docs/DATA_PROVENANCE.md](docs/DATA_PROVENANCE.md).
+
 ## Quickstart
 
 Install, start the server, and ask it something -- in process or over HTTP. `pip install -e ".[server,fast]"`
@@ -389,14 +395,15 @@ for how this line fares against `autotrust/JEV-27B-VL`, `LiquidAI/d1-3B`, and th
 `JEV-35B-NVFP4` (two further models from that family, `autotrust/GEV-26B-Decide` and
 `autotrust/AutoTrust-JEV-27B-v1.1`, could not be served in this project's environment and are not in that
 comparison). The FP8 checkpoint's latest revision adds training data for long-document variable tracking and fact
-chaining -- see [docs/DATA_PROVENANCE.md](docs/DATA_PROVENANCE.md#v051-long-document-variable-tracking-and-fact-chaining-prismyra-decision-35b-a3b-fp8-revision-556e7094)
-and that checkpoint's own card for what changed and what it measured. This line does not replace the checkpoints
-above, which remain available:
+chaining -- see [docs/DATA_PROVENANCE.md](docs/DATA_PROVENANCE.md#v051-long-document-variable-tracking-and-fact-chaining-prismyra-decision-35b-a3b-fp8-revision-556e7094-prismyra-decision-35b-a3b-nvfp4-revision-8b70f770),
+now carried through to both checkpoints (the NVFP4 checkpoint's own quantization-aware training stage runs on top
+of it), and that checkpoint's own card for what changed and what it measured. This line does not replace the
+checkpoints above, which remain available:
 
 | checkpoint | layers | card | Hugging Face |
 |---|---|---|---|
-| `prismyra-decision-35b-a3b-fp8` | 36 | any this project's kernels support | [littlemex/prismyra-decision-35b-a3b-fp8](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-fp8) (revision `556e7094` as of this release; previous revision `cb99f138` stays reachable in the same repository's history) |
-| `prismyra-decision-35b-a3b-nvfp4` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-35b-a3b-nvfp4](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-nvfp4) (revision `9d08c9b4` as of this release; primary checkpoint for this line) |
+| `prismyra-decision-35b-a3b-fp8` | 36 | any this project's kernels support | [littlemex/prismyra-decision-35b-a3b-fp8](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-fp8) (revision `65eaf686` as of this release; the v0.5.1 long-document data landed at `556e7094`, with `cb99f138` [v0.5.0] still reachable in the same repository's history) |
+| `prismyra-decision-35b-a3b-nvfp4` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-35b-a3b-nvfp4](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-nvfp4) (revision `8b70f770` as of this release, now with the same v0.5.1 long-document adapter quantization-aware trained for NVFP4; `72cacf3d` stays reachable for the pre-v0.5.1 revision; primary checkpoint for this line) |
 
 The 36-layer FP8 checkpoint is the one to start with on a card the 36- and 40-layer FP8 checkpoints both fit on: on
 the five sets it is measured against it ties or clears every bar the 40-layer checkpoint does, while running faster.

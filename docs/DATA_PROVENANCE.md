@@ -199,7 +199,7 @@ RACE, SciQ, DREAM and social_i_qa -- all four non-commercial or unconfirmed in e
 in this line at all; DREAM and social_i_qa's roles are covered by self-authored synthetic data instead, and RACE and
 SciQ's roles are not directly replaced (see each checkpoint's own card for where that shows up in evaluation).
 
-## v0.5.1: long-document variable tracking and fact chaining (`prismyra-decision-35b-a3b-fp8` revision `556e7094`)
+## v0.5.1: long-document variable tracking and fact chaining (`prismyra-decision-35b-a3b-fp8` revision `556e7094`, `prismyra-decision-35b-a3b-nvfp4` revision `8b70f770`)
 
 This revision adds two new training families on top of the v0.5.0 line's pool above, both aimed at a long-document
 weakness that line's own evaluation showed plainly. Neither family uses a third-party dataset of pre-written
@@ -239,3 +239,13 @@ already part of this line's licence accounting under v0.5.0, and the variable-tr
 built around that filler is this project's own generated text, not sourced from anywhere. Every source behind this
 revision's adapter remains licensed for commercial use and for training a derivative model, with no restriction on
 redistributing the resulting weights.
+
+### The NVFP4 checkpoint's own v0.5.1 revision
+
+The NVFP4 checkpoint's v0.5.1 revision starts from the FP8 checkpoint's v0.5.1 adapter described above (including
+the two new families) and carries it through the same gated-delta-net-in-NVFP4 quantization-aware training stage
+the project's NVFP4 line has used since v0.5.0 -- no training data changes beyond what is already documented
+above, and the two new families are part of this stage's training data, not held out from it. This stage's own
+distillation signal is this same checkpoint's own FP8 form immediately before the stage, read on the same
+commercially-clear inputs: still this project's own model's output, never a third party's. Licence summary:
+unchanged from the paragraph above.
