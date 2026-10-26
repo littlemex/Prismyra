@@ -62,6 +62,66 @@ def test_a_row_count_mismatch_is_refused():
         score(torch.zeros(2, 4), torch.zeros(3, 4), [[0, 1]])
 
 
+# --------------------------------------------------------------------------- temperatures
+def test_no_temperatures_is_bit_identical_to_before_the_parameter_existed():
+    """The default. An engine built without `calibrate_temperature=` must get exactly what every caller got before
+    this parameter was added -- not a value close to it."""
+    hidden = torch.tensor([[1.0, 0.0], [0.0, 2.0]])
+    unembedding = torch.tensor([[2.0, 0.0], [0.0, 2.0]])
+    token_ids = [[0, 1], [0, 1]]
+    without_priors_param = score(hidden, unembedding, token_ids)
+    with_explicit_none = score(hidden, unembedding, token_ids, None, None)
+    for a, b in zip(without_priors_param, with_explicit_none, strict=True):
+        assert torch.equal(a, b)
+
+
+def test_a_temperature_cannot_change_which_option_wins():
+    hidden = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 3.0]])
+    unembedding = torch.eye(3)
+    token_ids = [[0, 1, 2], [0, 1, 2]]
+    raw = score(hidden, unembedding, token_ids)
+    for t in (0.2, 0.5, 1.0, 2.0, 5.0):
+        scaled = score(hidden, unembedding, token_ids, None, [t, t])
+        for before, after in zip(raw, scaled, strict=True):
+            assert int(before.argmax()) == int(after.argmax())
+            assert pytest.approx(float(after.sum()), abs=1e-6) == 1.0
+
+
+def test_a_temperature_of_one_is_a_no_op():
+    hidden = torch.tensor([[1.0, 0.3, -0.5]])
+    unembedding = torch.eye(3)
+    token_ids = [[0, 1, 2]]
+    raw = score(hidden, unembedding, token_ids)
+    scaled = score(hidden, unembedding, token_ids, None, [1.0])
+    torch.testing.assert_close(raw[0], scaled[0])
+
+
+def test_temperature_above_one_flattens_the_distribution():
+    hidden = torch.tensor([[3.0, 0.0]])
+    unembedding = torch.eye(2)
+    token_ids = [[0, 1]]
+    raw = score(hidden, unembedding, token_ids)[0]
+    flattened = score(hidden, unembedding, token_ids, None, [4.0])[0]
+    assert float(flattened.max()) < float(raw.max())
+
+
+def test_a_temperature_count_mismatch_is_refused():
+    with pytest.raises(ValueError, match="temperatures"):
+        score(torch.zeros(2, 4), torch.zeros(3, 4), [[0, 1], [0, 2]], None, [1.0])
+
+
+def test_priors_and_temperature_compose_prior_first():
+    """The order the module docstring promises: a prior is subtracted, then the result is divided by the
+    temperature -- not the other way round, which would scale the prior itself into the correction."""
+    hidden = torch.tensor([[2.0, 0.0]])
+    unembedding = torch.eye(2)
+    token_ids = [[0, 1]]
+    prior = [torch.tensor([1.0, 0.0])]
+    expected = torch.softmax(torch.tensor([(2.0 - 1.0) / 2.0, (0.0 - 0.0) / 2.0]), dim=-1)
+    got = score(hidden, unembedding, token_ids, prior, [2.0])[0]
+    torch.testing.assert_close(got, expected)
+
+
 # --------------------------------------------------------------------------- the quantised output embedding
 def test_a_quantised_head_is_refused_when_its_scales_are_missing(monkeypatch, tmp_path):
     """Casting fp8 straight to bf16 drops the scales, and each option reads a different row: the options reorder."""

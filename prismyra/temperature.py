@@ -21,13 +21,25 @@ to 1.5 halving expected calibration error on MMLU and RACE. This package had no 
 all, having tried and rejected a different idea -- subtracting what an empty context prefers, which cost 15 points of
 accuracy on RACE because an empty context still contains the question. Temperature scaling cannot do that, because it
 cannot change a decision.
+
+`GroupedTemperature`, below, is a second, separate thing: a one global `Temperature` is fitted and applied by a
+*caller*, after `ask()` has already answered (`Temperature.rescore`, `evals/run.py`'s own calibration section).
+`GroupedTemperature` is wired into the engine's own read-out instead (`Prismyra(..., calibrate_temperature=...)`,
+`readout.score`'s `temperatures` argument), and it corrects by option count rather than with one number for
+everything, because a single scalar measured on the production five-set benchmark does not survive 5-fold
+cross-validation (`docs/CALIBRATION.md`: pooled ECE goes from 0.0179 to 0.0184, i.e. worse) while the correction
+restricted to the one well-populated option count that round measured (4-choice questions, 1,101 of 2,057 answers)
+does (0.0179 to 0.0162). See `docs/CALIBRATION.md` for the full comparison -- including the methods that were
+measured and rejected, and why a per-tag or a vector-scaling correction cannot ship no matter how they score.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from .schema import PrismyraError
 
@@ -168,3 +180,47 @@ def _report(probabilities: Sequence[Sequence[float]], correct: Sequence[int]) ->
         "expected_calibration_error": round(expected_calibration_error(probabilities, correct), 4),
         "brier": round(brier(probabilities, correct), 4),
     }
+
+
+class GroupedTemperature:
+    """Temperature scaling read from a spec at construction time, applied inside the engine's own read-out, one
+    scalar per option count.
+
+    Off unless a spec is given (`Prismyra(..., calibrate_temperature=...)`), the same convention `prismyra.heads`
+    uses: a path to a JSON file, an already-loaded list, or `None`. A spec is a list of entries, one per option
+    count it corrects:
+
+        [{"nchoices": 4, "temperature": 0.9111, "fit_on": "...", "fit_date": "..."}]
+
+    Only `nchoices` and `temperature` are read; anything else in an entry (why this number, on what data, when)
+    is left for a human to trace and is never consumed. A question whose option count has no entry is read at
+    T=1 -- untouched, bit-identical to no spec at all -- which is deliberate: this does not claim to model every
+    option count, only the ones a round actually measured and chose to ship. `docs/CALIBRATION.md` is that
+    record for the spec this package ships (`prismyra/calibration_temperature.json`): 4-choice questions only,
+    fitted with `Temperature.fit` (the grid search above) on the nchoices==4 rows of the 2,057-question
+    production set, validated by 5-fold cross-validation rather than the in-sample fit that grid alone would be.
+
+    `for_options` is the one thing the read-out needs at request time: no fitting, no labels, a dict lookup.
+    """
+
+    def __init__(self, spec: str | Path | list | None):
+        self.by_nchoices: dict[int, float] = {}
+        if spec is None:
+            return
+        entries = json.loads(Path(spec).read_text()) if isinstance(spec, (str, Path)) else spec
+        for entry in entries:
+            nchoices = int(entry["nchoices"])
+            temperature = float(entry["temperature"])
+            if temperature <= 0:
+                raise PrismyraError(f"temperature for {nchoices}-choice questions must be positive, not {temperature}")
+            if nchoices in self.by_nchoices:
+                raise PrismyraError(f"temperature spec declares {nchoices}-choice questions twice")
+            self.by_nchoices[nchoices] = temperature
+
+    def __bool__(self) -> bool:
+        return bool(self.by_nchoices)
+
+    def for_options(self, options: Sequence[str]) -> float:
+        """The divisor `readout.score` applies to this question's scores before its softmax. `1.0` -- a no-op --
+        when this option count is not in the spec."""
+        return self.by_nchoices.get(len(options), 1.0)
