@@ -9,7 +9,9 @@ import time
 
 import pytest
 
-opentelemetry = pytest.importorskip("opentelemetry")
+opentelemetry = pytest.importorskip(
+    "opentelemetry.sdk"
+)  # the API alone (opentelemetry-api) is already a transitive dependency of fastapi; this needs the SDK
 
 from opentelemetry.sdk.metrics import MeterProvider  # noqa: E402
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader  # noqa: E402

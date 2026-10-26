@@ -10,7 +10,9 @@ import time
 
 import pytest
 
-opentelemetry = pytest.importorskip("opentelemetry")
+opentelemetry = pytest.importorskip(
+    "opentelemetry.sdk"
+)  # the API alone (opentelemetry-api) is already a transitive dependency of fastapi; this needs the SDK
 
 from opentelemetry.sdk._logs import LoggerProvider  # noqa: E402
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter, SimpleLogRecordProcessor  # noqa: E402
