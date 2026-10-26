@@ -277,6 +277,38 @@ not admitted changes nothing already serving; a fit that is gets written atomica
 handed to the live server via `POST /v1/learn/reload`, exactly as an operator driving both endpoints by
 hand would.
 
+`--num-threads` alone is not enough to bound the CPU cost, and this was found and fixed on real hardware,
+not in review: `fit.run()`'s own numpy usage (`_soft_rows`'s `np.asarray`, `Vectorizer.transform`) is built
+against a BLAS backend (OpenBLAS/MKL) that picks its *own* thread count from `OMP_NUM_THREADS`/
+`OPENBLAS_NUM_THREADS`/`MKL_NUM_THREADS`/`NUMEXPR_NUM_THREADS`/`VECLIB_MAXIMUM_THREADS`, independently of
+LightGBM's own setting. Measured on a real L40S node (48 vCPUs): with `--num-threads 1` and these left at
+their default, one fit call drove 23-24 cores above 20% utilisation at once; `main()` now calls
+`cap_blas_threads` (setting all five, via `os.environ.setdefault`, before anything that could import numpy)
+immediately after parsing arguments, which brought that down to the single core `--num-threads 1` actually
+promises.
+
+**Measured impact on serving, with that fix in place** (real L40S, `Qwen/Qwen3-0.6B`, a continuous
+closed-loop `/ask` load, 5 idle-off and 5 idle-on 20-second windows alternating, a synthetic tag with 3,000
+logged rows so one fit call takes several seconds of real CPU work):
+
+| | off | on (whole window) | on (only while the fit call itself ran) | budget |
+|---|---|---|---|---|
+| p50 | 63.68 ms | +0.12% | +0.02% | +2% |
+| p99 | 71.95 ms | +4.08% | +4.50% | +5% |
+| throughput | 15.58 req/s | -0.07% | -0.12% | - |
+
+Both within budget. A second run forced continuous back-to-back fitting through the entire "on" window
+(`prismyra-learn-idle` itself never does this -- one fit per idle window reached, then it waits for the
+next poll) as a deliberately pessimistic upper bound: p50 +0.09%, p99 +3.23%, still within budget. Under a
+sustained load that kept the worker's own queue non-empty the whole time, `prismyra-learn-idle` attempted
+zero fits across 15 polls (`is_busy`'s own gate stayed tripped throughout) and the process's own CPU usage
+stayed low (3.8% mean, 9.3% max of a 48-core machine) while it did nothing but poll -- see
+`benchmarks/idle_latency_bench.py` for the harness and the project's own run log for the full numbers.
+Testing this at 16 and 64 questions per request hit an unrelated, pre-existing incompatibility between the
+engine's multi-question branch path and the `transformers` versions this project's own range allows
+(reproduces with `--batcher` on or off, on both the small and the 35B reference model); the single-question
+measurement above is what this round could complete.
+
 ## The read/write interfaces: `ExperienceSink` and `ExperienceSource`
 
 Where a tagged request's `Experience` goes, and where `prismyra.learn.fit`/`.idle` read it back from, are

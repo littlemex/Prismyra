@@ -8,13 +8,24 @@ busy, is a tag due, did exactly one tag get picked per idle window), not about d
 from __future__ import annotations
 
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
 from prismyra.learn import idle as idle_mod
-from prismyra.learn.idle import IdleConfig, IdleError, RefitReport, TagIdleState, is_busy, load_state, save_state
+from prismyra.learn.idle import (
+    _BLAS_THREAD_ENV_VARS,
+    IdleConfig,
+    IdleError,
+    RefitReport,
+    TagIdleState,
+    cap_blas_threads,
+    is_busy,
+    load_state,
+    save_state,
+)
 
 
 def test_is_busy_reads_the_queue_depth():
@@ -191,3 +202,21 @@ def test_run_forever_refits_exactly_once_per_idle_window(tmp_path, fake_server, 
     # idle window finds the tag no longer due (`min_new_rows` unmet) -- which is the property under test:
     # an idle tag whose experience has not grown is not refit again and again for no reason.
     assert calls == ["snake-move-v1"]
+
+
+def test_cap_blas_threads_sets_every_blas_env_var_to_num_threads(monkeypatch):
+    for var in _BLAS_THREAD_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    cap_blas_threads(1)
+    for var in _BLAS_THREAD_ENV_VARS:
+        assert os.environ[var] == "1"
+
+
+def test_cap_blas_threads_does_not_override_an_operators_own_setting(monkeypatch):
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    for var in _BLAS_THREAD_ENV_VARS[1:]:
+        monkeypatch.delenv(var, raising=False)
+    cap_blas_threads(1)
+    assert os.environ["OMP_NUM_THREADS"] == "8"  # untouched -- the operator's own choice wins
+    for var in _BLAS_THREAD_ENV_VARS[1:]:
+        assert os.environ[var] == "1"  # every other one still gets capped
