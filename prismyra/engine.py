@@ -2536,6 +2536,40 @@ class Prismyra:
             prefill.cache, lambda: self.fork(prefill, rows), run, ids, positions, rows, width, remaining
         )
 
+    def _require_branch_kernel(self) -> None:
+        """Refuse a branch pass clearly, before it runs, when this engine has no borrowed attention kernel.
+
+        Every branch pass -- one row or many, the fused layer-interleaved path or the two-pass one -- depends on
+        it: `cache.ForkLayer.update()` returns `(None, None)` for a branch write by design (see that class's own
+        module docstring; the real keys and values live in a page table built by `branch_read`/`paged_read`), and
+        only `kernels.qwen3_moe.FlashAttention` -- installed over `self_attn` by the one adapter this project ships,
+        and only for the architecture it was measured on (`Qwen3MoeAdapter.supports`) -- knows to read that table
+        instead of the `update()` return value. The framework's own attention does not, and is never asked to:
+        without the adapter, `self._borrowed_kernel` is `False` and this raises before a `self_attn` call ever
+        sees the `None`. Found the hard way, on a real GPU, with `Qwen/Qwen3-0.6B` (no adapter: `Qwen3MoeAdapter.
+        supports` wants `Qwen3_5Moe*` architectures): an uncaught `(None, None)` crashes three frames inside
+        `transformers.integrations.sdpa_attention`/`modeling_rope_utils`, as an `AttributeError` or `IndexError`
+        on whichever line of that module happens to read `key.shape` first -- the exact version of `transformers`
+        (checked at 5.15.0, 5.16.0 and 5.17.0, the whole range this project pins) does not change that, because
+        the `None` is this project's own and no release of `transformers` is written to expect it. `ask()` with
+        exactly one question (`_ask_in_one_pass`) never forks and so never calls this -- it is the one path a
+        kernel-less engine can still answer through, which is also why the single-question benchmarks that flagged
+        this (`benchmarks/idle_latency_bench.py`) had to stay at one question rather than the sixteen or sixty-four
+        every other measurement in this project's history uses on the one architecture that does carry the
+        adapter. `require_kernels=True` raises this same shortfall earlier, at construction, for a caller who
+        would rather know before the first request; this exists for every caller who did not ask for that.
+        """
+        if self._borrowed_kernel:
+            return
+        reason = "; ".join(self.applied.skipped) if self.applied.skipped else "no adapter applied"
+        raise PrismyraError(
+            f"answering more than one question about {self.model_name} forks the context into a branch pass, "
+            f"which needs the borrowed attention kernel this engine has none of ({reason}). Ask one question at "
+            f"a time -- `_ask_in_one_pass` never forks and needs no kernel -- or build the engine against a "
+            f"model `kernels.qwen3_moe.Qwen3MoeAdapter.supports` recognises. `Prismyra(..., require_kernels=True)` "
+            f"raises this at construction instead of at the first multi-question ask."
+        )
+
     def _bucket_key(self, cache, rows: int, width: int) -> tuple:
         """The shape a recording is kept under: `(rows, width)`, widened with a remainder bucket when the cache is
         paged storage.
@@ -2601,6 +2635,7 @@ class Prismyra:
         row's remainder would fix it properly; until that is built, a mixed batch is not a shape graphs generalises
         over at all, and the honest thing is to say so rather than key it coarser and answer some rows wrong.
         """
+        self._require_branch_kernel()
         # Lane=2: CUDA graph capture is a stream-scoped operation, and recording's own
         # claim to "a private allocator pool for the life of the engine" has never been checked against a second
         # lane capturing on a second stream at the same time. Rather than find out by trusting it, a non-zero lane

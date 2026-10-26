@@ -2074,3 +2074,48 @@ def test_dense_nvfp4_fusion_group_is_row_count_invariant():
 
     assert torch.equal(alone, with_companions)
     assert torch.equal(alone, at_boundary)
+
+
+# --------------------------------------------------------------------------------------------------- branch-bug
+# RUN-branch-bug.md: `/ask`/`engine.ask` with two or more questions crashed with an `AttributeError`/`IndexError`
+# three frames inside `transformers.integrations.sdpa_attention`/`modeling_rope_utils`, reproduced at transformers
+# 5.15.0, 5.16.0 and 5.17.0, on both `Qwen/Qwen3-0.6B` and `Qwen/Qwen3.6-35B-A3B-FP8`/
+# `littlemex/prismyra-decision-35b-a3b-fp8` -- but only when the *last* of those has no borrowed kernel for some
+# other reason (`require_kernels=False`'s default, or `fast_kernels=False`). On real hardware, the supported
+# checkpoint with its adapter correctly applied answers two, sixteen and sixty-four questions exactly as it
+# always has; the two tests below are what a bisection across that boundary actually found: the model matters
+# only through `self._borrowed_kernel`, not through its size or its architecture otherwise.
+
+
+def test_two_sixteen_and_sixty_four_questions_answer_on_the_supported_model(engine):
+    """The regression this bug report first worried about: `ask()` with more than one question, on the one
+    architecture this project's kernel adapter is measured on, must keep answering -- `_require_branch_kernel`
+    must be silent here, not a new refusal. Real hardware: `littlemex/prismyra-decision-35b-a3b-fp8` and
+    `Qwen/Qwen3.6-35B-A3B-FP8` both answered all three counts under `interleaved_fork` (the default) and under
+    `self._branch` (`interleaved_fork=False`) alike; `engine`'s own construction decides which this runs as.
+    """
+    for n in (2, 16, 64):
+        result = engine.ask(CONTEXT, questions(n))
+        assert set(result.answers) == {f"q{i}" for i in range(n)}
+        for answer in result.answers.values():
+            assert answer.option in ("yes", "no")
+
+
+def test_two_questions_refuse_clearly_without_the_borrowed_kernel():
+    """The bug itself, reproduced and pinned: an engine with no borrowed-kernel adapter for its architecture
+    (`Qwen/Qwen3-0.6B` -- `kernels.qwen3_moe.Qwen3MoeAdapter.supports` wants `Qwen3_5Moe*`) must raise a clear
+    `PrismyraError` for two questions, not crash inside `transformers`. One question must still answer --
+    `_ask_in_one_pass` never forks and so never needs the kernel -- which is the control that proves this
+    engine loaded and works at all, so the two-question failure is the branch path's own precondition and not
+    a broken checkpoint.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    engine = Prismyra("Qwen/Qwen3-0.6B")
+    assert not engine._borrowed_kernel, "this test needs a model this project's adapter does not recognise"
+
+    one = engine.ask(CONTEXT, [Boolean(id="q0", prompt="Is clause 0 about shipping?")])
+    assert one.answers["q0"].option in ("yes", "no")
+
+    with pytest.raises(PrismyraError, match="no adapter for this architecture"):
+        engine.ask(CONTEXT, questions(2))
