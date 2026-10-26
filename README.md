@@ -402,8 +402,8 @@ checkpoints above, which remain available:
 
 | checkpoint | layers | card | Hugging Face |
 |---|---|---|---|
-| `prismyra-decision-35b-a3b-fp8` | 36 | any this project's kernels support | [littlemex/prismyra-decision-35b-a3b-fp8](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-fp8) (revision `65eaf686` as of this release; the v0.5.1 long-document data landed at `556e7094`, with `cb99f138` [v0.5.0] still reachable in the same repository's history) |
-| `prismyra-decision-35b-a3b-nvfp4` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-35b-a3b-nvfp4](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-nvfp4) (revision `8b70f770` as of this release, now with the same v0.5.1 long-document adapter quantization-aware trained for NVFP4; `72cacf3d` stays reachable for the pre-v0.5.1 revision; primary checkpoint for this line) |
+| `prismyra-decision-35b-a3b-fp8` | 36 | any this project's kernels support | [littlemex/prismyra-decision-35b-a3b-fp8](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-fp8) (revision `9db9e0ac` as of this release; the v0.5.1 long-document data landed at `556e7094`, with `cb99f138` [v0.5.0] still reachable in the same repository's history) |
+| `prismyra-decision-35b-a3b-nvfp4` | 36 | Blackwell with native 4-bit tensor cores (sm_120, e.g. RTX PRO 4500) only | [littlemex/prismyra-decision-35b-a3b-nvfp4](https://huggingface.co/littlemex/prismyra-decision-35b-a3b-nvfp4) (revision `67b7f799` as of this release, now with the same v0.5.1 long-document adapter quantization-aware trained for NVFP4; `72cacf3d` stays reachable for the pre-v0.5.1 revision; primary checkpoint for this line) |
 
 The 36-layer FP8 checkpoint is the one to start with on a card the 36- and 40-layer FP8 checkpoints both fit on: on
 the five sets it is measured against it ties or clears every bar the 40-layer checkpoint does, while running faster.
