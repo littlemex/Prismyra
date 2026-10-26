@@ -121,3 +121,204 @@ would do that, and it does not exist yet.
   state -- stage 2's own student uses input features only. Capturing it would mean wrapping `engine.ask` in
   `prismyra.heads.record_hidden` on a path shared with every other caller's request, including ones `--batcher`
   has merged into the same forward pass, for a feature nothing here consumes yet.
+
+## Stage 4: switching traffic between a student and Prismyra
+
+Stage 1/2 (above) only ever logs and trains offline; nothing it does can change what a caller receives.
+Stage 4 (`prismyra.learn.router`, `.controller`, `.students`) is the part of DISTILL-RL-DESIGN-v2.md section
+4 that can: for a tag that opts in, some fraction of its traffic is answered by its own distilled student
+instead of Prismyra, with the device skipped entirely for the fraction that is. A tag that does not opt in
+(no `"router"` field) is unaffected by any of this -- it keeps meaning exactly what it meant in stage 1/2.
+
+### Registering a router
+
+```json
+{"task": "snake-move-up-v1", "question": "...", "options": ["up", "down", "left", "right"],
+ "kind": "choice", "normalize": "none", "retain_days": 30, "keep_hidden": false,
+ "eval_set": "evals/snake-move-up-v1-gold.jsonl",
+ "router": {"mode": "ramp", "student_path": "students/snake-move-up-v1.json",
+            "ramp_step": 500, "ramp_interval_s": 300, "ramp_max_ratio": 10000,
+            "rollback_min_match_rate": 0.9, "rollback_max_drift": 0.3}}
+```
+
+`student_path` must point at a `StudentArtifact` (`python -m prismyra.learn.fit`'s own `--out`) whose
+`admitted` is `true` -- loading one that is not admitted is a refusal at server startup
+(`prismyra.learn.students.StudentError`), the same "fail loudly, not silently" discipline the rest of this
+package already keeps. `mode` is one of:
+
+| mode | what decides the route | what the audit lane checks |
+|---|---|---|
+| `ab` | a fixed `ratio` (per 10,000), never changed by this package | a sample of both directions, for monitoring only |
+| `ramp` | `ratio` raised by `ramp_step` every `ramp_interval_s`, while the audited comparison keeps passing | same as `ab`, and what lets ramping continue |
+| `shadow` | never serves the student; `ratio` is unused | always -- every request, both sides, every time |
+| `confidence` | the student's own top probability against `tau`; `ratio` (if set) is an extra eligibility gate | a sample of the student-served subset |
+| `bandit` | the controller's own UCB1 pick among `bandit_arms` (ratios), re-evaluated every `ramp_interval_s` | the audited sample attributes reward to whichever arm was active |
+
+`RouterConfig`'s full field list -- all but `mode`/`student_path` optional, every default named once in
+`prismyra.learn.spec` -- is `ratio`, `tau` (required for `confidence`), `bandit_arms` (required for
+`bandit`), `ramp_step`/`ramp_interval_s`/`ramp_min_ratio`/`ramp_max_ratio`,
+`audit_min_fraction`/`audit_max_fraction`, and `rollback_min_match_rate`/`rollback_max_drift`/
+`rollback_cooldown_s`.
+
+### The determinism contract
+
+> 経路は決定的にする: `hash(tag, 正規化した入力) mod 10000 < ratio` かつ、生徒の最大の確率が `tau` 以上なら
+> 生徒、それ以外は Prismyra。同じ入力と同じ表の版なら、いつも同じ経路を通る。
+
+`prismyra.learn.router.bucket_for` is exactly this hash (SHA-256, not Python's own salted `hash()`), and
+`decide()` is a pure function of `(tag, normalized_input, ratio, audit_fraction, student's own prediction)`
+-- the same four inputs always produce the same `RouteOutcome`. What moves `ratio`/`audit_fraction` over
+time (`ramp`'s own climb, `bandit`'s own arm choice, a rollback cutting either back down) is
+`prismyra.learn.controller.Controller`'s job, never the per-request decision's own: a "表の版" is one
+`(ratio, audit_fraction)` snapshot, named by `prismyra.learn.router.params_version` and carried on every
+logged row (`route_params_version`), so a later reader can tell whether two rows were routed under
+comparable conditions.
+
+### The audit lane, and how a rollback fires
+
+Independent of the primary routing decision, a second deterministic hash (`bucket_for(..., salt="audit:")`)
+decides whether this request is also checked against the side that did not serve it: a student-served
+request gets Prismyra's own answer for comparison (paying the device, for that one request); a
+Prismyra-served request gets the student's own cheap, CPU-only prediction. `audit_fraction` is sized by
+`Controller._audit_fraction_locked` to target about 20 audited requests per `ramp_interval_s`-sized window,
+shrinking as a tag's own traffic grows (so a busy tag is not over-audited) and widening toward
+`audit_max_fraction` for a cold one (so a brand-new tag is never left unauditable).
+
+Every tick (at most once per `ramp_interval_s`, on whichever request happens to arrive after that much time
+has passed -- no background thread), `Controller` checks the audited window's agreement rate against
+`rollback_min_match_rate` and the accumulated drift histogram (see below) against `rollback_max_drift`
+(`features.population_stability_index` between a frozen reference window and the current one). Either
+failing cuts `ratio` to `ramp_min_ratio` (0, unless raised) and halts any further raising for
+`rollback_cooldown_s` -- `ab`'s own fixed ratio is not exempt from this: a flat split that regresses is
+still a regression.
+
+### What a routed response carries
+
+A response to a tagged, routed question or decision item gains two fields nothing else does:
+`served_by` (`"prismyra"` or `f"student:{version}"`, `prismyra.learn.students.student_version`'s own name
+for the exact artifact that answered) and `request_id` -- the same id `POST /v1/feedback` (below) and the
+logged `Experience` row both use. An untagged request, and a tagged request whose tag has no `router`,
+gain neither field: the response is unchanged from stage 1/2.
+
+### `POST /v1/feedback`: a gold label or a reward, after the fact
+
+DISTILL-RL-DESIGN-v2.md section 2 always described "報酬かラベル (あれば)" as collected "out of band"
+without saying how. This is that path:
+
+```
+POST /v1/feedback
+{"request_id": "<id a routed response carried>", "label": "up"}
+-- or --
+{"request_id": "<id>", "reward": 0.73}
+```
+
+Exactly one of `label`/`reward`; `prismyra.learn.hook.LearnHook.submit_feedback` refuses both or neither.
+Written to a separate bounded queue (`prismyra.learn.experience.FeedbackLog`), off the request path, the
+same drop-rather-than-block contract every other sink in this package keeps. 404 when `--learn-spec` was
+not given at all; there is nowhere for this to join into.
+
+At training time, `prismyra.learn.fit.run`'s own `feedback_dir` parameter (`--feedback-dir` on the CLI)
+joins every logged row against a feedback record by `request_id`. A matched row trains on the gold label
+directly -- one row, weight 1.0, for that option -- instead of the teacher's own (possibly wrong)
+probabilities for the same row (`prismyra.learn.fit._soft_rows`). A `label` outside the tag's own option
+set is dropped, not guessed at; a `reward` (a scalar, not a class) is left for a later stage -- turning one
+into a classification target is a different, unmeasured question.
+
+### Privacy: `retain_context`
+
+A tag's `"retain_context"` (optional; default `"full"`) controls how much of a request's own `context`
+survives into its logged `Experience`, independent of whether that tag routes any traffic at all:
+
+| `retain_context` | what is stored | what is not |
+|---|---|---|
+| `"full"` | the raw context, exactly as stage 1/2 always stored it | -- |
+| `"features_only"` | the already-vectorised feature vector (`precomputed_features`), from the tag's own loaded student's `Vectorizer` -- only once that student exists | the raw context |
+| `"none"` | nothing but the drift histogram (`feature_summary`, below) | the raw context, and no `precomputed_features` either |
+
+`feature_summary` -- a small (32-bucket), unweighted, hashed token-count histogram
+(`prismyra.learn.features.feature_summary`) -- is kept regardless of `retain_context`: it is lossy (it
+cannot be un-hashed back into text) and it is what `Controller`'s drift check compares across time, so a
+tag set to `"none"` for privacy still feeds the one safety mechanism that depends on seeing *some* signal
+about what is being asked.
+
+### Hot-swapping a student: `POST /v1/learn/reload`
+
+```
+POST /v1/learn/reload
+{"task": "snake-move-up-v1"}
+```
+
+Re-reads `student_path` from disk and swaps the in-memory `StudentHandle` the router uses -- no restart.
+The operator's own responsibility is writing a new, already-*admitted* artifact to exactly that path first,
+atomically (a temp file in the same directory, then `os.replace`, never a partial write a reader could
+observe mid-write) -- this endpoint never fits anything itself, and a not-admitted artifact at that path is
+refused the same way the initial load at server startup is.
+
+### Idle-time retraining: `prismyra-learn-idle`
+
+A standalone console script, not a thread inside `prismyra.server` (DISTILL-RL-DESIGN-v2.md section 5's own
+"独立した段階として作る"): it polls the server's own `GET /stats` over HTTP, and only when the queue (and,
+with `--batcher`, the batcher's own queue) has been empty for `--idle-polls-required` consecutive polls does
+it consider refitting one due tag -- due meaning enough new experience (`--min-new-rows`) has accumulated
+since the last fit, and enough wall-clock time (`--retrain-interval-s`) has passed. One tag per idle window,
+never more: a long queue of due tags does not monopolise an idle window a caller's own traffic just handed
+back.
+
+```
+prismyra-learn-idle --server-url http://127.0.0.1:8000 --learn-spec learn.json \
+  --backbone <model id> --nice 19 --num-threads 1
+```
+
+`--nice` (default 19) lowers this whole process's own OS scheduling priority; `--num-threads` bounds how
+many CPU threads one `fit.run()` call is allowed. Both exist because this is CPU contention a background
+job must not impose on a GPU server sharing the same box -- `/stats`-polling alone answers "is the device
+idle", not "is it safe to also burn CPU here", which is what these two knobs bound instead. A fit that is
+not admitted changes nothing already serving; a fit that is gets written atomically to `student_path` and
+handed to the live server via `POST /v1/learn/reload`, exactly as an operator driving both endpoints by
+hand would.
+
+## The read/write interfaces: `ExperienceSink` and `ExperienceSource`
+
+Where a tagged request's `Experience` goes, and where `prismyra.learn.fit`/`.idle` read it back from, are
+each one small interface (`prismyra.learn.experience.ExperienceSink`/`.ExperienceSource`), not a fact baked
+into `LearnHook`'s own logic. Every sink and every source agree on one schema -- the same
+`Experience.to_json()`/`.from_json()` shape, versioned (`schema_version`, currently 2; a row with none is
+read as 1, stage 1/2's own shape, with every stage-4 field defaulted to absent) -- so switching which one a
+server uses never changes what a later reader has to parse.
+
+| sink | writes to | enabled by |
+|---|---|---|
+| `LocalExperienceLog` (default) | one JSONL file per `(tag, UTC date)`, local disk | nothing extra -- this is stage 1/2's own, unchanged |
+| `RayExperienceLogActor` | the same, inside a Ray actor | `--learn-backend ray` |
+| `prismyra.learn.otel_sink.OtelExperienceSink` | an OTel log record per experience, OTLP to a collector | `--learn-otel-endpoint <url>` (needs `pip install "prismyra[otel]"`) |
+
+More than one at once is `prismyra.learn.experience.MultiSink`: `--learn-otel-endpoint` *adds* the OTel
+sink alongside whichever `--learn-backend` chose, it does not replace it. Every sink keeps the same
+contract stage 1/2 established -- a bounded queue, a full one drops rather than blocks, writing happens off
+the request path.
+
+| source | reads from | ships in this package as |
+|---|---|---|
+| `LocalExperienceSource` (default) | the same on-disk layout `LocalExperienceLog` writes | `prismyra.learn.fit.run`'s own default when no `source=` is given |
+| `prismyra.learn.http_source.HttpPullExperienceSource` | a generic paginated `GET {url}?task=...&since=...&page=...` contract (see that module's own docstring) | `run(..., source=HttpPullExperienceSource(url))` |
+
+A destination-specific reader (CloudWatch Logs, a Prometheus range query) is meant to be built *on top of*
+the same generic pull contract `HttpPullExperienceSource` already implements, not as a reason to add that
+destination's own SDK as a hard dependency of this package -- see `prismyra.learn.http_source`'s module
+docstring for exactly where that line is drawn. Whichever source feeds it, `POST /v1/feedback`'s own
+`request_id` join (above) works identically: `prismyra.learn.experience.load_feedback` and
+`prismyra.learn.fit._soft_rows` both operate on `Experience.request_id` alone, never on how the row reached
+them.
+
+## `prismyra.learn` and `prismyra.telemetry` stay separate streams
+
+`prismyra.telemetry` (`docs/OBSERVABILITY.md`) is this project's *general* observability layer -- server
+metrics, traces, logs about operation, never about a request's own content. `prismyra.learn`'s experience
+log is the opposite: it exists specifically to carry a registered tag's request content, and only when
+`--learn-spec` turned that on. The two can share OTel SDK bootstrap machinery when both happen to be
+enabled (`OtelExperienceSink` can be pointed at a `logger_provider` someone else already built), but never
+data: a different OTel `Logger` name (`"prismyra.learn.experience"` vs `prismyra.telemetry`'s own
+`"prismyra.telemetry"`), a different enable flag, no code path that reads one's own data into the other's.
+Turning on `--otel` alone emits zero `Experience` rows; turning on `--learn-spec` alone emits zero spans or
+metrics through `prismyra.telemetry`. `tests/test_telemetry_isolation.py` is what checks both directions,
+together with the untouched stage 1/2 case (neither on) and the case where both are.

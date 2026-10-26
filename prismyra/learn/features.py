@@ -32,7 +32,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
@@ -113,6 +113,43 @@ class HashingTfidf:
         n_docs = len(corpus) or 1
         idf = tuple(math.log((n_docs + 1) / (doc_count[i] + 1)) + 1.0 for i in range(dims))
         return HashingTfidf(dims=dims, idf=idf)
+
+
+def feature_summary(context: str, dims: int = 32) -> tuple[int, ...]:
+    """A small, fixed-width, unweighted hashed token-count histogram of ``context`` -- stage 4's drift probe
+    (DISTILL-RL-DESIGN-v2.md section 5: finding a change in the input distribution without needing a hidden
+    state or a tag's own fitted `Vectorizer`). Deliberately not `HashingTfidf`: that class needs an IDF fitted
+    over a training corpus, which does not exist yet for a tag with no student, and this has to work for every
+    tagged request from the moment a spec is loaded, student or not. ``dims`` is small on purpose -- this is a
+    drift signal, not a training feature, and 32 buckets is enough to notice "the input shape changed" without
+    costing more than a few hash computations per request.
+
+    Computed from the raw input before `prismyra.learn.spec.TagSpec.retain_context` decides whether that input
+    itself is kept: a lossy histogram of token buckets cannot be un-hashed back into the text that produced it,
+    which is what lets a tag set `retain_context` to `"none"` and still feed stage 4's drift detector.
+    """
+    counts = [0] * dims
+    for t in tokenize(context):
+        counts[_bucket(t, dims)] += 1
+    return tuple(counts)
+
+
+def population_stability_index(reference: Sequence[int], current: Sequence[int]) -> float:
+    """The population stability index between two same-length count histograms (e.g. two
+    `feature_summary` windows) -- a standard drift metric: 0 for identical distributions, growing with how
+    differently the two windows spend their mass across buckets. Each count is Laplace-smoothed by one before
+    normalising so an empty bucket in either window never produces a division by zero or a `log(0)`.
+    """
+    if len(reference) != len(current):
+        raise ValueError(f"reference has {len(reference)} buckets, current has {len(current)}")
+    ref_total = sum(reference) + len(reference)
+    cur_total = sum(current) + len(current)
+    psi = 0.0
+    for r, c in zip(reference, current, strict=True):
+        ref_p = (r + 1) / ref_total
+        cur_p = (c + 1) / cur_total
+        psi += (cur_p - ref_p) * math.log(cur_p / ref_p)
+    return psi
 
 
 #: ``(document, question) -> {feature name: numeric value}``. The whole shape a registered feature builder

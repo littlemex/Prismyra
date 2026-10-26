@@ -277,7 +277,44 @@ def _item_response(item: DecideItem, answer, model: str, merged_with: list[str])
     }
 
 
-def decide_many(engine, raw_items: list[dict], ask) -> tuple[list[dict], int]:
+def _item_response_from_route(
+    item: DecideItem, probabilities, model: str, merged_with: list[str], served_by: str, request_id: str
+) -> dict:
+    """`_item_response`'s own shape, built from stage 4's routed probabilities instead of an `Answer` the
+    engine produced. ``probabilities`` is already keyed by ``item.reported_options`` -- the same vocabulary
+    `prismyra.learn.tagging.tag_for` matched this item's `(kind, question, options)` against, and so the same
+    one `prismyra.learn.fit`'s student was trained on (`prismyra.server._log_decide_routes` logs exactly this
+    keying) -- which is why this needs no internal-label translation the way an engine `Answer` keyed by
+    `Boolean`'s ``("no", "yes")`` or a `Choice`'s single-token symbols would.
+    """
+    probs = [probabilities[opt] for opt in item.reported_options]
+    chosen_index = probs.index(max(probs))
+    chosen = item.reported_options[chosen_index]
+    if item.kind == "noul":
+        value: bool | int | str = chosen == "true"
+    elif item.kind == "score":
+        value = int(chosen)
+    else:
+        value = chosen
+    return {
+        "id": item.external_id,
+        "kind": item.kind,
+        "options": list(item.reported_options),
+        "probabilities": probs,
+        "choice_index": chosen_index,
+        "choice": chosen,
+        "value": value,
+        "adaptation": "native" if item.kind != "choice" else "symbol-labelled",
+        "symbols": dict(item.symbols) if item.symbols else None,
+        "protocol": PROTOCOL,
+        "model": model,
+        "merged_with": merged_with,
+        "served_by": served_by,
+        "request_id": request_id,
+    }
+
+
+def decide_many(engine, raw_items: list[dict], ask, *, route_fn=None) -> tuple[list[dict], int]:
     """Parse, group by state, and answer every group in one call to `ask`.
 
     `ask` is `(context, questions) -> Result` -- the caller's own queue entry point (`Worker.submit` in
@@ -286,19 +323,37 @@ def decide_many(engine, raw_items: list[dict], ask) -> tuple[list[dict], int]:
     the same all-or-nothing admission `/ask` already gives a malformed question, rather than this
     endpoint inventing a partial-success shape nothing else here has.
 
+    ``route_fn`` is stage 4's own hook (DISTILL-RL-DESIGN-v2.md section 4), and its default, `None`, is what
+    keeps this function's own behaviour identical to every caller before stage 4 existed -- `prismyra.
+    learn.hook.LearnHook.route`'s own no-router-configured case already returns `None` per item, so a server
+    with `--learn-spec` on but no tag routing yet calls this exactly as before, one `route_fn(raw, item) is None`
+    check per item and nothing past it. When `route_fn(raw, item)` returns a `prismyra.learn.router.RouteOutcome`
+    whose `served_by` starts with ``"student"`` and whose `needs_engine` is `False`, that item is answered
+    from the outcome's own `answer_probabilities` and never joins a group at all -- `ask` is never called for
+    it, which is the whole saving stage 4 exists for. An item whose outcome still needs the device (`served_by
+    == "prismyra"`, or an audited student answer) joins its group exactly as before; which probabilities end
+    up in its response is decided again afterwards, from the outcome, not from whether the device happened to
+    run.
+
     Returns the responses in the caller's own order and the number of `ask` calls actually made --
-    equal to the number of distinct states, which is what a caller measuring "did batching several
-    decisions about one record actually cost one pass" should compare against the number of items.
+    equal to the number of distinct states still needing the device, which is what a caller measuring "did
+    batching several decisions about one record actually cost one pass" should compare against the number of
+    items, and now also what measures stage 4's own saving when some of those items needed no pass at all.
     """
     # Computed only when a `choice` item is actually present: `choice_labels` probes the tokenizer, and a
     # request with only `noul`/`score` items (which score Prismyra's own fixed, already-known-safe verbalizers)
     # has no use for it.
     labels = choice_labels(engine.tokenizer) if any(raw.get("kind") == "choice" for raw in raw_items) else []
     items = [parse_item(raw, i, labels) for i, raw in enumerate(raw_items)]
+    outcomes = [
+        route_fn(raw, item) if route_fn is not None else None for raw, item in zip(raw_items, items, strict=True)
+    ]
 
     groups: dict[str, list[DecideItem]] = {}
     order: list[str] = []
-    for item in items:
+    for item, outcome in zip(items, outcomes, strict=True):
+        if outcome is not None and not outcome.needs_engine:
+            continue  # answered by the student alone -- never shares a pass, never costs one
         if item.context not in groups:
             groups[item.context] = []
             order.append(item.context)
@@ -312,8 +367,34 @@ def decide_many(engine, raw_items: list[dict], ask) -> tuple[list[dict], int]:
             answers_by_internal_id[i.question.id] = result[i.question.id]
 
     responses = []
-    for item in items:
+    for item, outcome in zip(items, outcomes, strict=True):
+        if outcome is not None and outcome.served_by.startswith("student"):
+            if outcome.needs_engine:
+                group = groups[item.context]
+                merged_with = [other.external_id for other in group if other is not item]
+            else:
+                merged_with = []
+            responses.append(
+                _item_response_from_route(
+                    item,
+                    outcome.answer_probabilities,
+                    engine.model_name,
+                    merged_with,
+                    outcome.served_by,
+                    outcome.request_id,
+                )
+            )
+            continue
         group = groups[item.context]
         merged_with = [other.external_id for other in group if other is not item]
-        responses.append(_item_response(item, answers_by_internal_id[item.question.id], engine.model_name, merged_with))
+        resp = _item_response(item, answers_by_internal_id[item.question.id], engine.model_name, merged_with)
+        if outcome is not None:
+            resp["served_by"] = outcome.served_by
+            resp["request_id"] = outcome.request_id
+            # Reported-vocabulary probabilities for whoever's turn it was to log this request
+            # (`prismyra.server`'s background task reads this and strips it before the response goes out --
+            # a caller outside this package never sees it). Already computed as `resp["probabilities"]`;
+            # named separately only so stripping one dict key cannot be confused with editing the answer.
+            resp["_route_probabilities"] = dict(zip(item.reported_options, resp["probabilities"], strict=True))
+        responses.append(resp)
     return responses, len(order)

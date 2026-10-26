@@ -64,11 +64,11 @@ def test_a_put_experience_is_written_and_counted(tmp_path):
     try:
         assert log.put(make_exp(spec)) is True
         for _ in range(50):
-            if log.stats.logged == 1:
+            if log.stats()["logged"] == 1:
                 break
             time.sleep(0.05)
-        assert log.stats.logged == 1
-        assert log.stats.dropped == 0
+        assert log.stats()["logged"] == 1
+        assert log.stats()["dropped"] == 0
     finally:
         log.stop()
 
@@ -88,7 +88,7 @@ def test_a_full_queue_drops_and_counts_rather_than_blocking(tmp_path):
     try:
         assert log.put(make_exp(spec)) is True
         assert log.put(make_exp(spec)) is False
-        assert log.stats.dropped == 1
+        assert log.stats()["dropped"] == 1
     finally:
         log._stop.set()  # no thread was started; nothing to join
 

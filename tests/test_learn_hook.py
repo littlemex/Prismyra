@@ -98,7 +98,12 @@ def test_stats_reports_queue_depth_and_dropped(tmp_path):
     hook = make_hook(tmp_path, log_dir=tmp_path / "exp", max_queue=10_000)
     try:
         stats = hook.stats()
-        assert set(stats) == {"logged", "dropped", "queue_depth"}
+        # `"feedback"` (stage 4's own `POST /v1/feedback` log) is always present once `LearnHook` exists --
+        # a spec with no routed tag still gets a feedback channel, the same cost class as the experience log
+        # itself. `"routing"` is present only when at least one tag configured a `RouterConfig` (none did
+        # here), which is covered separately in `tests/test_learn_router.py`.
+        assert set(stats) == {"logged", "dropped", "queue_depth", "feedback"}
+        assert stats["feedback"] == {"logged": 0, "dropped": 0, "queue_depth": 0}
     finally:
         hook.stop()
 

@@ -26,14 +26,14 @@ half-built version of them away. In-process callers that want follow-ups use `Pr
 import argparse
 import base64
 import dataclasses
-import json
+import time
 import uuid
 from typing import Any, Literal
 
 from . import decide as decide_mod
 from .media import MAX_DECODED_FRAMES, decode_image, decode_video
 from .queue import QueueFull, Worker
-from .schema import Boolean, Choice, PrismyraError, Question, QuestionError, Result, Scale
+from .schema import Answer, Boolean, Choice, PrismyraError, Question, QuestionError, Result, Scale, Timing
 
 
 def build_questions(payload: list[dict[str, Any]]) -> list[Question]:
@@ -170,11 +170,19 @@ def _restore_ids(result: Result, id_map: dict[str, str]) -> Result:
     )
 
 
-def _log_tagged_questions(learn_hook, context: str, questions: list[Question], result: Result) -> None:
-    """`prismyra.learn`'s whole footprint on `/ask`: one `tag(...)` comparison per question, and -- only for a
-    question that matches a registered tag -- queue the experience. Called from a `BackgroundTasks` callback, so
-    this runs after the HTTP response has already been written to the socket; see `create_app`'s own docstring
-    for why that is where the design's "`learn_spec` が無ければ何もしない" contract draws the line.
+def _log_ask_routes(learn_hook, context: str, routes: dict, engine_result: Result | None, final_result: Result) -> None:
+    """`prismyra.learn`'s whole footprint on `/ask`, stage 1/2's `_log_tagged_questions` and stage 4's routing
+    log merged into one callback. Called from a `BackgroundTasks` callback, so this runs after the HTTP
+    response has already been written to the socket; see `create_app`'s own docstring for why that is where
+    the design's "`learn_spec` が無ければ何もしない" contract draws the line.
+
+    ``routes`` is the ``{question id: (tag, outcome, question)}`` map the handler already built, before the
+    engine was ever asked -- recomputing it here would mean tagging every question twice. ``outcome`` is
+    `None` for a tag with no router configured (stage 1/2's own case: `LearnHook.submit`, logging whatever
+    `final_result` answered it with, exactly as `_log_tagged_questions` used to); otherwise
+    `LearnHook.record_route`. ``engine_result`` is `None` exactly when every question in this request was
+    answered by a student with no audit sample (`route()`'s own `needs_engine` was `False` for all of them) --
+    the one case with no engine answer at all to hand `record_route` as a comparison.
 
     `h` is not captured here, or anywhere in stage 1/2 (DISTILL-RL-DESIGN-v2.md section 7 lists this as
     undecided): a tag's `keep_hidden` is validated and stored on every experience record regardless, ready for
@@ -183,14 +191,11 @@ def _log_tagged_questions(learn_hook, context: str, questions: list[Question], r
     `--batcher` has merged into the same pass -- for a feature stage 2's own student does not use (section 3:
     "特徴は入力だけから作る", input alone, never `h`). Deferred, not forgotten.
     """
-    if learn_hook is None:
-        return
-    for q in questions:
-        answer = result.answers.get(q.id)
-        if answer is None:
-            continue
-        tag = learn_hook.tag(task=None, question=q.prompt, options=q.options, kind=q.kind)
-        if tag is not None:
+    for qid, (tag, outcome, q) in routes.items():
+        if outcome is None:
+            answer = final_result.answers.get(qid)
+            if answer is None:
+                continue
             learn_hook.submit(
                 tag,
                 context=context,
@@ -200,40 +205,51 @@ def _log_tagged_questions(learn_hook, context: str, questions: list[Question], r
                 probabilities=answer.probabilities,
                 answered_by=answer.read_by or "prismyra",
             )
-
-
-def _log_tagged_decisions(learn_hook, raw_items: list[dict], responses: list[dict]) -> None:
-    """The `/v1/decide` twin of `_log_tagged_questions`, one `tag(...)` comparison per item, in the same
-    `BackgroundTasks` callback style and under the same `h`-is-not-captured-here note.
-
-    `raw_items` and `responses` are `decide_mod.decide_many`'s own input and output, in the same order (its own
-    docstring: "Returns the responses in the caller's own order") -- `zip` is what pairs a wire item with the
-    answer it produced without re-deriving which `ask()` group it fell into.
-
-    `state` is turned back into text with the same two rules `decide._state_to_context` applies (a string as-is,
-    a dict as `json.dumps`) rather than by calling that private function from here: the list form it refuses is
-    unreachable by this point, because `decide_many` already raised `DecideError` for it before any response
-    existed to log.
-    """
-    if learn_hook is None:
-        return
-    for raw, response in zip(raw_items, responses, strict=True):
-        question = str(raw.get("question", ""))
-        options = response["options"]
-        kind = raw["kind"]
-        tag = learn_hook.tag(task=raw.get("task"), question=question, options=options, kind=kind)
-        if tag is None:
             continue
-        state = raw.get("state", "")
-        context = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
-        learn_hook.submit(
+        engine_answer = engine_result.answers.get(qid) if engine_result is not None else None
+        engine_probabilities = dict(engine_answer.probabilities) if engine_answer is not None else None
+        learn_hook.record_route(
             tag,
+            outcome,
             context=context,
+            question=q.prompt,
+            options=q.options,
+            kind=q.kind,
+            engine_probabilities=engine_probabilities,
+        )
+
+
+def _log_decide_routes(learn_hook, routed_calls: list, responses: list[dict], route_probabilities: list) -> None:
+    """The `/v1/decide` twin of `_log_ask_routes`. ``routed_calls`` is built by the handler's own `route_fn`
+    closure, as a side effect of `decide_mod.decide_many` calling it once per item, in the same order as
+    `responses` -- each entry is `None` (the item was untagged) or ``(tag, outcome, question, item)``.
+    ``route_probabilities`` is `decide_mod.decide_many`'s own ``"_route_probabilities"`` key, already popped
+    off each response dict by the handler before it went out over the wire (`decide.py`'s own docstring on
+    that key: "a caller outside this package never sees it").
+    """
+    for call, response, engine_probabilities in zip(routed_calls, responses, route_probabilities, strict=True):
+        if call is None:
+            continue
+        tag, outcome, question, item = call
+        if outcome is None:
+            learn_hook.submit(
+                tag,
+                context=item.context,
+                question=question,
+                options=item.reported_options,
+                kind=item.kind,
+                probabilities=dict(zip(item.reported_options, response["probabilities"], strict=True)),
+                answered_by="prismyra",
+            )
+            continue
+        learn_hook.record_route(
+            tag,
+            outcome,
+            context=item.context,
             question=question,
-            options=options,
-            kind=kind,
-            probabilities=dict(zip(options, response["probabilities"], strict=True)),
-            answered_by="prismyra",
+            options=item.reported_options,
+            kind=item.kind,
+            engine_probabilities=engine_probabilities,
         )
 
 
@@ -269,6 +285,11 @@ def create_app(
     learn_log_dir: str | None = None,
     learn_backend: str = "local",
     learn_max_queue: int = 10_000,
+    learn_otel_endpoint: str | None = None,
+    learn_otel_service_name: str = "prismyra",
+    otel: bool = False,
+    otel_endpoint: str = "http://localhost:4318",
+    otel_service_name: str = "prismyra",
     **engine_kwargs,
 ):
     """A FastAPI application with the engine and its worker already running.
@@ -297,10 +318,17 @@ def create_app(
     `/v1/decide` request pays one extra comparison (`learn_hook.tag(...)`, pure Python, no device) to find out
     whether it is one of the registered tags; only a tagged request pays anything past that, and what it pays is
     a `BackgroundTasks` callback that runs after the response has already been sent (see the two handlers below).
+
+    **`otel`** turns on `prismyra.telemetry` -- server-operation metrics, traces and (via a collector's own
+    routing) logs, never a request's own content; see that package's own docstring for the line between
+    this and `learn_spec` above, which the two stay on opposite sides of even when both are on at once.
+    `False` (the default) means nothing under `prismyra.telemetry.otel_backend` is imported and `telemetry`
+    stays `None`, the same short-circuit discipline `learn_hook` already has.
     """
     from contextlib import asynccontextmanager
 
-    from fastapi import BackgroundTasks, FastAPI, HTTPException
+    from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+    from fastapi.exception_handlers import http_exception_handler
     from pydantic import BaseModel, Field
 
     from . import Prismyra, __version__
@@ -334,7 +362,21 @@ def create_app(
             log_dir=learn_log_dir,
             backend=learn_backend,
             max_queue=learn_max_queue,
+            otel_endpoint=learn_otel_endpoint,
+            otel_service_name=learn_otel_service_name,
         )
+
+    # Same discipline as `learn_hook`: `telemetry` stays `None`, and nothing under `prismyra.telemetry.
+    # otel_backend` is imported, unless `otel` was actually passed.
+    telemetry = None
+    if otel:
+        from .telemetry import TelemetryConfig, build_telemetry
+
+        telemetry = build_telemetry(TelemetryConfig(service_name=otel_service_name, otlp_endpoint=otel_endpoint))
+        telemetry.register_stats_source("engine", engine.stats)
+        telemetry.register_stats_source("queue", worker.stats)
+        if text_batcher is not None:
+            telemetry.register_stats_source("batcher", text_batcher.stats)
 
     @asynccontextmanager
     async def lifespan(_):
@@ -344,6 +386,8 @@ def create_app(
             text_batcher.stop()
         if learn_hook is not None:
             learn_hook.stop()
+        if telemetry is not None:
+            telemetry.shutdown()
 
     class QuestionIn(BaseModel):
         id: str | None = None
@@ -389,8 +433,20 @@ def create_app(
         description="Read one context once, then answer many typed questions about it.",
     )
 
+    if telemetry is not None:
+        # A global handler, not a `try`/`except` added inside every endpoint: `HTTPException` is already
+        # the one shape every admission/validation refusal in this file raises, so this is the one place
+        # that can record "a request was rejected" for all of them without touching any existing endpoint's
+        # own control flow. `http_exception_handler` is FastAPI's own default -- delegated to, not
+        # reimplemented, so the response a caller sees is unchanged by `otel` being on.
+        @app.exception_handler(HTTPException)
+        async def _telemetry_rejection_handler(request: Request, exc: HTTPException):
+            telemetry.record_rejection(endpoint=request.url.path, reason=str(exc.status_code))
+            return await http_exception_handler(request, exc)
+
     @app.post("/ask")
-    def ask(body: AskIn, background_tasks: BackgroundTasks) -> dict:
+    def ask(body: AskIn, background_tasks: BackgroundTasks, request: Request) -> dict:
+        t0 = time.monotonic()
         # Refused before admission, so an oversized request costs the queue nothing. 413 rather than 422: the request
         # is well formed, there is just too much of it. Tokenising to find out is cheap next to what admitting it
         # costs.
@@ -431,33 +487,101 @@ def create_app(
             questions = build_questions([q.model_dump() for q in body.questions])
         except QuestionError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
-        id_map = None
-        try:
-            # The batched path only when it can actually take the request: no media (`Batcher` is text-only) and
-            # not more questions than one pass holds. Everything else -- including every request when `batcher` is
-            # off -- takes the queue this endpoint always had, unchanged.
-            if text_batcher is not None and not images and not videos and len(questions) <= batcher_capacity:
-                namespaced, id_map = _namespaced(questions)
-                job = _ask_via_batcher(text_batcher, body.context, namespaced, request_timeout)
-            else:
-                job = worker.submit((body.context, questions, images, videos), timeout=request_timeout)
-        except QueueFull as e:
-            # The work was never started, so 503 with Retry-After is the honest answer. Its own exception type matters
-            # here: the engine raises `RuntimeError` too, and reporting that as an overloaded server would send the
-            # caller to retry a request that will fail the same way.
-            raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"}) from e
-        except TimeoutError as e:
-            # Admitted and still running. The device is not free, so a retry should not arrive immediately.
-            raise HTTPException(status_code=504, detail=str(e), headers={"Retry-After": "5"}) from e
-        except PrismyraError as e:
-            raise HTTPException(status_code=422, detail=str(e)) from e
-        result = _restore_ids(job.result, id_map) if id_map is not None else job.result
+
+        # Stage 4 (DISTILL-RL-DESIGN-v2.md section 4): for every question, find out whether a registered tag
+        # with a router configured wants it answered by its student instead of the engine -- `learn_hook.
+        # route` returns `None` at no more cost than one attribute check for every question this is not true
+        # of, which is every question whenever `learn_hook` is `None` (this loop does not even run) and every
+        # question whose tag never configured a router (stage 1/2's own case, unchanged by any of this).
+        # `tag`/`outcome` are typed `Any` deliberately: their real types (`prismyra.learn.spec.TagSpec`,
+        # `prismyra.learn.router.RouteOutcome`) live in a package this module must not import at module scope
+        # (see `create_app`'s own docstring on why -- `learn_hook` itself is already untyped for the same
+        # reason), so there is no name to spell here that both type-checks and keeps that import deferred.
+        routes: dict[str, tuple[Any, Any, Question]] = {}
         if learn_hook is not None:
-            background_tasks.add_task(_log_tagged_questions, learn_hook, body.context, questions, result)
-        return as_json(with_queue_time(result, job.queue_ms))
+            for q in questions:
+                tag = learn_hook.tag(task=None, question=q.prompt, options=q.options, kind=q.kind)
+                if tag is None:
+                    continue
+                outcome = learn_hook.route(tag, question=q.prompt, options=q.options, kind=q.kind, context=body.context)
+                routes[q.id] = (tag, outcome, q)
+
+        student_only_ids = {
+            qid for qid, (_, outcome, _) in routes.items() if outcome is not None and not outcome.needs_engine
+        }
+        engine_questions = [q for q in questions if q.id not in student_only_ids]
+
+        id_map = None
+        engine_result = None
+        if engine_questions:
+            try:
+                # The batched path only when it can actually take the request: no media (`Batcher` is text-only) and
+                # not more questions than one pass holds. Everything else -- including every request when `batcher` is
+                # off -- takes the queue this endpoint always had, unchanged.
+                if text_batcher is not None and not images and not videos and len(engine_questions) <= batcher_capacity:
+                    namespaced, id_map = _namespaced(engine_questions)
+                    job = _ask_via_batcher(text_batcher, body.context, namespaced, request_timeout)
+                else:
+                    job = worker.submit((body.context, engine_questions, images, videos), timeout=request_timeout)
+            except QueueFull as e:
+                # The work was never started, so 503 with Retry-After is the honest answer. Its own exception type
+                # matters here: the engine raises `RuntimeError` too, and reporting that as an overloaded server
+                # would send the caller to retry a request that will fail the same way.
+                raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"}) from e
+            except TimeoutError as e:
+                # Admitted and still running. The device is not free, so a retry should not arrive immediately.
+                raise HTTPException(status_code=504, detail=str(e), headers={"Retry-After": "5"}) from e
+            except PrismyraError as e:
+                raise HTTPException(status_code=422, detail=str(e)) from e
+            engine_result = _restore_ids(job.result, id_map) if id_map is not None else job.result
+            queue_ms = job.queue_ms
+        else:
+            queue_ms = 0.0
+
+        if not routes:
+            # No question in this request matched a routed tag (the common case: `learn_hook` is `None`, or
+            # every tag it matched has no router). `engine_result` answered every question, exactly as before
+            # any of this existed.
+            assert engine_result is not None
+            result = engine_result
+        else:
+            answers = dict(engine_result.answers) if engine_result is not None else {}
+            for qid, (_tag, outcome, q) in routes.items():
+                if outcome is not None and outcome.served_by.startswith("student"):
+                    probs = outcome.answer_probabilities
+                    chosen = max(probs, key=probs.get)
+                    answers[qid] = Answer(
+                        id=qid,
+                        kind=q.kind,
+                        value=q.value_of(chosen),
+                        option=chosen,
+                        probabilities=probs,
+                        read_by=outcome.served_by,
+                    )
+            if engine_result is not None:
+                base = engine_result
+            else:
+                base = Result(answers={}, timing=Timing(), model=engine.model_name)
+            result = dataclasses.replace(base, answers=answers)
+
+        if learn_hook is not None:
+            background_tasks.add_task(_log_ask_routes, learn_hook, body.context, routes, engine_result, result)
+        if telemetry is not None:
+            served_by = "prismyra"
+            if any(o is not None and o.served_by.startswith("student") for _, o, _ in routes.values()):
+                served_by = "student"
+            telemetry.record_request(
+                endpoint="/ask",
+                start_time=t0,
+                end_time=time.monotonic(),
+                served_by=served_by,
+                timing=result.timing,
+                traceparent=request.headers.get("traceparent"),
+            )
+        return as_json(with_queue_time(result, queue_ms))
 
     @app.post("/v1/decide")
-    def decide(body: DecideIn | list[DecideIn], background_tasks: BackgroundTasks) -> dict:
+    def decide(body: DecideIn | list[DecideIn], background_tasks: BackgroundTasks, request: Request) -> dict:
         """A JEV-compatible read-out (see `prismyra.decide`'s own module docstring for the contract and why
         a `choice` question is always relabelled). The body is a single JEV-shaped decision -- answered and
         returned exactly as JEV's own `/v1/decide` would shape one -- or a JSON array of them, Prismyra's own
@@ -470,6 +594,7 @@ def create_app(
         more than the queue already serialising access to the device; cross-request batching is `Batcher`'s
         job and this does not attempt it.
         """
+        t0 = time.monotonic()
         if isinstance(body, DecideIn):
             single = True
             raw_items = [body.model_dump()]
@@ -481,8 +606,32 @@ def create_app(
             job = worker.submit((context, questions, None, None), timeout=request_timeout)
             return job.result
 
+        # Stage 4's own hook into `decide_many` (DISTILL-RL-DESIGN-v2.md section 4): tag and route each item
+        # *before* it is decided whether that item needs the engine at all. `routed_calls` is filled, in the
+        # same order `decide_many` answers items in, purely as a side effect of this closure -- the simplest
+        # way for the background logging task below to get back the `TagSpec`/`RouteOutcome` pair it needs
+        # without this handler tagging every item a second time.
+        routed_calls: list[tuple | None] = []
+
+        def route_fn(raw: dict, item):
+            assert learn_hook is not None  # only ever passed to decide_many when this is true (see call below)
+            question = str(raw.get("question", ""))
+            tag = learn_hook.tag(
+                task=raw.get("task"), question=question, options=item.reported_options, kind=raw["kind"]
+            )
+            if tag is None:
+                routed_calls.append(None)
+                return None
+            outcome = learn_hook.route(
+                tag, question=question, options=item.reported_options, kind=raw["kind"], context=item.context
+            )
+            routed_calls.append((tag, outcome, question, item))
+            return outcome
+
         try:
-            responses, num_requests = decide_mod.decide_many(engine, raw_items, ask)
+            responses, num_requests = decide_mod.decide_many(
+                engine, raw_items, ask, route_fn=route_fn if learn_hook is not None else None
+            )
         except decide_mod.DecideError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         except QuestionError as e:
@@ -494,18 +643,85 @@ def create_app(
         except PrismyraError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
 
+        # `_route_probabilities` exists only to carry a comparison figure from `decide_many` to the background
+        # logging task below; `decide.py`'s own docstring is explicit that a caller outside this package never
+        # sees it, which is why it is popped here, before the response is handed back, rather than after.
+        route_probabilities = [r.pop("_route_probabilities", None) for r in responses]
+
         if learn_hook is not None:
-            background_tasks.add_task(_log_tagged_decisions, learn_hook, raw_items, responses)
+            background_tasks.add_task(_log_decide_routes, learn_hook, routed_calls, responses, route_probabilities)
+        if telemetry is not None:
+            served_by = (
+                "student"
+                if any(r.get("served_by", "prismyra").startswith("student") for r in responses)
+                else "prismyra"
+            )
+            # No `timing=` here: unlike `/ask`'s single `Result`, a `/v1/decide` call can merge several
+            # `ask()` groups into one response, with no single `prismyra.schema.Timing` object to attach
+            # queue/context/readout events to -- the span still gets the request's own total duration.
+            telemetry.record_request(
+                endpoint="/v1/decide",
+                start_time=t0,
+                end_time=time.monotonic(),
+                served_by=served_by,
+                traceparent=request.headers.get("traceparent"),
+            )
         if single:
             return responses[0]
         return {"results": responses, "num_model_requests": num_requests}
+
+    @app.post("/v1/feedback")
+    def feedback(body: dict) -> dict:
+        """A gold label or a reward for a request answered earlier, named by the `request_id` that request's
+        own response carried (`served_by`'s companion field, on every routed `/ask` or `/v1/decide` answer).
+        DISTILL-RL-DESIGN-v2.md section 2 always described this as "報酬かラベル (あれば)...out of band" without
+        saying how out-of-band traffic would ever arrive; this is that path. Written to a separate log
+        (`prismyra.learn.experience.FeedbackLog`), off the request path the same way stage 1/2's own
+        experience log is -- a full queue drops the feedback rather than making this call wait, and nothing
+        here ever touches `/ask` or `/v1/decide`'s own queues or the device.
+
+        404 when `--learn-spec` was not given: there is nothing to join this against, and no log for it to
+        join into, so accepting the call and silently discarding it would look like success for data that
+        then exists nowhere.
+        """
+        if learn_hook is None:
+            raise HTTPException(status_code=404, detail="this server was not started with --learn-spec")
+        request_id = body.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise HTTPException(status_code=422, detail="'request_id' must be a non-empty string")
+        try:
+            accepted = learn_hook.submit_feedback(request_id, label=body.get("label"), reward=body.get("reward"))
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        return {"accepted": accepted}
+
+    @app.post("/v1/learn/reload")
+    def learn_reload(body: dict) -> dict:
+        """Hot-swap one tag's student artifact without restarting the process -- the loop idle-time retraining
+        (`prismyra.learn.idle`) closes: fit a new one out of band, admit it, write it where
+        `prismyra.learn.spec.RouterConfig.student_path` already points (atomically -- `os.replace` onto that
+        exact path, never a partial write a reader could observe mid-write), then call this. 404/400 for
+        exactly the reasons `/v1/feedback` above refuses: no `--learn-spec`, or a `task` this spec never
+        registered a router for.
+        """
+        if learn_hook is None:
+            raise HTTPException(status_code=404, detail="this server was not started with --learn-spec")
+        task = body.get("task")
+        if not isinstance(task, str) or not task:
+            raise HTTPException(status_code=422, detail="'task' must be a non-empty string")
+        try:
+            handle = learn_hook.reload_student(task)
+        except Exception as e:
+            # task, no router) is equally "refuse the reload, keep serving the previous student", not a server
+            # bug worth distinguishing from the others.
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return {"task": task, "student_version": handle.version}
 
     @app.get("/health")
     def health() -> dict:
         return {"ok": worker.alive, "depth": worker.depth}
 
-    @app.get("/stats")
-    def stats() -> dict:
+    def _build_stats() -> dict:
         out = {"engine": engine.stats(), "queue": worker.stats()}
         if text_batcher is not None:
             out["batcher"] = text_batcher.stats()
@@ -515,10 +731,28 @@ def create_app(
             out["learn"] = learn_hook.stats()
         return out
 
+    @app.get("/stats")
+    def stats() -> dict:
+        return _build_stats()
+
+    @app.get("/metrics")
+    def metrics():
+        """Prometheus text exposition, converted from `/stats` (`prismyra.telemetry.prometheus.
+        render_prometheus`) -- always here, no `otel` and no extra required; see docs/OBSERVABILITY.md for
+        the other way to feed Prometheus (an OTel collector's own Prometheus receiver, pointed at this
+        server's OTLP stream, when `--otel` is on).
+        """
+        from fastapi import Response
+
+        from .telemetry.prometheus import render_prometheus
+
+        return Response(content=render_prometheus(_build_stats()), media_type="text/plain; version=0.0.4")
+
     app.state.engine = engine
     app.state.worker = worker
     app.state.batcher = text_batcher
     app.state.learn_hook = learn_hook
+    app.state.telemetry = telemetry
     return app
 
 
@@ -608,6 +842,30 @@ def main(argv: list[str] | None = None) -> int:
         help="how many tagged experiences may wait to be written before a newly-arriving one is dropped and "
         "counted rather than ever slowing down a response",
     )
+    parser.add_argument(
+        "--learn-otel-endpoint",
+        default=None,
+        help="an OTLP/HTTP log endpoint; when given, every tagged experience is ALSO sent there "
+        "(prismyra.learn.otel_sink.OtelExperienceSink), alongside --learn-backend's own sink, not instead "
+        "of it. Requires 'pip install prismyra[otel]'. Unset (the default): nothing under "
+        "prismyra.learn.otel_sink is imported. This is a separate stream from --otel below -- this one "
+        "carries tagged request content (DISTILL-RL-DESIGN-v2.md's own experience record); --otel never does.",
+    )
+    parser.add_argument(
+        "--learn-otel-service-name",
+        default="prismyra",
+        help="the OTel Resource 'service.name' this sink's own records carry",
+    )
+    parser.add_argument(
+        "--otel",
+        action="store_true",
+        help="turn on prismyra.telemetry: server-operation metrics and traces, never a request's own "
+        "content (see prismyra.telemetry's own docstring for the line between this and --learn-otel-endpoint "
+        "above). Requires 'pip install prismyra[otel]'. Off by default: nothing under "
+        "prismyra.telemetry.otel_backend is imported.",
+    )
+    parser.add_argument("--otel-endpoint", default="http://localhost:4318", help="an OTLP/HTTP collector base URL")
+    parser.add_argument("--otel-service-name", default="prismyra", help="the OTel Resource 'service.name' this carries")
     args = parser.parse_args(argv)
 
     try:
@@ -633,6 +891,11 @@ def main(argv: list[str] | None = None) -> int:
         learn_log_dir=args.learn_log_dir,
         learn_backend=args.learn_backend,
         learn_max_queue=args.learn_max_queue,
+        learn_otel_endpoint=args.learn_otel_endpoint,
+        learn_otel_service_name=args.learn_otel_service_name,
+        otel=args.otel,
+        otel_endpoint=args.otel_endpoint,
+        otel_service_name=args.otel_service_name,
     )
     uvicorn.run(app, host=args.host, port=args.port)
     return 0

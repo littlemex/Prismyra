@@ -60,7 +60,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .experience import Experience
+from .experience import Experience, ExperienceSource, LocalExperienceSource
 from .features import HashingTfidf, Vectorizer
 from .spec import TagSpec, load_spec
 
@@ -70,15 +70,11 @@ class FitError(Exception):
 
 
 def _iter_experiences(log_dir: Path, tag: str):
-    tag_dir = log_dir / tag
-    if not tag_dir.is_dir():
-        return
-    for path in sorted(tag_dir.glob("*.jsonl")):
-        with path.open("r", encoding="utf-8") as fh:
-            for raw_line in fh:
-                stripped = raw_line.strip()
-                if stripped:
-                    yield Experience.from_json(json.loads(stripped))
+    """Kept as a thin, backward-compatible wrapper: this was `run()`'s own inline directory scan before the
+    read side was named as `prismyra.learn.experience.ExperienceSource` -- `LocalExperienceSource` is now
+    where that scan actually lives. `run()` itself no longer calls this; it is kept only in case something
+    outside this module already imports it by name."""
+    return LocalExperienceSource(log_dir).iter_experiences(tag)
 
 
 def dedup(experiences: list[Experience]) -> list[Experience]:
@@ -286,12 +282,35 @@ def tau_sweep(held_out: list[Experience], predict_fn, taus=None) -> list[dict]:
     return rows
 
 
-def _soft_rows(experiences: list[Experience], options: tuple[str, ...], vectorizer: Vectorizer):
+def _soft_rows(experiences: list[Experience], options: tuple[str, ...], vectorizer: Vectorizer, feedback=None):
+    """One row per non-zero option, weighted by probability (section 3's "柔らかいラベルは、クラスの数だけ行を
+    複製し、重みを確率にする") -- except for an experience whose `request_id` has a labelled
+    `prismyra.learn.experience.FeedbackRecord` in ``feedback``, which gets exactly one row instead, at weight
+    1.0, for the labelled option: a gold answer collected after the fact (``POST /v1/feedback``,
+    DISTILL-RL-DESIGN-v2.md section 2's "報酬かラベル (あれば)") is strictly better supervision than
+    distilling the teacher's own (possibly wrong) probabilities for that one row, so it replaces them rather
+    than being blended in. A `FeedbackRecord` carrying a `reward` instead of a `label` is left for a later
+    stage (section 7 already lists "まだ決めていないこと" here): turning a scalar reward into a classification
+    target is a different problem (weighting? thresholding?) from substituting a known-correct label, and
+    guessing at one answer now would be answering a question nobody has measured yet.
+    """
     x_rows: list[list[float]] = []
     y_rows: list[int] = []
     w_rows: list[float] = []
     for e in experiences:
         vec = vectorizer.transform(e.context, getattr(e, "question", ""))
+        label = None
+        if feedback is not None and e.request_id:
+            rec = feedback.get(e.request_id)
+            if rec is not None and rec.label is not None:
+                label = rec.label
+        if label is not None:
+            if label not in options:
+                continue  # a label outside this tag's own option set cannot be trained on; skip, don't guess
+            x_rows.append(vec)
+            y_rows.append(options.index(label))
+            w_rows.append(1.0)
+            continue
         for i, opt in enumerate(options):
             p = e.probabilities.get(opt, 0.0)
             if p <= 0.0:
@@ -311,6 +330,7 @@ def fit_student(
     seed: int = 0,
     num_boost_round: int = 100,
     min_data_in_leaf: int | None = None,
+    feedback=None,
 ):
     """Train one LightGBM booster on ``train``'s soft labels (section 3: "柔らかいラベルは、クラスの数だけ行を
     複製し、重みを確率にする") -- deterministic given a fixed build, instruction set, thread count and seed
@@ -333,7 +353,7 @@ def fit_student(
 
     records = [(e.context, e.question) for e in train]
     vectorizer = Vectorizer.fit(records, features_name=tag.features, dims=dims)
-    x_rows, y_rows, w_rows = _soft_rows(train, tag.options, vectorizer)
+    x_rows, y_rows, w_rows = _soft_rows(train, tag.options, vectorizer, feedback=feedback)
     if not x_rows:
         raise FitError(f"tag {tag.task!r} has no trainable experience (0 rows after soft-label expansion)")
 
@@ -371,11 +391,28 @@ def run(
     seed: int = 0,
     num_boost_round: int = 100,
     min_data_in_leaf: int | None = None,
+    feedback_dir: str | Path | None = None,
+    source: ExperienceSource | None = None,
 ) -> StudentArtifact:
     """``min_match_rate``/``min_accuracy_ratio`` of ``None`` (the default) means "use this tag's own spec
     value" (``tag.min_match_rate``/``tag.min_accuracy_ratio``, themselves ``prismyra.learn.spec``'s
     ``DEFAULT_MIN_MATCH_RATE``/``DEFAULT_MIN_ACCURACY_RATIO`` unless the tag's entry overrides them). Passing
-    either explicitly is a one-off, this-run-only override on top of that -- see the module docstring."""
+    either explicitly is a one-off, this-run-only override on top of that -- see the module docstring.
+
+    ``source`` is where the tag's logged experience is read from -- a `prismyra.learn.experience.
+    ExperienceSource`. `None` (the default) builds a `prismyra.learn.experience.LocalExperienceSource` over
+    ``log_dir`` (or, if that is also `None`, the spec file's own ``experience/`` directory), exactly this
+    function's behaviour before the read side had a name; passing one explicitly -- `prismyra.learn.
+    http_source.HttpPullExperienceSource`, say -- reads from wherever that implementation reads from
+    instead, with everything past this line (dedup, the train/held-out split, training itself) unaware of
+    the difference.
+
+    ``feedback_dir`` joins every logged experience that has one against a gold label collected later (``POST
+    /v1/feedback``, by `request_id`) -- `None` (the default) means "no feedback", exactly today's behaviour;
+    stage 1/2's own experience rows have no `request_id` at all (`experience.Experience.from_json`'s own
+    backward-compatible default, ``""``) and so can never match one regardless. See `_soft_rows` for what a
+    match changes.
+    """
     spec = load_spec(spec_path)
     tag = spec.by_task(task)
     if tag is None:
@@ -383,9 +420,17 @@ def run(
     effective_min_match_rate = tag.min_match_rate if min_match_rate is None else min_match_rate
     effective_min_accuracy_ratio = tag.min_accuracy_ratio if min_accuracy_ratio is None else min_accuracy_ratio
 
-    root = Path(log_dir) if log_dir is not None else Path(spec_path).parent / "experience"
-    all_experiences = dedup(list(_iter_experiences(root, task)))
+    if source is None:
+        root = Path(log_dir) if log_dir is not None else Path(spec_path).parent / "experience"
+        source = LocalExperienceSource(root)
+    all_experiences = dedup(list(source.iter_experiences(task)))
     train, held_out = split_train_held_out(all_experiences, held_out_fraction, seed)
+
+    feedback = None
+    if feedback_dir is not None:
+        from .experience import load_feedback
+
+        feedback = load_feedback(feedback_dir)
 
     booster, vectorizer = fit_student(
         tag,
@@ -395,6 +440,7 @@ def run(
         seed=seed,
         num_boost_round=num_boost_round,
         min_data_in_leaf=min_data_in_leaf,
+        feedback=feedback,
     )
 
     def predict_fn(context: str) -> dict[str, float]:
@@ -513,6 +559,15 @@ def main(argv: list[str] | None = None) -> int:
         help="LightGBM's own default (20) is too strict for a newly-registered tag with only a little logged "
         "experience; lower this to actually fit a tree on a small training set",
     )
+    parser.add_argument(
+        "--feedback-dir",
+        default=None,
+        help="a prismyra.learn.experience.FeedbackLog directory (the server's own --learn-log-dir's "
+        "'_feedback' subdirectory, by default); when given, a logged experience whose request_id has a "
+        "labelled feedback record there trains on that gold label instead of the teacher's own probabilities "
+        "for that one row -- see fit_student/_soft_rows. Unset (the default): no feedback is read, exactly "
+        "stage 1/2's own behaviour.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -537,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         num_boost_round=args.num_boost_round,
         min_data_in_leaf=args.min_data_in_leaf,
+        feedback_dir=args.feedback_dir,
     )
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
