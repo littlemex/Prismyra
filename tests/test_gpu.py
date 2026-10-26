@@ -452,8 +452,16 @@ def test_the_counted_kernels_match_what_the_config_implies(engine):
     verified = {s.name for s in engine.applied.swaps if s.verified}
     # The dense-projection fusion (`_fuse_pair`, prismyra/kernels/qwen3_moe.py) is found and verified by
     # structure, the same way `norm`/`dense_matmul`/`gated_norm` already are -- this set was not updated when
-    # that swap was added.
-    assert verified == {"norm", "dense_matmul", "gated_norm", "dense_fusion"}, engine.applied.as_dict()
+    # that swap was added. `attn_glue_rope`/`attn_glue_finish` (`_verify_attn_glue`) joined the same way: each is
+    # a kernel, not a count, and each carries the bit-exact probe that keeps it installed only when it agrees.
+    assert verified == {
+        "norm",
+        "dense_matmul",
+        "gated_norm",
+        "dense_fusion",
+        "attn_glue_rope",
+        "attn_glue_finish",
+    }, engine.applied.as_dict()
 
 
 # --------------------------------------------------------------------------- the convolution on its own
