@@ -33,10 +33,10 @@ import queue
 import re
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Protocol, TextIO
 
 from .spec import LearnSpec
 
@@ -47,11 +47,41 @@ from .spec import LearnSpec
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
+#: This module's own schema version, bumped from the implicit "1" every row written before stage 4 existed
+#: carried (none of them wrote the field at all). `Experience.from_json` reads a missing field as `1`, so
+#: every stage 1/2 log on disk today stays readable without being rewritten -- see that method.
+SCHEMA_VERSION = 2
+
+
 @dataclass(frozen=True)
 class Experience:
     """One tagged request-and-answer, exactly as described above. ``h`` is `None` whenever the tag's
     ``keep_hidden`` is false, or when the serving path that answered this request does not support capturing it
-    yet (``prismyra.learn.hook``'s own docstring names which paths those are, for stage 1/2)."""
+    yet (``prismyra.learn.hook``'s own docstring names which paths those are, for stage 1/2).
+
+    Stage 4 (DISTILL-RL-DESIGN-v2.md section 4) adds everything below ``h``, all defaulted so a schema-1 row
+    deserialises with every new field `None` rather than refusing to load:
+
+    * ``request_id`` -- the id this same request's response carried back to the caller (`served_by` in the
+      HTTP response), the join key `POST /v1/feedback` and `prismyra.learn.fit` use to attach a label or a
+      reward collected after the fact. Empty string, not `None`, for a schema-1 row: that is what
+      "no id was ever minted for this row" means for a field whose later readers index by it.
+    * ``answered_by`` -- already existed, and already carries exactly what stage 4 needs: ``"prismyra"`` or,
+      now, ``f"student:{artifact_version}"`` (`prismyra.learn.students.student_version`). Nothing new here.
+    * ``route_mode``/``route_bucket``/``route_params_version`` -- which strategy decided this row's route, the
+      hash bucket it fell into, and `prismyra.learn.router.params_version`'s name for the ratio/tau snapshot
+      in effect -- together, enough to tell whether two rows were routed under comparable conditions.
+    * ``comparison_probabilities`` -- the *other* side's probabilities, when this row was audited (section 4's
+      bias-and-quality audit) or came from a confidence-mode fallback: the student's, if ``answered_by`` is
+      ``"prismyra"``; Prismyra's, if ``answered_by`` starts with ``"student"``. `None` otherwise -- most rows,
+      since auditing every request would cost what stage 4 exists to avoid costing.
+    * ``feature_summary`` -- `prismyra.learn.features.feature_summary`'s small hashed-bucket histogram of the
+      input, kept regardless of ``retain_context`` (it is lossy and cannot be un-hashed back into the text),
+      because it is what `prismyra.learn.controller.Controller`'s drift check compares across time.
+    * ``precomputed_features`` -- set only when `prismyra.learn.spec.TagSpec.retain_context` is
+      ``"features_only"`` and a student (and so a fitted `Vectorizer`) already existed for this tag at submit
+      time: the one thing worth keeping once the raw context itself is not.
+    """
 
     tag: str
     spec_version: str
@@ -65,9 +95,17 @@ class Experience:
     versions: Mapping[str, str]
     reward_or_label: object | None = None
     h: tuple[float, ...] | None = None
+    request_id: str = ""
+    route_mode: str | None = None
+    route_bucket: int | None = None
+    route_params_version: str | None = None
+    comparison_probabilities: Mapping[str, float] | None = None
+    feature_summary: tuple[int, ...] | None = None
+    precomputed_features: tuple[float, ...] | None = None
 
     def to_json(self) -> dict:
         return {
+            "schema_version": SCHEMA_VERSION,
             "tag": self.tag,
             "spec_version": self.spec_version,
             "ts": self.ts,
@@ -80,10 +118,22 @@ class Experience:
             "versions": dict(self.versions),
             "reward_or_label": self.reward_or_label,
             "h": list(self.h) if self.h is not None else None,
+            "request_id": self.request_id,
+            "route_mode": self.route_mode,
+            "route_bucket": self.route_bucket,
+            "route_params_version": self.route_params_version,
+            "comparison_probabilities": (
+                dict(self.comparison_probabilities) if self.comparison_probabilities is not None else None
+            ),
+            "feature_summary": list(self.feature_summary) if self.feature_summary is not None else None,
+            "precomputed_features": list(self.precomputed_features) if self.precomputed_features is not None else None,
         }
 
     @staticmethod
     def from_json(raw: dict) -> Experience:
+        comparison = raw.get("comparison_probabilities")
+        summary = raw.get("feature_summary")
+        precomputed = raw.get("precomputed_features")
         return Experience(
             tag=raw["tag"],
             spec_version=raw["spec_version"],
@@ -97,6 +147,15 @@ class Experience:
             versions=dict(raw["versions"]),
             reward_or_label=raw.get("reward_or_label"),
             h=tuple(raw["h"]) if raw.get("h") is not None else None,
+            # `.get(..., "1"...)`: a row with no `schema_version` at all predates stage 4, and every field
+            # from here down predates it too -- read as absent, not as an error.
+            request_id=raw.get("request_id", ""),
+            route_mode=raw.get("route_mode"),
+            route_bucket=raw.get("route_bucket"),
+            route_params_version=raw.get("route_params_version"),
+            comparison_probabilities=dict(comparison) if comparison is not None else None,
+            feature_summary=tuple(summary) if summary is not None else None,
+            precomputed_features=tuple(precomputed) if precomputed is not None else None,
         )
 
 
@@ -121,6 +180,61 @@ class LogStats:
         return {"logged": self.logged, "dropped": self.dropped, "queue_depth": queue_depth}
 
 
+class ExperienceSink(Protocol):
+    """Where a tagged request's `Experience` goes once it has been built -- the interface
+    `prismyra.learn.hook.LearnHook` writes to, so that *which* sink a server uses is a configuration choice,
+    not a fact `LearnHook`'s own logic has to know. `LocalExperienceLog` (below) and `RayExperienceLogActor`
+    already have exactly this shape, unchanged by this `Protocol` existing; `prismyra.learn.otel_sink.
+    OtelExperienceSink` is the second implementation, and `MultiSink` (below) composes any number of them.
+
+    Every implementation keeps three promises section 8 already made for the one sink stage 1/2 had: a
+    bounded queue, a full queue drops rather than blocks, and writing happens off the request path (a
+    background thread, a background task, or both).
+    """
+
+    def put(self, exp: Experience) -> bool: ...
+
+    def queue_depth(self) -> int: ...
+
+    def stats(self) -> dict: ...
+
+    def stop(self) -> None: ...
+
+
+class MultiSink:
+    """Fans one `Experience` out to every sink in ``sinks`` -- "ローカルにも書き、OTel にも出す" at once,
+    each still keeping its own bounded queue and its own drop accounting. The *first* sink's own `stats()`
+    is reported under this object's own flat keys (`"logged"`/`"dropped"`/`"queue_depth"`), so a caller that
+    only ever configured one sink (every tag before this existed) sees exactly the shape it always did;
+    every sink's own numbers, by name, are additionally reported under `"sinks"`.
+    """
+
+    def __init__(self, sinks: Mapping[str, ExperienceSink]):
+        if not sinks:
+            raise ValueError("MultiSink needs at least one sink")
+        self._sinks = dict(sinks)
+        self._primary_name = next(iter(self._sinks))
+
+    def put(self, exp: Experience) -> bool:
+        # Every sink gets the attempt, independently -- one sink being full or erroring must not stop the
+        # others from receiving the same experience (the whole point of configuring more than one). A list
+        # comprehension, not `all(...)` over a generator: the latter short-circuits on the first `False` and
+        # would skip calling `put` on every sink after it.
+        results = [sink.put(exp) for sink in self._sinks.values()]
+        return all(results)
+
+    def queue_depth(self) -> int:
+        return self._sinks[self._primary_name].queue_depth()
+
+    def stats(self) -> dict:
+        primary = self._sinks[self._primary_name].stats()
+        return {**primary, "sinks": {name: sink.stats() for name, sink in self._sinks.items()}}
+
+    def stop(self) -> None:
+        for sink in self._sinks.values():
+            sink.stop()
+
+
 class LocalExperienceLog:
     """A bounded in-memory queue, drained by one background thread into one append-only JSONL file per
     ``(tag, UTC date)``, under ``root/<tag>/<YYYY-MM-DD>.jsonl``.
@@ -136,12 +250,12 @@ class LocalExperienceLog:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.spec = spec
-        self.stats = LogStats()
+        self._counts = LogStats()
         self._q: queue.Queue[Experience] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._open_files: dict[tuple[str, str], TextIO] = {}
         self._last_purge: dict[str, float] = {}
-        self._lock = threading.Lock()  # guards stats + _open_files, both touched only here and on the bg thread
+        self._lock = threading.Lock()  # guards _counts + _open_files, both touched only here and on the bg thread
         self._thread = threading.Thread(target=self._run, name="prismyra-learn-log", daemon=True)
 
     def start(self) -> LocalExperienceLog:
@@ -162,11 +276,15 @@ class LocalExperienceLog:
             return True
         except queue.Full:
             with self._lock:
-                self.stats.dropped += 1
+                self._counts.dropped += 1
             return False
 
     def queue_depth(self) -> int:
         return self._q.qsize()
+
+    def stats(self) -> dict:
+        with self._lock:
+            return self._counts.as_dict(self.queue_depth())
 
     def _run(self) -> None:
         while not self._stop.is_set() or not self._q.empty():
@@ -182,7 +300,7 @@ class LocalExperienceLog:
                 # still deserve a chance. Dropped-on-write is counted the same way dropped-on-full-queue is: both
                 # mean "this experience did not make it to disk".
                 with self._lock:
-                    self.stats.dropped += 1
+                    self._counts.dropped += 1
 
     def _write(self, exp: Experience) -> None:
         tag_dir = _safe_tag_dir(self.root, exp.tag)
@@ -196,7 +314,7 @@ class LocalExperienceLog:
         fh.write(json.dumps(exp.to_json(), ensure_ascii=False) + "\n")
         fh.flush()
         with self._lock:
-            self.stats.logged += 1
+            self._counts.logged += 1
 
     def _maybe_purge(self, tag: str, *, min_interval_s: float = 60.0) -> None:
         """Delete date-partitioned files older than this tag's ``retain_days``. Rate-limited per tag so a hot tag
@@ -227,6 +345,167 @@ class LocalExperienceLog:
                 p.unlink(missing_ok=True)
 
 
+@dataclass(frozen=True)
+class FeedbackRecord:
+    """One ``POST /v1/feedback`` call, joined back to its `Experience` row later by `request_id` -- the gold
+    label or reward DISTILL-RL-DESIGN-v2.md section 2 describes as "報酬かラベル (あれば)" but, before stage 4,
+    had nowhere to arrive from except by hand-editing a log. Exactly one of ``label``/``reward`` is set: a
+    feedback item is either a classification gold answer (`fit.py`'s own `eval_set` vocabulary) or a scalar
+    reward, never both, and never neither -- `prismyra.learn.hook.LearnHook.submit_feedback` is what enforces
+    that before one of these is ever constructed.
+    """
+
+    request_id: str
+    ts: float
+    label: str | None = None
+    reward: float | None = None
+
+    def to_json(self) -> dict:
+        return {"request_id": self.request_id, "ts": self.ts, "label": self.label, "reward": self.reward}
+
+    @staticmethod
+    def from_json(raw: dict) -> FeedbackRecord:
+        return FeedbackRecord(
+            request_id=raw["request_id"], ts=raw["ts"], label=raw.get("label"), reward=raw.get("reward")
+        )
+
+
+class FeedbackLog:
+    """`LocalExperienceLog`'s own bounded-queue-plus-one-thread shape, reused for feedback instead of
+    experience: a full queue drops rather than blocks (the same "never make `POST /v1/feedback`'s caller wait
+    on a disk write" reasoning section 8 already applies to the request path), and writing happens only on
+    the background thread. One file per UTC date under ``root`` directly -- feedback has no tag of its own
+    (a caller supplies only ``request_id``; which tag it belongs to is only known by joining it back to an
+    `Experience` row, which is `prismyra.learn.fit`'s job, not this log's), so there is no per-tag directory
+    and no `retain_days`-driven purge: a feedback row this small, read only by an offline join, is left for an
+    operator's own retention policy on the log directory as a whole rather than this module inventing a second
+    one.
+    """
+
+    def __init__(self, root: str | Path, *, max_queue: int = 10_000):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._counts = LogStats()
+        self._q: queue.Queue[FeedbackRecord] = queue.Queue(maxsize=max_queue)
+        self._stop = threading.Event()
+        self._open_files: dict[str, TextIO] = {}
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="prismyra-learn-feedback", daemon=True)
+
+    def start(self) -> FeedbackLog:
+        self._thread.start()
+        return self
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+        with self._lock:
+            for fh in self._open_files.values():
+                fh.close()
+            self._open_files.clear()
+
+    def put(self, rec: FeedbackRecord) -> bool:
+        try:
+            self._q.put_nowait(rec)
+            return True
+        except queue.Full:
+            with self._lock:
+                self._counts.dropped += 1
+            return False
+
+    def queue_depth(self) -> int:
+        return self._q.qsize()
+
+    def stats(self) -> dict:
+        with self._lock:
+            return self._counts.as_dict(self.queue_depth())
+
+    def _run(self) -> None:
+        while not self._stop.is_set() or not self._q.empty():
+            try:
+                rec = self._q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._write(rec)
+            except OSError:
+                with self._lock:
+                    self._counts.dropped += 1
+
+    def _write(self, rec: FeedbackRecord) -> None:
+        date = _date_str(rec.ts)
+        fh = self._open_files.get(date)
+        if fh is None:
+            fh = (self.root / f"{date}.jsonl").open("a", encoding="utf-8")
+            with self._lock:
+                self._open_files[date] = fh
+        fh.write(json.dumps(rec.to_json(), ensure_ascii=False) + "\n")
+        fh.flush()
+        with self._lock:
+            self._counts.logged += 1
+
+
+def load_feedback(root: str | Path) -> dict[str, FeedbackRecord]:
+    """Every `FeedbackRecord` under ``root`` (a `FeedbackLog`'s own directory), keyed by `request_id`, latest
+    write wins -- `prismyra.learn.fit`'s join step, and `prismyra.learn.idle`'s idle-time retraining, both
+    read this once per run rather than re-implementing the same directory scan.
+    """
+    root = Path(root)
+    out: dict[str, FeedbackRecord] = {}
+    if not root.is_dir():
+        return out
+    for path in sorted(root.glob("*.jsonl")):
+        with path.open("r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                stripped = raw_line.strip()
+                if stripped:
+                    rec = FeedbackRecord.from_json(json.loads(stripped))
+                    out[rec.request_id] = rec
+    return out
+
+
+class ExperienceSource(Protocol):
+    """The read side of `ExperienceSink`: where `prismyra.learn.fit` and `prismyra.learn.idle` get the
+    `Experience` rows they train on, decoupled from *how* those rows are stored. `LocalExperienceSource`
+    (below) reads the same on-disk layout `LocalExperienceLog` writes; a second implementation can read
+    from anywhere else that can produce the same objects -- `prismyra.learn.http_source.
+    HttpPullExperienceSource` is the one this project ships, a generic paginated HTTP/JSON puller rather
+    than one tied to a specific destination's own API, because the read side should not have to be rewritten
+    for every place `ExperienceSink` could plausibly have written to.
+
+    ``since`` filters to rows with ``Experience.ts >= since`` when given; every implementation applies the
+    same filter, so a caller joining feedback by `request_id` (`load_feedback`, above) gets the same
+    join regardless of which source produced the rows on the other side of it.
+    """
+
+    def iter_experiences(self, task: str, *, since: float | None = None) -> Iterator[Experience]: ...
+
+
+class LocalExperienceSource:
+    """Reads `LocalExperienceLog`'s own on-disk layout: ``root/<task>/<YYYY-MM-DD>.jsonl``, oldest file
+    first. This is `prismyra.learn.fit`'s original, inline directory scan, promoted to a named class that
+    implements `ExperienceSource` -- every existing caller that passed a bare `log_dir` path keeps working
+    unchanged; `run()` builds one of these itself when no other `ExperienceSource` is given.
+    """
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+
+    def iter_experiences(self, task: str, *, since: float | None = None) -> Iterator[Experience]:
+        tag_dir = self.root / task
+        if not tag_dir.is_dir():
+            return
+        for path in sorted(tag_dir.glob("*.jsonl")):
+            with path.open("r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+                    exp = Experience.from_json(json.loads(stripped))
+                    if since is None or exp.ts >= since:
+                        yield exp
+
+
 class _RayLogActorBody:
     """The actor's own methods, as a plain class. Not decorated with ``@ray.remote`` at class-definition time --
     that would run ``ray.remote`` (and so touch the ``ray`` import machinery) the moment this *module* is
@@ -244,7 +523,7 @@ class _RayLogActorBody:
         return self._inner.queue_depth()
 
     def stats(self) -> dict:
-        return self._inner.stats.as_dict(self._inner.queue_depth())
+        return self._inner.stats()
 
     def stop(self) -> None:
         self._inner.stop()

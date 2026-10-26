@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.8
+
+Stage 4 of the learning layer ([docs/LEARN.md](docs/LEARN.md)) can now switch a registered tag's live
+traffic between Prismyra and its own distilled student. Five routing strategies share one deterministic
+rule (`hash(tag, normalized input) mod 10000 < ratio`): a fixed split, a ratio that ramps up over time, a
+shadow mode that always runs the student for comparison but never serves its answer, a confidence threshold
+that only lets the student answer when its own top probability clears a bar, and a bandit that picks among
+a configured set of ratios by their own observed agreement rate. An audited sample of both directions feeds
+a rollback: a tag's ratio is cut back to zero and held there for a cooldown period the moment the audited
+agreement rate or the input's own drift (a population stability index over a hashed feature histogram)
+crosses a configured bound. A routed response carries `served_by` and `request_id`; `POST /v1/feedback`
+attaches a gold label or a reward to that id after the fact, and a labelled row trains on the label directly
+instead of the teacher's own probabilities. `POST /v1/learn/reload` hot-swaps a newly admitted student
+without restarting the process, and the new `prismyra-learn-idle` console script drives that loop on its
+own: it polls the server's queue depth, waits for it to be idle, and refits one due tag at a time in a
+separate, deliberately deprioritised process. None of this changes an unrouted tag's behaviour, and an
+unrouted request remains byte-identical to this layer not existing at all.
+
+The experience log's write and read sides are now each one small interface
+(`prismyra.learn.experience.ExperienceSink`/`ExperienceSource`) rather than a fact built into how a server
+logs or a student trains: a local JSONL file is still the default on both sides, an OTel log sink and a
+generic paginated HTTP pull source are the second implementation of each, and more than one sink can run at
+once.
+
+A new `prismyra.telemetry` package adds optional, off-by-default observability for the server's own
+operation -- request counts and latency, queue depth, rejected-request counts, and a span per request --
+over OTLP to an operator's own collector, plus a dependency-free `/metrics` endpoint that always works. It
+never carries a request's own content, and it shares no data path with the learning layer's own experience
+log even when both are turned on at once.
+
 ## 0.4.7
 
 An optional, off-by-default learning layer lets an operator register a closed, versioned

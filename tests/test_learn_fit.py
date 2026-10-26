@@ -10,6 +10,7 @@ import pytest
 from prismyra.learn.experience import Experience
 from prismyra.learn.fit import (
     FitError,
+    _soft_rows,
     argmax,
     dedup,
     run,
@@ -82,6 +83,105 @@ def synthetic_rows(n_per_class=40):
 
 def test_argmax():
     assert argmax({"a": 0.1, "b": 0.9}) == "b"
+
+
+# --------------------------------------------------------------------------- stage 4: feedback overrides the
+# teacher's soft label for a row whose request_id has one (DISTILL-RL-DESIGN-v2.md section 2's "報酬かラベル
+# (あれば)", POST /v1/feedback's own join). `_soft_rows` touches no LightGBM at all, so these need no
+# importorskip.
+
+
+def test_soft_rows_without_feedback_expands_every_nonzero_option():
+    from prismyra.learn.experience import Experience
+    from prismyra.learn.features import Vectorizer
+
+    exp = Experience(
+        tag="t",
+        spec_version="v",
+        ts=1.0,
+        context="doc",
+        question="q",
+        options=("negative", "positive"),
+        kind="noul",
+        probabilities={"negative": 0.3, "positive": 0.7},
+        answered_by="prismyra",
+        versions={},
+    )
+    vec = Vectorizer.fit([("doc", "q")], features_name=None, dims=8)
+    _x_rows, y_rows, w_rows = _soft_rows([exp], ("negative", "positive"), vec)
+    assert y_rows == [0, 1]
+    assert w_rows == [0.3, 0.7]
+
+
+def test_soft_rows_with_a_matching_feedback_label_uses_a_single_hard_row():
+    from prismyra.learn.experience import Experience, FeedbackRecord
+    from prismyra.learn.features import Vectorizer
+
+    exp = Experience(
+        tag="t",
+        spec_version="v",
+        ts=1.0,
+        context="doc",
+        question="q",
+        options=("negative", "positive"),
+        kind="noul",
+        probabilities={"negative": 0.95, "positive": 0.05},  # the teacher got this one wrong
+        answered_by="prismyra",
+        versions={},
+        request_id="r1",
+    )
+    feedback = {"r1": FeedbackRecord(request_id="r1", ts=1.0, label="positive")}
+    vec = Vectorizer.fit([("doc", "q")], features_name=None, dims=8)
+    _x_rows, y_rows, w_rows = _soft_rows([exp], ("negative", "positive"), vec, feedback=feedback)
+    assert y_rows == [1]  # "positive" -- the gold label, not the teacher's own probabilities
+    assert w_rows == [1.0]
+
+
+def test_soft_rows_ignores_feedback_for_an_experience_with_no_request_id():
+    from prismyra.learn.experience import Experience, FeedbackRecord
+    from prismyra.learn.features import Vectorizer
+
+    exp = Experience(
+        tag="t",
+        spec_version="v",
+        ts=1.0,
+        context="doc",
+        question="q",
+        options=("negative", "positive"),
+        kind="noul",
+        probabilities={"negative": 0.3, "positive": 0.7},
+        answered_by="prismyra",
+        versions={},
+        # request_id left at its schema-1 default (""), the same as every row logged before stage 4 existed.
+    )
+    feedback = {"r1": FeedbackRecord(request_id="r1", ts=1.0, label="negative")}
+    vec = Vectorizer.fit([("doc", "q")], features_name=None, dims=8)
+    _x_rows, y_rows, w_rows = _soft_rows([exp], ("negative", "positive"), vec, feedback=feedback)
+    assert y_rows == [0, 1]  # unaffected: no request_id means nothing in `feedback` could ever match it
+    assert w_rows == [0.3, 0.7]
+
+
+def test_soft_rows_drops_a_feedback_label_outside_the_tags_own_options():
+    from prismyra.learn.experience import Experience, FeedbackRecord
+    from prismyra.learn.features import Vectorizer
+
+    exp = Experience(
+        tag="t",
+        spec_version="v",
+        ts=1.0,
+        context="doc",
+        question="q",
+        options=("negative", "positive"),
+        kind="noul",
+        probabilities={"negative": 0.3, "positive": 0.7},
+        answered_by="prismyra",
+        versions={},
+        request_id="r1",
+    )
+    feedback = {"r1": FeedbackRecord(request_id="r1", ts=1.0, label="not-an-option")}
+    vec = Vectorizer.fit([("doc", "q")], features_name=None, dims=8)
+    x_rows, y_rows, w_rows = _soft_rows([exp], ("negative", "positive"), vec, feedback=feedback)
+    assert x_rows == [] and y_rows == [] and w_rows == []  # skipped, not guessed at
 
 
 def _simple_exp(context: str, ts: float, probabilities=None) -> Experience:

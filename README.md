@@ -14,7 +14,7 @@ Install, start the server, and ask it something -- in process or over HTTP. `pip
 needs Linux and CUDA for the `fast` extra; drop it to run on the framework's own (slower) fallback instead.
 
 ```bash
-git clone --branch v0.4.7 https://github.com/littlemex/Prismyra
+git clone --branch v0.4.8 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e ".[server,fast]"
 prismyra-serve --host 127.0.0.1 --port 8000 --batcher &
@@ -170,14 +170,14 @@ help and one figure this project published and then withdrew.
 **There is no release on PyPI**, so it installs from the repository, pinned to a tag:
 
 ```bash
-pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.4.7"                  # runs, and leaves every borrowed kernel on its fallback
-pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.4.7"             # the kernels: needs vLLM and Triton, so Linux and CUDA
+pip install "prismyra @ git+https://github.com/littlemex/Prismyra@v0.4.8"                  # runs, and leaves every borrowed kernel on its fallback
+pip install "prismyra[fast] @ git+https://github.com/littlemex/Prismyra@v0.4.8"             # the kernels: needs vLLM and Triton, so Linux and CUDA
 ```
 
 A clone works the same way, checked out at the same tag:
 
 ```bash
-git clone --branch v0.4.7 https://github.com/littlemex/Prismyra
+git clone --branch v0.4.8 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e .                  # runs, and leaves every borrowed kernel on its fallback
 pip install -e ".[fast]"          # the kernels: needs vLLM and Triton, so Linux and CUDA
@@ -494,7 +494,8 @@ replaces, nothing else.
 | [docs/DECIDE.md](docs/DECIDE.md) | `POST /v1/decide`, a JEV-compatible read-out, and how it batches several decisions into one read |
 | [docs/READOUT.md](docs/READOUT.md) | What a probability is, exactly |
 | [docs/HEADS.md](docs/HEADS.md) | A learned read-out for one option set, used only by the questions that declare that set |
-| [docs/LEARN.md](docs/LEARN.md) | Registered tags, a bounded experience log, and an offline-trained student (`--learn-spec`); off by default |
+| [docs/LEARN.md](docs/LEARN.md) | Registered tags, a bounded experience log, an offline-trained student, and switching live traffic to it (`--learn-spec`); off by default |
+| [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) | Server-operation metrics, traces and logs over OTLP (`--otel`); off by default, and a separate concern from `--learn-spec`'s own data |
 | [docs/KERNELS.md](docs/KERNELS.md) | Each replacement, what it is worth, and what was rejected |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | How the numbers were measured and how to reproduce them |
 | [docs/ACCURACY.md](docs/ACCURACY.md) | Whether the answers are right, on public labels, and where they are not |
@@ -512,7 +513,7 @@ that depends on how the work was arranged, so `0.999492` and `0.99974` are the s
 differs from one below, that is worth reporting.
 
 ```bash
-git clone --branch v0.4.7 https://github.com/littlemex/Prismyra
+git clone --branch v0.4.8 https://github.com/littlemex/Prismyra
 cd Prismyra
 pip install -e ".[server,fast]"
 prismyra-serve --host 127.0.0.1 --port 8000

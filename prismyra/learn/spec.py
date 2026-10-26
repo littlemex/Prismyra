@@ -45,8 +45,26 @@ REQUIRED_FIELDS = frozenset(
 #: type is validated here -- an unregistered name is a refusal at fit time (``prismyra.learn.features``), not at
 #: spec-load time. ``"min_match_rate"`` and ``"min_accuracy_ratio"`` override, for this one tag, the two
 #: admission-condition defaults below (``DEFAULT_MIN_MATCH_RATE``, ``DEFAULT_MIN_ACCURACY_RATIO``) that
-#: ``prismyra.learn.fit.run`` otherwise applies to every tag.
-OPTIONAL_FIELDS = frozenset({"features", "min_match_rate", "min_accuracy_ratio"})
+#: ``prismyra.learn.fit.run`` otherwise applies to every tag. ``"router"`` and ``"retain_context"`` are stage 4
+#: (DISTILL-RL-DESIGN-v2.md section 4): a tag with neither keeps meaning exactly what it meant before either
+#: field existed -- no ``"router"`` means `prismyra.learn.router.decide` is never consulted for that tag, and
+#: every one of its requests goes to Prismyra exactly as stage 1/2 always sent it.
+OPTIONAL_FIELDS = frozenset({"features", "min_match_rate", "min_accuracy_ratio", "router", "retain_context"})
+
+#: Stage 4's own closed vocabulary of routing strategies (docs/LEARN.md's "Stage 4" section has the full account
+#: of each). Closed for the same reason `NORMALIZE_RULES` is: a typo'd mode string is a refusal at load time,
+#: not a tag that silently never routes anything.
+ROUTER_MODES = frozenset({"ab", "ramp", "shadow", "confidence", "bandit"})
+
+#: How much of a tag's own `context` survives into its logged experience (section 8's "個人情報が入りうる
+#: context を残すかどうかは、既存の retain_days と keep_hidden と同じく spec で決める"). `"full"` -- the only
+#: behaviour stage 1/2 ever had -- stores the raw context exactly as before. `"features_only"` drops it and
+#: keeps only the already-vectorised features a loaded student's own artifact can produce (nothing to keep
+#: before a tag has one, in which case this degrades to `"none"`'s own behaviour for that record). `"none"`
+#: drops the context and keeps only `feature_summary`'s lossy drift histogram. See
+#: `prismyra.learn.hook.LearnHook.submit` for where this is applied -- never in this module, which validates
+#: the *setting*, not a request.
+RETAIN_CONTEXT_RULES = frozenset({"full", "features_only", "none"})
 
 #: The one place a student's admission bar is a number. ``prismyra.learn.fit.run`` reads these -- never a
 #: literal of its own -- for any tag whose entry does not set ``"min_match_rate"``/``"min_accuracy_ratio"``.
@@ -75,6 +93,48 @@ class SpecError(Exception):
     """
 
 
+#: Stage 4's own defaults, defined once here for the same reason `DEFAULT_MIN_MATCH_RATE` is: a tag's entry
+#: overrides what it needs to, everything else inherits a value that is never retyped at each call site.
+DEFAULT_RAMP_STEP = 500
+DEFAULT_RAMP_INTERVAL_S = 300.0
+DEFAULT_RAMP_MIN_RATIO = 0
+DEFAULT_RAMP_MAX_RATIO = 10_000
+DEFAULT_AUDIT_MIN_FRACTION = 50
+DEFAULT_AUDIT_MAX_FRACTION = 2_000
+DEFAULT_ROLLBACK_MIN_MATCH_RATE = 0.85
+DEFAULT_ROLLBACK_MAX_DRIFT = 0.35
+DEFAULT_ROLLBACK_COOLDOWN_S = 900.0
+
+
+@dataclass(frozen=True)
+class RouterConfig:
+    """Stage 4's switch for one tag (DISTILL-RL-DESIGN-v2.md section 4). Parsed from a tag entry's own
+    ``"router"`` object; absent entirely for a tag that has not opted in, which is what keeps every tag written
+    before this field existed meaning exactly what it meant before -- see `prismyra.learn.router`'s own
+    docstring for how each `mode` uses these numbers.
+
+    ``ratio``, every ``*_fraction`` and every ``*_ratio`` in this dataclass is a count per 10,000
+    (`DISTILL-RL-DESIGN-v2.md`'s own `hash(...) mod 10000 < ratio`), an integer, not a float: a float ratio
+    compared against an integer hash bucket is exactly the kind of binary-rounding mismatch that would make
+    "the same input always takes the same path" stop being quite true at the edges.
+    """
+
+    mode: str
+    student_path: str
+    ratio: int = 0
+    tau: float | None = None
+    ramp_step: int = DEFAULT_RAMP_STEP
+    ramp_interval_s: float = DEFAULT_RAMP_INTERVAL_S
+    ramp_min_ratio: int = DEFAULT_RAMP_MIN_RATIO
+    ramp_max_ratio: int = DEFAULT_RAMP_MAX_RATIO
+    audit_min_fraction: int = DEFAULT_AUDIT_MIN_FRACTION
+    audit_max_fraction: int = DEFAULT_AUDIT_MAX_FRACTION
+    rollback_min_match_rate: float = DEFAULT_ROLLBACK_MIN_MATCH_RATE
+    rollback_max_drift: float = DEFAULT_ROLLBACK_MAX_DRIFT
+    rollback_cooldown_s: float = DEFAULT_ROLLBACK_COOLDOWN_S
+    bandit_arms: tuple[int, ...] = ()
+
+
 @dataclass(frozen=True)
 class TagSpec:
     """One registered tag, exactly as section 1 of the design describes it."""
@@ -90,6 +150,8 @@ class TagSpec:
     features: str | None = None
     min_match_rate: float = DEFAULT_MIN_MATCH_RATE
     min_accuracy_ratio: float = DEFAULT_MIN_ACCURACY_RATIO
+    retain_context: str = "full"
+    router: RouterConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +187,136 @@ def _check_admission_fraction(path: Path, where: str, field: str, value: object)
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0.0 < value <= 1.0):
         _fail(path, where, f"{field!r} must be a number in (0, 1], got {value!r}")
     return float(value)
+
+
+def _check_fraction_int(path: Path, where: str, field: str, value: object, *, max_value: int = 10_000) -> int:
+    """``ratio`` and every stage 4 ``*_fraction`` share one shape: an integer count per 10,000, in
+    ``[0, max_value]``."""
+    if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= max_value):
+        _fail(path, where, f"{field!r} must be an integer in [0, {max_value}], got {value!r}")
+    return value
+
+
+def _check_positive_number(path: Path, where: str, field: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        _fail(path, where, f"{field!r} must be a positive number, got {value!r}")
+    return float(value)
+
+
+def _check_router(path: Path, where: str, raw: dict) -> RouterConfig:
+    """``"router"``'s own nested object. Checked in full, the same discipline every other field on an entry
+    gets: a typo'd mode or a missing ``student_path`` is a refusal to start, not a tag that silently never
+    routes anything to a student. See `prismyra.learn.router` for what each ``mode`` does with these numbers.
+    """
+    where = f"{where}.router"
+    if not isinstance(raw, dict):
+        _fail(path, where, f"must be a JSON object, got {type(raw).__name__}")
+
+    required = {"mode", "student_path"}
+    optional = {
+        "ratio",
+        "tau",
+        "ramp_step",
+        "ramp_interval_s",
+        "ramp_min_ratio",
+        "ramp_max_ratio",
+        "audit_min_fraction",
+        "audit_max_fraction",
+        "rollback_min_match_rate",
+        "rollback_max_drift",
+        "rollback_cooldown_s",
+        "bandit_arms",
+    }
+    missing = required - raw.keys()
+    extra = raw.keys() - required - optional
+    if missing:
+        _fail(path, where, f"missing field(s): {sorted(missing)}")
+    if extra:
+        _fail(path, where, f"unknown field(s): {sorted(extra)} -- the allowed fields are {sorted(required | optional)}")
+
+    mode = raw["mode"]
+    if mode not in ROUTER_MODES:
+        _fail(path, where, f"'mode' must be one of {sorted(ROUTER_MODES)}, got {mode!r}")
+
+    student_path = raw["student_path"]
+    if not isinstance(student_path, str) or not student_path.strip():
+        msg = f"'student_path' must be a non-empty string (a path to a StudentArtifact), got {student_path!r}"
+        _fail(path, where, msg)
+
+    ratio = _check_fraction_int(path, where, "ratio", raw.get("ratio", 0))
+
+    tau = None
+    if "tau" in raw:
+        tau = raw["tau"]
+        if isinstance(tau, bool) or not isinstance(tau, (int, float)) or not (0.0 <= tau <= 1.0):
+            _fail(path, where, f"'tau' must be a number in [0, 1], got {tau!r}")
+        tau = float(tau)
+    if mode == "confidence" and tau is None:
+        _fail(path, where, "mode 'confidence' requires 'tau'")
+
+    bandit_arms: tuple[int, ...] = ()
+    if "bandit_arms" in raw:
+        arms = raw["bandit_arms"]
+        if not isinstance(arms, list) or not arms:
+            _fail(path, where, f"'bandit_arms' must be a non-empty list of integers, got {arms!r}")
+        bandit_arms = tuple(_check_fraction_int(path, where, "bandit_arms[]", a) for a in arms)
+    if mode == "bandit" and not bandit_arms:
+        _fail(path, where, "mode 'bandit' requires a non-empty 'bandit_arms'")
+
+    ramp_step = _check_fraction_int(path, where, "ramp_step", raw.get("ramp_step", DEFAULT_RAMP_STEP))
+    ramp_interval_s = _check_positive_number(
+        path, where, "ramp_interval_s", raw.get("ramp_interval_s", DEFAULT_RAMP_INTERVAL_S)
+    )
+    ramp_min_ratio = _check_fraction_int(
+        path, where, "ramp_min_ratio", raw.get("ramp_min_ratio", DEFAULT_RAMP_MIN_RATIO)
+    )
+    ramp_max_ratio = _check_fraction_int(
+        path, where, "ramp_max_ratio", raw.get("ramp_max_ratio", DEFAULT_RAMP_MAX_RATIO)
+    )
+    if ramp_min_ratio > ramp_max_ratio:
+        _fail(path, where, f"'ramp_min_ratio' ({ramp_min_ratio}) exceeds 'ramp_max_ratio' ({ramp_max_ratio})")
+
+    audit_min_fraction = _check_fraction_int(
+        path, where, "audit_min_fraction", raw.get("audit_min_fraction", DEFAULT_AUDIT_MIN_FRACTION)
+    )
+    audit_max_fraction = _check_fraction_int(
+        path, where, "audit_max_fraction", raw.get("audit_max_fraction", DEFAULT_AUDIT_MAX_FRACTION)
+    )
+    if audit_min_fraction > audit_max_fraction:
+        msg = f"'audit_min_fraction' ({audit_min_fraction}) exceeds 'audit_max_fraction' ({audit_max_fraction})"
+        _fail(path, where, msg)
+
+    rollback_min_match_rate = _check_admission_fraction(
+        path, where, "rollback_min_match_rate", raw.get("rollback_min_match_rate", DEFAULT_ROLLBACK_MIN_MATCH_RATE)
+    )
+    rollback_max_drift = raw.get("rollback_max_drift", DEFAULT_ROLLBACK_MAX_DRIFT)
+    bad_rollback_max_drift = (
+        isinstance(rollback_max_drift, bool)
+        or not isinstance(rollback_max_drift, (int, float))
+        or not (0.0 < rollback_max_drift <= 2.0)
+    )
+    if bad_rollback_max_drift:
+        _fail(path, where, f"'rollback_max_drift' must be a number in (0, 2], got {rollback_max_drift!r}")
+    rollback_cooldown_s = _check_positive_number(
+        path, where, "rollback_cooldown_s", raw.get("rollback_cooldown_s", DEFAULT_ROLLBACK_COOLDOWN_S)
+    )
+
+    return RouterConfig(
+        mode=mode,
+        student_path=student_path,
+        ratio=ratio,
+        tau=tau,
+        ramp_step=ramp_step,
+        ramp_interval_s=ramp_interval_s,
+        ramp_min_ratio=ramp_min_ratio,
+        ramp_max_ratio=ramp_max_ratio,
+        audit_min_fraction=audit_min_fraction,
+        audit_max_fraction=audit_max_fraction,
+        rollback_min_match_rate=rollback_min_match_rate,
+        rollback_max_drift=float(rollback_max_drift),
+        rollback_cooldown_s=rollback_cooldown_s,
+        bandit_arms=bandit_arms,
+    )
 
 
 def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
@@ -189,6 +381,18 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
     if "min_accuracy_ratio" in raw:
         min_accuracy_ratio = _check_admission_fraction(path, where, "min_accuracy_ratio", raw["min_accuracy_ratio"])
 
+    retain_context = "full"
+    if "retain_context" in raw:
+        retain_context = raw["retain_context"]
+        if retain_context not in RETAIN_CONTEXT_RULES:
+            _fail(
+                path, where, f"'retain_context' must be one of {sorted(RETAIN_CONTEXT_RULES)}, got {retain_context!r}"
+            )
+
+    router = None
+    if "router" in raw:
+        router = _check_router(path, where, raw["router"])
+
     return TagSpec(
         task=task,
         question=question,
@@ -201,6 +405,8 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
         features=features,
         min_match_rate=min_match_rate,
         min_accuracy_ratio=min_accuracy_ratio,
+        retain_context=retain_context,
+        router=router,
     )
 
 
