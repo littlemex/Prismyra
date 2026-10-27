@@ -466,6 +466,31 @@ try:
     import triton.language as tl
 
     @triton.jit
+    def _round_bf16_rne(x):
+        """`x.to(tl.bfloat16)` on a float32 value truncates (rounds toward zero) on this Triton build, not the
+        round-to-nearest-even every PyTorch/CUDA bfloat16 kernel uses for the same narrowing. Measured on real
+        hardware while building `_rope_pass_kernel` below: a cell where eager's two separately-rounded multiplies
+        summed to 0.214599609375 in exact arithmetic rounds to 0.21484375 under round-to-nearest-even (the nearer
+        of the two representable neighbours) but to 0.2138671875 under truncation (the plain `.to(tl.bfloat16)`
+        this function replaces) -- the second of those is bit-identical to what `_gated_rms_norm` above is already
+        and silently doing, which is why its own install check (`_swap_gated_norm`) uses a tolerance rather than
+        `torch.equal`: this file already shipped a rounding mismatch at every one of that kernel's two narrowing
+        casts, just never a probe strict enough to see it matter.
+
+        Round-to-nearest-even on the raw bits (IEEE 754's definition, not Triton's native cast): add a bias of
+        `0x7FFF` plus the bit immediately below the cut (so a tie rounds to the even bfloat16, not always up) to
+        the float32's bit pattern, then keep the upper 16 bits. NaN is exempt -- adding to a NaN's mantissa can
+        flip it to infinity, so a NaN is passed through by its own truncating cast instead (`is_nan`'s own value
+        does not depend on which rounding produced it).
+        """
+        bits = x.to(tl.uint32, bitcast=True)
+        lsb = (bits >> 16) & 1
+        rounded = bits + (0x7FFF + lsb)
+        hi = (rounded >> 16).to(tl.uint16)
+        is_nan = x != x  # noqa: PLR0124 - the standard float NaN test, deliberately comparing x with itself
+        return tl.where(is_nan, x.to(tl.bfloat16), hi.to(tl.bfloat16, bitcast=True))
+
+    @triton.jit
     def _gated_rms_norm(X, G, W, Y, N, eps, BLOCK: tl.constexpr):
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK)
@@ -478,8 +503,174 @@ try:
         g = tl.load(G + row * N + cols, mask=mask, other=0.0).to(tl.float32)
         y = scaled * (g * tl.sigmoid(g))
         tl.store(Y + row * N + cols, y.to(tl.bfloat16), mask=mask)
+
+    @triton.jit
+    def _rope_pass_kernel(
+        X,
+        COS,
+        SIN,
+        OUT,
+        stride_x_b,
+        stride_x_h,
+        stride_x_s,
+        stride_x_d,
+        stride_cs_b,
+        stride_cs_s,
+        stride_cs_d,
+        stride_o_b,
+        stride_o_h,
+        stride_o_s,
+        stride_o_d,
+        rotary_dim,
+        head_dim,
+        HALF: tl.constexpr,
+        PASS_BLOCK: tl.constexpr,
+    ):
+        b = tl.program_id(0)
+        s = tl.program_id(1)
+        h = tl.program_id(2)
+
+        half = rotary_dim // 2
+        half_idx = tl.arange(0, HALF)
+        half_mask = half_idx < half
+
+        x_base = X + b * stride_x_b + h * stride_x_h + s * stride_x_s
+        cs_base = COS + b * stride_cs_b + s * stride_cs_s
+        sn_base = SIN + b * stride_cs_b + s * stride_cs_s
+        o_base = OUT + b * stride_o_b + h * stride_o_h + s * stride_o_s
+
+        x1 = tl.load(x_base + half_idx * stride_x_d, mask=half_mask, other=0.0).to(tl.float32)
+        x2 = tl.load(x_base + (half_idx + half) * stride_x_d, mask=half_mask, other=0.0).to(tl.float32)
+        c1 = tl.load(cs_base + half_idx * stride_cs_d, mask=half_mask, other=0.0).to(tl.float32)
+        c2 = tl.load(cs_base + (half_idx + half) * stride_cs_d, mask=half_mask, other=0.0).to(tl.float32)
+        s1 = tl.load(sn_base + half_idx * stride_cs_d, mask=half_mask, other=0.0).to(tl.float32)
+        s2 = tl.load(sn_base + (half_idx + half) * stride_cs_d, mask=half_mask, other=0.0).to(tl.float32)
+
+        # Each multiply is rounded to bfloat16 before the add, the same three roundings
+        # `(q_rot * cos) + (rotate_half(q_rot) * sin)` makes as three separate kernel launches in eager: the two
+        # multiplies each write a bfloat16 tensor, and the add promotes two already-rounded bfloat16 operands and
+        # rounds once more. A fused kernel that instead carried the products in float32 across the add (one
+        # rounding instead of three) is the exact change RUN-speed-compile.md measured moving devset answers by
+        # up to 0.58 -- not a bug, a different and also-valid rounding of the same formula, just not this one.
+        # Every one of these four roundings goes through `_round_bf16_rne`, not the plain `.to(tl.bfloat16)`
+        # Triton itself would apply here (see that function's own docstring for why the plain cast disagrees).
+        m1 = _round_bf16_rne(x1 * c1).to(tl.float32)
+        m2 = _round_bf16_rne((-x2) * s1).to(tl.float32)
+        o1 = _round_bf16_rne(m1 + m2)
+
+        m3 = _round_bf16_rne(x2 * c2).to(tl.float32)
+        m4 = _round_bf16_rne(x1 * s2).to(tl.float32)
+        o2 = _round_bf16_rne(m3 + m4)
+
+        tl.store(o_base + half_idx * stride_o_d, o1, mask=half_mask)
+        tl.store(o_base + (half_idx + half) * stride_o_d, o2, mask=half_mask)
+
+        # The channels beyond `rotary_dim` ("q_pass"/"k_pass" in `apply_rotary_pos_emb`) are untouched by rope and
+        # only ever concatenated back in eager -- an identity copy, folded into this launch instead of a separate
+        # `torch.cat` kernel.
+        pass_n = head_dim - rotary_dim
+        pass_idx = tl.arange(0, PASS_BLOCK)
+        pass_mask = pass_idx < pass_n
+        p = tl.load(x_base + (rotary_dim + pass_idx) * stride_x_d, mask=pass_mask, other=0.0)
+        tl.store(o_base + (rotary_dim + pass_idx) * stride_o_d, p, mask=pass_mask)
+
+    @triton.jit
+    def _finish_glue_kernel(
+        OUT,
+        GATE,
+        Y,
+        stride_out_row,
+        stride_out_col,
+        stride_gate_row,
+        stride_gate_col,
+        N,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < N
+        o = tl.load(OUT + row * stride_out_row + cols * stride_out_col, mask=mask, other=0.0).to(tl.float32)
+        g = tl.load(GATE + row * stride_gate_row + cols * stride_gate_col, mask=mask, other=0.0).to(tl.float32)
+        # Two roundings, matching eager's two kernels: `torch.sigmoid(gate)` writes a bfloat16 tensor on its own,
+        # and the elementwise multiply against it rounds again on its own output. Both go through
+        # `_round_bf16_rne`, for the same reason `_rope_pass_kernel` does.
+        sig = _round_bf16_rne(tl.sigmoid(g)).to(tl.float32)
+        y = _round_bf16_rne(o * sig)
+        tl.store(Y + row * N + cols, y, mask=mask)
+
 except ImportError:  # pragma: no cover - the adapter checks for triton before installing this
     _gated_rms_norm = None
+    _rope_pass_kernel = None
+    _finish_glue_kernel = None
+
+
+def _rope_glue_apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """`apply_rotary_pos_emb` for one tensor (query or key), as one kernel launch instead of eager's per-half
+    multiply/multiply/add/cat. See `_rope_pass_kernel`'s own comment for why this is bit-exact and not an
+    approximation: it performs the identical sequence of roundings, in the identical order, that eager's separate
+    kernels already perform -- it only stops paying for a kernel launch and a memory round-trip between each one.
+    """
+    batch, heads, seq, head_dim = x.shape
+    rotary_dim = cos.shape[-1]
+    half = rotary_dim // 2
+    out = torch.empty_like(x)
+    half_block = triton.next_power_of_2(max(half, 1))
+    pass_n = head_dim - rotary_dim
+    pass_block = triton.next_power_of_2(max(pass_n, 1))
+    grid = (batch, seq, heads)
+    _rope_pass_kernel[grid](
+        x,
+        cos,
+        sin,
+        out,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        cos.stride(0),
+        cos.stride(1),
+        cos.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        rotary_dim,
+        head_dim,
+        HALF=half_block,
+        PASS_BLOCK=pass_block,
+    )
+    return out
+
+
+def _rope_glue(query: torch.Tensor, key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """Drop-in replacement for `apply_rotary_pos_emb(query, key, cos, sin)`, installed only after
+    `_verify_attn_glue` has checked it bit-exact against that function on a synthetic probe."""
+    return _rope_glue_apply(query, cos, sin), _rope_glue_apply(key, cos, sin)
+
+
+def _finish_glue_apply(out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """Drop-in replacement for `out.reshape(*shape, -1).contiguous() * torch.sigmoid(gate)`, as one kernel launch.
+    `out`/`gate` are read through their own strides, so a non-contiguous `out` costs nothing extra here that the
+    eager `.contiguous()` call would not already have paid -- this kernel never materialises that defensive copy."""
+    width = gate.shape[-1]
+    o = out.reshape(-1, width)
+    g = gate.reshape(-1, width)
+    rows = g.shape[0]
+    y = torch.empty((rows, width), dtype=torch.bfloat16, device=o.device)
+    block = triton.next_power_of_2(width)
+    _finish_glue_kernel[(rows,)](
+        o,
+        g,
+        y,
+        o.stride(0),
+        o.stride(1),
+        g.stride(0),
+        g.stride(1),
+        width,
+        BLOCK=block,
+        num_warps=max(1, min(8, block // 256)),
+    )
+    return y.view(gate.shape)
 
 
 def _swap_gated_norm(applied, root: nn.Module) -> None:
@@ -535,6 +726,15 @@ class FlashAttention(nn.Module):
     position's answer is never read.
     """
 
+    #: Set once, by `_verify_attn_glue`, to whether the hand-written Triton kernel below agreed bit-for-bit with
+    #: `apply_rotary_pos_emb`/the sigmoid-gate on a synthetic probe. Class-level rather than per-instance: the
+    #: question the probe answers ("does this kernel round where the framework rounds, on this dtype and this
+    #: head/rotary geometry") does not depend on which layer is asking, only on the one adapter install that ran
+    #: the probe. `False` until that install happens, so a `FlashAttention` built without going through
+    #: `Qwen3MoeAdapter.replace()` (a stray construction in a test, say) keeps the framework's own arithmetic.
+    _rope_glue_ok = False
+    _finish_glue_ok = False
+
     def __init__(self, inner: nn.Module):
         super().__init__()
         self.inner = inner
@@ -555,12 +755,18 @@ class FlashAttention(nn.Module):
         key = a.k_norm(a.k_proj(hidden_states).view(heads)).transpose(1, 2)
         value = a.v_proj(hidden_states).view(heads).transpose(1, 2)
         cos, sin = position_embeddings
-        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+        if FlashAttention._rope_glue_ok and query.dtype == torch.bfloat16 and len(shape) == 2:
+            query, key = _rope_glue(query, key, cos, sin)
+        else:
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
         return query, key, value, gate.reshape(*shape, -1), shape
 
     def _finish(self, out, gate, shape):
         a = self.inner
-        attn = out.reshape(*shape, -1).contiguous() * torch.sigmoid(gate)
+        if FlashAttention._finish_glue_ok and out.dtype == torch.bfloat16 and gate.dtype == torch.bfloat16:
+            attn = _finish_glue_apply(out.reshape(*shape, -1), gate)
+        else:
+            attn = out.reshape(*shape, -1).contiguous() * torch.sigmoid(gate)
         return a.o_proj(attn), None
 
     def forward(
@@ -713,6 +919,100 @@ class FlashAttention(nn.Module):
             causal=True,
         )
         return self._finish(out[0] if isinstance(out, tuple) else out, gate, shape)
+
+
+def _verify_attn_glue(applied: Applied, decoder) -> None:
+    """Check the two hand-written Triton kernels above (`_rope_pass_kernel`, `_finish_glue_kernel`) against the
+    framework's own `apply_rotary_pos_emb` and sigmoid-gate, once, on a synthetic probe, before any `FlashAttention`
+    instance is allowed to call either.
+
+    `torch.equal` rather than a tolerance, unlike `_swap_and_verify`/`_swap_gated_norm`: those compare two
+    implementations that round at different points by construction (the borrowed kernel accumulates differently
+    than the framework's own float32-then-round), so a tolerance is the only question that makes sense to ask.
+    These two kernels were written to round at exactly the same points eager's own separate kernels round at (see
+    their own comments), so the claim is bit-identity, and bit-identity is what gets checked -- a looser bar would
+    hide a rounding-order mistake in exactly the shape RUN-speed-compile.md already found one in.
+
+    The probe uses odd-sized `batch`/`seq` (2, 37) on purpose, so a coincidence that only holds for a round number
+    does not pass unnoticed. Geometry (`head_dim`, `rotary_dim`, head counts) comes from the decoder config rather
+    than a guess, the same way `_delta_inputs` reads its shapes from the config instead of remembering them.
+    """
+    if _rope_pass_kernel is None or _finish_glue_kernel is None:
+        applied.skipped.append("attn_glue: triton is not available")
+        FlashAttention._rope_glue_ok = False
+        FlashAttention._finish_glue_ok = False
+        return
+    if not torch.cuda.is_available():
+        applied.skipped.append("attn_glue: no CUDA device to verify the kernel on")
+        FlashAttention._rope_glue_ok = False
+        FlashAttention._finish_glue_ok = False
+        return
+
+    device = torch.device("cuda")
+    head_dim = int(decoder.head_dim)
+    partial = float((decoder.rope_parameters or {}).get("partial_rotary_factor", 1.0))
+    rotary_dim = int(head_dim * partial)
+    n_heads = int(decoder.num_attention_heads)
+    n_kv_heads = int(decoder.num_key_value_heads)
+    batch, seq = 2, 37
+
+    withheld = _withheld()
+
+    if "attn_glue_rope" in withheld:
+        applied.skipped.append("attn_glue_rope: withheld by PRISMYRA_WITHOUT")
+        FlashAttention._rope_glue_ok = False
+    else:
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import apply_rotary_pos_emb
+
+        generator = torch.Generator(device="cpu").manual_seed(head_dim * 1_000 + rotary_dim)
+        q = (torch.randn(batch, n_heads, seq, head_dim, generator=generator) * 0.3).to(
+            device=device, dtype=torch.bfloat16
+        )
+        k = (torch.randn(batch, n_kv_heads, seq, head_dim, generator=generator) * 0.3).to(
+            device=device, dtype=torch.bfloat16
+        )
+        angle = torch.rand(batch, seq, rotary_dim, generator=generator) * 6.283185307179586
+        cos = angle.cos().to(device=device, dtype=torch.bfloat16)
+        sin = angle.sin().to(device=device, dtype=torch.bfloat16)
+        try:
+            with torch.inference_mode():
+                want_q, want_k = apply_rotary_pos_emb(q, k, cos, sin)
+                got_q, got_k = _rope_glue(q, k, cos, sin)
+            rope_ok = torch.equal(want_q, got_q) and torch.equal(want_k, got_k)
+        except Exception as e:  # noqa: BLE001 - a probe that cannot run at all is a resource question, not a finding
+            _reraise_if_resource_exhausted(e, "attn_glue_rope")
+            applied.skipped.append(f"attn_glue_rope left alone: {type(e).__name__}: {e}")
+            rope_ok = False
+        FlashAttention._rope_glue_ok = rope_ok
+        if rope_ok:
+            applied.swaps.append(Swap("attn_glue_rope", 1, None, verified="bit-exact on a synthetic probe"))
+        else:
+            applied.skipped.append("attn_glue_rope: disagreed with apply_rotary_pos_emb on the probe, left alone")
+
+    if "attn_glue_finish" in withheld:
+        applied.skipped.append("attn_glue_finish: withheld by PRISMYRA_WITHOUT")
+        FlashAttention._finish_glue_ok = False
+    else:
+        width = n_heads * head_dim
+        generator = torch.Generator(device="cpu").manual_seed(width)
+        out = (torch.randn(batch * seq, n_heads, head_dim, generator=generator) * 0.3).to(
+            device=device, dtype=torch.bfloat16
+        )
+        gate = (torch.randn(batch, seq, width, generator=generator) * 0.3).to(device=device, dtype=torch.bfloat16)
+        try:
+            with torch.inference_mode():
+                want = out.reshape(batch, seq, -1).contiguous() * torch.sigmoid(gate)
+                got = _finish_glue_apply(out.reshape(batch, seq, -1), gate)
+            finish_ok = torch.equal(want, got)
+        except Exception as e:  # noqa: BLE001
+            _reraise_if_resource_exhausted(e, "attn_glue_finish")
+            applied.skipped.append(f"attn_glue_finish left alone: {type(e).__name__}: {e}")
+            finish_ok = False
+        FlashAttention._finish_glue_ok = finish_ok
+        if finish_ok:
+            applied.swaps.append(Swap("attn_glue_finish", 1, None, verified="bit-exact on a synthetic probe"))
+        else:
+            applied.skipped.append("attn_glue_finish: disagreed with the sigmoid-gate on the probe, left alone")
 
 
 #: Replacements named here are not installed, and the skip says so. A measurement tool, not a feature: the only honest
@@ -1181,6 +1481,11 @@ class Qwen3MoeAdapter:
                     expected["attention"],
                 )
             )
+            # The two Triton kernels every installed `FlashAttention` can now call (`_project`'s rope, `_finish`'s
+            # sigmoid-gate), gated on the bit-exact probe above rather than on `attention`'s own count: a model with
+            # zero attention layers this adapter recognised still has nothing calling either kernel, and the probe
+            # ran and decided correctly in that case too, so there is nothing to fold it into.
+            _verify_attn_glue(applied, decoder)
             # Counted by neither of these two: found by structure, so verified against what they replace instead. The
             # normalisation is offered both scale conventions and keeps whichever agrees to a rounding step.
             _swap_and_verify(
