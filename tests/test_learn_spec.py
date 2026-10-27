@@ -235,3 +235,31 @@ def test_an_unknown_student_backend_is_refused(tmp_path):
 def test_an_empty_student_backend_is_refused(tmp_path):
     with pytest.raises(SpecError, match="'student'"):
         load_spec(write(tmp_path, [{**ENTRY, "student": ""}]))
+
+
+# --------------------------------------------------------------------------- the optional "text_tokenizer" field
+
+
+def test_an_entry_without_text_tokenizer_defaults_to_words(tmp_path):
+    spec = load_spec(write(tmp_path, [ENTRY]))
+    assert spec.tags[0].text_tokenizer == "words"
+
+
+def test_an_entry_can_opt_into_a_char_ngram_tokenizer(tmp_path):
+    spec = load_spec(write(tmp_path, [{**ENTRY, "text_tokenizer": "char3"}]))
+    assert spec.tags[0].text_tokenizer == "char3"
+
+
+def test_an_unknown_text_tokenizer_is_refused(tmp_path):
+    with pytest.raises(SpecError, match="'text_tokenizer'"):
+        load_spec(write(tmp_path, [{**ENTRY, "text_tokenizer": "wordpiece"}]))
+
+
+def test_a_char_ngram_tokenizer_below_the_minimum_n_is_refused(tmp_path):
+    with pytest.raises(SpecError, match="'text_tokenizer'"):
+        load_spec(write(tmp_path, [{**ENTRY, "text_tokenizer": "char1"}]))
+
+
+def test_an_empty_text_tokenizer_is_refused(tmp_path):
+    with pytest.raises(SpecError, match="'text_tokenizer'"):
+        load_spec(write(tmp_path, [{**ENTRY, "text_tokenizer": ""}]))

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from .backends import DEFAULT_STUDENT_BACKEND, STUDENT_BACKENDS
+from .features import DEFAULT_TEXT_TOKENIZER, is_valid_text_tokenizer
 
 #: The exact field set an entry must have -- no more, no fewer. Extra fields are refused rather than ignored: a
 #: silently-ignored field is how a typo (``"retain_day"``) ships for weeks before anyone notices retention was
@@ -54,8 +55,14 @@ REQUIRED_FIELDS = frozenset(
 #: `prismyra.learn.backends.StudentBackend` trains and predicts for this tag's stage 2 student
 #: (``prismyra.learn.backends.STUDENT_BACKENDS``, default ``prismyra.learn.backends.DEFAULT_STUDENT_BACKEND``,
 #: i.e. ``"lightgbm"`` -- a tag with no ``"student"`` field keeps meaning exactly what it meant before this
-#: field existed).
-OPTIONAL_FIELDS = frozenset({"features", "min_match_rate", "min_accuracy_ratio", "router", "retain_context", "student"})
+#: field existed). ``"text_tokenizer"`` (``prismyra.learn.features.DEFAULT_TEXT_TOKENIZER``/``is_valid_text_
+#: tokenizer``) picks what the hashed-TF-IDF default tokenizes into -- whole words/JSON leaves (``"words"``,
+#: unchanged default) or character n-grams (``"charN"``) -- and, like ``"features"``, is read but never
+#: enforced against ``"features"``: a tag naming a structured builder *and* a non-default text tokenizer is
+#: not refused, the tokenizer field is simply unused by that branch (`features.Vectorizer`'s own docstring).
+OPTIONAL_FIELDS = frozenset(
+    {"features", "min_match_rate", "min_accuracy_ratio", "router", "retain_context", "student", "text_tokenizer"}
+)
 
 #: Stage 4's own closed vocabulary of routing strategies (docs/LEARN.md's "Stage 4" section has the full account
 #: of each). Closed for the same reason `NORMALIZE_RULES` is: a typo'd mode string is a refusal at load time,
@@ -159,6 +166,7 @@ class TagSpec:
     retain_context: str = "full"
     router: RouterConfig | None = None
     student: str = DEFAULT_STUDENT_BACKEND
+    text_tokenizer: str = DEFAULT_TEXT_TOKENIZER
 
 
 @dataclass(frozen=True)
@@ -406,6 +414,16 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
         if student not in STUDENT_BACKENDS:
             _fail(path, where, f"'student' must be one of {sorted(STUDENT_BACKENDS)}, got {student!r}")
 
+    text_tokenizer = DEFAULT_TEXT_TOKENIZER
+    if "text_tokenizer" in raw:
+        text_tokenizer = raw["text_tokenizer"]
+        if not isinstance(text_tokenizer, str) or not is_valid_text_tokenizer(text_tokenizer):
+            _fail(
+                path,
+                where,
+                f"'text_tokenizer' must be 'words' or 'charN' for an integer N >= 2, got {text_tokenizer!r}",
+            )
+
     return TagSpec(
         task=task,
         question=question,
@@ -421,6 +439,7 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
         retain_context=retain_context,
         router=router,
         student=student,
+        text_tokenizer=text_tokenizer,
     )
 
 

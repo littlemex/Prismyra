@@ -194,6 +194,177 @@ XGBoost adds is a second, real, interchangeable implementation behind the same a
 router -- comparable accuracy on both tasks above, and router-level latency indistinguishable from LightGBM's
 once HTTP and request handling are in the measurement, which is what a caller of `/v1/decide` actually pays.
 
+### Round 2 (2026-10-27, same day): where the 43 ms actually went, a reused task that really admits, and character n-grams
+
+The round above measured a student-served `/v1/decide` request at 43 ms (HTTP included) against Prismyra's
+own 81 ms -- about 1.9x faster, not the order of magnitude a CPU-only prediction should be capable of. This
+round traced that gap and found most of it was never the booster's own cost at all.
+
+**`prismyra.decide.choice_labels` was recomputed on every single `/v1/decide` request with a `choice` item**,
+including one a router answers from the student alone, without the engine, in well under a millisecond
+otherwise -- `decide_many` called it unconditionally, before even asking whether a router was configured.
+Measured directly against this project's own real tokenizer
+(`littlemex/prismyra-decision-35b-a3b-fp8`, the same build used throughout this document), with the real call
+shape production code actually makes (`choice_labels(engine.tokenizer)`, i.e. `limit=255`, the default --
+this tokenizer only has 68 single-token labels available at all, so `usable(255)` fails and the full binary
+search runs every time):
+
+| | p50 | n |
+|---|---|---|
+| uncached (before this round's fix) | 21.46 ms | 20 |
+| cached (after) | 0.00033 ms (0.33 us) | 2,000 |
+
+A ~65,000x difference, paid on every request before this round, now paid once per tokenizer for the life of
+the process. Fixed with a `weakref.WeakKeyDictionary` keyed on the tokenizer object itself, not `id(tokenizer)`
+-- a plain dict keyed by a recycled id would silently serve a different tokenizer's cached labels once the
+original was garbage-collected, which the weak-reference key rules out by construction instead of bounding
+with eviction. `tests/test_decide.py`'s `test_choice_labels_is_cached_per_tokenizer_and_limit`,
+`test_choice_labels_cache_is_keyed_by_limit_too` and
+`test_choice_labels_cache_does_not_confuse_two_different_tokenizers` pin this.
+
+With the fix warm (10 requests of warm-up, matching this document's own measurement convention), a real,
+unrouted `/v1/decide` request (53 short options, answered by Prismyra alone -- no student, no router
+configured at all) measured over real HTTP on the same L40S: p50 53.95 ms, p99 54.52 ms, min 53.53 ms, max
+55.16 ms, n=150. Essentially unchanged from this document's own 81 ms/43 ms baseline figures for the
+*engine's* own cost, because once cached, `choice_labels`'s own remaining cost (microseconds) is invisible
+against a ~54 ms GPU forward pass -- the fix's benefit is concentrated entirely on the path where the GPU is
+*not* touched at
+all, where an extra ~21 ms on top of a sub-2-millisecond student-served answer would have been a 10-20x
+regression, not a rounding error. No choice-kind task admitted in this round to measure that exact combination
+live (see below); the two pieces above -- the real uncached-vs-cached tokenizer cost, and the real sub-2 ms
+student-served latency a boolean-kind task (`snake-move-up-v1`, below) achieves once a router is configured
+-- combine to the same conclusion the project's own `/ask` measurement already reached for a different kind
+(RUN-learn-router.md: 1.50 ms student-served, 43.19 ms baseline): once the engine is skipped, the remaining
+per-request cost (JSON, tag matching, router decision, booster prediction, response assembly) is already
+comfortably under 5 ms, and the only thing that was adding double-digit milliseconds to it was this one
+uncached tokenizer probe.
+
+**The router mode-switch bug found running the first round's demo by hand is fixed** -- see "Moving one tag
+between modes across a restart" above for the mechanism; the real-machine re-run is below, alongside the
+backend comparison and the determinism check, against a task that genuinely admits this round.
+
+**A character n-gram text tokenizer** (`"text_tokenizer": "charN"` on a tag's own entry, `N >= 2`) is now an
+alternative to the hashed-word default for the hashed-TF-IDF branch (`prismyra.learn.features.char_ngrams`/
+`tokenize_for`) -- self-implemented, not `scikit-learn` (not already a dependency of this project, and the
+task this round answers asked to implement it directly rather than add one). Measured on a new real task
+below (`banking77-intent-v1`), it made things clearly *worse* for LightGBM and roughly neutral for XGBoost --
+a real, reportable finding about which tokenization a GBDT student actually wants for word-level intent
+classification, not the improvement a text-feature-engineering change is usually reached for.
+
+#### A new task, measured honestly: `banking77-intent-v1`
+
+[`PolyAI/banking77`](https://huggingface.co/datasets/PolyAI/banking77) (CC-BY-4.0, confirmed commercial-use in
+`docs/DATA_PROVENANCE.md`) -- 77 real customer-service banking intents, read from the dataset's own canonical
+source (`raw.githubusercontent.com/PolyAI-LDN/task-specific-datasets/.../banking_data/{train,test}.csv`, the
+exact URL the HF dataset's own now-unsupported loading script reads, not a different or unaudited mirror).
+
+**77 intents do not fit on this build.** A `kind="choice"` item needs one single-token label per option, *and*
+the rendered question has to fit the one-pass reader's widest fixed branch (`prismyra.fork.WIDTHS[-1]` = 512
+tokens, `prismyra.engine.ShelfEngine.validate`). Measured, not assumed: this tokenizer supports only 68
+single-token labels (not JEV's own 255-wide ceiling other tokenizers reach), and even 68's own rendered prompt
+is 635 tokens -- past the 512 limit. The largest count that clears both checks, found by binary search against
+the real tokenizer (`tools/collect_and_fit_xgb2.py`'s `max_choice_options_for_prompt`), is **53**. The 53
+intents kept are the 53 most frequent in the real training file (not an alphabetical cut), which keeps 7,754 of
+10,003 real training rows and 2,120 of 3,080 real test rows.
+
+7,000 of those training rows went through the real engine's `/v1/decide` (tagged, logged, the ordinary path);
+600 gold test rows (never in the training file) were answered directly through `engine.ask`, relabelled
+exactly as a live `/v1/decide` `choice` item is, to build an honest `eval_set`. Held out: 840 of the 7,000
+(12%, de-duplicated down from 7,000 to 7,000 distinct contexts).
+
+**Not admitted, on any of the four combinations tried, at the project's own default 0.90/0.90 bar:**
+
+| backend | text tokenizer | eval accuracy (student) | Prismyra accuracy | held-out agreement (95% lower bound) |
+|---|---|---|---|---|
+| lightgbm | words | 0.233 | 0.343 | 0.682 |
+| lightgbm | char3 | 0.047 | 0.343 | 0.060 |
+| xgboost | words | 0.230 | 0.343 | 0.725 |
+| xgboost | char3 | 0.252 | 0.343 | 0.758 |
+
+A 53-way classification is a harder target than the 3-way sentiment tasks above, and it shows: even the best
+combination here (xgboost/char3, held-out lower bound 0.758) is well short of 0.90. The character-n-gram
+tokenizer is not a free win -- it badly hurt LightGBM (0.047, barely above the 1/53 ≈ 0.019 chance rate) while
+leaving XGBoost roughly where `words` already was, a backend-dependent interaction worth knowing before
+reaching for it on a word-level semantic task like this one (a customer's banking intent turns on whole words
+like "transfer"/"exchange"/"card", not the sub-word patterns a character n-gram scheme is suited to).
+
+The learning curve (lightgbm/words, held-out set and `eval_set` both fixed, only the training prefix size
+changed) is reported as measured, including its own noise, not smoothed:
+
+| train rows | eval accuracy | held-out agreement |
+|---|---|---|
+| 1,500 | 0.052 | 0.157 |
+| 3,000 | 0.220 | 0.656 |
+| 4,500 | 0.037 | 0.100 |
+| 6,160 (full) | 0.233 | 0.713 |
+
+The drop at 4,500 is real, not a typo -- a hashed-TF-IDF LightGBM student on a 53-way target can apparently
+land on a markedly worse split at an intermediate data size than at a smaller one, before recovering at the
+full size. **This task does not admit under this round's data size and feature choices, reported as such.**
+A future round with more logged traffic, a registered structured feature (this task's input is free text, so
+`prismyra.learn.features.register_features` has nothing obviously better to extract than the hashed default
+already does), or a tag-level override of the bar for traffic that genuinely needs a lower one, is left to
+a later round -- the result here is not adjusted to force a pass.
+
+#### A reused task, admitted: `snake-move-up-v1`
+
+learn3/learn4's own structured board features (`tools/snake_features.py`, `"features": "snake_board_v1"`,
+carried over **unmodified**) were re-collected fresh this round -- 4,000 training boards, 400 gold eval
+boards, through the real engine -- rather than reusing artifacts or logs from an earlier round. 3,975 distinct
+boards (3,498 train / 477 held out after a 12% split).
+
+**Admitted for both backends, at the project's own unmodified 0.90/0.90 bar:**
+
+| backend | eval accuracy (student) | Prismyra accuracy | held-out agreement (95% lower bound) | admitted |
+|---|---|---|---|---|
+| lightgbm | 0.800 | 0.790 | 0.970 | yes |
+| xgboost | 0.795 | 0.790 | 0.951 | yes |
+
+Both held-out lower bounds clear 0.90 with real margin (0.970/0.951), and both students' eval accuracy is at
+least Prismyra's own on this fresh gold slice (lightgbm's is actually a touch higher, 0.800 vs 0.790 -- not a
+claim that the student plays Snake better than Prismyra in general, just that it did not lose any accuracy on
+this particular 400-board sample). This is this round's "(a) reuse an already-admitted task" result:
+structured, per-task features registered once (`register_features`) keep working, carry over cleanly to a new
+backend, and admit on a completely fresh sample without re-tuning anything.
+
+#### Router demo, real server, real HTTP (L40S, `snake-move-up-v1`, both admitted artifacts above)
+
+`ab`, `ratio: 10000` (always student), one run per backend, fresh `--learn-log-dir` each, through `/ask`
+(this tag's own `"kind": "boolean"`, not `/v1/decide` -- see `prismyra.server.build_questions`'s own kind
+vocabulary, which is not the same closed set `prismyra.decide`'s JEV-compatible endpoint reads), 60 requests,
+real sockets:
+
+| backend | student-served fraction | p50 (HTTP included) | p99 |
+|---|---|---|---|
+| lightgbm | 100% (60/60) | 1.89 ms | 74.26 ms |
+| xgboost | 100% (60/60) | 2.05 ms | 73.81 ms |
+
+(The one p99 outlier in each run is the first request of the run, not a routing cost -- 59/60 requests in
+each were well under the p50 shown.) Both backends land comfortably under this round's own 5 ms target for a
+student-served request, HTTP included, and are indistinguishable from each other at this precision -- the
+same "booster cost is sub-millisecond either way" conclusion the backend-only table above already reached.
+
+Then, deliberately, the exact sequence that found the mode-switch bug -- `shadow`, then `confidence`, then
+`ramp`, **sharing one `--learn-log-dir` across all three switches**, which is precisely the scenario the fix
+above addresses:
+
+| mode | ratio resolved | student-served | p50 | notes |
+|---|---|---|---|---|
+| `shadow` | 0 | 0/60 (by design) | 54.0 ms | never serves the student; this is Prismyra's own cost |
+| `confidence` (`tau: 0.5`) | **10,000** | 60/60 | 1.95 ms | before the fix, this read back shadow's own `0` literally and served 0/60 |
+| `ramp` (`ramp_step: 2000`, 8s) | 2,000 | 14/60 | 53.9 ms (mixed) | fresh `_initial_ratio` (0) then one immediate tick (+2,000), not confidence's leftover 10,000 or shadow's leftover 0 |
+
+`confidence` resolving to `ratio=10000` here -- not the `0` the pre-fix code would have read back from
+`shadow`'s own state -- is `confidence_ratio_gate`'s "ratio left unset means no extra gate, `tau` decides
+alone" rule finally taking effect on a tag whose state already existed under a different mode, which is
+exactly what RUN-xgb-student.md's own real-hardware finding reported broken. `ramp` resolving to `2,000`
+(`ramp_min_ratio`'s default of `0`, then one tick of `+ramp_step` since `last_tick` for a freshly
+reinitialised state is always due) rather than inheriting confidence's `10,000` is the same fix's other half.
+
+**Determinism**, re-checked this round against the real server (not only the `FakeClock` unit test): the same
+input, five times in one server session, and once more after a full process restart (fresh `prismyra-serve`,
+same artifact) -- all six answers, including `read_by`, were bit-for-bit identical (excluding timing fields).
+
 ## Guarantees
 
 - **Off by default.** No `--learn-spec` means `prismyra.learn` is never imported, and nothing on `/ask` or
@@ -248,13 +419,21 @@ package already keeps. `mode` is one of:
 `audit_min_fraction`/`audit_max_fraction`, and `rollback_min_match_rate`/`rollback_max_drift`/
 `rollback_cooldown_s`.
 
-**Moving one tag between modes across a restart.** `prismyra.learn.controller.Controller`'s state (`ratio`,
-among other things) is keyed by tag name alone and persists under `--learn-log-dir`, independent of which
-`mode` wrote it. A tag moved from `"shadow"` (whose own `ratio` is unused and defaults to `0`) straight to
-`"confidence"` on the same log directory inherits that `0` rather than starting from `confidence_ratio_gate`'s
-"unset means no gate" reading, which only applies to a tag with no saved state yet -- the student then never
-clears `eligible = bucket < ratio` regardless of `tau`. Set `"ratio": 10000` explicitly on the new mode's own
-entry when switching, rather than relying on the field's default.
+**Moving one tag between modes across a restart.** `prismyra.learn.controller.Controller`'s state
+(`prismyra.learn.controller.TagState`) persists under `--learn-log-dir`, one row per tag, and now also
+records which `mode` last (re)initialised it. A tag moved from `"shadow"` (whose own `ratio` is unused and
+defaults to `0`) straight to `"confidence"` on the same log directory used to inherit that `0` literally,
+rather than starting from `confidence_ratio_gate`'s "unset means no gate" reading -- which, before this fix,
+only ever applied to a tag with no saved state at all, so the student never cleared `eligible = bucket <
+ratio` regardless of `tau`. This was found running the real router by hand (switching `shadow` ->
+`confidence` -> `ramp` against one `--learn-log-dir`, 0/60 requests reached the student under `confidence`)
+and is fixed in `Controller._state_for`: a stored `TagState` whose `mode` does not match the mode now being
+resolved is treated as if the tag had never been seen before and reinitialised through `_initial_ratio` for
+*this* mode, rather than reinterpreting a number that was never written for it. An operator switching a
+tag's mode no longer needs to set `"ratio"` explicitly to work around this -- the real-machine demo below
+(2026-10-27, round 2) re-ran exactly this `shadow` -> `confidence` -> `ramp` sequence against one shared log
+directory and confirms it now resolves correctly at every step. `tests/test_learn_controller.py::
+test_switching_mode_reinitialises_ratio_instead_of_carrying_the_old_mode_over` pins the regression.
 
 ### The determinism contract
 

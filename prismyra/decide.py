@@ -54,7 +54,9 @@ on faith.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import weakref
 from dataclasses import dataclass
 
 from .schema import Boolean, Choice, PrismyraError, Question, QuestionError, Scale
@@ -110,6 +112,28 @@ class DecideItem:
     symbols: dict[str, str] | None = None
 
 
+#: ``choice_labels``'s own memo. The result depends on nothing but the tokenizer's vocabulary and ``limit``
+#: -- the *same* two tokenizer calls per candidate, with the *same* outcome, every single time `decide_many`
+#: is asked to answer a `kind="choice"` item. That was the actual shape of the cost: measured on this
+#: project's own real tokenizer, on real hardware, at 21.46 ms (p50) per uncached call, almost entirely
+#: tokenizer encode calls repeated inside `usable`'s binary search -- see `docs/LEARN.md`'s "Round 2"
+#: section (2026-10-27) for the full measurement, including the 0.33-microsecond cached figure. It ran on
+#: *every* `/v1/decide` request with a `choice` item, including ones a router answered from the student
+#: alone, without the engine, in well under a millisecond otherwise. Paying it once per tokenizer and
+#: reusing the answer is exactly the "a router-served request should cost what the router's own work costs,
+#: not what probing the engine's tokenizer costs" fix this exists for.
+#:
+#: A `weakref.WeakKeyDictionary`, not a plain `dict` keyed by `id(tokenizer)`: a server process loads one
+#: tokenizer per engine and keeps it alive for the process's lifetime, so either would work there, but a
+#: *test* process routinely constructs and discards many short-lived tokenizer objects across a run.
+#: `id(tokenizer)` is only unique while `tokenizer` is still alive -- once it is garbage-collected, CPython is
+#: free to hand that same id to the next unrelated object, and a plain dict keyed by that recycled id would
+#: silently hand back a different tokenizer's cached labels. Keying on the object itself, through a weak
+#: reference, means the cache entry disappears the moment its tokenizer does, which rules that out instead of
+#: bounding it with eviction.
+_CHOICE_LABELS_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
 def choice_labels(tokenizer, limit: int = 255) -> list[str]:
     """How many single-token labels this tokenizer can support at once, found the same way JEV's own
     `setup()` finds its A-Z/AA-ZZ pool, but via Prismyra's own check (`readout.plan`) instead of a second,
@@ -122,7 +146,23 @@ def choice_labels(tokenizer, limit: int = 255) -> list[str]:
     at the full candidate count first (cheap when it simply works, which it does on every tokenizer this
     project targets: 702 candidates, Prismyra's own ceiling is 255), falling back to a binary search only
     if that first try fails.
+
+    Memoised (see `_CHOICE_LABELS_CACHE`'s own note): the probing above is pure in ``tokenizer`` and
+    ``limit`` alone, so computing it twice for the same tokenizer object only ever reproduces the same
+    answer slower. A ``tokenizer`` that cannot be weakly referenced (no `__weakref__` slot) falls back to
+    computing the answer uncached rather than failing the call outright -- this project's own tokenizers
+    (and every fake used in this file's own tests) all support it, so this is a defensive fallback, not a
+    path any of this project's own callers are expected to take.
     """
+    try:
+        by_limit = _CHOICE_LABELS_CACHE.get(tokenizer)
+    except TypeError:
+        by_limit = None
+    if by_limit is not None:
+        cached = by_limit.get(limit)
+        if cached is not None:
+            return cached
+
     from .readout import plan
 
     limit = min(limit, len(_LABEL_CANDIDATES))
@@ -136,16 +176,21 @@ def choice_labels(tokenizer, limit: int = 255) -> list[str]:
         return True
 
     if usable(limit):
-        return _LABEL_CANDIDATES[:limit]
-    lo, hi, best = 2, limit, 1
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        if usable(mid):
-            best = mid
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return _LABEL_CANDIDATES[:best]
+        result = _LABEL_CANDIDATES[:limit]
+    else:
+        lo, hi, best = 2, limit, 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if usable(mid):
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        result = _LABEL_CANDIDATES[:best]
+
+    with contextlib.suppress(TypeError):  # tokenizer cannot be weakly referenced -- see this function's own docstring
+        _CHOICE_LABELS_CACHE.setdefault(tokenizer, {})[limit] = result
+    return result
 
 
 def _state_to_context(state) -> str:

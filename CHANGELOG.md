@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.10
+
+Three fixes to stage 4, found running the student path on real hardware a second time:
+
+- **`prismyra.decide.choice_labels` is now cached per tokenizer.** It was being recomputed on every single
+  `/v1/decide` request with a `kind: "choice"` item, including one a router answers from the student alone
+  without ever touching the engine -- on this project's own real tokenizer the uncached cost was 21.46 ms
+  (p50), almost all of a measured 43 ms student-served round trip. Cached, it costs 0.33 microseconds.
+  Memoised with a `weakref.WeakKeyDictionary` keyed on the tokenizer object itself, so a garbage-collected
+  tokenizer's cache entry cannot be served to an unrelated object that happens to reuse its `id()`.
+- **A tag's router can now switch `mode` without carrying over a stale `ratio`.** Running `shadow`, then
+  `confidence`, against the same `--learn-log-dir` used to leave `confidence` reading back `shadow`'s own
+  `ratio=0` literally, instead of `confidence_ratio_gate`'s "unset ratio means no extra gate" rule -- a rule
+  that previously only applied to a brand-new tag. `prismyra.learn.controller.Controller` now records which
+  mode last initialised a tag's state, and reinitialises it through `_initial_ratio` the moment the mode
+  resolving it changes.
+- **A text-feature tag can now ask for character n-grams instead of whole words.** `"text_tokenizer": "charN"`
+  on a tag's own entry (default unchanged, `"words"`) selects `prismyra.learn.features.char_ngrams` for the
+  hashed-TF-IDF branch -- self-implemented rather than a new dependency. Measured on a new real task
+  (`banking77-intent-v1`, 53-way intent classification): it badly hurt LightGBM and left XGBoost roughly
+  unchanged, a backend-dependent finding, not a universal improvement.
+
+See [docs/LEARN.md](docs/LEARN.md#round-2-2026-10-27-same-day-where-the-43-ms-actually-went-a-reused-task-that-really-admits-and-character-n-grams) for the real-machine measurements behind all three, a new task measured honestly as not
+admitted (`banking77-intent-v1`), and a reused task (`snake-move-up-v1`, learn3/learn4's own structured
+features, unmodified) that admits for both student backends on a fresh sample.
+
 ## 0.4.9
 
 Stage 2's student can now be trained and served by XGBoost as well as LightGBM. A tag picks one with its
