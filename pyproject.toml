@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prismyra"
-version = "0.4.8"
+version = "0.4.9"
 description = "Read one context once, then answer many typed questions about it."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -64,6 +64,11 @@ dev = ["pytest>=8.0", "ruff==0.16.8", "mypy>=1.11", "fastapi>=0.115", "httpx>=0.
 # hand needs it. LightGBM's own determinism contract (`deterministic=True`) is documented as same-build,
 # same-instruction-set-only, which is exactly why it was chosen over CatBoost here -- see `prismyra/learn/fit.py`.
 learn = ["lightgbm>=4.0"]
+# The second `prismyra.learn.backends.StudentBackend`, kept as its own extra rather than folded into `learn`:
+# a tag's spec entry picks "lightgbm" or "xgboost" per `prismyra.learn.spec.TagSpec.student`, and an operator
+# running only lightgbm-backed tags has no reason to install xgboost too. `tree_method="hist"` on CPU, with a
+# fixed `seed` and `nthread`, is the determinism contract this backend keeps -- see `prismyra/learn/backends.py`.
+learn-xgb = ["xgboost>=2.0"]
 # `prismyra.telemetry` (server-operation metrics/traces) and `prismyra.learn.otel_sink` (a second
 # `ExperienceSink` that carries tagged request content to an OTel collector instead of, or alongside, a
 # local JSONL file). Neither is a dependency of the library, the server, or `prismyra.learn` itself: with
