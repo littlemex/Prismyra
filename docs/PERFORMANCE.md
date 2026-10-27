@@ -738,6 +738,69 @@ independent shelves on one device** -- lanes are shown not to corrupt answers un
 to raise questions served per second. Treat "concurrent lanes can raise how many requests are served" as the
 direction this is built for, not as a measured result.
 
+## Fused rope and output-gate glue (bit-exact)
+
+Attention's rope rotate (`apply_rotary_pos_emb`) and output-gate multiply (`sigmoid(gate) * out`) were each several
+separate eager kernel launches -- a multiply, a multiply, an add for rope; a sigmoid and a multiply for the gate.
+Two hand-written Triton kernels (`prismyra/kernels/qwen3_moe.py`'s `_rope_glue`/`_finish_glue_apply`) fuse each into
+one launch, reproducing the exact sequence of bf16 roundings eager's separate kernels perform (not a `torch.compile`
+fusion, which lowers the same formula into fewer roundings and is *not* bit-exact against eager -- see the "Tried
+and not kept" note below for why that path was measured and abandoned). Installed only after a synthetic probe
+confirms bit-for-bit agreement with the framework's own arithmetic on this card and this geometry; left alone,
+silently, on a card or build where it does not.
+
+| check | fp8 (L40S) | nvfp4 (RTX PRO 4500) |
+|---|---|---|
+| random shapes (40 trials, batch 1-3, seq 1-199) | 27,644,032 elements, 0 mismatches | 25,705,472 + 1,938,560 elements, 0 mismatches |
+| devset/kev_prod/weak4/tied8, full, on/off toggled in one process | 5,691 rows, 0 mismatches | 5,693 rows, 0 mismatches |
+| `pytest -m gpu` | 50 passed, 5 skipped, 0 failed | (not run as a full suite; the two checks above cover this change directly) |
+
+Speed, same engine with the fusion toggled, 5 alternating rounds, `benchmarks/compare_jev_d1.py`, fp8/L40S:
+
+| questions | fused (on) | unfused (off) | difference |
+|---|---:|---:|---:|
+| 1 | 152.26 ms | 153.28 ms | -0.67% |
+| 16 | 218.02 ms | 219.54 ms | -0.69% |
+| 64 | 304.80 ms | 306.44 ms | -0.54% |
+
+A small, real win (0.5-0.7%), not the one that closes the gap to a serving engine that compiles the whole prefill
+into one graph (below) -- this is the one piece of that gap this package can fuse while keeping every answer
+bit-for-bit identical to before.
+
+### Tried and not kept: a `torch.compile` fusion of the same glue, and a non-deterministic "fast" mode built on it
+
+A caller might reasonably want to trade the determinism guarantee away for more speed than the bit-exact fusion
+above gives, the way a general-purpose serving engine does. Two things were tried under that premise and both
+measured as a net loss once wired against the fusion above (not against plain eager) -- recorded here so a later
+attempt starts from where this one stopped rather than re-measuring the same two dead ends.
+
+* **Compiling the whole backbone forward pass** (closer to how a serving engine fuses an entire prefill into one
+  graph): `torch.compile(backbone.forward, dynamic=True, fullgraph=False)`, with the quantised linear layers marked
+  `torch.compiler.disable()` so Dynamo would treat them as opaque rather than crash tracing into their Triton grid
+  math (which it does, otherwise). Even with that guard, the gated delta net's per-layer `cache_params.
+  has_previous_state` check is data-dependent control flow Dynamo cannot trace through, so each of the 36 layers
+  forces its own recompile; measured **34% slower** than eager (103.4 ms to 138.6 ms, one question, fp8/L40S) --
+  36 guard-dispatch boundaries cost more than the fusion between them saves. Reaching the win a serving engine gets
+  this way needs an explicit, layer-aware compile-region split (closer to that engine's own piecewise compilation),
+  which is a materially larger, differently-shaped change than this round's time covered.
+* **Compiling only the rope/output-gate glue** (the same two ops the bit-exact Triton kernels above fuse), via
+  `torch.compile(dynamic=True)` instead of the hand-written kernel, gated per request (`Prismyra.ask(mode="fast")`,
+  refused unless the engine is built with `enable_fast_mode=True`; `mode="default"`, the only behaviour before this
+  was tried, is unaffected either way). Determinism and accuracy both came back acceptable in this round's own
+  measurement (repeating 40 devset rows 11 times each found 0 decision flips and 0 probability movement for either
+  mode; a full-devset paired accuracy comparison came back +0.475pt, 95% CI [-0.158, +1.109], within the -0.5pt
+  floor this kind of change is judged against). **Speed did not clear the bar it exists for**: measured against
+  `benchmarks/compare_jev_d1.py`/a `quant_wire_speed.py`-style grid (1k/4k/16k/3,446 tokens x 1/2/4/16/64 questions,
+  both fp8/L40S and nvfp4/RTX PRO 4500, alternating rounds), the compiled path was **slower in all 40 cells
+  measured**, by 0.19% to 40% -- worst at one question on a short (1,000-token) document, where `mode="fast"`
+  additionally gives up the recorded one-pass CUDA-graph replay that range already uses (replaying a captured
+  graph's own kernels is fixed at capture time, so a per-call flag toggled afterwards cannot change what a replay
+  actually runs -- `mode="fast"` routes around replay for exactly this reason, which costs it the one case replay
+  already wins). The underlying reason the compiled path has nothing left to gain: the bit-exact Triton kernels
+  above already fused this same glue into one launch each, so `torch.compile`'s own fusion has almost nothing left
+  to fold together, and the `mode="fast"` path pays Dynamo's per-call guard-dispatch cost for it anyway. Not shipped
+  -- no `mode` parameter, `enable_fast_mode` flag, or `--enable-fast-mode` CLI flag exists in this release.
+
 ## Four speed settings, one that risks the answer
 
 For each row, the question is whether its default answers bit-identically to the alternative it could instead be set
