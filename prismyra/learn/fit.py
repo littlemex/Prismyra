@@ -62,7 +62,7 @@ import numpy as np
 
 from .backends import DEFAULT_STUDENT_BACKEND, STUDENT_BACKENDS, get_backend
 from .experience import Experience, ExperienceSource, LocalExperienceSource
-from .features import HashingTfidf, Vectorizer
+from .features import DEFAULT_TEXT_TOKENIZER, HashingTfidf, Vectorizer
 from .spec import SpecError, TagSpec, load_spec
 
 
@@ -187,6 +187,7 @@ class StudentArtifact:
     feature_names: tuple[str, ...] | None = None
     backend: str = DEFAULT_STUDENT_BACKEND
     backend_version: str | None = None
+    text_tokenizer: str = DEFAULT_TEXT_TOKENIZER
 
     def to_json(self) -> dict:
         return {
@@ -207,6 +208,7 @@ class StudentArtifact:
             "feature_names": list(self.feature_names) if self.feature_names is not None else None,
             "backend": self.backend,
             "backend_version": self.backend_version,
+            "text_tokenizer": self.text_tokenizer,
         }
 
     @staticmethod
@@ -230,12 +232,20 @@ class StudentArtifact:
             feature_names=tuple(feature_names) if feature_names is not None else None,
             backend=raw.get("backend", DEFAULT_STUDENT_BACKEND),
             backend_version=raw.get("backend_version"),
+            text_tokenizer=raw.get("text_tokenizer", DEFAULT_TEXT_TOKENIZER),
         )
 
     def vectorizer(self) -> Vectorizer:
         if self.features is None:
-            return Vectorizer(features_name=None, hashing=HashingTfidf(dims=self.dims, idf=self.idf), names=None)
-        return Vectorizer(features_name=self.features, hashing=None, names=self.feature_names)
+            return Vectorizer(
+                features_name=None,
+                hashing=HashingTfidf(dims=self.dims, idf=self.idf),
+                names=None,
+                text_tokenizer=self.text_tokenizer,
+            )
+        return Vectorizer(
+            features_name=self.features, hashing=None, names=self.feature_names, text_tokenizer=self.text_tokenizer
+        )
 
     def predict_proba(self, context: str, question: str = "") -> dict[str, float]:
         """Load-bearing for a later stage, not for stage 1/2: given this exact artifact, reproduce the
@@ -372,7 +382,7 @@ def fit_student(
     backend = get_backend(backend_name if backend_name is not None else tag.student)
 
     records = [(e.context, e.question) for e in train]
-    vectorizer = Vectorizer.fit(records, features_name=tag.features, dims=dims)
+    vectorizer = Vectorizer.fit(records, features_name=tag.features, dims=dims, text_tokenizer=tag.text_tokenizer)
     x_rows, y_rows, w_rows = _soft_rows(train, tag.options, vectorizer, feedback=feedback)
     if not x_rows:
         raise FitError(f"tag {tag.task!r} has no trainable experience (0 rows after soft-label expansion)")
@@ -545,6 +555,7 @@ def run(
         backend=backend.name,
         backend_version=backend.library_version(),
         feature_names=vectorizer.names,
+        text_tokenizer=vectorizer.text_tokenizer,
     )
 
 

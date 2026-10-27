@@ -62,6 +62,64 @@ def test_choice_labels_falls_back_to_a_smaller_pool_the_tokenizer_actually_suppo
     assert labels == _LABEL_CANDIDATES[:10]
 
 
+class _CountingTokenizer(_UnlimitedTokenizer):
+    """`_UnlimitedTokenizer`'s own behaviour, plus a running count of how many times it was actually called
+    -- what the caching test below asserts against, instead of timing (flaky under load) or reading the
+    cache's private internals directly."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, text, **kwargs):
+        self.calls += 1
+        return super().__call__(text, **kwargs)
+
+
+def test_choice_labels_is_cached_per_tokenizer_and_limit():
+    """The fix for the real-hardware finding in RUN-xgb-student.md: an uncached `choice_labels` repeats a
+    binary search of tokenizer calls on *every* `/v1/decide` request with a `choice` item, including ones a
+    router answers from the student alone without ever touching the engine. A second call with the same
+    tokenizer and the same ``limit`` must not call the tokenizer again at all.
+    """
+    tok = _CountingTokenizer()
+    first = choice_labels(tok, limit=255)
+    calls_after_first = tok.calls
+    assert calls_after_first > 0  # the first call really did probe the tokenizer
+
+    second = choice_labels(tok, limit=255)
+    assert second == first
+    assert tok.calls == calls_after_first  # the cached call made no new tokenizer calls at all
+
+
+def test_choice_labels_cache_is_keyed_by_limit_too():
+    """A cache hit on one ``limit`` must not be served to a different ``limit`` for the same tokenizer --
+    `choice_labels(tok, limit=5)` and `choice_labels(tok, limit=255)` are different questions even though
+    they share a tokenizer, and the smaller one finding `_LABEL_CANDIDATES[:5]` must not poison the cache
+    for the larger one.
+    """
+    tok = _UnlimitedTokenizer()
+    small = choice_labels(tok, limit=5)
+    large = choice_labels(tok, limit=255)
+    assert small == _LABEL_CANDIDATES[:5]
+    assert large == _LABEL_CANDIDATES[:255]
+
+
+def test_choice_labels_cache_does_not_confuse_two_different_tokenizers():
+    """Two distinct tokenizer objects, even ones with the same limit and the same class, must each get their
+    own cache entry -- a regression guard for the "`id()` can be recycled after garbage collection" hazard
+    the `WeakKeyDictionary` cache is built to rule out (see `prismyra.decide._CHOICE_LABELS_CACHE`'s own
+    docstring).
+    """
+    first_tok = _LimitedTokenizer(limit=7)
+    first = choice_labels(first_tok, limit=255)
+    del first_tok  # encourage (not guarantee) the id this object held to be recycled below
+
+    second_tok = _LimitedTokenizer(limit=20)
+    second = choice_labels(second_tok, limit=255)
+    assert first == _LABEL_CANDIDATES[:7]
+    assert second == _LABEL_CANDIDATES[:20]
+
+
 def test_parse_item_labels_a_choice_question_past_the_26_letter_alphabet():
     """`choice_labels`' own candidate order continues past `Z` with two-letter labels (`AA`, `AB`, ...). A
     `choice` question with more than 26 options must actually reach and use them, not just have them exist in

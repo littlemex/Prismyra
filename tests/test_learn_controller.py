@@ -49,6 +49,62 @@ def test_ab_mode_ratio_is_fixed_and_never_ramps(tmp_path):
     assert ratio == 3000  # ab never ticks: no ramp_interval_s logic applies to it
 
 
+def test_switching_mode_reinitialises_ratio_instead_of_carrying_the_old_mode_over(tmp_path):
+    """RUN-xgb-student.md's own real-hardware finding: running `shadow` and then `confidence` against the
+    *same* `--learn-log-dir` left confidence routing 0/60 requests to the student, because shadow's own
+    persisted `ratio=0` (its `_initial_ratio`, since shadow never serves the student) was read back as a
+    literal zero by confidence's eligibility gate (`bucket < ratio`), instead of confidence's own "ratio
+    left at 0 means no extra gate, tau decides alone" rule (`confidence_ratio_gate`) -- a rule that only
+    ever applied to a brand-new tag, never to one whose state already existed under a different mode.
+    """
+    clock = FakeClock()
+    ctrl = Controller(tmp_path / "state.json", now=clock)
+
+    shadow_cfg = RouterConfig(mode="shadow", student_path="s.json")
+    shadow_ratio, _ = ctrl.resolve(TAG, shadow_cfg)
+    assert shadow_ratio == 0  # shadow's own ratio is never read; this is `_initial_ratio`'s "ab"-shaped default
+
+    confidence_cfg = RouterConfig(mode="confidence", student_path="s.json", ratio=0, tau=0.5)
+    confidence_ratio, _ = ctrl.resolve(TAG, confidence_cfg)
+    # The bug: before the fix this was 0 (shadow's leftover number, read literally), which made every
+    # request ineligible (`bucket < 0` is never true) no matter how confident the student was.
+    assert confidence_ratio == 10_000  # confidence_ratio_gate's "ratio left at 0 means no extra gate" rule
+
+    # And the reverse direction: switching a tag that is mid-ramp into "ab" must not keep whatever ratio the
+    # ramp had climbed to -- "ab"'s own ratio is a spec literal (`RouterConfig.ratio`), not a state the
+    # previous mode is allowed to hand it.
+    ramp_cfg = RouterConfig(mode="ramp", student_path="s.json", ramp_step=1000, ramp_interval_s=10, ramp_min_ratio=0)
+    ctrl.resolve(TAG, ramp_cfg)
+    clock.advance(10)
+    ramped_ratio, _ = ctrl.resolve(TAG, ramp_cfg)
+    assert ramped_ratio == 1000  # ramp really did climb once, same as test_ramp_mode_climbs_...
+
+    ab_cfg = RouterConfig(mode="ab", student_path="s.json", ratio=3000)
+    ab_ratio, _ = ctrl.resolve(TAG, ab_cfg)
+    assert ab_ratio == 3000  # not 1000 (ramp's leftover) and not 0 (ramp's own _initial_ratio)
+
+
+def test_mode_unchanged_across_a_reload_keeps_the_persisted_ratio(tmp_path):
+    """The fix above must not make every reload look like a mode switch: a state file written by this same
+    fix (`mode` always set) and reloaded under the identical mode keeps ticking from where it left off --
+    this is `test_state_survives_a_flush_and_reload`'s own scenario, re-asserted here to pin the no-op case
+    the mismatch check must not disturb.
+    """
+    clock = FakeClock()
+    state_path = tmp_path / "state.json"
+    ctrl = Controller(state_path, now=clock)
+    cfg = RouterConfig(mode="ramp", student_path="s.json", ramp_step=1000, ramp_interval_s=10, ramp_min_ratio=0)
+    ctrl.resolve(TAG, cfg)
+    clock.advance(10)
+    ratio_before, _ = ctrl.resolve(TAG, cfg)
+    assert ratio_before == 1000
+    ctrl.flush()
+
+    reloaded = Controller(state_path, now=clock)
+    ratio_after, _ = reloaded.resolve(TAG, cfg)
+    assert ratio_after == ratio_before  # same mode across the reload: no reinitialisation
+
+
 def test_ramp_mode_climbs_by_step_every_interval_when_nothing_fails(tmp_path):
     clock = FakeClock()
     ctrl = Controller(tmp_path / "state.json", now=clock)

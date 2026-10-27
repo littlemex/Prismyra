@@ -77,6 +77,60 @@ def _flatten_pairs(obj: object, prefix: str = "") -> list[str]:
     return out
 
 
+#: ``"words"`` (this module's long-standing default: `tokenize`'s JSON-aware flattening, or lowercased bare
+#: words for plain text) or ``"charN"`` for an integer ``N`` -- character ``N``-grams of the lowercased,
+#: whitespace-collapsed text. `DEFAULT_TEXT_TOKENIZER`/`_CHAR_NGRAM_RE` are this scheme's whole validation
+#: surface; `prismyra.learn.spec`'s tag parser imports both to check a tag's own `"text_tokenizer"` field the
+#: same way it already checks `"student"` against `prismyra.learn.backends.STUDENT_BACKENDS`.
+DEFAULT_TEXT_TOKENIZER = "words"
+_CHAR_NGRAM_RE = re.compile(r"^char([2-9]|[1-9][0-9]+)$")
+#: Character n-grams below this length are refused at spec-load time (`is_valid_text_tokenizer`): a 1-gram
+#: throws away exactly the thing a character n-gram scheme exists to keep (adjacency), degenerating into an
+#: unordered letter-frequency count that `"words"` already does better by working on whole tokens instead.
+CHAR_NGRAM_MIN_N = 2
+
+
+def is_valid_text_tokenizer(name: str) -> bool:
+    """Every ``"text_tokenizer"`` value `prismyra.learn.spec` will accept on a tag entry: `"words"`, or
+    ``"charN"`` for an integer ``N >= CHAR_NGRAM_MIN_N``."""
+    return name == DEFAULT_TEXT_TOKENIZER or bool(_CHAR_NGRAM_RE.fullmatch(name))
+
+
+def char_ngrams(text: str, n: int) -> list[str]:
+    """Character ``n``-grams of ``text``: lowercased, with every run of whitespace collapsed to one space
+    first (so two inputs differing only in spacing or capitalisation produce the same bag, the same
+    normalisation concern `tokenize`'s own JSON-key-order handling addresses for the word scheme), then every
+    overlapping window of ``n`` characters, including the spaces -- `"ab cd"`'s own 3-grams are `["ab ", "b c",
+    " cd"]`, not `["ab", "cd"]`: a hashing scheme has no notion of "word boundary" to respect, and silently
+    stripping spaces would throw away exactly the adjacency-across-words information a character n-gram
+    scheme is chosen over bag-of-words for in the first place (catching misspellings, partial words, and
+    language with no whitespace word boundaries at all, none of which `tokenize`'s regex-word splitting
+    handles). A ``text`` shorter than ``n`` once collapsed contributes itself whole, rather than nothing --
+    the same "degrade gracefully on tiny input" choice `HashingTfidf.transform`'s empty-token-list guard
+    (``n = len(tokens) or 1``) already makes for the word scheme.
+    """
+    squashed = re.sub(r"\s+", " ", text.strip().lower())
+    if not squashed:
+        return []
+    if len(squashed) < n:
+        return [squashed]
+    return [squashed[i : i + n] for i in range(len(squashed) - n + 1)]
+
+
+def tokenize_for(name: str, context: str) -> list[str]:
+    """Dispatch on a `"text_tokenizer"` name already checked by `is_valid_text_tokenizer` -- `tokenize`
+    itself for `"words"`, `char_ngrams` for `"charN"`. The one place `Vectorizer`'s hashed-TF-IDF branch
+    decides which of the two produced the tokens `HashingTfidf` then hashes and weights identically either
+    way; everything past this call treats the result as an undifferentiated bag of strings.
+    """
+    if name == DEFAULT_TEXT_TOKENIZER:
+        return tokenize(context)
+    match = _CHAR_NGRAM_RE.fullmatch(name)
+    if match is None:
+        raise FeatureError(f"{name!r} is not a valid text tokenizer name (expected 'words' or 'charN')")
+    return char_ngrams(context, int(match.group(1)))
+
+
 def _bucket(token: str, dims: int) -> int:
     # md5, not Python's own `hash`: `hash("x")` is salted per-process (`PYTHONHASHSEED`) unless a caller has
     # disabled that, and a feature scheme whose bucket assignment can change between two runs of the identical
@@ -201,6 +255,16 @@ class Vectorizer:
     of this) or a registered structured-feature builder (``features_name`` set, ``names`` fixing the column
     order). Exactly one of ``hashing``/``names`` is set, matching which branch ``features_name`` picked.
 
+    ``text_tokenizer`` (`DEFAULT_TEXT_TOKENIZER`/`tokenize_for`'s own name space) only matters for the hashed
+    branch -- it decides what `HashingTfidf.transform` and `HashingTfidf.fit` tokenize the corpus *into*
+    (whole words/JSON leaves, or character n-grams), not whether hashing happens at all. Ignored for the
+    structured branch (a registered builder decides its own features and never calls `tokenize_for`), rather
+    than refused there: a tag naming a non-default `text_tokenizer` alongside ``features`` is not a
+    contradiction worth failing spec validation over, just a field this particular branch has no use for.
+    Defaulted (``= DEFAULT_TEXT_TOKENIZER``) rather than required, so an artifact serialized before this field
+    existed (`StudentArtifact.from_json`'s own backward-compatibility reading) reconstructs a `Vectorizer`
+    that tokenizes exactly as it always did.
+
     Column order for the structured branch is fixed once, at `fit`, from the *first* training record's keys --
     a builder is expected to return the same key set on every call (its docstring's contract, not this class's
     to enforce), and a later call whose dict is missing a key seen at fit time contributes 0.0 for that column
@@ -210,25 +274,34 @@ class Vectorizer:
     features_name: str | None
     hashing: HashingTfidf | None
     names: tuple[str, ...] | None
+    text_tokenizer: str = DEFAULT_TEXT_TOKENIZER
 
     def transform(self, context: str, question: str = "") -> list[float]:
         if self.features_name is None:
             assert self.hashing is not None
-            return self.hashing.transform(tokenize(context))
+            return self.hashing.transform(tokenize_for(self.text_tokenizer, context))
         assert self.names is not None
         fn = get_feature_builder(self.features_name)
         values = fn(context, question)
         return [float(values.get(name, 0.0)) for name in self.names]
 
     @staticmethod
-    def fit(records: list[tuple[str, str]], *, features_name: str | None, dims: int) -> Vectorizer:
+    def fit(
+        records: list[tuple[str, str]],
+        *,
+        features_name: str | None,
+        dims: int,
+        text_tokenizer: str = DEFAULT_TEXT_TOKENIZER,
+    ) -> Vectorizer:
         """``records`` is a list of ``(context, question)`` pairs from the training set -- the hashed branch
         only ever looks at the ``context`` half (fitting IDF over the training corpus, same as before this
         class existed); the structured branch calls the registered builder once, on the first record, purely
         to learn its fixed set of output keys."""
         if features_name is None:
-            corpus = [tokenize(context) for context, _ in records]
-            return Vectorizer(features_name=None, hashing=HashingTfidf.fit(corpus, dims), names=None)
+            corpus = [tokenize_for(text_tokenizer, context) for context, _ in records]
+            return Vectorizer(
+                features_name=None, hashing=HashingTfidf.fit(corpus, dims), names=None, text_tokenizer=text_tokenizer
+            )
         fn = get_feature_builder(features_name)
         names = tuple(sorted(fn(*records[0]).keys())) if records else ()
-        return Vectorizer(features_name=features_name, hashing=None, names=names)
+        return Vectorizer(features_name=features_name, hashing=None, names=names, text_tokenizer=text_tokenizer)

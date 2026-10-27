@@ -65,9 +65,24 @@ _DRIFT_WINDOW_MIN_N = 50
 
 @dataclass
 class TagState:
-    """One tag's own row of `Controller`'s state file."""
+    """One tag's own row of `Controller`'s state file.
+
+    ``mode`` is the `RouterConfig.mode` that was in effect when this row's ``ratio`` (and the rest of its
+    bookkeeping) was last (re)initialised -- not a mirror of whatever mode a later call happens to pass in.
+    It exists to fix a real bug found running the router by hand (RUN-xgb-student.md, the "ルーター実演で
+    見つかった実装上の注意点" section): a tag run first in ``"shadow"`` mode persists ``ratio=0`` (shadow's
+    own `_initial_ratio`, since shadow never serves the student and so never needs a real number); switching
+    that same tag to ``"confidence"`` afterwards, against the *same* state file, found that `0` already on
+    disk and used it as a literal ratio, silently skipping `confidence_ratio_gate`'s "ratio left at 0 means
+    no extra gate, `tau` decides alone" rule -- a rule that only ever ran for a *brand-new* tag, never for one
+    whose state already existed under a different mode. `_state_for` below is what closes that: a mismatch
+    between the stored ``mode`` and the mode just asked for means the stored ``ratio``'s meaning no longer
+    matches what is being asked of it, so the row is reinitialised through `_initial_ratio` exactly as if the
+    tag had never been seen before, rather than reinterpreting a number that was never written for this mode.
+    """
 
     ratio: int
+    mode: str | None = None
     halted_until: float = 0.0
     last_tick: float = 0.0
     last_request: float = 0.0
@@ -85,6 +100,7 @@ class TagState:
     def to_json(self) -> dict:
         return {
             "ratio": self.ratio,
+            "mode": self.mode,
             "halted_until": self.halted_until,
             "last_tick": self.last_tick,
             "last_request": self.last_request,
@@ -105,6 +121,14 @@ class TagState:
         ref = raw.get("drift_reference")
         return TagState(
             ratio=raw["ratio"],
+            # `.get(..., None)`, not a hard requirement: a state file written before this field existed
+            # (RUN-xgb-student.md's own ramp/shadow/confidence demo, fixed by renaming `--learn-log-dir` per
+            # phase rather than by this field) has no `mode` at all. Reading that as `None` -- "unknown mode"
+            # -- rather than guessing one is what makes `_state_for` below treat an upgraded, pre-existing
+            # state file exactly like a mode switch: the first `resolve()` call after the upgrade reinitialises
+            # it through `_initial_ratio`, once, instead of silently trusting a number recorded under a mode
+            # this field cannot name.
+            mode=raw.get("mode"),
             halted_until=raw.get("halted_until", 0.0),
             last_tick=raw.get("last_tick", 0.0),
             last_request=raw.get("last_request", 0.0),
@@ -194,8 +218,16 @@ class Controller:
 
     def _state_for(self, tag: str, cfg: RouterConfig) -> TagState:
         st = self._states.get(tag)
+        if st is not None and st.mode != cfg.mode:
+            # This tag's persisted ratio was last initialised for a *different* mode (see `TagState.mode`'s
+            # own docstring for the shadow -> confidence bug this fixes) -- its numeric value carries that
+            # mode's meaning, not this one's, so it is not safe to keep. `st.mode is None` (a state file
+            # written before this field existed) also mismatches here, by the same logic: an unlabelled
+            # ratio is exactly as untrustworthy as one labelled for a different mode. Start this mode's own
+            # bookkeeping from scratch, the same way a tag this `Controller` has never seen at all would.
+            st = None
         if st is None:
-            st = TagState(ratio=_initial_ratio(cfg))
+            st = TagState(ratio=_initial_ratio(cfg), mode=cfg.mode)
             if cfg.mode == "bandit":
                 st.bandit_arm = st.ratio
             self._states[tag] = st
