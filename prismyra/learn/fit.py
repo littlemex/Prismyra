@@ -60,9 +60,10 @@ from pathlib import Path
 
 import numpy as np
 
+from .backends import DEFAULT_STUDENT_BACKEND, STUDENT_BACKENDS, get_backend
 from .experience import Experience, ExperienceSource, LocalExperienceSource
 from .features import HashingTfidf, Vectorizer
-from .spec import TagSpec, load_spec
+from .spec import SpecError, TagSpec, load_spec
 
 
 class FitError(Exception):
@@ -158,6 +159,15 @@ def load_eval_set(path: Path) -> list[EvalItem]:
 class StudentArtifact:
     """What ``--out`` holds: one versioned, self-describing JSON file. Not wired into serving by anything in
     this package -- "生徒の成果物は、版付きのファイルとして保存する。配信にはまだ入れない" (section 3).
+
+    ``backend`` (`prismyra.learn.backends.STUDENT_BACKENDS`) and ``backend_version`` (that backend's own
+    installed ``__version__`` at fit time, informational only -- never compared against anything, see
+    `prismyra.learn.backends`' own docstring on why) are what let `students.StudentHandle` and `predict_proba`
+    below know which library's own `load` to call. An artifact written before either field existed has
+    neither key in its JSON; `from_json` reads that the same way it reads every other field this package has
+    added since stage 1/2 -- a missing key means "this predates the field", not a malformed file, so
+    ``backend`` defaults to ``prismyra.learn.backends.DEFAULT_STUDENT_BACKEND`` (``"lightgbm"``, the only
+    backend that has ever existed before this field did) and ``backend_version`` defaults to `None`.
     """
 
     tag: str
@@ -175,6 +185,8 @@ class StudentArtifact:
     metrics: dict
     features: str | None = None
     feature_names: tuple[str, ...] | None = None
+    backend: str = DEFAULT_STUDENT_BACKEND
+    backend_version: str | None = None
 
     def to_json(self) -> dict:
         return {
@@ -193,6 +205,8 @@ class StudentArtifact:
             "metrics": self.metrics,
             "features": self.features,
             "feature_names": list(self.feature_names) if self.feature_names is not None else None,
+            "backend": self.backend,
+            "backend_version": self.backend_version,
         }
 
     @staticmethod
@@ -214,6 +228,8 @@ class StudentArtifact:
             metrics=raw["metrics"],
             features=raw.get("features"),
             feature_names=tuple(feature_names) if feature_names is not None else None,
+            backend=raw.get("backend", DEFAULT_STUDENT_BACKEND),
+            backend_version=raw.get("backend_version"),
         )
 
     def vectorizer(self) -> Vectorizer:
@@ -224,11 +240,9 @@ class StudentArtifact:
     def predict_proba(self, context: str, question: str = "") -> dict[str, float]:
         """Load-bearing for a later stage, not for stage 1/2: given this exact artifact, reproduce the
         probabilities it would assign a new input, without touching training again."""
-        import lightgbm as lgb
-
-        booster = lgb.Booster(model_str=self.model_text)
+        model = get_backend(self.backend).load(self.model_text)
         vec = self.vectorizer().transform(context, question)
-        (probs,) = booster.predict(np.asarray([vec], dtype=np.float64))
+        (probs,) = model.predict_proba(np.asarray([vec], dtype=np.float64))
         return dict(zip(self.options, (float(p) for p in probs), strict=True))
 
 
@@ -331,14 +345,16 @@ def fit_student(
     num_boost_round: int = 100,
     min_data_in_leaf: int | None = None,
     feedback=None,
+    backend_name: str | None = None,
 ):
-    """Train one LightGBM booster on ``train``'s soft labels (section 3: "柔らかいラベルは、クラスの数だけ行を
-    複製し、重みを確率にする") -- deterministic given a fixed build, instruction set, thread count and seed
-    (LightGBM's own documented contract for ``deterministic=True``, which is why this project's spec picked it
-    over CatBoost: ``catboost#1825`` is an open, acknowledged instruction-set-dependence bug this project does
-    not want to inherit).
+    """Train one student on ``train``'s soft labels (section 3: "柔らかいラベルは、クラスの数だけ行を複製し、
+    重みを確率にする") -- deterministic given a fixed build, instruction set, thread count and seed. Which
+    library trains it is `backend_name` if given, else ``tag.student``
+    (`prismyra.learn.spec.TagSpec.student`, itself `prismyra.learn.backends.DEFAULT_STUDENT_BACKEND` unless
+    the tag's own entry overrides it) -- see `prismyra.learn.backends` for what each backend promises about
+    determinism and how it maps these same soft-label rows onto its own training objective.
 
-    ``min_data_in_leaf`` defaults to LightGBM's own default (20) when left `None`. A tag with only a few dozen
+    ``min_data_in_leaf`` defaults to the backend's own default when left `None`. A tag with only a few dozen
     logged experiences -- the common case for a newly-registered tag, long before it has enough traffic to
     train on seriously -- cannot form a single split under that default and trains a stump that always
     predicts the majority class; passing a smaller value is how a caller fits something meaningful on a tag
@@ -348,8 +364,12 @@ def fit_student(
     The feature scheme comes from ``tag.features``: `None` (no entry wrote a ``"features"`` field) fits the
     hashed-TF-IDF default exactly as before this field existed; a name fits whatever `register_features`
     registered under it, and a name nothing registered is a loud `FeatureError`, not a silent fallback.
+
+    Returns ``(model_text, vectorizer, backend)`` -- the serialized model, the fitted `Vectorizer`, and the
+    `prismyra.learn.backends.StudentBackend` that produced both, so `run()` can record `backend.name` on the
+    artifact without re-deriving it.
     """
-    import lightgbm as lgb
+    backend = get_backend(backend_name if backend_name is not None else tag.student)
 
     records = [(e.context, e.question) for e in train]
     vectorizer = Vectorizer.fit(records, features_name=tag.features, dims=dims)
@@ -357,23 +377,17 @@ def fit_student(
     if not x_rows:
         raise FitError(f"tag {tag.task!r} has no trainable experience (0 rows after soft-label expansion)")
 
-    dataset = lgb.Dataset(np.asarray(x_rows, dtype=np.float64), label=y_rows, weight=w_rows, free_raw_data=True)
-    params = {
-        "objective": "multiclass",
-        "num_class": len(tag.options),
-        "deterministic": True,
-        "force_row_wise": True,
-        "num_threads": num_threads,
-        "seed": seed,
-        "bagging_seed": seed,
-        "feature_fraction_seed": seed,
-        "data_random_seed": seed,
-        "verbosity": -1,
-    }
-    if min_data_in_leaf is not None:
-        params["min_data_in_leaf"] = min_data_in_leaf
-    booster = lgb.train(params, dataset, num_boost_round=num_boost_round)
-    return booster, vectorizer
+    model_text = backend.train(
+        x_rows,
+        y_rows,
+        w_rows,
+        num_class=len(tag.options),
+        num_threads=num_threads,
+        seed=seed,
+        num_boost_round=num_boost_round,
+        min_data_in_leaf=min_data_in_leaf,
+    )
+    return model_text, vectorizer, backend
 
 
 def run(
@@ -393,11 +407,17 @@ def run(
     min_data_in_leaf: int | None = None,
     feedback_dir: str | Path | None = None,
     source: ExperienceSource | None = None,
+    backend_name: str | None = None,
 ) -> StudentArtifact:
     """``min_match_rate``/``min_accuracy_ratio`` of ``None`` (the default) means "use this tag's own spec
     value" (``tag.min_match_rate``/``tag.min_accuracy_ratio``, themselves ``prismyra.learn.spec``'s
     ``DEFAULT_MIN_MATCH_RATE``/``DEFAULT_MIN_ACCURACY_RATIO`` unless the tag's entry overrides them). Passing
     either explicitly is a one-off, this-run-only override on top of that -- see the module docstring.
+
+    ``backend_name`` is the same shape, for which library trains this tag's student: ``None`` (the default)
+    means "use this tag's own ``student`` field" (`prismyra.learn.spec.TagSpec.student`); passing one of
+    `prismyra.learn.backends.STUDENT_BACKENDS` explicitly overrides it for this run only, same as
+    ``--student-backend`` on the CLI below.
 
     ``source`` is where the tag's logged experience is read from -- a `prismyra.learn.experience.
     ExperienceSource`. `None` (the default) builds a `prismyra.learn.experience.LocalExperienceSource` over
@@ -432,7 +452,7 @@ def run(
 
         feedback = load_feedback(feedback_dir)
 
-    booster, vectorizer = fit_student(
+    model_text, vectorizer, backend = fit_student(
         tag,
         train=train,
         dims=dims,
@@ -441,11 +461,13 @@ def run(
         num_boost_round=num_boost_round,
         min_data_in_leaf=min_data_in_leaf,
         feedback=feedback,
+        backend_name=backend_name,
     )
+    loaded = backend.load(model_text)
 
     def predict_fn(context: str) -> dict[str, float]:
         vec = vectorizer.transform(context, tag.question)
-        (probs,) = booster.predict(np.asarray([vec], dtype=np.float64))
+        (probs,) = loaded.predict_proba(np.asarray([vec], dtype=np.float64))
         return dict(zip(tag.options, (float(p) for p in probs), strict=True))
 
     reasons: list[str] = []
@@ -514,12 +536,14 @@ def run(
         kind=tag.kind,
         dims=dims,
         idf=vectorizer.hashing.idf if vectorizer.hashing is not None else (),
-        model_text=booster.model_to_string(),
+        model_text=model_text,
         created_at=time.time(),
         admitted=condition_1 and condition_2,
         reasons=tuple(reasons),
         metrics=metrics,
         features=tag.features,
+        backend=backend.name,
+        backend_version=backend.library_version(),
         feature_names=vectorizer.names,
     )
 
@@ -568,12 +592,32 @@ def main(argv: list[str] | None = None) -> int:
         "for that one row -- see fit_student/_soft_rows. Unset (the default): no feedback is read, exactly "
         "stage 1/2's own behaviour.",
     )
+    parser.add_argument(
+        "--student-backend",
+        choices=sorted(STUDENT_BACKENDS),
+        default=None,
+        help="override, for this run only, the tag's own 'student' field (prismyra.learn.spec.TagSpec) -- "
+        "the default (unset) is to use the tag's spec value, itself DEFAULT_STUDENT_BACKEND ('lightgbm') "
+        "unless the tag's own entry overrides it. 'xgboost' needs pip install \"prismyra[learn-xgb]\".",
+    )
     args = parser.parse_args(argv)
 
     try:
-        import lightgbm  # noqa: F401
+        spec_for_check = load_spec(args.learn_spec)
+        tag_for_check = spec_for_check.by_task(args.task)
+        tag_backend = tag_for_check.student if tag_for_check is not None else DEFAULT_STUDENT_BACKEND
+    except SpecError:
+        tag_backend = DEFAULT_STUDENT_BACKEND
+    effective_backend = args.student_backend or tag_backend
+
+    try:
+        if effective_backend == "xgboost":
+            import xgboost  # noqa: F401
+        else:
+            import lightgbm  # noqa: F401
     except ImportError:
-        print('this needs the extra: pip install "prismyra[learn]"')
+        extra = "learn-xgb" if effective_backend == "xgboost" else "learn"
+        print(f'this needs the extra: pip install "prismyra[{extra}]"')
         return 1
 
     import prismyra
@@ -593,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
         num_boost_round=args.num_boost_round,
         min_data_in_leaf=args.min_data_in_leaf,
         feedback_dir=args.feedback_dir,
+        backend_name=args.student_backend,
     )
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

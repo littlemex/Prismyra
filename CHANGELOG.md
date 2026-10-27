@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.9
+
+Stage 2's student can now be trained and served by XGBoost as well as LightGBM. A tag picks one with its
+own optional `"student"` field (`"lightgbm"`, the default and unchanged behaviour, or `"xgboost"`);
+`python -m prismyra.learn.fit --student-backend` overrides it for one run. XGBoost is an optional extra
+(`pip install "prismyra[learn-xgb]"`) and is never imported unless a tag asks for it. Both backends train on
+the same soft-label rows, are pinned to a fixed seed and thread count, and promise the same contract: the
+same input and the same artifact give the same answer, including across a server restart. A
+`StudentArtifact` now records which backend and library version produced it (`backend`/`backend_version`);
+an artifact written before these fields existed reads as `"lightgbm"`, unchanged. See
+[docs/LEARN.md](docs/LEARN.md#choosing-a-student-backend-lightgbm-or-xgboost) for a real-task measurement
+against both backends, over real traffic, on a real engine.
+
 ## 0.4.8
 
 Stage 4 of the learning layer ([docs/LEARN.md](docs/LEARN.md)) can now switch a registered tag's live

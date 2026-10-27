@@ -42,6 +42,7 @@ Optional (omitting any of these keeps the tag meaning exactly what it meant befo
 | `features` | the name of a feature builder registered with `prismyra.learn.features.register_features`, used by stage 2's student instead of the hashed-TF-IDF default; an unregistered name is a refusal at fit time, not at spec-load time |
 | `min_match_rate` | overrides, for this tag only, the student-admission condition 2 bar below (default: `prismyra.learn.spec.DEFAULT_MIN_MATCH_RATE`, 0.90); a number in `(0, 1]` |
 | `min_accuracy_ratio` | overrides, for this tag only, the student-admission condition 1 bar below (default: `prismyra.learn.spec.DEFAULT_MIN_ACCURACY_RATIO`, 0.90); a number in `(0, 1]` |
+| `student` | which `prismyra.learn.backends.StudentBackend` trains and predicts for this tag's stage 2 student (`"lightgbm"` or `"xgboost"`; default `"lightgbm"`) -- see [Choosing a student backend](#choosing-a-student-backend-lightgbm-or-xgboost) below |
 
 A request is tagged in exactly one of two ways (`prismyra.learn.tagging.tag_for`): it names a registered `task`
 directly (and still has to agree with that entry's `kind` and option set), or its `(kind, question, options)`
@@ -103,8 +104,95 @@ Agreement with Prismyra alone is deliberately not enough: a student that reprodu
 a high agreement rate by construction, which is why condition 1 is scored against `eval_set`'s gold labels, not
 against Prismyra's own answer. The artifact (one JSON file, `StudentArtifact`) also reports a
 confidence-threshold (`tau`) sweep -- answer rate versus disagreement rate -- for an operator to pick a point
-on, rather than this script picking one. **The artifact is saved, never wired into serving.** Stage 4 is what
-would do that, and it does not exist yet.
+on, rather than this script picking one. **The artifact is saved, never wired into serving on its own.** See
+[Stage 4](#stage-4-switching-traffic-between-a-student-and-prismyra) below for the part that can route traffic
+to an admitted artifact.
+
+## Choosing a student backend: LightGBM or XGBoost
+
+`prismyra.learn.backends.StudentBackend` is the seam between `fit`/`students` and the library that actually
+trains and predicts. Two implementations ship today, `"lightgbm"` (the default, unchanged behaviour) and
+`"xgboost"`. A tag picks one with its own optional `"student"` field:
+
+```json
+{"task": "sentiment-finnews-v1", ..., "student": "xgboost"}
+```
+
+Omitting `"student"` keeps a tag meaning exactly what it meant before this field existed (`"lightgbm"`).
+`python -m prismyra.learn.fit --student-backend {lightgbm,xgboost}` overrides it for one run, the same
+per-run-override shape `--min-match-rate`/`--min-accuracy-ratio` already have. `"xgboost"` is an optional
+extra (`pip install "prismyra[learn-xgb]"`); neither library is imported unless a tag actually asks for it.
+
+Both backends train on the same soft-label rows `_soft_rows` already builds (one row per non-zero-probability
+option, weighted by that option's probability) -- LightGBM as `objective: "multiclass"`, XGBoost as
+`objective: "multi:softprob"`, both `deterministic`/CPU-only, both pinned to a fixed `seed` and `num_threads`.
+XGBoost's own determinism mechanism is `tree_method="hist"` with no row/column subsampling, which on CPU gives
+the same "same build, same input, same seed/threads -> byte-identical model" contract LightGBM's own
+`deterministic=True` already promises -- see `prismyra/learn/backends.py` for the one place the two actually
+differ (XGBoost, with no subsampling active, does not depend on `seed` at all, which is a stronger guarantee,
+not a weaker one). `StudentArtifact.backend`/`.backend_version` record which library and version produced an
+artifact; an artifact written before these fields existed reads as `"lightgbm"`/`None`, unchanged.
+
+### Real-task measurement (2026-10-27, one L40S, `littlemex/prismyra-decision-35b-a3b-fp8` v0.5.1)
+
+Two commercially-clear, real 3-class sentiment tasks (`docs/DATA_PROVENANCE.md`'s own cleared list):
+`cardiffnlp/tweet_eval` (`sentiment` config) and `zeroshot/twitter-financial-news-sentiment`. 2,500 real
+training texts per task were sent through the real engine's `/v1/decide` (`kind: "choice"`) to log experience
+the ordinary way; a separate 200-row gold `eval_set` per task was built the same way, carrying Prismyra's own
+`prismyra_probabilities`.
+
+At the project's own default admission bar (`min_match_rate`/`min_accuracy_ratio` = 0.90/0.90), **neither
+backend cleared admission on either task at this data size**:
+
+| task | backend | eval accuracy (student) | Prismyra accuracy | held-out agreement (95% lower bound) |
+|---|---|---|---|---|
+| tweet sentiment | lightgbm | 0.670 | 0.755 | 0.467 |
+| tweet sentiment | xgboost | 0.645 | 0.755 | 0.480 |
+| financial-news sentiment | lightgbm | 0.825 | 0.915 | 0.788 |
+| financial-news sentiment | xgboost | 0.775 | 0.915 | 0.774 |
+
+Financial-news headlines (explicit words like "cut", "downgrade") agree with the teacher far more than general
+tweets do at this data size; neither reaches the 0.90 bar. This is reported as measured, not adjusted to force
+a pass -- a real win on real tasks is left to a future round with more logged traffic, better features
+(`prismyra.learn.features.register_features`), or a tag-level override of the bar for traffic that genuinely
+needs a lower one.
+
+To exercise the stage 4 routing mechanics end-to-end against this real engine, one further, explicitly labelled
+artifact was fit with a one-run-only override (`--min-match-rate 0.3 --min-accuracy-ratio 0.3`) on the
+financial-news task's xgboost student -- a demonstration artifact, not a claim that it would be admitted under
+the default bar. Measured over real HTTP (loopback, same host as the engine), against the same 200 gold rows,
+with a fresh `--learn-log-dir` per router mode (switching a tag's router mode on a shared controller state can
+otherwise inherit the previous mode's own `ratio`, including a mode like `"shadow"` that leaves it at `0`):
+
+| router mode | student-served fraction | p50 latency |
+|---|---|---|
+| none (Prismyra only) | 0% | 81.34 ms |
+| `ab`, `ratio: 10000` (lightgbm) | 100% (60/60) | 43.57 ms |
+| `ab`, `ratio: 10000` (xgboost) | 100% (60/60) | 42.46 ms |
+| `shadow` | 0% (by design -- never serves the student) | -- |
+| `confidence`, `tau: 0.5` | 93.3% (56/60) | 46.22 ms |
+| `ramp` (5 windows, `ramp_step: 2000`/8s) | 16% -> 40% -> 60% -> 76% -> 100% | 74.7 -> 73.2 -> 44.4 -> 43.9 -> 43.2 ms |
+
+A student-served request is about **1.9x faster end-to-end** than Prismyra's own (43 ms vs 81 ms, HTTP
+included) -- both backends land at essentially the same real latency, because the booster's own prediction
+cost (sub-millisecond either way, below) is small next to `/v1/decide`'s own per-request overhead for a
+`"choice"` question. The same input sent five times in a row, and again after a full server process restart,
+answered identically in every mode tested (including which side served it).
+
+Backend-only comparison (`benchmarks/learn_backend_bench.py`, same L40S node's CPU, synthetic data, 3,000 rows,
+256 dims, 100 boosting rounds, one row at a time):
+
+| | lightgbm | xgboost |
+|---|---|---|
+| train time | 5.66 s | 9.67 s |
+| predict p50 (one row) | 0.051 ms | 0.254 ms |
+| predict p99 (one row) | 0.066 ms | 0.367 ms |
+| peak RSS during training | 119 MB | 177 MB |
+
+LightGBM remains the faster, lighter-weight booster on its own; XGBoost is not a speed upgrade over it. What
+XGBoost adds is a second, real, interchangeable implementation behind the same artifact format and the same
+router -- comparable accuracy on both tasks above, and router-level latency indistinguishable from LightGBM's
+once HTTP and request handling are in the measurement, which is what a caller of `/v1/decide` actually pays.
 
 ## Guarantees
 
@@ -159,6 +247,14 @@ package already keeps. `mode` is one of:
 `bandit`), `ramp_step`/`ramp_interval_s`/`ramp_min_ratio`/`ramp_max_ratio`,
 `audit_min_fraction`/`audit_max_fraction`, and `rollback_min_match_rate`/`rollback_max_drift`/
 `rollback_cooldown_s`.
+
+**Moving one tag between modes across a restart.** `prismyra.learn.controller.Controller`'s state (`ratio`,
+among other things) is keyed by tag name alone and persists under `--learn-log-dir`, independent of which
+`mode` wrote it. A tag moved from `"shadow"` (whose own `ratio` is unused and defaults to `0`) straight to
+`"confidence"` on the same log directory inherits that `0` rather than starting from `confidence_ratio_gate`'s
+"unset means no gate" reading, which only applies to a tag with no saved state yet -- the student then never
+clears `eligible = bucket < ratio` regardless of `tau`. Set `"ratio": 10000` explicitly on the new mode's own
+entry when switching, rather than relying on the field's default.
 
 ### The determinism contract
 
