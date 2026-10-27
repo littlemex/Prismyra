@@ -247,10 +247,11 @@ def test_training_the_same_data_twice_gives_byte_identical_model_text(tmp_path):
 
     from prismyra.learn.fit import fit_student
 
-    booster_a, vec_a = fit_student(tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10)
-    booster_b, vec_b = fit_student(tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10)
-    assert booster_a.model_to_string() == booster_b.model_to_string()
+    model_text_a, vec_a, backend_a = fit_student(tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10)
+    model_text_b, vec_b, backend_b = fit_student(tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10)
+    assert model_text_a == model_text_b
     assert vec_a == vec_b
+    assert backend_a.name == backend_b.name == "lightgbm"
 
 
 def test_a_different_seed_can_change_the_model(tmp_path):
@@ -260,11 +261,11 @@ def test_a_different_seed_can_change_the_model(tmp_path):
 
     from prismyra.learn.fit import fit_student
 
-    booster_a, _ = fit_student(tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10)
-    booster_b, _ = fit_student(tag, train=train, dims=64, num_threads=1, seed=1, num_boost_round=10)
+    model_text_a, _, _ = fit_student(tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10)
+    model_text_b, _, _ = fit_student(tag, train=train, dims=64, num_threads=1, seed=1, num_boost_round=10)
     # Not asserted to always differ (a tiny, easy dataset could coincide), but this dataset's seed-0 and
     # seed-1 trees are known to differ -- regression protection against `seed` silently not being wired in.
-    assert booster_a.model_to_string() != booster_b.model_to_string()
+    assert model_text_a != model_text_b
 
 
 def test_fit_student_refuses_an_empty_training_set(tmp_path):
@@ -564,7 +565,9 @@ def test_fit_student_honours_a_tags_registered_features_field(tmp_path):
 
     from prismyra.learn.fit import fit_student
 
-    _booster, vectorizer = fit_student(tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10)
+    _model_text, vectorizer, _backend = fit_student(
+        tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10
+    )
     assert vectorizer.features_name == "word-count-v1"
     assert vectorizer.hashing is None
     assert vectorizer.names == ("n_negative_words", "n_positive_words", "n_words")
@@ -630,3 +633,171 @@ def test_fit_student_raises_on_an_unregistered_features_name(tmp_path):
 
     with pytest.raises(FeatureError, match="no feature builder named"):
         fit_student(tag, train=train, dims=16, num_threads=1, seed=0, num_boost_round=5)
+
+
+# --------------------------------------------------------------------------- the "xgboost" student backend
+# (prismyra.learn.backends.XGBoostBackend). A tag opts in with its own "student": "xgboost" spec field, or a
+# caller overrides it for one run with fit_student's/run's own backend_name= -- these tests mirror the
+# lightgbm-backend tests above exactly, on the same fixtures, so the only thing either side of the backend
+# seam is free to differ about is which library actually trained the student.
+
+xgboost = pytest.importorskip("xgboost")
+
+
+def test_training_the_same_data_twice_with_xgboost_gives_identical_model_text(tmp_path):
+    _, spec = make_spec(tmp_path)
+    tag = spec.by_task(TASK)
+    train = [_exp(spec, ctx, p, i) for i, (ctx, p, _) in enumerate(synthetic_rows(20))]
+
+    from prismyra.learn.fit import fit_student
+
+    model_text_a, vec_a, backend_a = fit_student(
+        tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10, backend_name="xgboost"
+    )
+    model_text_b, vec_b, backend_b = fit_student(
+        tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10, backend_name="xgboost"
+    )
+    assert model_text_a == model_text_b
+    assert vec_a == vec_b
+    assert backend_a.name == backend_b.name == "xgboost"
+
+
+def test_xgboost_with_no_subsampling_does_not_depend_on_seed(tmp_path):
+    # Not a bug: see tests/test_learn_backends.py's own
+    # test_xgboost_hist_with_no_subsampling_does_not_depend_on_seed for the full explanation --
+    # XGBoostBackend never samples rows or columns, so CPU tree_method="hist" has no randomness `seed` could
+    # feed, on this dataset or any other. The equivalent LightGBM claim ("a different seed can change the
+    # model") is `test_a_different_seed_can_change_the_model`, just above.
+    _, spec = make_spec(tmp_path)
+    tag = spec.by_task(TASK)
+    train = [_exp(spec, ctx, p, i) for i, (ctx, p, _) in enumerate(synthetic_rows(20))]
+
+    from prismyra.learn.fit import fit_student
+
+    model_text_a, _, _ = fit_student(
+        tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10, backend_name="xgboost"
+    )
+    model_text_b, _, _ = fit_student(
+        tag, train=train, dims=64, num_threads=1, seed=1, num_boost_round=10, backend_name="xgboost"
+    )
+    assert model_text_a == model_text_b
+
+
+def test_a_tags_own_student_field_selects_xgboost_without_a_caller_override(tmp_path):
+    _, spec = make_spec(tmp_path, student="xgboost")
+    tag = spec.by_task(TASK)
+    assert tag.student == "xgboost"
+    train = [_exp(spec, ctx, p, i) for i, (ctx, p, _) in enumerate(synthetic_rows(20))]
+
+    from prismyra.learn.fit import fit_student
+
+    _model_text, _vec, backend = fit_student(tag, train=train, dims=64, num_threads=1, seed=0, num_boost_round=10)
+    assert backend.name == "xgboost"
+
+
+def test_run_admits_an_xgboost_student_that_beats_prismyra_and_agrees_on_held_out(tmp_path):
+    spec_path, spec = make_spec(tmp_path, retain_days=30, student="xgboost")
+    rows = synthetic_rows(60)
+    write_experience(tmp_path, spec, rows)
+    _write_eval_set(tmp_path / "eval.jsonl", synthetic_rows(15))
+
+    artifact = run(
+        spec_path=spec_path,
+        task=TASK,
+        log_dir=None,
+        package_version="0.0.0-test",
+        backbone="stub/model",
+        dims=128,
+        held_out_fraction=0.25,
+        min_match_rate=0.5,
+        min_accuracy_ratio=0.5,
+        num_threads=1,
+        seed=0,
+        num_boost_round=30,
+        min_data_in_leaf=2,
+    )
+    assert artifact.admitted, artifact.reasons
+    assert artifact.backend == "xgboost"
+    assert artifact.backend_version == xgboost.__version__
+    assert "held_out_agreement" in artifact.metrics
+    assert "tau_sweep" in artifact.metrics
+
+    probs = artifact.predict_proba("this is amazing news item 0")
+    assert set(probs) == {"negative", "positive"}
+    assert abs(sum(probs.values()) - 1.0) < 1e-6
+
+
+def test_run_backend_name_overrides_a_tags_own_lightgbm_default_to_xgboost(tmp_path):
+    # The tag's own spec entry still says "lightgbm" (the default, unset); run()'s own backend_name= is a
+    # one-run-only override on top of that, the same shape --min-match-rate/--min-accuracy-ratio already have.
+    spec_path, spec = make_spec(tmp_path, retain_days=30)
+    assert spec.by_task(TASK).student == "lightgbm"
+    write_experience(tmp_path, spec, synthetic_rows(60))
+    _write_eval_set(tmp_path / "eval.jsonl", synthetic_rows(15))
+
+    artifact = run(
+        spec_path=spec_path,
+        task=TASK,
+        log_dir=None,
+        package_version="0.0.0-test",
+        backbone="stub/model",
+        dims=128,
+        held_out_fraction=0.25,
+        min_match_rate=0.5,
+        min_accuracy_ratio=0.5,
+        num_threads=1,
+        seed=0,
+        num_boost_round=30,
+        min_data_in_leaf=2,
+        backend_name="xgboost",
+    )
+    assert artifact.admitted, artifact.reasons
+    assert artifact.backend == "xgboost"
+
+
+# --------------------------------------------------------------------------- backend recorded on the artifact,
+# and back-compat with an artifact written before "backend"/"backend_version" existed
+
+
+def test_the_artifact_records_which_backend_trained_it(tmp_path):
+    spec_path, spec = make_spec(tmp_path, eval_set="does-not-exist.jsonl")
+    write_experience(tmp_path, spec, synthetic_rows(40))
+    artifact = run(
+        spec_path=spec_path,
+        task=TASK,
+        log_dir=None,
+        package_version="0",
+        backbone="m",
+        dims=64,
+        num_threads=1,
+        seed=0,
+        num_boost_round=10,
+    )
+    assert artifact.backend == "lightgbm"
+    assert artifact.backend_version == lightgbm.__version__
+
+
+def test_an_artifact_with_no_backend_key_reads_as_lightgbm_for_back_compat(tmp_path):
+    spec_path, spec = make_spec(tmp_path, eval_set="does-not-exist.jsonl")
+    write_experience(tmp_path, spec, synthetic_rows(40))
+    artifact = run(
+        spec_path=spec_path,
+        task=TASK,
+        log_dir=None,
+        package_version="0",
+        backbone="m",
+        dims=64,
+        num_threads=1,
+        seed=0,
+        num_boost_round=10,
+    )
+    from prismyra.learn.fit import StudentArtifact
+
+    raw = artifact.to_json()
+    del raw["backend"]
+    del raw["backend_version"]
+    restored = StudentArtifact.from_json(raw)
+    assert restored.backend == "lightgbm"
+    assert restored.backend_version is None
+    probs = restored.predict_proba("this is amazing news item 0")
+    assert set(probs) == {"negative", "positive"}

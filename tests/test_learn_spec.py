@@ -212,3 +212,26 @@ def test_a_bad_min_accuracy_ratio_is_refused(tmp_path, bad):
 def test_min_match_rate_of_exactly_one_is_allowed(tmp_path):
     spec = load_spec(write(tmp_path, [{**ENTRY, "min_match_rate": 1.0}]))
     assert spec.tags[0].min_match_rate == 1.0
+
+
+# --------------------------------------------------------------------------- the optional "student" field
+
+
+def test_an_entry_without_student_defaults_to_lightgbm(tmp_path):
+    spec = load_spec(write(tmp_path, [ENTRY]))
+    assert spec.tags[0].student == "lightgbm"
+
+
+def test_an_entry_can_opt_into_xgboost(tmp_path):
+    spec = load_spec(write(tmp_path, [{**ENTRY, "student": "xgboost"}]))
+    assert spec.tags[0].student == "xgboost"
+
+
+def test_an_unknown_student_backend_is_refused(tmp_path):
+    with pytest.raises(SpecError, match="'student'"):
+        load_spec(write(tmp_path, [{**ENTRY, "student": "catboost"}]))
+
+
+def test_an_empty_student_backend_is_refused(tmp_path):
+    with pytest.raises(SpecError, match="'student'"):
+        load_spec(write(tmp_path, [{**ENTRY, "student": ""}]))

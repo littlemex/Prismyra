@@ -40,7 +40,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from .spec import LearnSpec, TagSpec, load_spec
+from .spec import LearnSpec, SpecError, TagSpec, load_spec
 
 #: The BLAS backends `fit.run`'s own numpy usage can be built against. Not LightGBM's own thread pool
 #: (`--num-threads`, read directly by `fit.run` as its own `num_threads` parameter) -- these are a *second*,
@@ -323,10 +323,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cap_blas_threads(args.num_threads)
 
+    # Which backend(s) this invocation actually needs: a deployment with every routed tag on "lightgbm" (the
+    # default) must not be refused for lacking xgboost, and vice versa -- `_routed_tags` is the same filter
+    # `run_forever` applies, so this checks exactly the tags this process is about to try to fit.
     try:
-        import lightgbm  # noqa: F401
-    except ImportError:
-        print('this needs the extra: pip install "prismyra[learn]"')
+        spec_for_check = load_spec(args.learn_spec)
+        needed_backends = {t.student for t in _routed_tags(spec_for_check, tuple(args.task))}
+    except SpecError:
+        needed_backends = {"lightgbm"}
+    missing_extras = []
+    for backend_name in sorted(needed_backends) or ["lightgbm"]:
+        try:
+            if backend_name == "xgboost":
+                import xgboost  # noqa: F401
+            else:
+                import lightgbm  # noqa: F401
+        except ImportError:
+            missing_extras.append("learn-xgb" if backend_name == "xgboost" else "learn")
+    if missing_extras:
+        extras = " ".join(f'"prismyra[{e}]"' for e in sorted(set(missing_extras)))
+        print(f"this needs the extra(s): pip install {extras}")
         return 1
 
     try:

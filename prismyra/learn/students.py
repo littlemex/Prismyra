@@ -1,10 +1,11 @@
 """Loading a `prismyra.learn.fit.StudentArtifact` for stage 4's router, and nothing past that.
 
 `prismyra.learn.fit` is deliberately "not imported by anything else in the package" (its own docstring); this
-module is the one, narrow exception, and it is still careful about it -- `lightgbm` (the `learn` extra) is
-imported lazily, inside `StudentHandle.predict`, exactly like `fit.py`'s own `StudentArtifact.predict_proba`
-already does, so that loading `prismyra.learn.router`/`prismyra.learn.hook` for a server that has no student
-configured for any tag never requires the extra to be installed.
+module is the one, narrow exception, and it is still careful about it -- the artifact's own `backend`
+(`prismyra.learn.backends.StudentBackend`, `"lightgbm"` or `"xgboost"`) is what `StudentHandle.__init__`
+resolves to a `prismyra.learn.backends.get_backend(...).load(...)` call, and that is the one place either
+library (`learn`/`learn-xgb` extra) is imported -- so that loading `prismyra.learn.router`/`prismyra.learn.
+hook` for a server that has no student configured for any tag never requires either to be installed.
 
 A student is only ever read here from the file an admitted run of `python -m prismyra.learn.fit` wrote --
 nothing in this module trains, re-evaluates or mutates one. The one check this module adds past
@@ -20,6 +21,7 @@ import hashlib
 import threading
 from pathlib import Path
 
+from .backends import get_backend
 from .fit import StudentArtifact
 
 
@@ -31,21 +33,23 @@ def student_version(artifact: StudentArtifact) -> str:
     """A short, content-addressed name for one artifact -- what `served_by` (`f"student:{...}"`, both in the
     HTTP response and in a logged `Experience.answered_by`) and `prismyra.learn.router.decide`'s own
     `student_version` parameter use to tell two fits of the *same* tag apart. Hashes `model_text` (the trained
-    booster itself) together with `spec_version` (DISTILL-RL-DESIGN-v2.md section 2's "backbone が変わると、
-    生徒...は、すべて無効になる" travels through `spec_version` because a backbone change forces a new spec
-    load in practice) rather than trusting `created_at`, which two artifacts fit back-to-back on identical
-    data could plausibly share to the second.
+    model itself) and `backend` (switching a tag from one `prismyra.learn.backends.StudentBackend` to another
+    is as real a change as retraining on new data, even on the rare chance two different backends produced
+    byte-identical `model_text`) together with `spec_version` (DISTILL-RL-DESIGN-v2.md section 2's "backbone
+    が変わると、生徒...は、すべて無効になる" travels through `spec_version` because a backbone change forces
+    a new spec load in practice) rather than trusting `created_at`, which two artifacts fit back-to-back on
+    identical data could plausibly share to the second.
     """
-    payload = f"{artifact.spec_version}\x00{artifact.model_text}".encode()
+    payload = f"{artifact.spec_version}\x00{artifact.backend}\x00{artifact.model_text}".encode()
     return hashlib.sha256(payload).hexdigest()[:12]
 
 
 class StudentHandle:
     """One loaded, admitted artifact, ready to answer `prismyra.learn.router.decide`'s `student_predict`
-    thunk. `predict` loads `lightgbm` and builds the `Booster` once, in `__init__` (eager, not lazy past
-    construction): a `StudentHandle` is only ever constructed for a tag whose `RouterConfig` is already live,
-    so the cost of building the booster is paid once, at server startup, rather than on this tag's first
-    request.
+    thunk. `predict` loads this artifact's own backend and builds the model once, in `__init__` (eager, not
+    lazy past construction): a `StudentHandle` is only ever constructed for a tag whose `RouterConfig` is
+    already live, so the cost of deserializing the model is paid once, at server startup, rather than on this
+    tag's first request.
     """
 
     def __init__(self, artifact: StudentArtifact):
@@ -57,9 +61,8 @@ class StudentHandle:
             )
         self.artifact = artifact
         self.version = student_version(artifact)
-        import lightgbm as lgb  # see module docstring: the one place this extra is required, and only here
-
-        self._booster = lgb.Booster(model_str=artifact.model_text)
+        # see module docstring: the one place either backend's own library is required, and only here
+        self._model = get_backend(artifact.backend).load(artifact.model_text)
         self._vectorizer = artifact.vectorizer()
 
     def transform(self, context: str, question: str = "") -> tuple[float, ...]:
@@ -70,11 +73,11 @@ class StudentHandle:
         return tuple(self._vectorizer.transform(context, question))
 
     def predict(self, context: str, question: str = "") -> dict[str, float]:
-        """`StudentArtifact.predict_proba`'s own logic, minus rebuilding the booster on every call."""
+        """`StudentArtifact.predict_proba`'s own logic, minus rebuilding the model on every call."""
         import numpy as np
 
         vec = self.transform(context, question)
-        (probs,) = self._booster.predict(np.asarray([vec], dtype=np.float64))
+        (probs,) = self._model.predict_proba(np.asarray([vec], dtype=np.float64))
         return dict(zip(self.artifact.options, (float(p) for p in probs), strict=True))
 
 
