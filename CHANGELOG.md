@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.11
+
+- **Attention's rope rotate and output-gate multiply are now each one hand-written Triton kernel instead of
+  several separate eager launches.** Reproduces eager's exact sequence of bf16 roundings (not a `torch.compile`
+  fusion, which lowers the same formula into fewer roundings and is not bit-exact against it), so it is installed
+  only after a synthetic probe confirms bit-for-bit agreement on this card and this geometry, and left alone
+  otherwise. Checked bit-exact on both supported cards: 40 random shapes (0 mismatches across 27.6M elements on
+  fp8/L40S, 27.6M on nvfp4/RTX PRO 4500) and devset/kev_prod/weak4/tied8 in full, on/off toggled in one process
+  (0 mismatches across 5,691 rows on fp8, 5,693 on nvfp4). A small, real speed win (0.5-0.7% at 1/16/64 questions,
+  fp8/L40S) -- see [docs/PERFORMANCE.md](docs/PERFORMANCE.md#fused-rope-and-output-gate-glue-bit-exact) for the
+  numbers, and for why a bigger `torch.compile`-based attempt (both a whole-backbone compile and a non-deterministic
+  "fast mode" built on this same glue) was tried and not kept: both measured as a net speed loss once compared
+  against the bit-exact fusion above, not against plain eager.
+
 ## 0.4.10
 
 Three fixes to stage 4, found running the student path on real hardware a second time:
