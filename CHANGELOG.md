@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.12
+
+- **The one-pass path's own routed-expert MoE tile is now per-M-bucket, not one frozen tile for every row
+  count above 64.** `kernels/onepass_moe_tuning.py`'s table was still a single tile for every M above 64
+  because that is what vLLM's own `get_default_config` (a decode-era heuristic) already returns at that M --
+  not because every M actually wants the same tile. `BLOCK_SIZE_K`/`SPLIT_K` are held fixed across every
+  bucket (the only two parameters that can move the K-reduction order in `fused_moe_kernel`); every other
+  parameter is free to vary per bucket, the same idea `kernels/fp8_tuning.py` already ships for the dense-FP8
+  matmul. Checked `torch.equal` against the previous single tile at 14 M buckets (64-16,384) on both this
+  project's cards, and on five random non-checkpoint layer shapes: zero mismatches. Decisiveness (companion/
+  question-count invariance, paged-vs-joined bit-exactness, the full GPU test suite) re-checked on real
+  hardware and unchanged. Measured +2.45% at the exact row count a prior profiling round flagged as this
+  kernel's own largest single cost (fp8/L40S, `fused_experts()` alone, interleaved CUDA-event timing), +0.02%
+  to +3.52% across every bucket; end to end, +0.35% at one question, no change at 16/64 questions (the forked
+  path, which never reaches this table). See
+  [docs/KERNELS.md](docs/KERNELS.md#the-one-pass-tile-stopped-being-one-tile-speed-tiles) for the full
+  measurement.
+
 ## 0.4.11
 
 - **Attention's rope rotate and output-gate multiply are now each one hand-written Triton kernel instead of

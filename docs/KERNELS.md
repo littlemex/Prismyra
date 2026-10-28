@@ -406,6 +406,69 @@ routed-expert path on this card (`PRISMYRA_EXPERTS` unset) is expected to see th
 by the same reasoning that figure was measured against in the first place, but that case was not separately
 re-measured here.
 
+## The one-pass tile stopped being one tile (`speed-tiles`)
+
+The table above was still a single frozen tile for every M above 64, not because that is the fastest shape at
+every M, but because vLLM's own `get_default_config` (the function the table was frozen from) only varies
+`BLOCK_SIZE_M`/`GROUP_SIZE_M` below M=64 and returns one identical dict for every M above it -- a decode-era
+heuristic ("Use a small M tile for decode-like batches") applied unconditionally to a one-pass read's M, which
+is a whole document's context plus one question (thousands of rows, not a decode step). `kernels/fp8_tuning.py`
+already ships an M-bucketed table for the dense-FP8 matmul for exactly this reason; this table did not, because
+vLLM's own per-M config *file* mechanism for the fused-MoE kernel (`get_moe_configs`) returns `None`
+unconditionally whenever `VLLM_BATCH_INVARIANT` is set (checked by reading the function) -- which this project's
+engine sets on every CUDA process -- so the file-based route `fp8_tuning.py` uses cannot work here; the custom
+`_config` override `onepass_moe_tuning.scope()` already used for the single tile is extended to pick a tile per
+M bucket instead.
+
+Safe to vary without moving the answer, for the same reason `fp8_tuning.py`'s own per-M table already is:
+`fused_moe_kernel`'s K-loop (`for k in range(0, tl.cdiv(K, BLOCK_SIZE_K))`) is strictly sequential, and its trip
+count and stride depend only on `BLOCK_SIZE_K`. `SPLIT_K` is declared as a kernel parameter but never read
+inside the kernel body in the vLLM version this project pins (checked: grep finds it only ever assigned by
+callers, always to `1`, never referenced inside the `@triton.jit` function), so it cannot move the reduction
+order either. `BLOCK_SIZE_M`/`BLOCK_SIZE_N` only choose which tile of the output a program computes;
+`GROUP_SIZE_M` only reorders which program computes which tile (L2 locality); `num_warps` splits a tile's own
+compute across warps, not the K-reduction inside one `tl.dot`; `num_stages` only changes software-pipelining
+depth. None of these can change the sequence of floating-point operations that produces one output element once
+`BLOCK_SIZE_K` and `SPLIT_K` are held fixed -- confirmed, not assumed: a purpose-built tuner
+(`tools/speedtiles_build.py`'s counterpart used to build this table) checked every candidate `torch.equal`
+against the previous single-tile table before timing it, on this checkpoint's real routed-expert GEMM shapes
+(256 experts, 1024x2048 gate+up, 2048x512 down, top-8) at 14 M buckets (64 to 16,384) on both cards this project
+ships `fast` kernels for, and on five random (non-checkpoint) layer shapes at two more M values: zero mismatches
+across all of it. `tile_for(m)` picks the bucket whose key is numerically closest to `m` (the same nearest-bucket
+rule vLLM's own `try_get_optimal_moe_config`/`get_w8a8_block_fp8_configs` already use for their own per-M
+tables), so a given M always maps to the same tile every time -- determinism is a property of the table being a
+pure function of M, computed once at import time, not of the table being flat.
+
+**Decisiveness, re-checked on real hardware, not assumed to survive the change.** `tools/audit_sm120.py`'s own
+two sections, on the L40S with the FP8 checkpoint (the card and the only checkpoint whose routed experts
+actually run this kernel): companion/question-count invariance held at 4,392/4,392 bit-exact (0 flips); paged
+vs joined held at exactly its pre-existing baseline (24/2,448 non-exact, all at qn=1, which only ever carried a
+measured-tolerance guarantee -- 0 non-exact at qn>=2, the bit-exact guarantee this project actually depends on).
+The full GPU test suite (`pytest -m gpu`, `tests/test_gpu.py`/`test_onepass_moe_tuning.py`/
+`test_gpu_require_kernels.py`) passed in full on the L40S (50 passed, 6 skipped for memory reasons unrelated to
+this change). On the RTX PRO 4500, the NVFP4 checkpoint's own `paged_and_joined` tests pass unchanged (this
+checkpoint's routed experts are NVFP4, so they never reach this table at all -- the pass only confirms this
+change does not break anything the NVFP4 path depends on); the FP8 checkpoint itself does not fit this card's
+32 GiB alongside the test harness's own overhead, so an equivalent full-engine run on this card's own routed-FP8
+path was not attempted (consistent with this checkpoint/card pairing never having been the project's
+recommended one).
+
+**Speed, measured on real hardware.** At the exact row count `speed-kdiff`'s own profile flagged (3,446 tokens,
+L40S, fp8): five interleaved rounds of `fused_experts()` alone (CUDA events, baseline and the new tile
+alternating, 3 warm-up + 12 timed calls per sample) moved from a 1.8923 ms median to a 1.8460 ms median, +2.45%,
+at every one of the 14 M buckets this table covers (+0.02% to +3.52%, all positive, `torch.equal` holding
+throughout). End to end (`benchmarks/compare_jev_d1.py`, this checkpoint, 3,446-token document, 3 rounds old
+then 3 rounds new, 2 warm-up + 7 timed `ask()` calls per round): 1 question moved from a 152.57 ms mean-of-medians
+to 152.03 ms, -0.35%; 16 and 64 questions (the forked path, which never reaches this table) moved by less than
+0.2% in either direction -- noise, not a regression, exactly as `speed-kdiff`'s own standing bar for "a real
+change" would read it, and in the same direction the kernel-level number predicts once diluted by the ~70% of
+the forward pass this table does not touch. On the RTX PRO 4500, the curated search (the full 216-candidate grid
+compiled too slowly on this architecture to finish inside this round's time budget -- see `RUN-speed-tiles.md`
+-- so the search here reused every tile that won at least one M bucket on the L40S plus a few extra, all
+re-checked `torch.equal` on this card's own shapes) found a genuine, if small, win at M<=256 (+0.19% to +0.76%)
+and landed on the same tile as the pre-existing single frozen one at every M from 512 up -- not a regression,
+just nothing better found there yet.
+
 ## Dense projections in NVFP4 (Blackwell only, experimental)
 
 `PRISMYRA_DENSE=nvfp4` is the same idea as `PRISMYRA_EXPERTS=nvfp4` above, applied to the other half of a
