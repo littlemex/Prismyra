@@ -842,7 +842,8 @@ class Prismyra:
             pin_name = onepass_moe_tuning.device_name()
             pin = onepass_moe_tuning.pinned_config()
             if pin is not None:
-                self.applied.notes.append(f"onepass_moe_pin: {pin_name} loaded {pin}")
+                buckets = "1 (flat)" if onepass_moe_tuning.is_flat_tile(pin) else f"{len(pin)}"
+                self.applied.notes.append(f"onepass_moe_pin: {pin_name} loaded ({buckets} M bucket(s))")
             else:
                 msg = (
                     f"onepass_moe_pin: no pinned one-pass MoE tile for {pin_name!r} (checked "
@@ -1511,7 +1512,7 @@ class Prismyra:
         cache = build_cache(self.config, self.room_for(tokens) + WIDTHS[-1], 1, self.dtype, self.device, WIDTHS[-1])
         from .kernels import onepass_moe_tuning
 
-        with torch.inference_mode(), onepass_moe_tuning.scope():
+        with torch.inference_mode(), onepass_moe_tuning.scope(tokens):
             out = self.backbone(input_ids=ids, use_cache=True, past_key_values=cache)
             hidden = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[0, -1:]
         # Released before returning, inside the caller's lock: the output holds the cache, and the next request must

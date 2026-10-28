@@ -338,7 +338,7 @@ def record_bucket(
         # like every other kernel this file records).
         from .kernels import onepass_moe_tuning
 
-        with onepass_moe_tuning.scope():
+        with onepass_moe_tuning.scope(length):
             if embeds is not None:
                 out = engine.backbone(inputs_embeds=embeds, use_cache=True, past_key_values=cache)
             else:
