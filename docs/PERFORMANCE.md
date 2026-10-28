@@ -683,7 +683,80 @@ for why removing the dispatcher registration alone costs this little on the L40S
 whether the same holds on the RTX PRO 4500 -- there, the one data point available (`narrow`, above) shows removing
 the registration breaking the guarantee outright, which the targeted fixes evidently do not cover on that card.
 
-### Streaming many documents without running out of memory
+### The shelf reaches /v1/decide too
+
+`/v1/decide`'s own `ask` callback (`decide_mod.decide_many`'s entry point into the device) used to call `worker.submit`
+unconditionally -- the one place in `server.py` that never took the shelf path, no matter how `--batcher` was
+configured. A caller re-asking several typed decisions about the same record across separate requests -- an agent
+deciding one field at a time about a transcript it already asked about, say -- paid for the read every single time,
+even with `--batcher` on. It now routes through the same gate `/ask` already uses (`_batcher_capacity`; `state` is
+always text, so the media exclusion never applies here) and the same id namespacing (`_namespaced`/`_restore_ids`),
+because `decide.parse_item`'s internal question id is always `item0`, `item1`, ... -- the *same strings* for every
+`/v1/decide` request, unlike `/ask`'s caller-chosen ids, which only collide when a caller happens to repeat one.
+Without namespacing, two concurrent `/v1/decide` requests landing in the same pass would collide on every single
+pair, not only on a repeated id.
+
+Measured over real HTTP (one document, 3,446 tokens, repeated across 9 calls against a fresh never-before-seen
+document of the same length each of 9 calls, 2 warm-up then median of 7, `fp8` on an L40S):
+
+| questions | `/ask`, repeated | `/ask`, fresh each time | `/v1/decide`, repeated | `/v1/decide`, fresh each time |
+|---:|---:|---:|---:|---:|
+| 1 | 107.5 ms | 293.4 ms | 100.0 ms | 289.4 ms |
+| 2 | 106.4 ms | 297.8 ms | 102.2 ms | 291.4 ms |
+| 4 | 112.9 ms | 300.9 ms | 108.2 ms | 297.5 ms |
+| 16 | 141.1 ms | 343.8 ms | 130.4 ms | 321.7 ms |
+| 64 | 500.1 ms | 500.8 ms | -- | -- |
+
+`/v1/decide` carries the same 2.4-2.9x saving `/ask` already had, within noise of it at every width measured. At 64
+questions neither endpoint benefits: 64 exceeds `engine.group` (32, the default this server was started with), so
+`_batcher_capacity` sends both the repeated and the fresh case to the plain queue -- the same fallback `/ask` already
+documents for an over-wide request, not a new limit this change introduces. `nvfp4` on the RTX PRO 4500 shows the
+same shape, a larger ratio because the fixed read this saves is a larger fraction of a shorter answer: 76.1 ms
+against 232.6 ms at one question (3.05x), narrowing to 101.0 ms against 278.1 ms at 16 (2.75x), and the same 64
+question fallback (392.5 ms against 392.9 ms).
+
+**Whether a shelf *hit* answers exactly as a fresh read would have, measured precisely rather than only bounded.**
+`tests/test_gpu.py::test_a_shelf_matches_ask_bit_for_bit` already checks this with `pytest.approx(..., abs=1e-4)`,
+left at that tolerance from before the width and row-count fixes two sections above landed. Re-measured on both
+supported checkpoints with the exact residual printed rather than only asserted against a bound -- a document
+already resident from an earlier pass (not the pass that first read it), one real GPU, one process, against
+`ask()`'s own answer for the identical context and questions:
+
+| checkpoint (card) | first put (a read, not yet a hit) | a genuine second hit (no read) | decision flips |
+|---|---:|---:|---:|
+| `fp8` (L40S) | 0.0 | 0.0 | 0 |
+| `nvfp4` (RTX PRO 4500) | 0.0 | 0.0 | 0 |
+
+Bit-exact, not merely within the shipped test's own tolerance, on both -- the 1e-4 figure the test still carries is
+leftover conservatism from before this project's own companion/question-count matrix closed at 0 (see "A shelf
+answers like ask()" above), not a residual this measurement still finds. This is the narrow claim the shipped test
+already made, confirmed to the actual bit rather than to a bound: **a document that stays on the shelf answers a
+later question about it exactly as it would have answered the first time**, on these two fixtures.
+
+**That narrow claim does not, by itself, make `--batcher` safe to turn on by default**, and the reason has nothing
+to do with the shelf-hit axis just measured. `--batcher` requires `paged=True` (`Batcher.__init__` refuses without
+it), and `paged=True` is the axis "A shelf answers like ask()" above already measured as *not* bit-exact in
+general: 1.69% of a 1,893-question development set flips decision between `paged` and the joined (`--batcher`-off)
+storage, with no measurable aggregate accuracy cost. Turning `--batcher` on moves every single-question request
+from the joined storage to the paged one -- regardless of whether that request's document ever hits the shelf --
+and inherits that already-disclosed cost. The shelf itself adds nothing further to it: the measurement above is
+that a *hit* costs nothing beyond what being on the paged storage at all already costs. `--batcher` stays off by
+default for the reason it already was (the paged-vs-joined gap), not because of anything found while wiring
+`/v1/decide` into it or while measuring the hit above.
+
+**Memory, on the card this pinches hardest.** `nvfp4` holds about 22.5 GiB at rest on the RTX PRO 4500's 32 GiB (the
+card this project's own cards document as tightest). Driving the sweep above through `--batcher` let the shelf
+reach its resident cap (`SHELF_MAX_RESIDENTS`, 16) at this document's length, measured at 29.4 GiB used -- about 3.2
+GiB free against `SHELF_MEMORY_MARGIN`'s own 2 GiB reservation. Real, not a projection: `empty_cache_calls` stayed 0
+and nothing was rejected or abandoned (`/stats`) over this run, and the device-level eviction and memory-margin
+tests (`test_a_shelf_evicts_on_memory_pressure_even_with_tokens_to_spare`,
+`test_shelf_resident_count_stays_at_the_cap_with_room_to_spare`) pass on this card unchanged. An operator turning
+`--batcher` on for a 32 GB card specifically, who also expects longer documents than this measurement's 3,446
+tokens, should budget from this headroom figure rather than from the 65,536-token full-budget one `/ask`'s own
+module docstring quotes -- a shelf holding several residents at once is not the single-context case that number
+describes.
+
+
 
 Admission accounts for two costs a resident document holds, not one: its tokens, in the page pool, and a per-document
 snapshot of the recurrent state its read ended in, outside the pool, roughly constant in size regardless of the

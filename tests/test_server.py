@@ -157,7 +157,7 @@ def test_the_served_version_is_the_package_version():
     prismyra.Prismyra = lambda *a, **k: StubEngine()
     try:
         app = create_app("stub/model")
-        assert app.version == prismyra.__version__ == "0.4.12"
+        assert app.version == prismyra.__version__ == "0.4.13"
         client = TestClient(app)
         assert client.get("/openapi.json").json()["info"]["version"] == prismyra.__version__
     finally:
@@ -352,7 +352,10 @@ class _StubShelf:
     def ask(self, asked: dict, lane: int = 0) -> dict:
         out = {}
         for handle, questions in asked.items():
-            self.engine.shelf_asks.append((handle, len(questions)))
+            # The ids, not just a count: `test_decide_with_batcher_on_namespaces_each_requests_internal_ids_...`
+            # needs to see that two requests sharing a document never hand the shelf the same id twice, which a
+            # count alone cannot show.
+            self.engine.shelf_asks.append((handle, [q.id for q in questions]))
             out[handle] = _stub_result(questions)
         return out
 
@@ -671,3 +674,90 @@ def test_decide_endpoint_refuses_a_bad_kind_before_touching_the_device():
     response = client.post("/v1/decide", json={"kind": "freeform", "state": "x", "question": "?"})
     assert response.status_code == 422
     assert engine.asks == []
+
+
+# --------------------------------------------------------------------------- /v1/decide, through --batcher
+#
+# Before this, `/v1/decide`'s own `ask` closure always called `worker.submit` -- the one `ask` callback in this
+# file that never took the shelf path, no matter how `--batcher` was configured (see this module's own history:
+# `decide`'s docstring used to say so in as many words). These three tests are the `/v1/decide` side of the three
+# already above for `/ask` (`test_batcher_off_by_default_behaves_exactly_as_before`,
+# `test_batcher_on_routes_a_plain_text_request_through_the_scheduler`,
+# `test_namespaced_ids_never_collide_across_two_requests_sharing_a_document`): unchanged with `--batcher` off,
+# routed to the shelf with it on, and never colliding two requests' identically-named internal question ids
+# (`decide.parse_item`'s `internal_id = f"item{index}"` is the *same string* for every `/v1/decide` request,
+# unlike `/ask`'s caller-chosen ids, which only collide when a caller happens to repeat one).
+
+
+def test_decide_with_batcher_off_goes_through_the_plain_queue_exactly_as_before():
+    """Unchanged: no `Batcher` is built, and `decide_mod.decide_many`'s `ask` callback still calls `worker.submit`
+    directly, the same as before this closure learned about the shelf at all."""
+    engine = StubBatchableEngine()
+    client = _client_with(engine)
+    response = client.post(
+        "/v1/decide",
+        json={"kind": "noul", "state": "a short document", "question": "Is it urgent?"},
+    )
+    assert response.status_code == 200, response.text
+    assert engine.direct_asks and not engine.shelf_asks
+
+
+def test_decide_with_batcher_on_routes_through_the_shelf():
+    """With `--batcher` on, a `/v1/decide` request's engine work lands on the shelf `/ask` already uses --
+    `direct_asks` (the plain queue's own trace) stays empty, `shelf_asks` does not."""
+    engine = StubBatchableEngine(group=8)
+    client = _client_with(engine, batcher=True)
+    response = client.post(
+        "/v1/decide",
+        json={"kind": "noul", "state": "a short document", "question": "Is it urgent?"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["kind"] == "noul"
+    assert engine.shelf_asks and not engine.direct_asks
+
+
+def test_decide_with_batcher_on_still_merges_a_batch_sharing_one_state_into_one_shelf_ask():
+    """`decide_mod.decide_many`'s own saving (several decisions about one state cost one call) survives routing
+    through the shelf: two items sharing a `state` must still land in exactly one `shelf.ask` call, not two."""
+    engine = StubBatchableEngine(group=8)
+    client = _client_with(engine, batcher=True)
+    response = client.post(
+        "/v1/decide",
+        json=[
+            {"kind": "noul", "state": "the same record", "question": "Is it urgent?", "id": "a"},
+            {"kind": "score", "state": "the same record", "question": "How clear is it?", "id": "b"},
+        ],
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["num_model_requests"] == 1
+    assert len(engine.shelf_asks) == 1 and not engine.direct_asks
+    by_id = {r["id"]: r for r in body["results"]}
+    assert by_id["a"]["merged_with"] == ["b"]
+    assert by_id["a"]["value"] is not None and by_id["b"]["value"] is not None
+
+
+def test_decide_with_batcher_on_namespaces_each_requests_internal_ids_so_two_requests_never_collide():
+    """`decide.parse_item`'s internal id is always `item0` (there is only one item in each of these two
+    requests), the same string both times -- unlike `/ask`'s caller-chosen ids, which only collide when a caller
+    happens to repeat one, this collides on *every* pair of `/v1/decide` requests unless each is namespaced before
+    it reaches the shelf. Asserting on the ids `_StubShelf.ask` actually received (not just that it was called)
+    is what tells a namespaced id from a bare `item0` repeated twice.
+    """
+    engine = StubBatchableEngine(group=8)
+    client = _client_with(engine, batcher=True)
+
+    first = client.post("/v1/decide", json={"kind": "noul", "state": "the same document", "question": "Urgent?"})
+    second = client.post("/v1/decide", json={"kind": "noul", "state": "the same document", "question": "Urgent?"})
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+
+    assert len(engine.shelf_asks) == 2
+    first_ids = engine.shelf_asks[0][1]
+    second_ids = engine.shelf_asks[1][1]
+    assert first_ids != ["item0"] and second_ids != ["item0"], (
+        "the shelf must never see decide.py's own bare internal id -- it must be namespaced first"
+    )
+    assert first_ids != second_ids, "two different requests must not namespace to the same id"
+    assert first_ids[0].endswith(":item0") and second_ids[0].endswith(":item0")
