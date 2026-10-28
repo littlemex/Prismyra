@@ -500,6 +500,7 @@ replaces, nothing else.
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | How the numbers were measured and how to reproduce them |
 | [docs/ACCURACY.md](docs/ACCURACY.md) | Whether the answers are right, on public labels, and where they are not |
 | [docs/DATA_PROVENANCE.md](docs/DATA_PROVENANCE.md) | Every training source and teacher model behind the shipped adapter, and its licence |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | What is measured today, where each line of work is stuck, and what the next step is |
 | [recipes/decision-lora/](recipes/decision-lora/) | Training the read-out itself, and folding the adapter into the checkpoint before serving |
 | [examples/tetris/](examples/tetris/) | A decision loop, where the representation was worth more than anything in the engine |
 
