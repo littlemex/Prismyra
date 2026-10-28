@@ -801,6 +801,23 @@ attempt starts from where this one stopped rather than re-measuring the same two
   to fold together, and the `mode="fast"` path pays Dynamo's per-call guard-dispatch cost for it anyway. Not shipped
   -- no `mode` parameter, `enable_fast_mode` flag, or `--enable-fast-mode` CLI flag exists in this release.
 
+### `ask()`'s own wrapper cost against calling the library directly: measured, not assumed
+
+A reported 46 ms gap between a "library-direct" eager call and `ask()` at one question, 3,446 tokens, fp8/L40S
+turned out, on inspection, to be two different things compared as one: the slower number came from running
+`ask()` against the unshipped `mode`/`enable_fast_mode` branch just above (which is not on this release's `ask()`
+at all), and the faster number did not reproduce against this release's own `_read_one_pass` -- scaled linearly
+from a verified 2,293-token measurement on the same checkpoint and card, it predicts ~148 ms at this length, close
+to what this release actually measures (144-146 ms), not 105.8 ms. Measured directly, same process, same GPU
+state, same input, phase by phase: `ask()`'s own wrapper (tokenising the question's options, tokenising the
+question text, building the suffix, the admission check, the peak-memory baseline, assembling the input tensor,
+the read-out and its host sync) costs 6.7-8.3 ms on top of the 144-146 ms forward pass, and 85% of that (5.5 ms)
+is tokenising the 3,446-token context itself -- necessary work, not overhead. The one piece that was not
+necessary: `_ask_in_one_pass` tokenised the question's rendered text twice, once inside `_width_for` (to check it
+is not wider than a branch may be, then discarding the token ids) and once more immediately after (to build the
+actual suffix) -- about 0.12 ms, now done once. Below the noise floor of a single `ask()` call (the untouched
+forward pass alone varies by 1-2 ms run to run on this card), so no entry in the tables above moves.
+
 ## Four speed settings, one that risks the answer
 
 For each row, the question is whether its default answers bit-identically to the alternative it could instead be set

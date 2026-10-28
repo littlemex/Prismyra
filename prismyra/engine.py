@@ -1446,8 +1446,13 @@ class Prismyra:
         if not context.strip():
             raise PrismyraError("a context cannot be empty")
         planned = plan(question, self.tokenizer)
-        self._width_for([planned])  # the forked path's refusal of an over-wide question, so both paths refuse alike
         suffix = branch_ids(planned.text, self.tokenizer)
+        # The forked path's refusal of an over-wide question, so both paths refuse alike -- from `suffix`'s own
+        # length rather than a second `branch_ids(planned.text, ...)` call through `_width_for([planned])`: the one
+        # question this path ever has is already tokenised two lines up, and tokenising its text again to throw
+        # the ids away and keep only their count measured real on real hardware (`docs/PERFORMANCE.md`'s
+        # "speed-gap" section), even though it was never the source of this path's slowness.
+        self._round_width_or_refuse(len(suffix))
         with self._lock:
             encoded = encode(context, None, None, self.processor, self.tokenizer, self.device)
             tokens = encoded.tokens + len(suffix)
@@ -2320,6 +2325,20 @@ class Prismyra:
         prior taken at a different width would correct for a different arrangement of the batch.
         """
         widest = max(len(branch_ids(p.text, self.tokenizer)) for p in plans)
+        return self._round_width_or_refuse(widest)
+
+    def _round_width_or_refuse(self, widest: int) -> int:
+        """`_width_for`'s own rounding and refusal, taken from a token count a caller already has in hand.
+
+        Split out so a caller that already tokenised a plan's text for another reason (`_ask_in_one_pass`'s
+        `suffix`, read directly off the one it is about to read with, rather than through a second call to
+        `branch_ids` on the same text) gets the same bucket and the same refusal `_width_for` gives, without
+        tokenising twice. `measure_once(SRC_DIR)`'s own phase breakdown found the discarded retokenize the one
+        change speed-gap could make this path with zero computational or numerical difference -- see
+        `docs/PERFORMANCE.md`'s "speed-gap" section for the real-hardware measurement that found it (and for why it
+        is the only change that round made: the ask()-vs-direct-call gap it was sent to find was not there to begin
+        with).
+        """
         try:
             return round_width(widest)
         except TooWide as e:
