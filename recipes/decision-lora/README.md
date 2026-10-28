@@ -511,7 +511,9 @@ that one probe.
 JEV-35B (bf16) has the best Brier and ECE of the four; JEV-35B-NVFP4 has the worst of both by a wide margin,
 consistent with its accuracy and determinism results above.
 
-**Speed** (one document, 3,446 tokens by each checkpoint's own tokenizer, 2 warm-up calls then median of 7):
+**Speed** (one document, 3,446 tokens by each checkpoint's own tokenizer, 2 warm-up calls then median of 7).
+**A later round found the method below unfair to this project's own checkpoints and re-measured it; see the
+corrected numbers immediately after before drawing any conclusion from this table.**
 
 | questions | `fp8` (1x L40S) | `nvfp4` (1x RTX PRO 4500) | JEV-35B (2x L40S, TP=2) | JEV-35B-NVFP4 (1x RTX PRO 4500) |
 |---|---:|---:|---:|---:|
@@ -519,12 +521,50 @@ consistent with its accuracy and determinism results above.
 | 16 | **252.3 ms** | **211.6 ms** | 688.6 ms | 412.5 ms |
 | 64 | **369.4 ms** | **302.1 ms** | 2,759.2 ms | 1,675.1 ms |
 
-**At one question, the JEV-35B family is faster.** At 16 and 64 questions, both Prismyra checkpoints are
-faster, by a widening margin (JEV-35B takes 2.76 seconds at 64 questions against `fp8`'s 0.37). This round
-answers several questions about the same document in one batched call rather than one call per question -- a
-different implementation than JEV-27B-VL's one-call-per-decision API above -- yet JEV-35B's own time still grows
-close to linearly with the number of questions, where this project's own checkpoints do not; this round did not
-trace that difference to a specific cause.
+**This table's method is not the same test for the two families, even though both sides ran "2 warm-up calls then
+median of 7" against the identical document.** JEV-35B and JEV-35B-NVFP4 are served through vLLM with
+`enable_prefix_caching=True`, and every one of the 9 calls above (warm-up and timed) names the *same* document --
+so calls 2 through 9 reuse the key/value cache the first call built, skipping the read entirely. Prismyra's own
+`ask(context, questions)` is sugar for `open_context(...).ask(...)`: every call opens a fresh `Context` and reads
+the document from scratch, with no mechanism to carry a read across separate `ask()` calls. "The same procedure"
+produced a warmed cache for one side and nothing for the other -- confirmed on the device, not inferred: a
+repeated call against this document hits `3,168` of its `3,446` tokens in the JEV-35B-NVFP4 engine's own prefix
+cache (`RequestOutput.num_cached_tokens`), every time.
+
+**Re-measured with a fresh, never-before-seen document on every one of the 9 calls -- the one procedure that
+cannot give either side a warmed cache to be measured against, companion documents for within-call sharing kept,
+only the cross-call reuse removed** (same hardware, same day, `enable_prefix_caching=True` kept on for both JEV
+checkpoints; a document this different every time, not merely this different between warm-up and timed calls,
+closes the asymmetry the table above measured):
+
+| questions | `fp8` (1x L40S) | `nvfp4` (1x RTX PRO 4500) | JEV-35B (2x L40S, TP=2) | JEV-35B-NVFP4 (1x RTX PRO 4500) |
+|---|---:|---:|---:|---:|
+| 1 | **154.0 ms** | **155.1 ms** | 447.1 ms | 231.3 ms |
+| 16 | **254.6 ms** | **199.1 ms** | 1,040.3 ms | 595.1 ms |
+| 64 | **373.5 ms** | **331.0 ms** | 3,119.8 ms | 1,882.5 ms |
+
+**Prismyra's own checkpoints are faster than both JEV-35B checkpoints at every width measured, including one
+question** -- `fp8` 2.9x faster than JEV-35B at one question (154.0 ms against 447.1 ms) and `nvfp4` 1.5x faster
+than JEV-35B-NVFP4 (155.1 ms against 231.3 ms), widening to 8.4x and 5.7x at 64 questions. This reverses the
+previous table's own one-question conclusion: that table's "JEV-35B family is faster" at one question came from
+measuring one side with a warmed cache and the other without one, not from either model being faster on a cold
+read. The original table's 16/64-question conclusion (Prismyra faster, by a widening margin) does not reverse --
+if anything it widens further once neither side gets a warmed cache, because JEV's own per-call cost without the
+cache credit grows closer to linearly with the question count, which the original table's own prose already
+noted without identifying the cause: the growth was partly real (JEV re-reads the document's KV from scratch on
+every repeated question-batch call too, cache aside) and partly a side effect of measuring its best case and this
+project's un-cached case side by side.
+
+**Prismyra has an equivalent to JEV's warmed-cache case, and it beats JEV's own best number.** `open_context(text)`
+read once and kept open, with `.ask(questions)` called against it 2 warm-up + 7 timed times (`Context.ask`, not
+`Prismyra.ask`) -- the one code path that gives this project's own checkpoints the same opportunity
+`enable_prefix_caching=True` gave JEV in the first table above -- answers one question in 91.3 ms (`fp8`) and
+67.0 ms (`nvfp4`), **both faster than JEV-35B's and JEV-35B-NVFP4's own best-case numbers from the first table**
+(99.2 ms and 82.3 ms respectively). This is not exposed over `/ask` or `/v1/decide` today -- a caller who wants it
+uses `Prismyra.open_context` directly, in-process; see `prismyra/server.py`'s own "Stateless" note on why the HTTP
+server does not yet offer a persistent, caller-named session, and `docs/PERFORMANCE.md`'s "The shelf reaches
+/v1/decide too" for the related (but different) saving `prismyra-serve --batcher` already gives a *repeated*
+document across separate HTTP requests, which these two numbers are not measuring.
 
 **Long context.** This project's engine allocates a fixed token budget at start-up; `fp8` and `nvfp4` both
 answer one question about a 65,536-token document correctly, and both refuse a 128,726-token document
@@ -553,14 +593,21 @@ JEV-35B-NVFP4 56.2%; `fp8` and `nvfp4` were not measured here, for the same budg
 **Reproducing this comparison**: the accuracy and long-context halves score each item the same way as the
 earlier-round subsection above (argmax of the returned probabilities against the gold label; sign test per set
 with a Holm correction across the family being compared; Brier as mean squared distance from the one-hot gold
-label; ECE from 15 confidence bins). The speed half follows the same method as
+label; ECE from 15 confidence bins). The speed half's first table follows the same method as
 [`benchmarks/compare_jev_d1.py`](../../benchmarks/compare_jev_d1.py) (2 warm-up calls, median of 7, a filler
-document built to a target token count); JEV-35B's own `/v1/decide` request shape and tensor-parallel serving
-requirement mean this round's harness calls its weights directly through its own documented API rather than
-through that script unmodified. RACE and BoolQ are public (`race`, `boolq` on Hugging Face); the two
-buried-context sets, Kev transfer-v4, and the Decision RULER and Decision LCR samples drawn from them are this
-project's own held-out construction or a third-party long-context suite assembled locally, and are not bundled
-in this repository.
+document built to a target token count, the same document for every one of the 9 calls); JEV-35B's own
+`/v1/decide` request shape and tensor-parallel serving requirement mean this round's harness calls its weights
+directly through its own documented API rather than through that script unmodified. The corrected table changes
+one thing about that method: a fresh filler document, built the same way but reseeded, for every one of the 9
+calls (warm-up included) rather than one document reused across all 9 -- removing the one variable that gave
+`enable_prefix_caching=True` a warmed cache to answer from on JEV's side while Prismyra's own `ask()` never had
+one to begin with. The `open_context`-reused row calls `Prismyra.open_context` once and `.ask()` on the returned
+`Context` repeatedly, in-process -- there is no public, documented harness for forcing JEV's own vLLM server to
+hold a *caller-chosen* document open across calls rather than relying on its LRU prefix cache happening to still
+hold it, so no equivalent row is reported for JEV here. RACE and BoolQ are public (`race`, `boolq` on Hugging
+Face); the two buried-context sets, Kev transfer-v4, and the Decision RULER and Decision LCR samples drawn from
+them are this project's own held-out construction or a third-party long-context suite assembled locally, and are
+not bundled in this repository.
 
 ## Weak-category mixture: sentiment and causal/multi-step reasoning
 

@@ -591,8 +591,22 @@ def create_app(
 
         Goes through the same single-worker queue `/ask` uses when `--batcher` is off, not through `Batcher`:
         this endpoint's own saving is merging *one request's own* decisions sharing a state, which needs no
-        more than the queue already serialising access to the device; cross-request batching is `Batcher`'s
-        job and this does not attempt it.
+        more than the queue already serialising access to the device.
+
+        **With `--batcher` on, each distinct state in this request also takes the shelf path `/ask` already
+        takes** -- same gate (`_batcher_capacity`, text only; `state` is always text, see
+        `decide._state_to_context`), same id namespacing (`_namespaced`/`_restore_ids`), same shelf. A record
+        decided about repeatedly -- an agent re-asking several typed questions about the same transcript
+        across separate requests, say -- is read once and every later decision about it is a branch pass, not
+        a second read, the same saving `docs/PERFORMANCE.md`'s "The scheduler on a shelf" measures for `/ask`.
+        Before this, `/v1/decide` was the one endpoint a repeated document never got that saving through, no
+        matter how `--batcher` was configured -- this closure was the only `ask` callback in this file that
+        still always went to `worker`, unconditionally. See `docs/PERFORMANCE.md`'s "The shelf reaches
+        /v1/decide too" for what changed, and what it costs when a `--batcher` server's requests are decisions
+        rather than plain `/ask` calls: `decide_mod.decide_many` already calls `ask` once per distinct state in
+        one request, and each of those calls now queues (and, if nothing is already waiting, lingers) on its
+        own -- the same per-group latency `/ask` itself never has to pay, because a plain `/ask` request is
+        always exactly one group.
         """
         t0 = time.monotonic()
         if isinstance(body, DecideIn):
@@ -603,6 +617,21 @@ def create_app(
             raw_items = [b.model_dump() for b in body]
 
         def ask(context: str, questions: list[Question]):
+            """`decide_mod.decide_many`'s own entry point into the device, once per distinct state in this
+            request. The batched shelf path when it can take this group -- text only (always true here) and
+            not more questions than one pass holds (`_batcher_capacity`) -- otherwise the plain queue, the
+            same choice `/ask`'s own handler makes for its engine questions. Namespaced the same way `/ask`
+            namespaces its own questions (`_namespaced`/`_restore_ids`): `decide.py`'s internal question ids
+            are always `item0`, `item1`, ... (`parse_item`'s own `internal_id = f"item{index}"`), the *same*
+            strings for every `/v1/decide` request regardless of caller -- without namespacing, two concurrent
+            requests about the same document would collide in exactly the way `_namespaced`'s own docstring
+            describes for `/ask`, and would do so on *every* request rather than only on an id a caller
+            happened to repeat.
+            """
+            if text_batcher is not None and len(questions) <= batcher_capacity:
+                namespaced, id_map = _namespaced(questions)
+                job = _ask_via_batcher(text_batcher, context, namespaced, request_timeout)
+                return _restore_ids(job.result, id_map)
             job = worker.submit((context, questions, None, None), timeout=request_timeout)
             return job.result
 

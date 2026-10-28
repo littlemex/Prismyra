@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.13
+
+- **`/v1/decide` now reaches the shelf `--batcher` already gives `/ask`.** `decide_mod.decide_many`'s own `ask`
+  callback used to call `worker.submit` unconditionally -- the one `ask` callback in `server.py` that never took
+  the batched shelf path, no matter how `--batcher` was configured. A document decided about repeatedly across
+  separate `/v1/decide` requests now costs one read and a branch pass per later decision, the same saving `/ask`
+  already had. Namespaced the same way `/ask`'s own ids are (`_namespaced`/`_restore_ids`): `decide.parse_item`'s
+  internal question id is always `item0`, `item1`, ... -- the same string for every request, unlike `/ask`'s
+  caller-chosen ids, which only collide when a caller happens to repeat one, so this collides on every pair of
+  concurrent `/v1/decide` requests sharing a pass unless namespaced first. Measured over real HTTP (one document,
+  3,446 tokens, `--batcher`, `fp8`/L40S and `nvfp4`/RTX PRO 4500): 2.4-2.9x faster on a repeated document than on
+  a fresh one every call, within noise of `/ask`'s own saving at every width. See
+  [docs/PERFORMANCE.md](docs/PERFORMANCE.md#the-shelf-reaches-v1decide-too) for the full measurement.
+- **Whether a shelf *hit* answers exactly as a fresh read would have, measured to the bit rather than only
+  bounded.** `tests/test_gpu.py::test_a_shelf_matches_ask_bit_for_bit` has carried a `pytest.approx(abs=1e-4)`
+  tolerance since before this project's companion/question-count matrix closed at 0 ("A shelf answers like
+  ask()", `docs/PERFORMANCE.md`). Re-measured with the exact residual printed instead of only asserted against a
+  bound, on both supported checkpoints: 0.0 worst movement, 0 decision flips, for a genuine shelf hit (a document
+  already resident from an earlier pass, not the pass that first read it) against `ask()`'s own answer for the
+  identical context and questions. This does not change the default: `--batcher` stays off by default for the
+  reason it already was, an unrelated and already-disclosed gap (`paged` against the joined storage does not
+  generalize past an 8-document fixture) that turning `--batcher` on inherits regardless of whether any given
+  request's document ever hits the shelf. See
+  [docs/PERFORMANCE.md](docs/PERFORMANCE.md#the-shelf-reaches-v1decide-too) for the measurement and why it does
+  not move the default.
+- **The published speed comparison against `autotrust/JEV-35B`/`JEV-35B-NVFP4` measured the two sides unevenly,
+  and is corrected.** `recipes/decision-lora/README.md`'s "2 warm-up calls then median of 7" method asked both
+  families the identical document on every one of 9 calls -- which hands JEV's own `enable_prefix_caching=True`
+  engine a warmed key/value cache (confirmed on the device: 3,168 of 3,446 tokens hit it on every repeat) while
+  this project's own `ask()` carries no cache between calls at all, by design (`Prismyra.ask` opens a fresh
+  `Context` every call). "The same procedure" produced a warmed cache for one side and nothing for the other.
+  Re-measured with a fresh, never-before-seen document on every one of the 9 calls, removing the one variable
+  that gave either side a cache to be measured against: this project's own checkpoints are faster than both JEV
+  checkpoints at every question count measured, including one (`fp8` 2.9x faster than JEV-35B, `nvfp4` 1.5x
+  faster than JEV-35B-NVFP4, widening to 8.4x/5.7x at 64 questions) -- where the original table's own heading
+  read "at one question, the JEV-35B family is faster". `Prismyra.open_context` held open and reused across
+  calls (the one code path that gives this project's own checkpoints the same opportunity JEV's cache gave it)
+  answers one question faster still than either JEV checkpoint's own original best-case number. Both affected
+  Hugging Face model cards (`littlemex/prismyra-decision-35b-a3b-fp8`, `littlemex/prismyra-decision-35b-a3b-nvfp4`)
+  are corrected to match. See
+  [recipes/decision-lora/README.md](recipes/decision-lora/README.md#against-jev-35b-and-jev-35b-nvfp4-current-round)
+  for the full corrected tables and method.
+- **The NVFP4 checkpoint's own memory-at-rest figure (22.5 GiB) is reconfirmed on the RTX PRO 4500**, after an
+  unrelated measurement attempt loaded the checkpoint without `PRISMYRA_EXPERTS=nvfp4`/`PRISMYRA_NVFP4_EXPERTS`/
+  `PRISMYRA_NVFP4_CALIB` set and got roughly 30 GiB of freshly-initialized, un-quantized expert weights instead of
+  the checkpoint's own quantized ones -- an operator error in that one measurement script's own environment, not
+  a regression in this checkpoint or its loader; `tools/audit_sm120.py`'s full matrix (4,392/4,392 bit-exact,
+  0 decision flips; paged-vs-joined 2,424/2,448 bit-exact, worst move 0.024258) and the full GPU test suite
+  re-ran clean on this checkpoint with the three variables set correctly.
+
 ## 0.4.12
 
 - **The one-pass path's own routed-expert MoE tile is now per-M-bucket, not one frozen tile for every row
