@@ -60,14 +60,35 @@ REQUIRED_FIELDS = frozenset(
 #: unchanged default) or character n-grams (``"charN"``) -- and, like ``"features"``, is read but never
 #: enforced against ``"features"``: a tag naming a structured builder *and* a non-default text tokenizer is
 #: not refused, the tokenizer field is simply unused by that branch (`features.Vectorizer`'s own docstring).
+#: ``"admission"`` names a non-default admission mode for stage 2's student (``prismyra.learn.fit.run``) --
+#: see `ADMISSION_MODES` just below for what exists so far and `AdmissionConfig` for its own shape. A tag with
+#: no ``"admission"`` field (every tag before this field existed, and every tag since that has not opted in)
+#: keeps meaning exactly what it meant before: the original, full-coverage admission bar.
 OPTIONAL_FIELDS = frozenset(
-    {"features", "min_match_rate", "min_accuracy_ratio", "router", "retain_context", "student", "text_tokenizer"}
+    {
+        "features",
+        "min_match_rate",
+        "min_accuracy_ratio",
+        "router",
+        "retain_context",
+        "student",
+        "text_tokenizer",
+        "admission",
+    }
 )
 
 #: Stage 4's own closed vocabulary of routing strategies (docs/LEARN.md's "Stage 4" section has the full account
 #: of each). Closed for the same reason `NORMALIZE_RULES` is: a typo'd mode string is a refusal at load time,
 #: not a tag that silently never routes anything.
 ROUTER_MODES = frozenset({"ab", "ramp", "shadow", "confidence", "bandit"})
+
+#: `"admission"`'s own closed vocabulary (PREREG-R2 idea 1). A tag with no `"admission"` field is judged by
+#: `prismyra.learn.fit.run`'s original, full-coverage bar (section 3's two conditions, unchanged) -- that is
+#: not a member of this set, it is the absence of the field, the same "a field that did not exist yet keeps
+#: meaning what it meant before" discipline `OPTIONAL_FIELDS` already keeps everywhere else. `"confidence"` is
+#: the one mode that exists so far: judge the student on the slice of traffic a `"confidence"`-mode router
+#: would actually serve, not on every row regardless of whether the student would have answered it.
+ADMISSION_MODES = frozenset({"confidence"})
 
 #: How much of a tag's own `context` survives into its logged experience (section 8's "個人情報が入りうる
 #: context を残すかどうかは、既存の retain_days と keep_hidden と同じく spec で決める"). `"full"` -- the only
@@ -149,6 +170,29 @@ class RouterConfig:
 
 
 @dataclass(frozen=True)
+class AdmissionConfig:
+    """One tag's own non-default admission mode (PREREG-R2 idea 1: "admission for what is served"). ``mode``
+    is checked against `ADMISSION_MODES`; ``"confidence"`` is the only one that exists today.
+
+    A ``"confidence"``-mode tag is judged by `prismyra.learn.fit.run` on the slice of traffic a
+    `prismyra.learn.spec.RouterConfig` in ``"confidence"`` mode at this same ``tau`` would actually serve: the
+    held-out agreement condition is scored only over held-out items the student would answer at this ``tau``
+    (not every held-out item regardless), and the eval-set condition is scored on the *hybrid* answer (the
+    student where confident, Prismyra's own prediction otherwise), never on the student's full-coverage
+    accuracy. Admitting on the full-coverage numbers would judge a different system from the one that is
+    actually served -- see `prismyra.learn.fit`'s own module docstring addendum for the full reasoning.
+
+    ``tau`` is independent of, and not compared against, any `RouterConfig.tau` a tag's own ``"router"`` block
+    might set -- an operator fits and reports a confidence-mode artifact before deciding whether, or at what
+    ``tau``, to actually route traffic to it (`prismyra.learn.students.StudentHandle`'s own admission check,
+    below, is the place that ties the two together once a router is configured).
+    """
+
+    mode: str
+    tau: float
+
+
+@dataclass(frozen=True)
 class TagSpec:
     """One registered tag, exactly as section 1 of the design describes it."""
 
@@ -167,6 +211,7 @@ class TagSpec:
     router: RouterConfig | None = None
     student: str = DEFAULT_STUDENT_BACKEND
     text_tokenizer: str = DEFAULT_TEXT_TOKENIZER
+    admission: AdmissionConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -334,6 +379,33 @@ def _check_router(path: Path, where: str, raw: dict) -> RouterConfig:
     )
 
 
+def _check_admission(path: Path, where: str, raw: dict) -> AdmissionConfig:
+    """``"admission"``'s own nested object -- the same "checked in full, or a refusal to start" discipline
+    `_check_router` already applies to ``"router"``. ``tau`` shares `_check_router`'s own bounds (a number in
+    ``[0, 1]``, the probability scale a student's own top-class probability lives on)."""
+    where = f"{where}.admission"
+    if not isinstance(raw, dict):
+        _fail(path, where, f"must be a JSON object, got {type(raw).__name__}")
+
+    required = {"mode", "tau"}
+    missing = required - raw.keys()
+    extra = raw.keys() - required
+    if missing:
+        _fail(path, where, f"missing field(s): {sorted(missing)}")
+    if extra:
+        _fail(path, where, f"unknown field(s): {sorted(extra)} -- the allowed fields are {sorted(required)}")
+
+    mode = raw["mode"]
+    if mode not in ADMISSION_MODES:
+        _fail(path, where, f"'mode' must be one of {sorted(ADMISSION_MODES)}, got {mode!r}")
+
+    tau = raw["tau"]
+    if isinstance(tau, bool) or not isinstance(tau, (int, float)) or not (0.0 <= tau <= 1.0):
+        _fail(path, where, f"'tau' must be a number in [0, 1], got {tau!r}")
+
+    return AdmissionConfig(mode=mode, tau=float(tau))
+
+
 def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
     where = f"entry {index}"
     if not isinstance(raw, dict):
@@ -424,6 +496,10 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
                 f"'text_tokenizer' must be 'words' or 'charN' for an integer N >= 2, got {text_tokenizer!r}",
             )
 
+    admission = None
+    if "admission" in raw:
+        admission = _check_admission(path, where, raw["admission"])
+
     return TagSpec(
         task=task,
         question=question,
@@ -440,6 +516,7 @@ def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:
         router=router,
         student=student,
         text_tokenizer=text_tokenizer,
+        admission=admission,
     )
 
 

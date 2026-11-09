@@ -13,6 +13,7 @@ from prismyra.learn.features import (
     Vectorizer,
     char_ngrams,
     get_feature_builder,
+    import_feature_modules,
     is_valid_text_tokenizer,
     register_features,
     tokenize,
@@ -224,3 +225,66 @@ def test_vectorizer_structured_branch_ignores_text_tokenizer():
         [("abc", "")], features_name="test-structured-ignores-tokenizer-v1", dims=4, text_tokenizer="char3"
     )
     assert vec.transform("abc") == [3.0]  # the structured builder answered, not a char-n-gram hash
+
+
+# --------------------------------------------------------------------------- import_feature_modules: `python -m
+# prismyra.learn.fit --features-module` and `prismyra-serve --features-module`'s whole implementation.
+
+
+def test_import_feature_modules_registers_builders_defined_at_import_time(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "a_standalone_features_module.py").write_text(
+        "from prismyra.learn.features import register_features\n"
+        "def _builder(context, question):\n"
+        "    return {'length': float(len(context))}\n"
+        "register_features('a-standalone-features-module-v1', _builder)\n"
+    )
+    try:
+        import_feature_modules(["a_standalone_features_module"])
+        fn = get_feature_builder("a-standalone-features-module-v1")
+        assert fn("abcde", "") == {"length": 5.0}
+    finally:
+        sys.modules.pop("a_standalone_features_module", None)
+
+
+def test_import_feature_modules_with_no_paths_does_nothing(tmp_path, monkeypatch):
+    # The off-by-default case: "" --features-module" never given at all -- the CLI calls this with an empty
+    # list either way, and it must be a no-op, not an error about zero paths.
+    import_feature_modules([])
+
+
+def test_import_feature_modules_raises_on_an_unimportable_path():
+    with pytest.raises(ImportError):
+        import_feature_modules(["this.module.does.not.exist.anywhere"])
+
+
+def test_sentence_embedding_example_registers_every_candidate_at_import_time():
+    # examples/features/sentence_embedding.py's whole "optional, lazy" promise: importing it (what
+    # --features-module does) registers every CANDIDATE_MODELS name immediately, without needing
+    # sentence-transformers to be installed at all (this project's own dev/learn extras never include it) --
+    # only *calling* a registered builder needs that package. This asserts the import-time registration half
+    # only; the lazy-import-on-call half is this module's own job and is not re-checked here.
+    import_feature_modules(["examples.features.sentence_embedding"])
+    from examples.features.sentence_embedding import CANDIDATE_MODELS, feature_name_for
+
+    for model_name in CANDIDATE_MODELS:
+        # Registered and resolvable -- get_feature_builder must not raise FeatureError for any of them.
+        get_feature_builder(feature_name_for(model_name))
+
+
+def test_sentence_embedding_builder_raises_a_clear_import_error_when_sentence_transformers_is_missing():
+    try:
+        import sentence_transformers  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        pytest.skip("sentence-transformers is installed in this environment; nothing to check here")
+
+    import_feature_modules(["examples.features.sentence_embedding"])
+    from examples.features.sentence_embedding import feature_name_for
+
+    fn = get_feature_builder(feature_name_for("BAAI/bge-small-en-v1.5"))
+    with pytest.raises(ImportError, match="sentence-transformers"):
+        fn("hello", "")

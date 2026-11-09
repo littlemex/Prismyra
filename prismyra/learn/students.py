@@ -23,10 +23,13 @@ from pathlib import Path
 
 from .backends import get_backend
 from .fit import StudentArtifact
+from .spec import RouterConfig
 
 
 class StudentError(Exception):
-    """A tag's `RouterConfig.student_path` does not resolve to an admitted `StudentArtifact`."""
+    """A tag's `RouterConfig.student_path` does not resolve to an admitted `StudentArtifact`, or resolves to
+    one that was admitted for a narrower policy than the router asking to load it actually runs (see
+    `StudentHandle`'s own check of `StudentArtifact.admitted_for`, below)."""
 
 
 def student_version(artifact: StudentArtifact) -> str:
@@ -50,15 +53,45 @@ class StudentHandle:
     lazy past construction): a `StudentHandle` is only ever constructed for a tag whose `RouterConfig` is
     already live, so the cost of deserializing the model is paid once, at server startup, rather than on this
     tag's first request.
+
+    **An artifact admitted under PREREG-R2's `"confidence"` admission mode is a narrower claim than a
+    full-admission one** (`prismyra.learn.fit`'s own module docstring addendum has the full reasoning):
+    "this student's hybrid answer, deferring to Prismyra below `tau`, is good enough" is not the same claim as
+    "this student is good enough to answer everything", and serving it under a router mode that *would*
+    answer everything (``"ab"``, ``"ramp"``, ``"bandit"``, or even ``"confidence"`` at a looser ``tau`` than
+    it was actually measured at) would silently cash a check this artifact never wrote. So `router`, when
+    given, is checked against `artifact.admitted_for`: a `"confidence"`-admitted artifact is accepted only for
+    a router itself configured in `"confidence"` mode with its own ``tau`` no lower than the one this artifact
+    was admitted at (a *stricter* live ``tau`` only ever serves a subset of what was measured, never more);
+    every other combination -- no router given at all, or one in any other mode, or `"confidence"` at a
+    looser ``tau`` -- is refused the same loud way a not-admitted artifact already is. A full-admission
+    artifact (`admitted_for` is `None`) is unaffected by any of this, exactly stage 4's original behaviour.
     """
 
-    def __init__(self, artifact: StudentArtifact):
+    def __init__(self, artifact: StudentArtifact, router: RouterConfig | None = None):
         if not artifact.admitted:
             reasons = "; ".join(artifact.reasons) or "no reason recorded"
             raise StudentError(
                 f"tag {artifact.tag!r}: this artifact was not admitted ({reasons}) -- fit a new one, or point "
                 "the tag's 'router.student_path' at one that passed"
             )
+        if artifact.admitted_for is not None and artifact.admitted_for.get("mode") == "confidence":
+            admitted_tau = artifact.admitted_for.get("tau")
+            served_as_confidence = (
+                router is not None
+                and router.mode == "confidence"
+                and router.tau is not None
+                and admitted_tau is not None
+                and router.tau >= admitted_tau
+            )
+            if not served_as_confidence:
+                router_desc = f"mode={router.mode!r}, tau={router.tau!r}" if router is not None else "unset"
+                raise StudentError(
+                    f"tag {artifact.tag!r}: this artifact was admitted only for 'confidence' mode at "
+                    f"tau>={admitted_tau!r} (admitted_for={artifact.admitted_for!r}), but the router serving "
+                    f"it is {router_desc} -- fit a new artifact admitted for that policy, or route it under "
+                    "'confidence' at a tau no lower than the one it was admitted at"
+                )
         self.artifact = artifact
         self.version = student_version(artifact)
         # see module docstring: the one place either backend's own library is required, and only here
@@ -92,7 +125,13 @@ class StudentRegistry:
         self._handles: dict[str, StudentHandle] = {}
         self._lock = threading.Lock()
 
-    def load(self, task: str, spec_dir: Path, student_path: str) -> StudentHandle:
+    def load(self, task: str, spec_dir: Path, student_path: str, router: RouterConfig | None = None) -> StudentHandle:
+        """``router`` is the tag's own `RouterConfig` (its ``mode``/``tau``, specifically) -- passed through to
+        `StudentHandle.__init__` unchanged, so it can refuse to load a `"confidence"`-admitted artifact under a
+        router that would not actually serve it the way it was measured (see that class's own docstring).
+        `None` (the default) is the full-admission-only check stage 4 always had -- every existing caller that
+        does not pass this keeps meaning exactly what it meant before this parameter existed.
+        """
         path = Path(student_path)
         if not path.is_absolute():
             path = spec_dir / path
@@ -105,7 +144,7 @@ class StudentRegistry:
             raise StudentError(
                 f"tag {task!r}: router.student_path {student_path!r} is an artifact for tag {artifact.tag!r}"
             )
-        handle = StudentHandle(artifact)
+        handle = StudentHandle(artifact, router=router)
         with self._lock:
             self._handles[task] = handle
         return handle
