@@ -26,6 +26,7 @@ half-built version of them away. In-process callers that want follow-ups use `Pr
 import argparse
 import base64
 import dataclasses
+import math
 import time
 import uuid
 from typing import Any, Literal
@@ -698,6 +699,62 @@ def create_app(
         if single:
             return responses[0]
         return {"results": responses, "num_model_requests": num_requests}
+
+    @app.post("/v1/chat/completions")
+    def chat_completions(body: dict, background_tasks: BackgroundTasks, request: Request) -> dict:
+        """A tag of the learn spec, asked through the OpenAI chat-completions shape, so that an OpenAI-compatible
+        router or gateway can call Prismyra as one of its models.
+
+        `model` names a tag (`task`) of the `--learn-spec`; the last user message's text is the `state`; the tag's
+        own question and options are what is asked. The answer goes through `/v1/decide` unchanged -- the same
+        queue, the same learn routing, the same logging -- and comes back as one assistant message whose content
+        is the chosen option. With `logprobs: true`, the one content token is the option with the natural log of
+        its probability, and `top_logprobs` lists the other options, so a router that reads confidence from
+        logprobs reads Prismyra's own probability. Nothing is generated, so no token usage is reported. Streaming
+        is refused rather than faked.
+        """
+        if learn_hook is None:
+            raise HTTPException(status_code=404, detail="this server was not started with --learn-spec")
+        if body.get("stream"):
+            raise HTTPException(status_code=400, detail="stream is not supported: the answer is one read-out")
+        model = body.get("model")
+        tag = next((t for t in learn_hook.spec.tags if t.task == model), None)
+        if tag is None:
+            raise HTTPException(status_code=404, detail=f"model {model!r} names no tag of the learn spec "
+                                f"(tags: {sorted(t.task for t in learn_hook.spec.tags)})")
+        state = None
+        for m in reversed(body.get("messages") or []):
+            if m.get("role") == "user":
+                c = m.get("content")
+                if isinstance(c, list):
+                    texts = [p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"]
+                    if len(texts) != len(c):
+                        raise HTTPException(status_code=422, detail="only text content parts are supported")
+                    c = "\n".join(texts)
+                state = c
+                break
+        if not isinstance(state, str) or not state:
+            raise HTTPException(status_code=422, detail="the request has no user message with text content")
+        decided = decide(DecideIn(kind=tag.kind, state=state, question=tag.question, options=list(tag.options),
+                                  task=tag.task), background_tasks, request)
+        choice = str(decided["choice"])
+        probs = dict(zip([str(o) for o in decided["options"]], decided["probabilities"], strict=True))
+        message: dict = {"index": 0, "message": {"role": "assistant", "content": choice}, "finish_reason": "stop"}
+        if body.get("logprobs"):
+            def lp(p: float) -> float:
+                return math.log(p) if p > 0 else -1e9
+            k = int(body.get("top_logprobs") or 0)
+            top = sorted(probs.items(), key=lambda kv: -kv[1])[:k]
+            message["logprobs"] = {"content": [{
+                "token": choice, "logprob": lp(probs.get(choice, 0.0)), "bytes": list(choice.encode()),
+                "top_logprobs": [{"token": o, "logprob": lp(p), "bytes": list(o.encode())} for o, p in top]}]}
+        out = {"id": f"chatcmpl-{decided.get('request_id') or uuid.uuid4().hex}", "object": "chat.completion",
+               "created": int(time.time()), "model": model, "choices": [message],
+               "prismyra": {"probabilities": probs}}
+        for k in ("served_by", "request_id"):
+            if k in decided:
+                out["prismyra"][k] = decided[k]
+        return out
 
     @app.post("/v1/feedback")
     def feedback(body: dict) -> dict:
