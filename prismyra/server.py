@@ -895,7 +895,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--otel-endpoint", default="http://localhost:4318", help="an OTLP/HTTP collector base URL")
     parser.add_argument("--otel-service-name", default="prismyra", help="the OTel Resource 'service.name' this carries")
+    parser.add_argument(
+        "--features-module",
+        action="append",
+        default=[],
+        help="a dotted import path whose import registers one or more feature builders via "
+        "prismyra.learn.features.register_features (the same flag, same meaning, as 'python -m "
+        "prismyra.learn.fit --features-module'); may be given more than once. Imported before --learn-spec "
+        "is loaded, so a tag whose router.student_path points at an artifact fit with a registered 'features' "
+        "builder can actually load that student at startup -- without this, StudentRegistry.load would hit "
+        "prismyra.learn.features.FeatureError for a name nothing has registered yet.",
+    )
     args = parser.parse_args(argv)
+
+    if args.features_module:
+        from .learn.features import import_feature_modules
+
+        import_feature_modules(args.features_module)
 
     try:
         import uvicorn

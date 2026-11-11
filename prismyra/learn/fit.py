@@ -46,6 +46,22 @@ without editing the spec file.
 versus error rate trade-off read directly off held-out data rather than fixed by this script -- a threshold
 that trades those two off is a judgement about what an operator's traffic can tolerate, which this script has
 no way to know. ``_tau_sweep`` reports the curve; nothing here picks a point on it.
+
+**Admission for what is actually served (PREREG-R2 idea 1).** The two conditions above judge a student that
+answers *every* request. A tag whose own ``"admission"`` field (``prismyra.learn.spec.TagSpec.admission``)
+sets ``{"mode": "confidence", "tau": <float>}`` is judged on a different system instead -- the one a
+``"confidence"``-mode ``RouterConfig`` at that same ``tau`` would actually serve: the student only where its
+own top probability clears ``tau``, Prismyra's own prediction everywhere else. Condition 1 becomes the
+*hybrid* answer's accuracy against gold (``score_eval_confidence``); condition 2 becomes the Wilson lower
+bound of agreement scored only over the held-out items the student would answer at this ``tau``
+(``held_out_confidence_agreement``), not every held-out item regardless of what the student would have said.
+Both still compare against the tag's own ``min_accuracy_ratio``/``min_match_rate`` -- unchanged bars, a
+different system being measured against them. An artifact admitted this way carries
+``StudentArtifact.admitted_for = {"mode": "confidence", "tau": tau}``; `prismyra.learn.students.StudentHandle`
+is the one place that reads it back, and it accepts such an artifact only for a router actually configured in
+``"confidence"`` mode at a ``tau`` no lower than the one it was admitted at -- serving it under ``"ab"`` or
+``"ramp"``, say, where it would answer *every* request rather than only its confident slice, is exactly the
+full-coverage system this admission mode was built to avoid judging.
 """
 
 from __future__ import annotations
@@ -188,6 +204,14 @@ class StudentArtifact:
     backend: str = DEFAULT_STUDENT_BACKEND
     backend_version: str | None = None
     text_tokenizer: str = DEFAULT_TEXT_TOKENIZER
+    #: ``None`` for a tag with no ``"admission"`` field, or one whose ``"admission"`` field this run did not
+    #: end up admitted under (`admitted` is `False`, so nothing was "admitted for" anything) -- both read as
+    #: "the original, full-coverage bar", which is what every artifact written before this field existed means
+    #: too. `{"mode": "confidence", "tau": <float>}` records that this *admitted* artifact cleared PREREG-R2's
+    #: confidence-mode bar at exactly this ``tau`` -- see `run`'s own "confidence" branch below, and
+    #: `prismyra.learn.students.StudentHandle` for the one place that reads this back to decide whether a
+    #: router may actually serve it.
+    admitted_for: dict | None = None
 
     def to_json(self) -> dict:
         return {
@@ -209,6 +233,7 @@ class StudentArtifact:
             "backend": self.backend,
             "backend_version": self.backend_version,
             "text_tokenizer": self.text_tokenizer,
+            "admitted_for": self.admitted_for,
         }
 
     @staticmethod
@@ -233,6 +258,7 @@ class StudentArtifact:
             backend=raw.get("backend", DEFAULT_STUDENT_BACKEND),
             backend_version=raw.get("backend_version"),
             text_tokenizer=raw.get("text_tokenizer", DEFAULT_TEXT_TOKENIZER),
+            admitted_for=raw.get("admitted_for"),
         )
 
     def vectorizer(self) -> Vectorizer:
@@ -274,6 +300,74 @@ def _score_eval(eval_items: list[EvalItem], predict_fn) -> dict:
         out["prismyra_accuracy"] = prismyra_correct / prismyra_scored
         out["prismyra_scored"] = prismyra_scored
     return out
+
+
+def score_eval_confidence(eval_items: list[EvalItem], predict_fn, tau: float) -> dict:
+    """PREREG-R2 idea 1's condition 1: the *hybrid* answer -- the student's own answer where its top
+    probability clears ``tau``, Prismyra's own recorded prediction (``item.prismyra_probabilities``)
+    everywhere else -- scored against gold, not the student's full-coverage accuracy `_score_eval` already
+    reports. A ``"confidence"``-mode router never serves the student outside that high-confidence slice, so
+    admitting on full-coverage accuracy would judge a system nothing ever actually runs. Restricted, like
+    `_score_eval`'s own condition-1 branch, to items carrying ``prismyra_probabilities`` -- there is nothing to
+    fall back to, and nothing to compare Prismyra's own accuracy against, for one that does not.
+    """
+    hybrid_correct = 0
+    prismyra_correct = 0
+    answered_by_student = 0
+    scored = 0
+    for item in eval_items:
+        if not item.prismyra_probabilities:
+            continue
+        scored += 1
+        probs = predict_fn(item.context)
+        student_choice, student_p = max(probs.items(), key=lambda kv: kv[1])
+        prismyra_choice = argmax(item.prismyra_probabilities)
+        prismyra_correct += int(prismyra_choice == item.gold)
+        if student_p >= tau:
+            answered_by_student += 1
+            hybrid_choice = student_choice
+        else:
+            hybrid_choice = prismyra_choice
+        hybrid_correct += int(hybrid_choice == item.gold)
+    n = scored or 1
+    return {
+        "n": scored,
+        "tau": tau,
+        "answered_by_student": answered_by_student,
+        "answer_rate": answered_by_student / n,
+        "hybrid_accuracy": hybrid_correct / n,
+        "prismyra_accuracy": prismyra_correct / n,
+    }
+
+
+def held_out_confidence_agreement(held_out: list[Experience], predict_fn, tau: float) -> dict:
+    """PREREG-R2 idea 1's condition 2: the Wilson lower bound of student/Prismyra agreement, scored only over
+    the held-out items the student would actually *answer* at this ``tau`` (top probability >= ``tau``) --
+    not `run`'s own unconditional, full-coverage ``held_out_agreement``. An empty answered subset (``tau`` the
+    student never clears on this held-out slice) reads as ``answered == 0``, which the admission condition
+    below treats the same way an empty held-out set already does: not admitted, never a lower bound of ``0.0``
+    being compared against the bar as if it meant something.
+    """
+    agree = 0
+    answered = 0
+    for e in held_out:
+        probs = predict_fn(e.context)
+        student_choice, student_p = max(probs.items(), key=lambda kv: kv[1])
+        if student_p < tau:
+            continue
+        answered += 1
+        teacher_choice = argmax(e.probabilities)
+        agree += int(student_choice == teacher_choice)
+    lower_bound = wilson_lower_bound(agree, answered)
+    n = len(held_out) or 1
+    return {
+        "held_out_n": len(held_out),
+        "answered": answered,
+        "answer_rate": answered / n,
+        "agree": agree,
+        "rate": (agree / answered) if answered else 0.0,
+        "lower_bound_95": lower_bound,
+    }
 
 
 def tau_sweep(held_out: list[Experience], predict_fn, taus=None) -> list[dict]:
@@ -480,6 +574,9 @@ def run(
         (probs,) = loaded.predict_proba(np.asarray([vec], dtype=np.float64))
         return dict(zip(tag.options, (float(p) for p in probs), strict=True))
 
+    admission_mode = tag.admission.mode if tag.admission is not None else "full"
+    confidence_tau = tag.admission.tau if tag.admission is not None else None
+
     reasons: list[str] = []
     metrics: dict = {
         "train_n": len(train),
@@ -491,28 +588,35 @@ def run(
             "min_match_rate": effective_min_match_rate,
             "min_accuracy_ratio": effective_min_accuracy_ratio,
         },
+        # "full" (the original bar, the only one that ever existed before PREREG-R2's admission field) or
+        # "confidence" -- which of the two blocks below (full-coverage vs. confidence-mode) this run was
+        # actually admitted or rejected on. The full-coverage numbers are still computed and reported either
+        # way (below): they cost nothing extra and tell a reader what the student's *unconditional* accuracy
+        # and agreement look like even when that is not what gated this run.
+        "admission_mode": admission_mode,
     }
 
+    eval_items: list[EvalItem] = []
     eval_path = Path(tag.eval_set)
     if not eval_path.is_absolute():
         eval_path = Path(spec_path).parent / eval_path
-    condition_1 = False
+    full_condition_1 = False
     if eval_path.is_file():
         eval_items = load_eval_set(eval_path)
         eval_metrics = _score_eval(eval_items, predict_fn)
         metrics["eval"] = eval_metrics
         if "prismyra_accuracy" in eval_metrics:
             required_accuracy = effective_min_accuracy_ratio * eval_metrics["prismyra_accuracy"]
-            condition_1 = eval_metrics["student_accuracy"] >= required_accuracy
-            if not condition_1:
+            full_condition_1 = eval_metrics["student_accuracy"] >= required_accuracy
+            if admission_mode == "full" and not full_condition_1:
                 reasons.append(
                     f"eval_set: student accuracy {eval_metrics['student_accuracy']:.4f} is below "
                     f"{effective_min_accuracy_ratio} x Prismyra's {eval_metrics['prismyra_accuracy']:.4f} "
                     f"= {required_accuracy:.4f}"
                 )
-        else:
+        elif admission_mode == "full":
             reasons.append(f"eval_set {eval_path} has no item with 'prismyra_probabilities'; condition 1 unmet")
-    else:
+    elif admission_mode == "full":
         reasons.append(f"eval_set {eval_path} does not exist; condition 1 unmet")
 
     agree = 0
@@ -528,14 +632,64 @@ def run(
         "rate": (agree / len(held_out)) if held_out else 0.0,
         "lower_bound_95": lower_bound,
     }
-    condition_2 = len(held_out) > 0 and lower_bound >= effective_min_match_rate
-    if not condition_2:
+    full_condition_2 = len(held_out) > 0 and lower_bound >= effective_min_match_rate
+    if admission_mode == "full" and not full_condition_2:
         reasons.append(
             f"held-out agreement lower bound {lower_bound:.4f} (n={len(held_out)}) is below "
             f"min_match_rate {effective_min_match_rate}"
         )
 
     metrics["tau_sweep"] = tau_sweep(held_out, predict_fn)
+
+    if admission_mode == "confidence":
+        assert confidence_tau is not None  # spec.py requires 'tau' on every "confidence" admission entry
+        confidence_eval = score_eval_confidence(eval_items, predict_fn, confidence_tau)
+        confidence_held_out = held_out_confidence_agreement(held_out, predict_fn, confidence_tau)
+        metrics["confidence_admission"] = {"eval": confidence_eval, "held_out": confidence_held_out}
+
+        condition_1 = confidence_eval["n"] > 0 and (
+            confidence_eval["hybrid_accuracy"] >= effective_min_accuracy_ratio * confidence_eval["prismyra_accuracy"]
+        )
+        if not condition_1:
+            if confidence_eval["n"] == 0:
+                if not eval_path.is_file():
+                    reasons.append(f"eval_set {eval_path} does not exist; condition 1 unmet")
+                else:
+                    reasons.append(
+                        f"eval_set {eval_path} has no item with 'prismyra_probabilities'; condition 1 unmet"
+                    )
+            else:
+                required = effective_min_accuracy_ratio * confidence_eval["prismyra_accuracy"]
+                reasons.append(
+                    f"confidence (tau={confidence_tau}): hybrid accuracy {confidence_eval['hybrid_accuracy']:.4f} "
+                    f"is below {effective_min_accuracy_ratio} x Prismyra's {confidence_eval['prismyra_accuracy']:.4f} "
+                    f"= {required:.4f}"
+                )
+
+        # "answer rate が 0 なら admit しない" (PREREG-R2): a held-out slice this tau never clears is not a
+        # bound of 0.0 clearing nothing, it is "this student answers nothing at this tau on this data",
+        # which `held_out_confidence_agreement`'s own `answered == 0` already distinguishes from a genuine,
+        # scored lower bound of zero.
+        condition_2 = confidence_held_out["answered"] > 0 and (
+            confidence_held_out["lower_bound_95"] >= effective_min_match_rate
+        )
+        if not condition_2:
+            if confidence_held_out["answered"] == 0:
+                reasons.append(f"confidence (tau={confidence_tau}): answer rate is 0 on the held-out set")
+            else:
+                reasons.append(
+                    f"confidence (tau={confidence_tau}): held-out agreement lower bound "
+                    f"{confidence_held_out['lower_bound_95']:.4f} (answered={confidence_held_out['answered']}) is "
+                    f"below min_match_rate {effective_min_match_rate}"
+                )
+    else:
+        condition_1 = full_condition_1
+        condition_2 = full_condition_2
+
+    admitted = condition_1 and condition_2
+    admitted_for = None
+    if admitted and admission_mode == "confidence":
+        admitted_for = {"mode": "confidence", "tau": confidence_tau}
 
     return StudentArtifact(
         tag=tag.task,
@@ -548,7 +702,7 @@ def run(
         idf=vectorizer.hashing.idf if vectorizer.hashing is not None else (),
         model_text=model_text,
         created_at=time.time(),
-        admitted=condition_1 and condition_2,
+        admitted=admitted,
         reasons=tuple(reasons),
         metrics=metrics,
         features=tag.features,
@@ -556,6 +710,7 @@ def run(
         backend_version=backend.library_version(),
         feature_names=vectorizer.names,
         text_tokenizer=vectorizer.text_tokenizer,
+        admitted_for=admitted_for,
     )
 
 
@@ -611,7 +766,21 @@ def main(argv: list[str] | None = None) -> int:
         "the default (unset) is to use the tag's spec value, itself DEFAULT_STUDENT_BACKEND ('lightgbm') "
         "unless the tag's own entry overrides it. 'xgboost' needs pip install \"prismyra[learn-xgb]\".",
     )
+    parser.add_argument(
+        "--features-module",
+        action="append",
+        default=[],
+        help="a dotted import path (e.g. 'examples.features.sentence_embedding') whose import registers one "
+        "or more feature builders via prismyra.learn.features.register_features; may be given more than "
+        "once. Needed only for a tag whose 'features' field names a builder this process has not already "
+        "imported some other way -- a tag using the hashed-TF-IDF default (no 'features' field) needs none "
+        "of this.",
+    )
     args = parser.parse_args(argv)
+
+    from .features import import_feature_modules
+
+    import_feature_modules(args.features_module)
 
     try:
         spec_for_check = load_spec(args.learn_spec)
@@ -654,6 +823,8 @@ def main(argv: list[str] | None = None) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(artifact.to_json(), ensure_ascii=False, indent=2), encoding="utf-8")
     verdict = "ADMITTED" if artifact.admitted else "NOT ADMITTED"
+    if artifact.admitted_for is not None:
+        verdict += f" (for {artifact.admitted_for!r})"
     print(f"{args.task}: {verdict}")
     for reason in artifact.reasons:
         print(f"  - {reason}")

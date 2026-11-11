@@ -248,6 +248,21 @@ def get_feature_builder(name: str) -> FeatureFn:
         raise FeatureError(f"no feature builder named {name!r} is registered (registered: {registered})") from None
 
 
+def import_feature_modules(module_paths: Iterable[str]) -> None:
+    """``python -m prismyra.learn.fit --features-module`` and ``prismyra-serve --features-module``'s whole
+    implementation: import each dotted module path, by name, so that a module whose only job is calling
+    `register_features` at import time (an `examples/features/sentence_embedding.py`-style module, say) is
+    loaded before a tag naming one of its builders is fit or served. Nothing here is specific to either
+    caller -- a plain ``importlib.import_module`` -- which is the point: the registration side already
+    refuses, loudly, at *use* time (`get_feature_builder`, above) if a name was never registered, so this
+    function has nothing to validate past "did the import itself succeed".
+    """
+    import importlib
+
+    for path in module_paths:
+        importlib.import_module(path)
+
+
 @dataclass(frozen=True)
 class Vectorizer:
     """One tag's chosen way of turning (document, question) into a fixed-width numeric vector -- either the

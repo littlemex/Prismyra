@@ -57,7 +57,9 @@ prismyra-serve --model ... --learn-spec learn.json
 ```
 
 Optional: `--learn-log-dir` (default: an `experience/` directory next to the spec file), `--learn-backend`
-(`local`, the default, or `ray`), `--learn-max-queue` (default 10,000).
+(`local`, the default, or `ray`), `--learn-max-queue` (default 10,000), `--features-module` (see
+[Registering a feature module from the command line](#registering-a-feature-module-from-the-command-line)
+below; the same flag, same meaning, as `python -m prismyra.learn.fit --features-module`).
 
 `/stats` gains a `learn` key: `{"logged": N, "dropped": N, "queue_depth": N}`. `dropped` counts experience that
 could not be written -- the queue was full, or the write itself failed -- never a request that failed.
@@ -107,6 +109,83 @@ confidence-threshold (`tau`) sweep -- answer rate versus disagreement rate -- fo
 on, rather than this script picking one. **The artifact is saved, never wired into serving on its own.** See
 [Stage 4](#stage-4-switching-traffic-between-a-student-and-prismyra) below for the part that can route traffic
 to an admitted artifact.
+
+## Admission for what is served: a tag's own `"admission"` field
+
+The admission above judges a student that answers *every* request. That is the right system to judge for
+`"ab"`/`"ramp"`/`"bandit"` routing (stage 4, below), which do serve every eligible request -- but
+`"confidence"`-mode routing only ever serves the fraction whose own top probability clears `tau`, deferring
+to Prismyra for the rest. Admitting a `"confidence"`-mode student on its full-coverage numbers judges a
+different system from the one that is actually served, which can refuse a student that would have been fine
+at the slice it would really answer, or admit one whose full-coverage numbers look fine but whose *confident*
+slice specifically is not (a student can be more often right than Prismyra in aggregate while being
+systematically overconfident on exactly the inputs it gets wrong).
+
+A tag's own `"admission"` field opts into judging it this way instead:
+
+```json
+{"task": "sentiment-finnews-v1", ..., "admission": {"mode": "confidence", "tau": 0.8}}
+```
+
+`mode` is checked against a closed set (today, only `"confidence"`); `tau` is a number in `[0, 1]`, the same
+scale `RouterConfig.tau` uses but read independently of it -- an operator fits and reports a confidence-mode
+artifact before deciding whether, or at what `tau`, to actually route live traffic to it. With
+`"admission"` set to `"confidence"`, the two conditions become:
+
+1. **Eval set:** the *hybrid* answer -- the student's own answer where its top probability is at least
+   `tau`, Prismyra's own recorded prediction (`eval_set`'s `prismyra_probabilities`) everywhere else -- scored
+   against gold, instead of the student's full-coverage accuracy. Still compared against the tag's own
+   `min_accuracy_ratio` times Prismyra's own accuracy (`prismyra.learn.fit.score_eval_confidence`).
+2. **Held-out:** the one-sided 95% Wilson lower bound of student/Prismyra agreement, scored only over the
+   held-out items the student would actually *answer* at this `tau` (top probability >= `tau`), not every
+   held-out item regardless of what the student would have said
+   (`prismyra.learn.fit.held_out_confidence_agreement`). An empty answered subset -- this `tau` the student
+   never clears on this held-out slice -- is not admitted: "answer rate が 0 なら admit しない", not a lower
+   bound of `0.0` read as if it meant something.
+
+`min_match_rate`/`min_accuracy_ratio` are unchanged -- the same bars, a different system measured against
+them. The full-coverage numbers (`metrics["eval"]`, `metrics["held_out_agreement"]`) are still computed and
+reported either way -- they cost nothing extra and are useful context even when they are not what gated this
+run; `metrics["admission_mode"]` (`"full"` or `"confidence"`) and `metrics["confidence_admission"]` record
+which numbers actually decided it.
+
+An artifact admitted this way carries `admitted_for: {"mode": "confidence", "tau": <float>}` in its JSON
+(absent, or `{"mode": "full"}`, for the original admission -- every artifact written before this field
+existed reads as the latter). `prismyra.learn.students.StudentHandle` is the one place that reads it back: it
+accepts such an artifact only for a tag whose `router` is itself in `"confidence"` mode with its own `tau` no
+lower than the one the artifact was admitted at (a *stricter* live `tau` only ever serves a subset of what was
+measured, never more) -- loading it under `"ab"`, say, where it would answer *every* eligible request, is
+refused loudly (`StudentError`) rather than silently serving a system nothing ever admitted.
+
+## Registering a feature module from the command line
+
+`--features-module`: a tag's `"features"` field (the table in [Registering tags](#registering-tags) above) names a builder
+`prismyra.learn.features.register_features` already registered -- which means *something* has to import the
+module that calls `register_features` before that tag is fit or served. `tools/snake_features.py` does this
+by being imported directly by whatever script runs it; `--features-module <dotted.import.path>` is the same
+idea wired into the two long-running entry points instead, so a feature module does not have to be imported
+by hand in a wrapper script:
+
+```
+python -m prismyra.learn.fit --learn-spec learn.json --task sentiment-finnews-v1 \
+  --backbone ... --out students/sentiment-finnews-v1.json \
+  --features-module examples.features.sentence_embedding
+prismyra-serve --model ... --learn-spec learn.json --features-module examples.features.sentence_embedding
+```
+
+May be given more than once. `prismyra.learn.features.import_feature_modules` is the whole implementation --
+a plain `importlib.import_module` per path, run before the spec is loaded (`fit.py`) or before the app is
+built (`server.py`, before any tag's `router.student_path` is loaded, so a `"confidence"`- or
+`"features"`-backed student can actually be loaded at startup). A module whose only job is calling
+`register_features` at import time is enough; `get_feature_builder` (used at fit or predict time) is still
+the place an unregistered name is refused, loudly, same as always.
+
+`examples/features/sentence_embedding.py` is a worked example (PREREG-R2 idea 2): one feature builder per
+sentence-embedding model, registered under `f"sentence_embedding:{model_name}"`
+(`register_sentence_embedding`/`feature_name_for`), with `sentence-transformers` imported lazily -- importing
+the module (what `--features-module` does) registers every name in its own `CANDIDATE_MODELS` immediately,
+but downloads and loads nothing until a tag whose `"features"` names one of them is actually fit or served.
+Not a dependency of `prismyra` itself: `pip install sentence-transformers` only when a tag actually uses one.
 
 ## Choosing a student backend: LightGBM or XGBoost
 
