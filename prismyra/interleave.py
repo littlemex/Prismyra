@@ -43,6 +43,18 @@ from . import chunking, varlen
 from .fork import Prefill, build_suffixes, pick, snapshot_bytes, snapshot_layer, widen_for_branch, widen_for_branch_many
 
 
+def _rope(text_model, hidden: torch.Tensor, positions: torch.Tensor):
+    """Rotary embeddings for text positions of shape (batch, length).
+
+    The model's rotary module is multimodal (M-RoPE): it takes one row of positions per axis -- temporal, height,
+    width -- shaped (3, batch, length), and transformers 5.17 indexes that shape directly. For text the three rows are
+    the same positions, which is how the model's own forward expands a 2-D `position_ids` before calling it.
+    """
+    if positions.dim() == 2:
+        positions = positions.unsqueeze(0).expand(3, -1, -1)
+    return text_model.rotary_emb(hidden, positions)
+
+
 def read_and_branch(
     engine, encoded, texts: list[str], width: int, group: int, padded_rows: int, only_group: bool = False
 ):
@@ -102,8 +114,8 @@ def read_and_branch(
 
     hidden_ctx = text_model.embed_tokens(ctx_ids)
     hidden_branch = text_model.embed_tokens(branch_ids)
-    ctx_rope = text_model.rotary_emb(hidden_ctx, ctx_positions)
-    branch_rope = text_model.rotary_emb(hidden_branch, branch_positions)
+    ctx_rope = _rope(text_model, hidden_ctx, ctx_positions)
+    branch_rope = _rope(text_model, hidden_branch, branch_positions)
 
     snap: dict[int, dict] = {}
     for i, decoder_layer in enumerate(layers):
@@ -253,7 +265,7 @@ def read_and_branch_shelf(engine, shelf, context: str, texts: list[str], width: 
     branch_positions = (
         torch.arange(encoded.tokens, encoded.tokens + branch_width, device=device).unsqueeze(0).expand(padded_rows, -1)
     )
-    branch_rope = text_model.rotary_emb(hidden_branch, branch_positions)
+    branch_rope = _rope(text_model, hidden_branch, branch_positions)
 
     for layer in cache.layers:
         begin = getattr(layer, "begin_documents", None)
@@ -268,7 +280,7 @@ def read_and_branch_shelf(engine, shelf, context: str, texts: list[str], width: 
         if has_pad
         else torch.arange(ctx_tokens, device=device).unsqueeze(0)
     )
-    ctx_rope = text_model.rotary_emb(hidden_ctx, ctx_positions)
+    ctx_rope = _rope(text_model, hidden_ctx, ctx_positions)
 
     snap: dict[int, dict] = {}
     for i, decoder_layer in enumerate(layers):
@@ -483,7 +495,7 @@ def read_and_branch_shelf_many(
     # is entered, but rope needs this before the layer loop starts): each real document's own tokens start at
     # zero, same as `open_batch`'s own positions for a batched read, and so does the shared padding segment's.
     ctx_positions = torch.cat([torch.arange(ln, device=device) for ln in lengths]).unsqueeze(0)
-    ctx_rope = text_model.rotary_emb(hidden_ctx, ctx_positions)
+    ctx_rope = _rope(text_model, hidden_ctx, ctx_positions)
     # Each document's own branch rows start at that document's own end -- `encoded[i].tokens`, not the shared
     # padding's end and not another document's -- same per-row-start-position reasoning `_branch_across` uses
     # for a mixed batch.
@@ -491,7 +503,7 @@ def read_and_branch_shelf_many(
         [torch.full((padded_rows_per_doc[i],), encoded[i].tokens, device=device, dtype=torch.long) for i in range(n)]
     )
     branch_positions = starts.unsqueeze(1) + torch.arange(branch_width, device=device).unsqueeze(0)
-    branch_rope = text_model.rotary_emb(hidden_branch, branch_positions)
+    branch_rope = _rope(text_model, hidden_branch, branch_positions)
 
     # Which document each branch row answers about, in row order -- `restore_and_fork_many`'s own `rows_for`
     # contract, handed to the paged attention layer's `begin_branches` below.
