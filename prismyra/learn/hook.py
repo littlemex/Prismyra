@@ -38,6 +38,18 @@ def _argmax(probs) -> str:
     return max(probs.items(), key=lambda kv: kv[1])[0]
 
 
+
+def tag_version(tag: TagSpec) -> str:
+    """What decides Prismyra's own answer for one tag, digested: the question, options, kind, normalisation and
+    feature builder. Unlike the spec's version it does not move when a router block or an admission is written
+    into the spec, so the fallback's version is the same before and after a student is deployed."""
+    import hashlib
+    import json
+
+    payload = json.dumps([tag.task, tag.question, list(tag.options), tag.kind, tag.normalize, tag.features],
+                         separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
 class LearnHook:
     """Bound to one loaded spec and one running log. See `tag`, `submit`, `route`, `record_route`,
     `submit_feedback` and `stats` -- the methods `prismyra.server` calls."""
@@ -155,7 +167,7 @@ class LearnHook:
             kind=kind,
             probabilities=dict(probabilities),
             answered_by=answered_by,
-            versions=self.versions(),
+            versions={**self.versions(), "tag": tag_version(tag)},
             h=h if tag.keep_hidden else None,
             request_id=request_id,
             feature_summary=feature_summary(context),
@@ -237,7 +249,7 @@ class LearnHook:
             kind=kind,
             probabilities=dict(final_probabilities),
             answered_by=outcome.served_by,
-            versions=self.versions(),
+            versions={**self.versions(), "tag": tag_version(tag)},
             h=None,
             request_id=outcome.request_id,
             route_mode=outcome.mode,

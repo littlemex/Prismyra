@@ -750,7 +750,9 @@ the server does not log tokens, so a self-hosted arm is priced from a declared p
 **One row per component.** `export --per-component` writes no router arm. Each logged request gives one row per
 component whose answer the log holds, under `--student-arm` or `--fallback-arm` and that component's own version: the
 student's `artifact_version` wherever its probabilities were logged (it answered, or a confidence-mode fallback kept
-them), and the fallback's `backbone|package|spec` wherever it answered or was audited. These are the versions an
+them), and the fallback's `backbone|package|tag` wherever it answered or was audited (`tag` digests the tag's question,
+options, kind, normalisation and feature builder, so writing a router or an admission into the spec does not change
+it; rows logged before the tag version existed carry `spec` instead). These are the versions an
 offline `score` of the same student carries, so a certificate over a cascade composed from its parts can be checked
 against served traffic. A reader composing a cascade pairs a part's attempts by item and run, so rows meant to pair
 with an offline `score` of the same items take that score's run with `--run` (each row's request id otherwise).

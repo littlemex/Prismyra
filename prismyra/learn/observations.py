@@ -249,8 +249,10 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
         if missing:
             counts[f"skipped: versions missing {missing}"] += 1
             continue
-        serving = [f"backbone:{exp.versions['backbone']}", f"package:{exp.versions['package']}",
-                   f"spec:{exp.versions['spec']}"]
+        # A row that names its tag's own version is bound to that, not to the whole spec file, so writing a
+        # router into the spec does not make the fallback a different arm. Older rows name only the spec.
+        what = f"tag:{exp.versions['tag']}" if exp.versions.get("tag") else f"spec:{exp.versions['spec']}"
+        serving = [f"backbone:{exp.versions['backbone']}", f"package:{exp.versions['package']}", what]
         parts = serving + [f"route:{exp.route_params_version or 'none'}"]
         if student_version_:
             parts.append(student_version_)

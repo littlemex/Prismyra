@@ -56,7 +56,10 @@ def test_tag_matches_and_versions_travel_with_the_experience(tmp_path):
     rows = list((tmp_path / "exp" / "phishing-v1").glob("*.jsonl"))
     assert len(rows) == 1
     row = json.loads(rows[0].read_text().strip())
-    assert row["versions"] == {"package": "9.9.9", "backbone": "stub/model", "spec": hook.spec.version}
+    from prismyra.learn.hook import tag_version
+
+    assert row["versions"] == {"package": "9.9.9", "backbone": "stub/model", "spec": hook.spec.version,
+                               "tag": tag_version(tag)}
     assert row["h"] is None  # not submitted with h, even though keep_hidden is true for this tag
 
 

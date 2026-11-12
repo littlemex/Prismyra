@@ -198,3 +198,22 @@ def test_one_run_name_lets_served_rows_pair_with_an_offline_score():
     rows, _ = obsmod.export_experience([_exp("x", 0.9, request_id="r1"), _exp("y", 0.9, request_id="r2")],
                                        per_component=True, run="score", **KW)
     assert [r["run"] for r in rows] == ["score", "score"]
+
+
+def test_the_fallback_is_bound_to_its_tag_not_to_the_spec_file():
+    a = _exp("x", 0.9, versions={"package": "0.4", "backbone": "qwen", "spec": "s1", "tag": "t1"})
+    b = _exp("y", 0.9, versions={"package": "0.4", "backbone": "qwen", "spec": "s2", "tag": "t1"})
+    rows, _ = obsmod.export_experience([a, b], per_component=True, **KW)
+    assert {r["arm_version"] for r in rows} == {"backbone:qwen|package:0.4|tag:t1"}
+
+
+def test_writing_a_router_into_the_spec_keeps_the_tag_version():
+    from dataclasses import replace
+
+    from prismyra.learn.hook import tag_version
+    from prismyra.learn.spec import RouterConfig, TagSpec
+
+    t = TagSpec(task="t", question="q", options=("a", "b"), kind="choice", normalize="none", retain_days=1,
+                keep_hidden=False, eval_set="e")
+    routed = replace(t, router=RouterConfig(mode="ab", student_path="s.json", ratio=1))
+    assert tag_version(t) == tag_version(routed) != tag_version(replace(t, question="other"))
