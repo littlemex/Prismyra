@@ -708,3 +708,30 @@ data: a different OTel `Logger` name (`"prismyra.learn.experience"` vs `prismyra
 Turning on `--otel` alone emits zero `Experience` rows; turning on `--learn-spec` alone emits zero spans or
 metrics through `prismyra.telemetry`. `tests/test_telemetry_isolation.py` is what checks both directions,
 together with the untouched stage 1/2 case (neither on) and the case where both are.
+
+## Graded attempts for an outside certifier: `prismyra.learn.observations`
+
+A student is worth serving only once something outside the process that trained it has measured it. Two writers turn
+what this package already has into graded attempts in the open observation record format (format 3, the one tierbook
+reads), without importing any certifier:
+
+```bash
+python -m prismyra.learn.observations score --artifact student.json --items items.jsonl \
+  --task-type sentiment --arm student-bge --out student.obs.jsonl
+python -m prismyra.learn.observations export --log-root experience/ --task sentiment-v1 \
+  --task-type sentiment --arm prismyra-router --student student.json --labels items.jsonl \
+  --stats stats.json --out router.obs.jsonl
+```
+
+| writer | answers | rows carry |
+|---|---|---|
+| `score` | a declared item set (`{item?, context, question?, label?}` per line), with an artifact that need not be serving | `arm` as given, `arm_version` the artifact's content-addressed name (plus its feature builder's name), `score` the top probability |
+| `export` | nothing: it reads the server's logged requests | `arm` the assigned arm's stable name, `path` the components that answered (`student`, `prismyra`, or both after a confidence fallback), `arm_version` the backbone, package, routing snapshot and declared student |
+
+A row is graded only against a label the operator supplied: an items file's `label`, or a feedback record's `label`.
+A scalar feedback `reward` becomes a verdict only through `--verdict-module MODULE:FUNC`, whose name is recorded as
+the grader; without one the row is `unobserved`, with the reason. A row answered by a different student artifact than
+the one declared is refused. Item ids are the content digest of the context (`sha256:` and the hex SHA-256 of its UTF-8
+bytes) unless the items file names them. `export` writes a manifest beside its output with the server's `logged` and
+`dropped` counts from `--stats`; without it the manifest says they are unknown, because a dropped row is a gap nobody
+else can see.
