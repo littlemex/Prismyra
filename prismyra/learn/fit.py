@@ -512,6 +512,7 @@ def run(
     feedback_dir: str | Path | None = None,
     source: ExperienceSource | None = None,
     backend_name: str | None = None,
+    exclude: frozenset[str] = frozenset(),
 ) -> StudentArtifact:
     """``min_match_rate``/``min_accuracy_ratio`` of ``None`` (the default) means "use this tag's own spec
     value" (``tag.min_match_rate``/``tag.min_accuracy_ratio``, themselves ``prismyra.learn.spec``'s
@@ -536,6 +537,10 @@ def run(
     stage 1/2's own experience rows have no `request_id` at all (`experience.Experience.from_json`'s own
     backward-compatible default, ``""``) and so can never match one regardless. See `_soft_rows` for what a
     match changes.
+
+    ``exclude`` is a set of item content digests (`prismyra.learn.observations.content_digest` of ``[context,
+    question]``) that must not reach training or the held-out split: an outside certifier's items. A row whose
+    context was not retained cannot be checked, so it is dropped too. Both counts are in ``metrics``.
     """
     spec = load_spec(spec_path)
     tag = spec.by_task(task)
@@ -548,6 +553,19 @@ def run(
         root = Path(log_dir) if log_dir is not None else Path(spec_path).parent / "experience"
         source = LocalExperienceSource(root)
     all_experiences = dedup(list(source.iter_experiences(task)))
+    excluded = {"in_an_excluded_set": 0, "context_not_retained": 0}
+    if exclude:
+        from .observations import content_digest
+
+        kept = []
+        for e in all_experiences:
+            if not e.context:
+                excluded["context_not_retained"] += 1
+            elif content_digest(e.context, e.question or "") in exclude:
+                excluded["in_an_excluded_set"] += 1
+            else:
+                kept.append(e)
+        all_experiences = kept
     train, held_out = split_train_held_out(all_experiences, held_out_fraction, seed)
 
     feedback = None
@@ -598,6 +616,8 @@ def run(
         # and agreement look like even when that is not what gated this run.
         "admission_mode": admission_mode,
     }
+    if exclude:
+        metrics["excluded"] = excluded
     if external:
         metrics["serving_admission"] = "external"
 
@@ -781,7 +801,23 @@ def main(argv: list[str] | None = None) -> int:
         "imported some other way -- a tag using the hashed-TF-IDF default (no 'features' field) needs none "
         "of this.",
     )
+    parser.add_argument(
+        "--exclude-set",
+        action="append",
+        default=[],
+        help="a set manifest (JSONL of {item, content_sha256}) whose items must not be trained on; repeatable. "
+        "Logged rows with those contents, and rows whose context was not retained, are dropped and counted",
+    )
+    parser.add_argument(
+        "--provenance-out",
+        default=None,
+        help="write the artifact's provenance here: its arm_version, the manifest of items it was fit on "
+        "(training and held-out rows, written beside it), and the excluded sets' file digests",
+    )
+    parser.add_argument("--provenance-arm", default=None, help="the arm name the provenance names (with --provenance-out)")
     args = parser.parse_args(argv)
+    if bool(args.provenance_out) != bool(args.provenance_arm):
+        parser.error("--provenance-out and --provenance-arm go together")
 
     from .features import import_feature_modules
 
@@ -807,6 +843,8 @@ def main(argv: list[str] | None = None) -> int:
 
     import prismyra
 
+    exclude, excluded_sets = _read_exclude_sets(args.exclude_set)
+    recording = _RecordingSource(args.log_dir, args.learn_spec) if args.provenance_out else None
     artifact = run(
         spec_path=args.learn_spec,
         task=args.task,
@@ -823,10 +861,16 @@ def main(argv: list[str] | None = None) -> int:
         min_data_in_leaf=args.min_data_in_leaf,
         feedback_dir=args.feedback_dir,
         backend_name=args.student_backend,
+        exclude=exclude,
+        source=recording,
     )
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(artifact.to_json(), ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.provenance_out:
+        _write_provenance(Path(args.provenance_out), args.provenance_arm, artifact, exclude, excluded_sets,
+                          recording.seen)
+        print(f"wrote {args.provenance_out}")
     verdict = "ADMITTED" if artifact.admitted else "NOT ADMITTED"
     if artifact.admitted_for is not None:
         verdict += f" (for {artifact.admitted_for!r})"
@@ -835,6 +879,65 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  - {reason}")
     print(f"wrote {out_path}")
     return 0
+
+
+
+def _read_exclude_sets(paths: list[str]) -> tuple[frozenset[str], list[dict]]:
+    import hashlib
+
+    digests: set[str] = set()
+    cited = []
+    for p in paths:
+        data = Path(p).read_bytes()
+        for n, line in enumerate(data.decode("utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            c = row.get("content_sha256") if isinstance(row, dict) else None
+            if not isinstance(c, str) or len(c) != 64:
+                raise FitError(f"{p}:{n}: an exclude-set row needs a 64-hex 'content_sha256'")
+            digests.add(c)
+        cited.append({"manifest": str(Path(p).resolve()), "sha256": hashlib.sha256(data).hexdigest()})
+    return frozenset(digests), cited
+
+
+class _RecordingSource(LocalExperienceSource):
+    """The default local source, remembering which rows it handed out, so provenance can name every item fit on."""
+
+    def __init__(self, log_dir, spec_path):
+        super().__init__(Path(log_dir) if log_dir is not None else Path(spec_path).parent / "experience")
+        self.seen: list[Experience] = []
+
+    def iter_experiences(self, task):
+        for e in super().iter_experiences(task):
+            self.seen.append(e)
+            yield e
+
+
+def _write_provenance(path: Path, arm: str, artifact, exclude, excluded_sets, seen_rows) -> None:
+    """An arm provenance file in the open format a certifier reads (format 1): what the artifact is and which items
+    reached it. Rows dropped by --exclude-set are not listed; every other row read is, train and held-out alike. A
+    row whose context was not retained cannot be named, so the count of those is stated beside the list."""
+    import hashlib
+
+    from .observations import content_digest, item_id
+    from .students import artifact_version
+
+    seen = sorted({(content_digest(e.context, e.question or ""), e.context, e.question or "")
+                   for e in seen_rows if e.context})
+    unnamed = sum(1 for e in seen_rows if not e.context)
+    manifest = path.with_name(path.name + ".trained_on.jsonl")
+    rows = "".join(json.dumps({"item": item_id(c, q), "content_sha256": d}) + "\n" for d, c, q in seen
+                   if d not in exclude)
+    manifest.write_text(rows, encoding="utf-8")
+    prov = {"format": 1, "arm": arm, "arm_version": artifact_version(artifact),
+            "trained_on": [{"set": "fit", "manifest": manifest.name,
+                            "sha256": hashlib.sha256(rows.encode("utf-8")).hexdigest()}],
+            "requires": [],
+            "trainer": {"prismyra_fit": artifact.package_version, "backbone": artifact.backbone,
+                        "excluded_sets": excluded_sets, "excluded": artifact.metrics.get("excluded"),
+                        "rows_read_without_context": unnamed}}
+    path.write_text(json.dumps(prov, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

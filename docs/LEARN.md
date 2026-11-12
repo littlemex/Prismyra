@@ -758,6 +758,13 @@ against served traffic.
 (options, feature settings, idf, the model text, the backend), the Prismyra package that runs it, and the feature
 module's name. The module's code is not covered: a builder changed in place must be renamed.
 
+**Keeping a certifier's items out of a fit.** `python -m prismyra.learn.fit ... --exclude-set cert.jsonl` (a set
+manifest, JSONL `{item, content_sha256}`, repeatable) drops every logged row whose `[context, question]` digest is in
+a set, and every row whose context was not retained (it cannot be checked); both counts go in the artifact's
+`metrics.excluded`. `--provenance-out P --provenance-arm NAME` writes the artifact's provenance in the open format
+(format 1): its `artifact_version`, a manifest beside it naming every row read (training and held-out), the excluded
+sets' file digests, and how many rows had no context to name.
+
 ## Admission decided outside Prismyra: mode `"external"`
 
 A tag may hand the decision to serve its student to someone outside Prismyra:

@@ -325,3 +325,35 @@ def test_an_external_tag_is_judged_and_reported_on_the_full_bar(tmp_path):
     assert artifact.metrics["admission_mode"] == "full"
     assert artifact.metrics["serving_admission"] == "external"
     assert artifact.admitted_for is None
+
+
+def test_an_exclude_set_keeps_its_items_out_of_the_fit_and_provenance_names_the_rest(tmp_path, monkeypatch):
+    import hashlib
+
+    from prismyra.learn import fit as fitmod
+    from prismyra.learn.observations import content_digest
+    from prismyra.learn.students import artifact_version
+
+    spec_path, spec = make_spec(tmp_path)
+    rows = synthetic_rows(60)
+    write_experience(tmp_path, spec, rows)
+    write_eval_set(tmp_path / "eval.jsonl", synthetic_rows(15))
+    question = json.loads(spec_path.read_text())[0]["question"]
+    held = [r for r in rows[:10]]
+    excl = tmp_path / "cert.jsonl"
+    excl.write_text("".join(json.dumps({"item": f"c{i}", "content_sha256": content_digest(r[0], question)})
+                            + "\n" for i, r in enumerate(held)))
+    out, prov = tmp_path / "student.json", tmp_path / "student.provenance.json"
+    argv = ["--learn-spec", str(spec_path), "--task", TASK, "--log-dir", str(tmp_path / "experience"),
+            "--backbone", "stub/model", "--out", str(out), "--exclude-set", str(excl), "--provenance-out", str(prov),
+            "--provenance-arm", "student", "--min-data-in-leaf", "2", "--num-boost-round", "10"]
+    assert fitmod.main(argv) == 0
+    art = fitmod.StudentArtifact.from_json(json.loads(out.read_text()))
+    assert art.metrics["excluded"]["in_an_excluded_set"] >= 1
+    p = json.loads(prov.read_text())
+    assert p["arm"] == "student" and p["arm_version"] == artifact_version(art)
+    manifest = prov.with_name(prov.name + ".trained_on.jsonl")
+    assert p["trained_on"][0]["sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+    named = {json.loads(line)["content_sha256"] for line in manifest.read_text().splitlines()}
+    assert named and not named & {content_digest(r[0], question) for r in held}
+    assert p["trainer"]["excluded_sets"][0]["sha256"] == hashlib.sha256(excl.read_bytes()).hexdigest()
