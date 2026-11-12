@@ -769,8 +769,11 @@ has no router, and the logged row carries it, so `POST /v1/feedback` can attach 
 manifest, JSONL `{item, content_sha256}`, repeatable) drops every logged row whose `[context, question]` digest is in
 a set, and every row whose context was not retained (it cannot be checked); both counts go in the artifact's
 `metrics.excluded`. `--provenance-out P --provenance-arm NAME` writes the artifact's provenance in the open format
-(format 1): its `artifact_version`, a manifest beside it naming every row read (training and held-out), the excluded
-sets' file digests, and how many rows had no context to name.
+(format 1): its `artifact_version`, two manifests beside it (every row the fit used, training and held-out, and the
+tag's eval set, which decided Prismyra's own verdict), and the excluded sets' file digests with how many of their
+items matched a logged row. A fit that used a row with no retained context cannot name it, so `--provenance-out` is
+refused for it rather than written with a hole. Exclusion also drops rows with no retained context; both counts are
+printed.
 
 ## Admission decided outside Prismyra: mode `"external"`
 

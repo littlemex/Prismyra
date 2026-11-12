@@ -39,16 +39,24 @@ def _argmax(probs) -> str:
 
 
 
+#: `TagSpec` fields that decide Prismyra's own answer for a tag, and the ones that do not. Every field is in exactly
+#: one set (a test enforces it), so a field added later must be placed deliberately.
+TAG_ANSWER_FIELDS = ("question", "options", "kind", "normalize")
+TAG_OTHER_FIELDS = ("task", "retain_days", "keep_hidden", "eval_set", "features", "min_match_rate",
+                    "min_accuracy_ratio", "retain_context", "router", "student", "text_tokenizer", "admission")
+
+
 def tag_version(tag: TagSpec) -> str:
-    """What decides Prismyra's own answer for one tag, digested: the question, options, kind, normalisation and
-    feature builder. Unlike the spec's version it does not move when a router block or an admission is written
-    into the spec, so the fallback's version is the same before and after a student is deployed."""
+    """A digest of what decides Prismyra's own answer for one tag (`TAG_ANSWER_FIELDS`). Unlike the spec's version it
+    does not move when a router, an admission or the student's feature builder is written into the spec, so the
+    fallback's version is the same before and after a student is deployed."""
     import hashlib
     import json
 
-    payload = json.dumps([tag.task, tag.question, list(tag.options), tag.kind, tag.normalize, tag.features],
-                         separators=(",", ":"))
+    payload = json.dumps({k: list(v) if isinstance(v, tuple) else v for k, v in
+                          ((k, getattr(tag, k)) for k in TAG_ANSWER_FIELDS)}, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
 
 class LearnHook:
     """Bound to one loaded spec and one running log. See `tag`, `submit`, `route`, `record_route`,

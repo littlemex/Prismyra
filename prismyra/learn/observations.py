@@ -204,7 +204,7 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
 
     With ``per_component`` the router arm is not written. Each request instead gives one row per component whose
     answer the log holds, under that component's own name and version: the student's (the artifact's
-    `artifact_version`) wherever its probabilities were logged, and the fallback's (``backbone|package|spec``)
+    `artifact_version`) wherever its probabilities were logged, and the fallback's (``backbone|package|tag``, or ``spec`` for rows logged before tags had a version)
     wherever it answered or was audited. These are the versions an offline score of the same components carries,
     so a certificate over a cascade composed from parts can be checked against served traffic.
 
@@ -393,7 +393,11 @@ def main(argv: list[str] | None = None) -> int:
             labels=load_items(args.labels) if args.labels else None, label_source=args.label_source,
             verdict=_verdict_fn(args.verdict_module), verdict_name=args.verdict_module or "",
             since=args.since, until=args.until, per_component=args.per_component, run=args.run)
+        if args.run and not args.labels:
+            print("note: --run without --labels keeps content-digest item ids; they pair only with a score whose "
+                  "items use the same ids", file=sys.stderr)
         manifest = {"rows": len(rows), "task": args.task, "arm": args.arm, "counts": counts,
+                    "run": args.run or "request id", "per_component": args.per_component,
                     "logged": stats["logged"] if stats else "unknown",
                     "dropped": stats["dropped"] if stats else "unknown", "stats_source": args.stats or None}
         _write_atomic(args.out, _rows_text(rows))

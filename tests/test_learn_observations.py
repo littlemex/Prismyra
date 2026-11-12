@@ -216,4 +216,16 @@ def test_writing_a_router_into_the_spec_keeps_the_tag_version():
     t = TagSpec(task="t", question="q", options=("a", "b"), kind="choice", normalize="none", retain_days=1,
                 keep_hidden=False, eval_set="e")
     routed = replace(t, router=RouterConfig(mode="ab", student_path="s.json", ratio=1))
-    assert tag_version(t) == tag_version(routed) != tag_version(replace(t, question="other"))
+    assert tag_version(t) == tag_version(routed) == tag_version(replace(t, features="m", task="renamed"))
+    assert tag_version(t) != tag_version(replace(t, question="other"))
+
+
+def test_every_tag_field_is_placed_as_deciding_the_answer_or_not():
+    import dataclasses
+
+    from prismyra.learn.hook import TAG_ANSWER_FIELDS, TAG_OTHER_FIELDS
+    from prismyra.learn.spec import TagSpec
+
+    names = {f.name for f in dataclasses.fields(TagSpec)}
+    assert set(TAG_ANSWER_FIELDS) | set(TAG_OTHER_FIELDS) == names
+    assert not set(TAG_ANSWER_FIELDS) & set(TAG_OTHER_FIELDS)

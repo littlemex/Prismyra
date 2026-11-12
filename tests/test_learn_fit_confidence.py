@@ -327,7 +327,7 @@ def test_an_external_tag_is_judged_and_reported_on_the_full_bar(tmp_path):
     assert artifact.admitted_for is None
 
 
-def test_an_exclude_set_keeps_its_items_out_of_the_fit_and_provenance_names_the_rest(tmp_path, monkeypatch):
+def test_an_exclude_set_keeps_its_items_out_of_the_fit_and_provenance_names_the_rest(tmp_path):
     import hashlib
 
     from prismyra.learn import fit as fitmod
@@ -339,7 +339,7 @@ def test_an_exclude_set_keeps_its_items_out_of_the_fit_and_provenance_names_the_
     write_experience(tmp_path, spec, rows)
     write_eval_set(tmp_path / "eval.jsonl", synthetic_rows(15))
     question = json.loads(spec_path.read_text())[0]["question"]
-    held = [r for r in rows[:10]]
+    held = rows[:10]
     excl = tmp_path / "cert.jsonl"
     excl.write_text("".join(json.dumps({"item": f"c{i}", "content_sha256": content_digest(r[0], question)})
                             + "\n" for i, r in enumerate(held)))
@@ -349,7 +349,9 @@ def test_an_exclude_set_keeps_its_items_out_of_the_fit_and_provenance_names_the_
             "--provenance-arm", "student", "--min-data-in-leaf", "2", "--num-boost-round", "10"]
     assert fitmod.main(argv) == 0
     art = fitmod.StudentArtifact.from_json(json.loads(out.read_text()))
-    assert art.metrics["excluded"]["in_an_excluded_set"] >= 1
+    x = art.metrics["excluded"]
+    assert x["in_an_excluded_set"] == 10 and x["excluded_items_matched"] == 10 and x["context_not_retained"] == 0
+    assert art.metrics["train_n"] + art.metrics["held_out_n"] == len(rows) - 10
     p = json.loads(prov.read_text())
     assert p["arm"] == "student" and p["arm_version"] == artifact_version(art)
     manifest = prov.with_name(prov.name + ".trained_on.jsonl")
@@ -357,3 +359,9 @@ def test_an_exclude_set_keeps_its_items_out_of_the_fit_and_provenance_names_the_
     named = {json.loads(line)["content_sha256"] for line in manifest.read_text().splitlines()}
     assert named and not named & {content_digest(r[0], question) for r in held}
     assert p["trainer"]["excluded_sets"][0]["sha256"] == hashlib.sha256(excl.read_bytes()).hexdigest()
+    assert len(named) == len(rows) - 10
+    assert [s["set"] for s in p["trained_on"]] == ["fit", "eval_set"]
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text(json.dumps({"item": "x", "content_sha256": "A" * 64}) + "\n")
+    with pytest.raises(fitmod.FitError, match="lowercase hex"):
+        fitmod._read_exclude_sets([str(bad)])

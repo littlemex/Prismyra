@@ -70,6 +70,8 @@ import argparse
 import json
 import math
 import random
+import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -513,6 +515,7 @@ def run(
     source: ExperienceSource | None = None,
     backend_name: str | None = None,
     exclude: frozenset[str] = frozenset(),
+    used: list | None = None,
 ) -> StudentArtifact:
     """``min_match_rate``/``min_accuracy_ratio`` of ``None`` (the default) means "use this tag's own spec
     value" (``tag.min_match_rate``/``tag.min_accuracy_ratio``, themselves ``prismyra.learn.spec``'s
@@ -540,7 +543,9 @@ def run(
 
     ``exclude`` is a set of item content digests (`prismyra.learn.observations.content_digest` of ``[context,
     question]``) that must not reach training or the held-out split: an outside certifier's items. A row whose
-    context was not retained cannot be checked, so it is dropped too. Both counts are in ``metrics``.
+    context was not retained cannot be checked, so it is dropped too. Both counts are in ``metrics``, with how many
+    rows each item of ``exclude`` matched. ``used``, when given, receives every row the fit read after exclusion
+    (training and held-out), so provenance names what was fit rather than reconstructing it.
     """
     spec = load_spec(spec_path)
     tag = spec.by_task(task)
@@ -553,19 +558,24 @@ def run(
         root = Path(log_dir) if log_dir is not None else Path(spec_path).parent / "experience"
         source = LocalExperienceSource(root)
     all_experiences = dedup(list(source.iter_experiences(task)))
-    excluded = {"in_an_excluded_set": 0, "context_not_retained": 0}
+    excluded = {"in_an_excluded_set": 0, "context_not_retained": 0, "excluded_items_matched": 0}
     if exclude:
         from .observations import content_digest
 
-        kept = []
+        kept, matched = [], set()
         for e in all_experiences:
-            if not e.context:
+            d = content_digest(e.context, e.question or "") if e.context else None
+            if d is None:
                 excluded["context_not_retained"] += 1
-            elif content_digest(e.context, e.question or "") in exclude:
+            elif d in exclude:
                 excluded["in_an_excluded_set"] += 1
+                matched.add(d)
             else:
                 kept.append(e)
         all_experiences = kept
+        excluded["excluded_items_matched"] = len(matched)
+    if used is not None:
+        used.extend(all_experiences)
     train, held_out = split_train_held_out(all_experiences, held_out_fraction, seed)
 
     feedback = None
@@ -844,7 +854,7 @@ def main(argv: list[str] | None = None) -> int:
     import prismyra
 
     exclude, excluded_sets = _read_exclude_sets(args.exclude_set)
-    recording = _RecordingSource(args.log_dir, args.learn_spec) if args.provenance_out else None
+    used: list = []
     artifact = run(
         spec_path=args.learn_spec,
         task=args.task,
@@ -862,15 +872,25 @@ def main(argv: list[str] | None = None) -> int:
         feedback_dir=args.feedback_dir,
         backend_name=args.student_backend,
         exclude=exclude,
-        source=recording,
+        used=used,
     )
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(artifact.to_json(), ensure_ascii=False, indent=2), encoding="utf-8")
     if args.provenance_out:
-        _write_provenance(Path(args.provenance_out), args.provenance_arm, artifact, exclude, excluded_sets,
-                          recording.seen)
+        tag = load_spec(args.learn_spec).by_task(args.task)
+        ev = Path(tag.eval_set) if Path(tag.eval_set).is_absolute() else Path(args.learn_spec).parent / tag.eval_set
+        try:
+            _write_provenance(Path(args.provenance_out), args.provenance_arm, artifact, excluded_sets, used, ev,
+                              tag.question)
+        except FitError as e:
+            print(f"refused: {e}", file=sys.stderr)
+            return 2
         print(f"wrote {args.provenance_out}")
+    if exclude:
+        x = artifact.metrics["excluded"]
+        print(f"excluded {x['in_an_excluded_set']} logged row(s) matching {x['excluded_items_matched']} of "
+              f"{len(exclude)} excluded item(s); {x['context_not_retained']} row(s) dropped for no retained context")
     verdict = "ADMITTED" if artifact.admitted else "NOT ADMITTED"
     if artifact.admitted_for is not None:
         verdict += f" (for {artifact.admitted_for!r})"
@@ -882,6 +902,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
 def _read_exclude_sets(paths: list[str]) -> tuple[frozenset[str], list[dict]]:
     import hashlib
 
@@ -889,54 +912,61 @@ def _read_exclude_sets(paths: list[str]) -> tuple[frozenset[str], list[dict]]:
     cited = []
     for p in paths:
         data = Path(p).read_bytes()
+        n_items = 0
         for n, line in enumerate(data.decode("utf-8").splitlines(), 1):
             if not line.strip():
                 continue
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise FitError(f"{p}:{n}: {e.msg}") from None
             c = row.get("content_sha256") if isinstance(row, dict) else None
-            if not isinstance(c, str) or len(c) != 64:
-                raise FitError(f"{p}:{n}: an exclude-set row needs a 64-hex 'content_sha256'")
+            if not isinstance(c, str) or not _HEX64.fullmatch(c):
+                raise FitError(f"{p}:{n}: an exclude-set row needs 'content_sha256', 64 lowercase hex characters")
             digests.add(c)
-        cited.append({"manifest": str(Path(p).resolve()), "sha256": hashlib.sha256(data).hexdigest()})
+            n_items += 1
+        cited.append({"manifest": p, "sha256": hashlib.sha256(data).hexdigest(), "items": n_items})
     return frozenset(digests), cited
 
 
-class _RecordingSource(LocalExperienceSource):
-    """The default local source, remembering which rows it handed out, so provenance can name every item fit on."""
+def _manifest(rows) -> bytes:
+    from .observations import content_digest
 
-    def __init__(self, log_dir, spec_path):
-        super().__init__(Path(log_dir) if log_dir is not None else Path(spec_path).parent / "experience")
-        self.seen: list[Experience] = []
-
-    def iter_experiences(self, task):
-        for e in super().iter_experiences(task):
-            self.seen.append(e)
-            yield e
+    ds = sorted({content_digest(e.context, e.question or "") for e in rows})
+    return "".join(json.dumps({"item": "sha256:" + d, "content_sha256": d}) + "\n" for d in ds).encode("utf-8")
 
 
-def _write_provenance(path: Path, arm: str, artifact, exclude, excluded_sets, seen_rows) -> None:
+def _write_provenance(path: Path, arm: str, artifact, excluded_sets, used_rows, eval_set: Path, question: str) -> None:
     """An arm provenance file in the open format a certifier reads (format 1): what the artifact is and which items
-    reached it. Rows dropped by --exclude-set are not listed; every other row read is, train and held-out alike. A
-    row whose context was not retained cannot be named, so the count of those is stated beside the list."""
+    reached it -- every row the fit read (training and held-out), and the tag's eval set, which decided Prismyra's
+    own verdict on it. A fit that read a row whose context was not retained cannot name it, so it is refused rather
+    than written with a hole."""
     import hashlib
 
-    from .observations import content_digest, item_id
     from .students import artifact_version
 
-    seen = sorted({(content_digest(e.context, e.question or ""), e.context, e.question or "")
-                   for e in seen_rows if e.context})
-    unnamed = sum(1 for e in seen_rows if not e.context)
-    manifest = path.with_name(path.name + ".trained_on.jsonl")
-    rows = "".join(json.dumps({"item": item_id(c, q), "content_sha256": d}) + "\n" for d, c, q in seen
-                   if d not in exclude)
-    manifest.write_text(rows, encoding="utf-8")
-    prov = {"format": 1, "arm": arm, "arm_version": artifact_version(artifact),
-            "trained_on": [{"set": "fit", "manifest": manifest.name,
-                            "sha256": hashlib.sha256(rows.encode("utf-8")).hexdigest()}],
-            "requires": [],
+    unnamed = sum(1 for e in used_rows if not e.context)
+    if unnamed:
+        raise FitError(f"{unnamed} fitted row(s) have no retained context, so provenance cannot name them; fit with "
+                       "--exclude-set (which drops them) or from a log that keeps context")
+    sets = []
+    fit_bytes = _manifest(used_rows)
+    fit_path = path.with_name(path.name + ".trained_on.jsonl")
+    fit_path.write_bytes(fit_bytes)
+    sets.append({"set": "fit", "manifest": fit_path.name, "sha256": hashlib.sha256(fit_bytes).hexdigest()})
+    if eval_set.is_file():
+        from .observations import content_digest
+
+        lines = [json.loads(line) for line in eval_set.read_text(encoding="utf-8").splitlines() if line.strip()]
+        ev = "".join(json.dumps({"item": "sha256:" + d, "content_sha256": d}) + "\n"
+                     for d in sorted({content_digest(x["context"], question) for x in lines}))
+        ev_path = path.with_name(path.name + ".eval_set.jsonl")
+        ev_path.write_bytes(ev.encode("utf-8"))
+        sets.append({"set": "eval_set", "manifest": ev_path.name,
+                     "sha256": hashlib.sha256(ev.encode("utf-8")).hexdigest()})
+    prov = {"format": 1, "arm": arm, "arm_version": artifact_version(artifact), "trained_on": sets, "requires": [],
             "trainer": {"prismyra_fit": artifact.package_version, "backbone": artifact.backbone,
-                        "excluded_sets": excluded_sets, "excluded": artifact.metrics.get("excluded"),
-                        "rows_read_without_context": unnamed}}
+                        "excluded_sets": excluded_sets, "excluded": artifact.metrics.get("excluded")}}
     path.write_text(json.dumps(prov, indent=2) + "\n", encoding="utf-8")
 
 
