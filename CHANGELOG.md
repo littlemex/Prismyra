@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- **Graded attempts for an outside certifier (`prismyra.learn.observations`).** `score` answers a declared item set
+  with an artifact that is not serving; `export` turns a server's logged requests into rows of the open observation
+  format, under the router's declared arm or, with `--per-component`, one row per component under its own version.
+  Items are named by the digest of `[context, question]`; labels join by content; a reward needs a named verdict
+  module; skipped rows are counted and the manifest says when drops are unknown. No certifier is imported.
+- **Admission mode `external`.** A tag's spec may name an admission record (Prismyra's own format: tag, one
+  `artifact_version`, the router block, `admitted_by`, evidence). Prismyra then serves the artifact only if the record
+  matches what it is about to serve, whatever its own bar said, and refuses a refit under the old record.
+- **`artifact_version`** digests every field that decides a student's answers plus the serving package. Logged rows
+  carry a per-tag version, so writing a router or an admission into the spec does not change the fallback's version.
+- **`fit --exclude-set` and `--provenance-out`.** A certifier's items are kept out of a fit and counted; provenance
+  names every row the fit used and the eval set, and is refused for a fit that used rows it cannot name.
+- **Gold labels before any router.** A tagged `/v1/decide` item with no router gets a `request_id`, so
+  `/v1/feedback` can attach a gold label that `fit --feedback-dir` trains on.
+
 ## 0.4.13
 
 - **`/v1/decide` now reaches the shelf `--batcher` already gives `/ask`.** `decide_mod.decide_many`'s own `ask`
