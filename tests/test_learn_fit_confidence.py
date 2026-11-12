@@ -312,3 +312,16 @@ def test_an_artifact_serialized_before_admitted_for_existed_reads_as_full_admiss
     del raw["admitted_for"]  # simulate a pre-existing artifact on disk, written before this field existed
     reloaded = StudentArtifact.from_json(raw)
     assert reloaded.admitted_for is None
+
+
+def test_an_external_tag_is_judged_and_reported_on_the_full_bar(tmp_path):
+    # Admission mode "external": Prismyra's own verdict no longer decides serving, but it is still computed on the
+    # original full-coverage bar and reported, and the artifact says the serving decision was handed out.
+    spec_path, spec = make_spec(tmp_path, admission={"mode": "external", "record": "admission.json"})
+    write_experience(tmp_path, spec, synthetic_rows(60))
+    write_eval_set(tmp_path / "eval.jsonl", synthetic_rows(15))
+
+    artifact = _run(spec_path, tmp_path)
+    assert artifact.metrics["admission_mode"] == "full"
+    assert artifact.metrics["serving_admission"] == "external"
+    assert artifact.admitted_for is None

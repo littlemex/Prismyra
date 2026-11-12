@@ -73,7 +73,7 @@ def fake_student(monkeypatch):
     # Importing fresh, right before patching, is what keeps the two in agreement.
     from prismyra.learn.students import StudentRegistry
 
-    def fake_load(self, task, spec_dir, student_path, router=None):
+    def fake_load(self, task, spec_dir, student_path, router=None, *, admission):
         self._handles[task] = handle
         return handle
 
@@ -284,7 +284,7 @@ def test_reload_student_swaps_in_a_newly_loaded_handle(tmp_path, monkeypatch):
     second = FakeStudentHandle(version="v2", probs={"up": 0.1, "down": 0.9})
     state = {"current": first}
 
-    def fake_load(self, task, spec_dir, student_path, router=None):
+    def fake_load(self, task, spec_dir, student_path, router=None, *, admission):
         self._handles[task] = state["current"]
         return state["current"]
 

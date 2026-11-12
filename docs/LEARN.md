@@ -127,7 +127,7 @@ A tag's own `"admission"` field opts into judging it this way instead:
 {"task": "sentiment-finnews-v1", ..., "admission": {"mode": "confidence", "tau": 0.8}}
 ```
 
-`mode` is checked against a closed set (today, only `"confidence"`); `tau` is a number in `[0, 1]`, the same
+`mode` is checked against a closed set (`"confidence"`, and `"external"` below); `tau` is a number in `[0, 1]`, the same
 scale `RouterConfig.tau` uses but read independently of it -- an operator fits and reports a confidence-mode
 artifact before deciding whether, or at what `tau`, to actually route live traffic to it. With
 `"admission"` set to `"confidence"`, the two conditions become:
@@ -746,3 +746,40 @@ student-answered rows and no `--student`. Backbone-answered rows cannot show whi
 beside the output, with feedback that joined no row and the server's `logged` and `dropped` from `--stats`. Without
 `--stats` the manifest says `unknown`, because a dropped row is a gap nobody else can see. The rows carry no `usage`:
 the server does not log tokens, so a self-hosted arm is priced from a declared per-attempt price.
+
+**One row per component.** `export --per-component` writes no router arm. Each logged request gives one row per
+component whose answer the log holds, under `--student-arm` or `--fallback-arm` and that component's own version: the
+student's `artifact_version` wherever its probabilities were logged (it answered, or a confidence-mode fallback kept
+them), and the fallback's `backbone|package|spec` wherever it answered or was audited. These are the versions an
+offline `score` of the same student carries, so a certificate over a cascade composed from its parts can be checked
+against served traffic.
+
+**What a version covers.** A student's `artifact_version` digests every artifact field that decides its answers
+(options, feature settings, idf, the model text, the backend), the Prismyra package that runs it, and the feature
+module's name. The module's code is not covered: a builder changed in place must be renamed.
+
+## Admission decided outside Prismyra: mode `"external"`
+
+A tag may hand the decision to serve its student to someone outside Prismyra:
+
+```json
+{"task": "sentiment-v1", ..., "router": {"mode": "confidence", "tau": 0.9, "student_path": "student.json"},
+ "admission": {"mode": "external", "record": "admission/sentiment-v1.json"}}
+```
+
+The record (path relative to the spec's directory) is in Prismyra's own format:
+
+```json
+{"format": 1, "tag": "sentiment-v1", "version": "student:...+package:...",
+ "router": {"mode": "confidence", "tau": 0.9, "student_path": "student.json"},
+ "admitted_by": "...", "evidence": {"uri": "...", "sha256": "..."}}
+```
+
+At load and at every reload, Prismyra serves the artifact only if the record is for this tag, the artifact's
+`artifact_version` equals `version`, and the live router block equals `router`. The artifact's own `admitted` and
+`admitted_for` are not read: a student below Prismyra's own bar is served under a matching record, and a refit under
+the old record is refused. Prismyra cannot know whether the outside judgement covered the router block, only that
+the live block is the one the record declares, so changing `tau` or `mode` needs a new record. `evidence` is kept,
+never read. `prismyra.learn.fit` still computes its own full-coverage bar for such a tag and records
+`serving_admission: "external"` beside it. A missing or malformed record refuses the load; it never falls back to
+Prismyra's own bar. tierbook's `export-policy --target prismyra-learn` writes these records.

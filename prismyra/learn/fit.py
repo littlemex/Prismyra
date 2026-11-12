@@ -574,8 +574,11 @@ def run(
         (probs,) = loaded.predict_proba(np.asarray([vec], dtype=np.float64))
         return dict(zip(tag.options, (float(p) for p in probs), strict=True))
 
-    admission_mode = tag.admission.mode if tag.admission is not None else "full"
-    confidence_tau = tag.admission.tau if tag.admission is not None else None
+    # "external": the serving decision is made outside Prismyra, so this run is judged and reported on the
+    # original full-coverage bar, which then no longer gates serving (`prismyra.learn.students.AdmissionRecord`).
+    external = tag.admission is not None and tag.admission.mode == "external"
+    admission_mode = tag.admission.mode if tag.admission is not None and not external else "full"
+    confidence_tau = tag.admission.tau if tag.admission is not None and not external else None
 
     reasons: list[str] = []
     metrics: dict = {
@@ -595,6 +598,8 @@ def run(
         # and agreement look like even when that is not what gated this run.
         "admission_mode": admission_mode,
     }
+    if external:
+        metrics["serving_admission"] = "external"
 
     eval_items: list[EvalItem] = []
     eval_path = Path(tag.eval_set)

@@ -120,7 +120,7 @@ def fit_and_save(tmp_path, out_name="student.json", *, entry_overrides=None, bac
 def test_student_registry_loads_an_admitted_artifact_and_predicts(tmp_path):
     spec_path, out_path, artifact = fit_and_save(tmp_path)
     registry = StudentRegistry()
-    handle = registry.load(TASK, spec_path.parent, out_path.name)
+    handle = registry.load(TASK, spec_path.parent, out_path.name, admission=None)
     assert handle.version == student_version(artifact)
     assert registry.get(TASK) is handle
 
@@ -137,7 +137,7 @@ def test_student_registry_loads_an_admitted_artifact_and_predicts(tmp_path):
 
 def test_predicting_the_same_input_twice_gives_the_same_answer(tmp_path):
     spec_path, out_path, _ = fit_and_save(tmp_path)
-    handle = StudentRegistry().load(TASK, spec_path.parent, out_path.name)
+    handle = StudentRegistry().load(TASK, spec_path.parent, out_path.name, admission=None)
     a = handle.predict("this is great news item 1")
     b = handle.predict("this is great news item 1")
     assert a == b
@@ -148,7 +148,7 @@ def test_a_not_admitted_artifact_is_refused_at_load_time(tmp_path):
     broken = {**artifact.to_json(), "admitted": False, "reasons": ["eval_set: student accuracy too low"]}
     out_path.write_text(json.dumps(broken))
     with pytest.raises(StudentError, match="not admitted"):
-        StudentRegistry().load(TASK, spec_path.parent, out_path.name)
+        StudentRegistry().load(TASK, spec_path.parent, out_path.name, admission=None)
 
 
 def test_an_artifact_for_a_different_tag_is_refused(tmp_path):
@@ -156,13 +156,13 @@ def test_an_artifact_for_a_different_tag_is_refused(tmp_path):
     mismatched = {**artifact.to_json(), "tag": "a-different-tag"}
     out_path.write_text(json.dumps(mismatched))
     with pytest.raises(StudentError, match="is an artifact for tag"):
-        StudentRegistry().load(TASK, spec_path.parent, out_path.name)
+        StudentRegistry().load(TASK, spec_path.parent, out_path.name, admission=None)
 
 
 def test_a_missing_student_path_is_refused(tmp_path):
     spec_path, _out_path, _artifact = fit_and_save(tmp_path)
     with pytest.raises(StudentError, match="does not exist"):
-        StudentRegistry().load(TASK, spec_path.parent, "nope.json")
+        StudentRegistry().load(TASK, spec_path.parent, "nope.json", admission=None)
 
 
 def test_student_version_changes_when_model_text_or_spec_version_changes(tmp_path):
@@ -187,7 +187,7 @@ def test_student_registry_loads_an_xgboost_backed_artifact_and_predicts(tmp_path
     spec_path, out_path, artifact = fit_and_save(tmp_path, backend_name="xgboost")
     assert artifact.backend == "xgboost"
     registry = StudentRegistry()
-    handle = registry.load(TASK, spec_path.parent, out_path.name)
+    handle = registry.load(TASK, spec_path.parent, out_path.name, admission=None)
     assert handle.version == student_version(artifact)
 
     positive_context = synthetic_rows(1)[0][0]
@@ -204,8 +204,8 @@ def test_xgboost_backed_prediction_is_the_same_across_two_independently_loaded_h
     # predict. See test_xgboost_backend_survives_a_real_process_restart (test_learn_backends.py) for the same
     # claim through an actual subprocess, not just a second in-process object.
     spec_path, out_path, _artifact = fit_and_save(tmp_path, backend_name="xgboost")
-    handle_a = StudentRegistry().load(TASK, spec_path.parent, out_path.name)
-    handle_b = StudentRegistry().load(TASK, spec_path.parent, out_path.name)
+    handle_a = StudentRegistry().load(TASK, spec_path.parent, out_path.name, admission=None)
+    handle_b = StudentRegistry().load(TASK, spec_path.parent, out_path.name, admission=None)
     context = synthetic_rows(1)[0][0]
     assert handle_a.predict(context) == handle_b.predict(context)
 
@@ -225,7 +225,7 @@ def test_student_version_differs_between_backends_on_the_same_tag(tmp_path):
 def test_a_tags_own_spec_student_field_is_honoured_without_a_registry_level_override(tmp_path):
     spec_path, out_path, artifact = fit_and_save(tmp_path, entry_overrides={"student": "xgboost"})
     assert artifact.backend == "xgboost"
-    handle = StudentRegistry().load(TASK, spec_path.parent, out_path.name)
+    handle = StudentRegistry().load(TASK, spec_path.parent, out_path.name, admission=None)
     context = synthetic_rows(1)[0][0]
     probs = handle.predict(context)
     assert set(probs) == {"negative", "positive"}

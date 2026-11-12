@@ -88,7 +88,12 @@ ROUTER_MODES = frozenset({"ab", "ramp", "shadow", "confidence", "bandit"})
 #: meaning what it meant before" discipline `OPTIONAL_FIELDS` already keeps everywhere else. `"confidence"` is
 #: the one mode that exists so far: judge the student on the slice of traffic a `"confidence"`-mode router
 #: would actually serve, not on every row regardless of whether the student would have answered it.
-ADMISSION_MODES = frozenset({"confidence"})
+#: `"external"` hands the serving decision to someone outside Prismyra: the field names an admission record
+#: (`prismyra.learn.students.AdmissionRecord`, Prismyra's own format) that says which artifact may be served
+#: under which router block, and Prismyra checks only that the record matches what it is about to serve.
+#: `prismyra.learn.fit.run` still computes and reports its own full-coverage bar for such a tag; that verdict
+#: no longer decides whether the artifact is served.
+ADMISSION_MODES = frozenset({"confidence", "external"})
 
 #: How much of a tag's own `context` survives into its logged experience (section 8's "個人情報が入りうる
 #: context を残すかどうかは、既存の retain_days と keep_hidden と同じく spec で決める"). `"full"` -- the only
@@ -189,7 +194,14 @@ class AdmissionConfig:
     """
 
     mode: str
-    tau: float
+    tau: float | None = None
+    #: ``"external"`` only: the admission record's path, relative to the spec file's directory.
+    record: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.mode == "external") != (self.record is not None) or (self.mode == "external") == (self.tau is not None):
+            raise ValueError(f"admission mode {self.mode!r} takes {'a record' if self.mode == 'external' else 'a tau'} "
+                             "and nothing else")
 
 
 @dataclass(frozen=True)
@@ -387,23 +399,37 @@ def _check_admission(path: Path, where: str, raw: dict) -> AdmissionConfig:
     if not isinstance(raw, dict):
         _fail(path, where, f"must be a JSON object, got {type(raw).__name__}")
 
-    required = {"mode", "tau"}
+    if "mode" not in raw:
+        _fail(path, where, "missing field(s): ['mode']")
+    mode = raw["mode"]
+    if mode not in ADMISSION_MODES:
+        _fail(path, where, f"'mode' must be one of {sorted(ADMISSION_MODES)}, got {mode!r}")
+    required = {"mode", "record"} if mode == "external" else {"mode", "tau"}
     missing = required - raw.keys()
     extra = raw.keys() - required
     if missing:
         _fail(path, where, f"missing field(s): {sorted(missing)}")
     if extra:
-        _fail(path, where, f"unknown field(s): {sorted(extra)} -- the allowed fields are {sorted(required)}")
+        _fail(path, where, f"unknown field(s): {sorted(extra)} -- the allowed fields for mode {mode!r} are "
+                           f"{sorted(required)}")
 
-    mode = raw["mode"]
-    if mode not in ADMISSION_MODES:
-        _fail(path, where, f"'mode' must be one of {sorted(ADMISSION_MODES)}, got {mode!r}")
+    if mode == "external":
+        record = raw["record"]
+        if not isinstance(record, str) or not record:
+            _fail(path, where, f"'record' must be a non-empty path, got {record!r}")
+        return AdmissionConfig(mode=mode, record=record)
 
     tau = raw["tau"]
     if isinstance(tau, bool) or not isinstance(tau, (int, float)) or not (0.0 <= tau <= 1.0):
         _fail(path, where, f"'tau' must be a number in [0, 1], got {tau!r}")
 
     return AdmissionConfig(mode=mode, tau=float(tau))
+
+
+def parse_router(raw: dict, where: str) -> RouterConfig:
+    """A router block checked exactly as a spec entry's ``"router"`` is, for a reader outside this module that
+    must compare one (an admission record names the block it admits)."""
+    return _check_router(Path(where), "router", raw)
 
 
 def _check_entry(path: Path, index: int, raw: dict) -> TagSpec:

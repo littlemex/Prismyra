@@ -12,18 +12,22 @@ nothing in this module trains, re-evaluates or mutates one. The one check this m
 `StudentArtifact.from_json` is the one `fit.py` itself warns a caller would need: `admitted` is `True`. A
 `RouterConfig.student_path` naming an artifact that failed its own admission bar is refused the same way a
 malformed spec entry is -- loudly, at startup, not by quietly answering every request with Prismyra forever
-(which would look like "the router is doing nothing" with no error to explain why).
+(which would look like "the router is doing nothing" with no error to explain why). The one exception is a tag
+whose admission is ``"external"``: an `AdmissionRecord` written outside Prismyra then decides instead of `admitted`.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 from .backends import get_backend
 from .fit import StudentArtifact
-from .spec import RouterConfig
+from .spec import AdmissionConfig, RouterConfig, SpecError, parse_router
 
 
 class StudentError(Exception):
@@ -47,6 +51,95 @@ def student_version(artifact: StudentArtifact) -> str:
     return hashlib.sha256(payload).hexdigest()[:12]
 
 
+#: The artifact fields that decide what a student answers. Everything else (when it was fit, Prismyra's own verdict
+#: and its numbers) is a statement about the artifact, not part of it.
+_ANSWER_FIELDS = ("tag", "spec_version", "options", "kind", "dims", "idf", "model_text", "features", "feature_names",
+                  "backend", "backend_version", "text_tokenizer")
+
+
+def artifact_version(artifact: StudentArtifact) -> str:
+    """The version an outside reader binds evidence to, opaque to every reader but Prismyra: a digest of every field
+    that decides the artifact's answers, the Prismyra package that runs it (featurisation is package code), and the
+    feature module's name. The module's own code is not covered; a builder changed in place must be renamed."""
+    from prismyra import __version__
+
+    raw = artifact.to_json()
+    payload = json.dumps({k: raw[k] for k in _ANSWER_FIELDS}, sort_keys=True, separators=(",", ":"))
+    v = f"student:{hashlib.sha256(payload.encode()).hexdigest()[:32]}+package:{__version__}"
+    return f"{v}+features:{artifact.features}" if artifact.features else v
+
+
+ADMISSION_RECORD_FORMAT = 1
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_RECORD_KEYS = {"format", "tag", "version", "router", "admitted_by", "evidence"}
+
+
+@dataclass(frozen=True)
+class AdmissionRecord:
+    """Someone outside Prismyra admitted one student artifact for one tag (`prismyra.learn.spec.AdmissionConfig`
+    mode ``"external"``). Prismyra's own format:
+
+        {"format": 1, "tag": "...", "version": "<artifact_version>", "router": {...a router block...},
+         "admitted_by": "...", "evidence": {"uri": "...", "sha256": "<64 hex>"}}
+
+    ``version`` is `artifact_version` of the one artifact admitted. ``router`` is the block the writer declared the
+    artifact may be served under; Prismyra cannot know whether the judgement covered that block, only that the live
+    block is the declared one, so a changed tau or mode needs a new record. Prismyra checks the tag, the version and
+    the block, and nothing else; it keeps ``evidence`` so a reader can find what the judgement rests on.
+    A record whose version names a router's served traffic rather than an artifact never matches: admit through the
+    student's own version (``observations score``, or ``export --per-component``).
+    """
+
+    tag: str
+    version: str
+    router: RouterConfig
+    admitted_by: str
+    evidence: dict
+
+    @staticmethod
+    def load(path: Path) -> "AdmissionRecord":
+        def bad(why: str):
+            return StudentError(f"admission record {path}: {why}")
+
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as e:
+            raise bad(e.strerror or str(e)) from None
+        except json.JSONDecodeError as e:
+            raise bad(e.msg) from None
+        if not isinstance(raw, dict) or type(raw.get("format")) is not int or raw["format"] != ADMISSION_RECORD_FORMAT:
+            raise bad(f"'format' must be the integer {ADMISSION_RECORD_FORMAT}")
+        if set(raw) != _RECORD_KEYS:
+            raise bad(f"keys must be exactly {sorted(_RECORD_KEYS)}, got {sorted(raw)}")
+        for k in ("tag", "version", "admitted_by"):
+            if not isinstance(raw[k], str) or not raw[k]:
+                raise bad(f"{k!r} must be a non-empty string")
+        ev = raw["evidence"]
+        if not (isinstance(ev, dict) and set(ev) == {"uri", "sha256"} and isinstance(ev["uri"], str) and ev["uri"]
+                and isinstance(ev["sha256"], str) and _HEX64.fullmatch(ev["sha256"])):
+            raise bad("'evidence' must be {uri, sha256 (64 lowercase hex)}")
+        if not isinstance(raw["router"], dict):
+            raise bad("'router' must be a router block")
+        try:
+            router = parse_router(raw["router"], str(path))
+        except SpecError as e:
+            raise bad(f"its router block: {e}") from None
+        return AdmissionRecord(tag=raw["tag"], version=raw["version"], router=router, admitted_by=raw["admitted_by"],
+                               evidence=dict(ev))
+
+    def check(self, artifact: StudentArtifact, router: RouterConfig | None) -> None:
+        """Refuse unless this record admits exactly ``artifact`` under exactly ``router``."""
+        if artifact.tag != self.tag:
+            raise StudentError(f"tag {artifact.tag!r}: the admission record is for tag {self.tag!r}")
+        mine = artifact_version(artifact)
+        if mine != self.version:
+            raise StudentError(f"tag {artifact.tag!r}: the artifact to serve is {mine!r}, but the admission record "
+                               f"(by {self.admitted_by!r}) admits {self.version!r}. A refit needs a new judgement")
+        if router != self.router:
+            raise StudentError(f"tag {artifact.tag!r}: the live router block {router!r} is not the one the admission "
+                               f"record declares ({self.router!r})")
+
+
 class StudentHandle:
     """One loaded, admitted artifact, ready to answer `prismyra.learn.router.decide`'s `student_predict`
     thunk. `predict` loads this artifact's own backend and builds the model once, in `__init__` (eager, not
@@ -66,16 +159,23 @@ class StudentHandle:
     every other combination -- no router given at all, or one in any other mode, or `"confidence"` at a
     looser ``tau`` -- is refused the same loud way a not-admitted artifact already is. A full-admission
     artifact (`admitted_for` is `None`) is unaffected by any of this, exactly stage 4's original behaviour.
+
+    **Under an `AdmissionRecord`** (a tag in admission mode ``"external"``) none of the above applies: the artifact's
+    own `admitted` and `admitted_for` are not read, and the record alone decides, by `AdmissionRecord.check`.
     """
 
-    def __init__(self, artifact: StudentArtifact, router: RouterConfig | None = None):
-        if not artifact.admitted:
+    def __init__(self, artifact: StudentArtifact, router: RouterConfig | None = None,
+                 record: AdmissionRecord | None = None):
+        if record is not None:
+            # An outside judgement replaces Prismyra's own bar (`admitted`, `admitted_for`) entirely.
+            record.check(artifact, router)
+        elif not artifact.admitted:
             reasons = "; ".join(artifact.reasons) or "no reason recorded"
             raise StudentError(
                 f"tag {artifact.tag!r}: this artifact was not admitted ({reasons}) -- fit a new one, or point "
                 "the tag's 'router.student_path' at one that passed"
             )
-        if artifact.admitted_for is not None and artifact.admitted_for.get("mode") == "confidence":
+        if record is None and artifact.admitted_for is not None and artifact.admitted_for.get("mode") == "confidence":
             admitted_tau = artifact.admitted_for.get("tau")
             served_as_confidence = (
                 router is not None
@@ -93,6 +193,7 @@ class StudentHandle:
                     "'confidence' at a tau no lower than the one it was admitted at"
                 )
         self.artifact = artifact
+        self.record = record
         self.version = student_version(artifact)
         # see module docstring: the one place either backend's own library is required, and only here
         self._model = get_backend(artifact.backend).load(artifact.model_text)
@@ -125,26 +226,31 @@ class StudentRegistry:
         self._handles: dict[str, StudentHandle] = {}
         self._lock = threading.Lock()
 
-    def load(self, task: str, spec_dir: Path, student_path: str, router: RouterConfig | None = None) -> StudentHandle:
+    def load(self, task: str, spec_dir: Path, student_path: str, router: RouterConfig | None = None, *,
+             admission: AdmissionConfig | None) -> StudentHandle:
         """``router`` is the tag's own `RouterConfig` (its ``mode``/``tau``, specifically) -- passed through to
         `StudentHandle.__init__` unchanged, so it can refuse to load a `"confidence"`-admitted artifact under a
         router that would not actually serve it the way it was measured (see that class's own docstring).
         `None` (the default) is the full-admission-only check stage 4 always had -- every existing caller that
-        does not pass this keeps meaning exactly what it meant before this parameter existed.
+        does not pass this keeps meaning exactly what it meant before this parameter existed. ``admission`` is the
+        tag's own `AdmissionConfig`, required so no caller can skip a record by omission; in mode ``"external"`` its
+        record, resolved against ``spec_dir``, replaces the artifact's own verdict.
         """
         path = Path(student_path)
         if not path.is_absolute():
             path = spec_dir / path
         if not path.is_file():
             raise StudentError(f"tag {task!r}: router.student_path {student_path!r} does not exist (resolved: {path})")
-        import json
-
         artifact = StudentArtifact.from_json(json.loads(path.read_text(encoding="utf-8")))
         if artifact.tag != task:
             raise StudentError(
                 f"tag {task!r}: router.student_path {student_path!r} is an artifact for tag {artifact.tag!r}"
             )
-        handle = StudentHandle(artifact, router=router)
+        record = None
+        if admission is not None and admission.mode == "external":
+            rp = Path(admission.record)
+            record = AdmissionRecord.load(rp if rp.is_absolute() else spec_dir / rp)
+        handle = StudentHandle(artifact, router=router, record=record)
         with self._lock:
             self._handles[task] = handle
         return handle

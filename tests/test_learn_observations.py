@@ -33,6 +33,11 @@ class FakeArtifact:
     features = None
     spec_version, backend, model_text = "s", "lightgbm", "m"
 
+    def to_json(self):
+        return {"tag": "t", "spec_version": self.spec_version, "options": list(OPTIONS), "kind": "noul", "dims": 1,
+                "idf": [], "model_text": self.model_text, "features": None, "feature_names": None,
+                "backend": self.backend, "backend_version": None, "text_tokenizer": "words"}
+
     def predict_proba(self, context, question=""):
         p = 0.9 if "good" in context else 0.5 if "tie" in context else 0.2
         return {"negative": 1 - p, "positive": p}
@@ -57,7 +62,8 @@ def test_score_grades_against_labels_and_refuses_a_label_outside_the_options(tmp
     rows = obsmod.score_items(FakeArtifact(), items, task_type="sent", arm="student", label_source="dataset")
     assert [r["outcome"] for r in rows] == ["accepted", "rejected", "unobserved", "unobserved"]
     assert rows[2]["reason"] == "no label" and rows[3]["reason"] == "tied top probabilities"
-    assert all(r["arm_version"] == obsmod.artifact_version(FakeArtifact()) for r in rows)
+    from prismyra.learn.students import artifact_version
+    assert all(r["arm_version"] == artifact_version(FakeArtifact()) for r in rows)
     bad = labels(tmp_path, [{"item": "a", "context": "good", "label": "Positive"}])
     with pytest.raises(obsmod.ObservationError, match="not one of the options"):
         obsmod.score_items(FakeArtifact(), bad, task_type="sent", arm="student", label_source="dataset")
@@ -74,7 +80,7 @@ def test_export_joins_named_labels_by_content_and_names_components(tmp_path):
     lab = labels(tmp_path, [{"item": "q1", "context": "x", "question": "q", "label": "positive"},
                             {"item": "q2", "context": "y", "question": "q", "label": "positive"},
                             {"item": "q3", "context": "z", "question": "q", "label": "negative"}])
-    from prismyra.learn.students import student_version
+    from prismyra.learn.students import artifact_version, student_version
     mine = f"student:{student_version(FakeArtifact())}"
     rows, counts = obsmod.export_experience(
         [_exp("x", 0.9, answered_by=mine, request_id="r1"),
@@ -85,7 +91,31 @@ def test_export_joins_named_labels_by_content_and_names_components(tmp_path):
     assert [r["path"] for r in rows] == [["student"], ["student", "prismyra"], ["prismyra"]]
     assert [r["outcome"] for r in rows] == ["accepted", "rejected", "accepted"]
     assert [r["run"] for r in rows] == ["r1", "r2", "r3"]
-    assert len({r["arm_version"] for r in rows}) == 1 and mine in rows[0]["arm_version"]
+    assert len({r["arm_version"] for r in rows}) == 1 and artifact_version(FakeArtifact()) in rows[0]["arm_version"]
+
+
+def test_per_component_rows_carry_each_components_own_version(tmp_path):
+    """The versions an offline score of the same parts carries, so a cascade's certificate meets served traffic."""
+    from prismyra.learn.students import artifact_version, student_version
+    lab = labels(tmp_path, [{"item": "q1", "context": "x", "question": "q", "label": "positive"},
+                            {"item": "q2", "context": "y", "question": "q", "label": "negative"},
+                            {"item": "q3", "context": "z", "question": "q", "label": "negative"}])
+    mine = f"student:{student_version(FakeArtifact())}"
+    rows, _ = obsmod.export_experience(
+        [_exp("x", 0.9, answered_by=mine, request_id="r1"),
+         _exp("y", 0.3, route_mode="confidence", comparison={"negative": 0.4, "positive": 0.6}, request_id="r2"),
+         _exp("z", 0.1, request_id="r3")],
+        student=FakeArtifact(), labels=lab, label_source="dataset", per_component=True, **KW)
+    got = [(r["item"], r["arm"], r["arm_version"], r["outcome"]) for r in rows]
+    fallback = "backbone:qwen|package:0.4|spec:s"
+    assert got == [("q1", "student", artifact_version(FakeArtifact()), "accepted"),
+                   ("q2", "student", artifact_version(FakeArtifact()), "rejected"),
+                   ("q2", "prismyra", fallback, "accepted"), ("q3", "prismyra", fallback, "accepted")]
+    assert all("path" not in r and "router" != r["arm"] for r in rows)
+    with pytest.raises(obsmod.ObservationError, match="no --student"):
+        obsmod.export_experience([_exp("y", 0.3, route_mode="confidence", comparison={"negative": 0.4,
+                                                                                      "positive": 0.6})],
+                                 per_component=True, **KW)
 
 
 def test_student_rows_need_the_declared_artifact():

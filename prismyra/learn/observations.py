@@ -159,16 +159,11 @@ def _check_label(label: str, options) -> None:
                                "never equal would grade every row rejected")
 
 
-def artifact_version(artifact) -> str:
-    from .students import student_version
-
-    v = f"student:{student_version(artifact)}"
-    return f"{v}+features:{artifact.features}" if artifact.features else v
-
-
 def score_items(artifact, items: list[dict], *, task_type: str, arm: str, label_source: str, run: str = "score",
                 predict: Callable[[str, str], dict[str, float]] | None = None) -> list[dict]:
     """Answer every item with ``artifact`` and grade it against the item's label."""
+    from .students import artifact_version
+
     predict = predict or artifact.predict_proba
     version = artifact_version(artifact)
     out = []
@@ -203,18 +198,26 @@ def _verdict_fn(spec: str | None):
 def export_experience(experiences: Iterable, *, task_type: str, arm: str, student_arm: str, fallback_arm: str,
                       student=None, feedback: dict | None = None, labels: list[dict] | None = None,
                       label_source: str = "", verdict: Callable | None = None, verdict_name: str = "",
-                      since: float | None = None, until: float | None = None) -> tuple[list[dict], dict]:
-    """Rows for a server's logged requests under the declared router ``arm``, and the counts behind them."""
+                      since: float | None = None, until: float | None = None,
+                      per_component: bool = False) -> tuple[list[dict], dict]:
+    """Rows for a server's logged requests under the declared router ``arm``, and the counts behind them.
+
+    With ``per_component`` the router arm is not written. Each request instead gives one row per component whose
+    answer the log holds, under that component's own name and version: the student's (the artifact's
+    `artifact_version`) wherever its probabilities were logged, and the fallback's (``backbone|package|spec``)
+    wherever it answered or was audited. These are the versions an offline score of the same components carries,
+    so a certificate over a cascade composed from parts can be checked against served traffic."""
     if verdict is not None and not verdict_name:
         raise ObservationError("a verdict function needs a name, recorded as the grader")
     if labels and not label_source:
         raise ObservationError("labels need a label_source saying where they came from")
     feedback = feedback or {}
     by_content = {it["digest"]: it for it in (labels or [])}
-    declared = None
+    declared = student_version_ = None
     if student is not None:
-        from .students import student_version
+        from .students import artifact_version, student_version
         declared = f"student:{student_version(student)}"
+        student_version_ = artifact_version(student)
     counts: Counter = Counter()
     joined: set[str] = set()
     out = []
@@ -242,49 +245,71 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
         if missing:
             counts[f"skipped: versions missing {missing}"] += 1
             continue
-        parts = [f"backbone:{exp.versions['backbone']}", f"package:{exp.versions['package']}",
-                 f"spec:{exp.versions['spec']}", f"route:{exp.route_params_version or 'none'}"]
-        if declared:
-            parts.append(declared)
+        serving = [f"backbone:{exp.versions['backbone']}", f"package:{exp.versions['package']}",
+                   f"spec:{exp.versions['spec']}"]
+        parts = serving + [f"route:{exp.route_params_version or 'none'}"]
+        if student_version_:
+            parts.append(student_version_)
         digest = content_digest(exp.context, exp.question or "")
         lab = by_content.get(digest)
         item = lab["item"] if lab is not None else "sha256:" + digest
-        answer, top, why = _answer(dict(exp.probabilities or {}))
-        common = dict(item=item, task_type=task_type, arm=arm, arm_version="|".join(parts), path=path, score=top,
-                      observed_at=_iso(exp.ts), run=exp.request_id or f"ts:{exp.ts!r}")
-        fb = feedback.get(exp.request_id) if exp.request_id else None
-        if fb is not None:
-            joined.add(exp.request_id)
-        options = exp.options or tuple(exp.probabilities or ())
-        fb_label = fb.label if fb is not None else None
-        gold = lab["label"] if lab is not None else None
-        for g in (fb_label, gold):
-            if g is not None:
-                _check_label(g, options)
-        if fb_label is not None and gold is not None and fb_label != gold:
-            counts["unobserved: feedback and labels disagree"] += 1
-            out.append(row(outcome="unobserved", reason="feedback and labels disagree", **common))
-            continue
-        truth, src = (fb_label, "feedback") if fb_label is not None else (gold, label_source)
-        if truth is not None:
-            if answer is None:
-                out.append(row(outcome="unobserved", reason=why, label_source=src, **common))
-            else:
-                out.append(row(outcome="accepted" if answer == truth else "rejected", grader=LABEL_EXACT,
-                               label_source=src, **common))
-        elif fb is not None and fb.reward is not None and verdict is not None:
-            v = verdict(fb.reward, exp)
-            if v is None:
-                out.append(row(outcome="unobserved", reason="verdict module returned no verdict",
-                               label_source="feedback-reward", **common))
-            else:
-                out.append(row(outcome=v, grader=verdict_name, label_source="feedback-reward", **common))
+        run = exp.request_id or f"ts:{exp.ts!r}"
+        if per_component:
+            by_student = answered.startswith("student:")
+            student_probs = exp.probabilities if by_student else exp.comparison_probabilities
+            fallback_probs = exp.comparison_probabilities if by_student else exp.probabilities
+            if student_probs is not None and not by_student and student_version_ is None:
+                raise ObservationError("the log has the student's probabilities and no --student was declared")
+            components = [(student_arm, student_version_, student_probs), (fallback_arm, "|".join(serving),
+                                                                             fallback_probs)]
         else:
-            out.append(row(outcome="unobserved",
-                           reason=("reward without a verdict module" if fb is not None and fb.reward is not None
-                                   else "no label"), **common))
+            components = [(arm, "|".join(parts), exp.probabilities)]
+        for c_arm, c_version, c_probs in components:
+            if c_probs is None:
+                continue
+            _grade(out, counts, joined, exp, lab, feedback, label_source, verdict, verdict_name,
+                   dict(item=item, task_type=task_type, arm=c_arm, arm_version=c_version,
+                        **({} if per_component else {"path": path}), observed_at=_iso(exp.ts), run=run),
+                   dict(c_probs))
     counts["feedback not joined to any exported row"] = len(set(feedback) - joined)
     return out, dict(sorted(counts.items()))
+
+
+def _grade(out, counts, joined, exp, lab, feedback, label_source, verdict, verdict_name, common, probs) -> None:
+    """One row for one answer to one logged request, graded the same way whichever component gave it."""
+    answer, top, why = _answer(probs)
+    common = {**common, "score": top}
+    fb = feedback.get(exp.request_id) if exp.request_id else None
+    if fb is not None:
+        joined.add(exp.request_id)
+    options = exp.options or tuple(exp.probabilities or ())
+    fb_label = fb.label if fb is not None else None
+    gold = lab["label"] if lab is not None else None
+    for g in (fb_label, gold):
+        if g is not None:
+            _check_label(g, options)
+    if fb_label is not None and gold is not None and fb_label != gold:
+        counts["unobserved: feedback and labels disagree"] += 1
+        out.append(row(outcome="unobserved", reason="feedback and labels disagree", **common))
+        return
+    truth, src = (fb_label, "feedback") if fb_label is not None else (gold, label_source)
+    if truth is not None:
+        if answer is None:
+            out.append(row(outcome="unobserved", reason=why, label_source=src, **common))
+        else:
+            out.append(row(outcome="accepted" if answer == truth else "rejected", grader=LABEL_EXACT,
+                           label_source=src, **common))
+    elif fb is not None and fb.reward is not None and verdict is not None:
+        v = verdict(fb.reward, exp)
+        if v is None:
+            out.append(row(outcome="unobserved", reason="verdict module returned no verdict",
+                           label_source="feedback-reward", **common))
+        else:
+            out.append(row(outcome=v, grader=verdict_name, label_source="feedback-reward", **common))
+    else:
+        out.append(row(outcome="unobserved",
+                       reason=("reward without a verdict module" if fb is not None and fb.reward is not None
+                               else "no label"), **common))
 
 
 def _write_atomic(path: str | Path, text: str) -> None:
@@ -326,6 +351,9 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--stats", default=None, help="the server's GET /stats JSON, with top-level logged and dropped")
     e.add_argument("--since", type=float, default=None, help="epoch seconds, inclusive")
     e.add_argument("--until", type=float, default=None, help="epoch seconds, exclusive")
+    e.add_argument("--per-component", action="store_true",
+                   help="write one row per component answer (student, fallback) under its own version instead of "
+                        "one row per request for the router arm")
     e.add_argument("--features-module", action="append", default=[])
     e.add_argument("--out", required=True)
     args = ap.parse_args(argv)
@@ -356,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
             feedback=load_feedback(args.feedback_root) if args.feedback_root else {},
             labels=load_items(args.labels) if args.labels else None, label_source=args.label_source,
             verdict=_verdict_fn(args.verdict_module), verdict_name=args.verdict_module or "",
-            since=args.since, until=args.until)
+            since=args.since, until=args.until, per_component=args.per_component)
         manifest = {"rows": len(rows), "task": args.task, "arm": args.arm, "counts": counts,
                     "logged": stats["logged"] if stats else "unknown",
                     "dropped": stats["dropped"] if stats else "unknown", "stats_source": args.stats or None}

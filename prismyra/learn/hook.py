@@ -95,7 +95,8 @@ class LearnHook:
             self._students = StudentRegistry()
             for t in routed:
                 assert t.router is not None
-                self._students.load(t.task, self.spec.path.parent, t.router.student_path, router=t.router)
+                self._students.load(t.task, self.spec.path.parent, t.router.student_path, router=t.router,
+                                    admission=t.admission)
 
     def tag(self, *, task: str | None, question: str, options, kind: str) -> TagSpec | None:
         """The one comparison the request handler makes whether or not it turns out to match anything."""
@@ -265,7 +266,8 @@ class LearnHook:
             raise SpecError(f"no tag named {task!r} in this spec")
         if tag.router is None or self._students is None:
             raise ValueError(f"tag {task!r} has no router configured")
-        return self._students.load(task, self.spec.path.parent, tag.router.student_path, router=tag.router)
+        return self._students.load(task, self.spec.path.parent, tag.router.student_path, router=tag.router,
+                                   admission=tag.admission)
 
     def submit_feedback(self, request_id: str, *, label: str | None = None, reward: float | None = None) -> bool:
         """``POST /v1/feedback``'s whole implementation: append one `FeedbackRecord`, off the request path,

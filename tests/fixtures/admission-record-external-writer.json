@@ -1,0 +1,15 @@
+{
+  "format": 1,
+  "tag": "sent-v1",
+  "version": "student:0f3c9a1b2d4e5f60718293a4b5c6d7e8+package:0.5.1",
+  "router": {
+    "mode": "confidence",
+    "tau": 0.9,
+    "student_path": "student.json"
+  },
+  "admitted_by": "tierbook export-policy",
+  "evidence": {
+    "uri": "/srv/policies/policy.json",
+    "sha256": "bb66146435adb41501439c4f30ad48c8fba54599f41d92e9b6875c5e69b188f3"
+  }
+}

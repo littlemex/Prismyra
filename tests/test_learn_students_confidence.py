@@ -95,4 +95,4 @@ def test_student_registry_load_passes_the_router_through_to_the_policy_check(tmp
 
     router = RouterConfig(mode="confidence", student_path="student.json", tau=0.5)
     with pytest.raises(StudentError, match="admitted only for 'confidence' mode"):
-        StudentRegistry().load(TASK, Path(tmp_path), "student.json", router=router)
+        StudentRegistry().load(TASK, Path(tmp_path), "student.json", router=router, admission=None)
