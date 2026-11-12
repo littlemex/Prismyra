@@ -114,7 +114,7 @@ def fake_students(monkeypatch):
     # Importing fresh, right before patching, is what keeps the two in agreement.
     from prismyra.learn.students import StudentRegistry
 
-    def fake_load(self, task, spec_dir, student_path, router=None):
+    def fake_load(self, task, spec_dir, student_path, router=None, *, admission):
         self._handles[task] = handles[task]
         return handles[task]
 
