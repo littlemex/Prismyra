@@ -752,7 +752,8 @@ component whose answer the log holds, under `--student-arm` or `--fallback-arm` 
 student's `artifact_version` wherever its probabilities were logged (it answered, or a confidence-mode fallback kept
 them), and the fallback's `backbone|package|spec` wherever it answered or was audited. These are the versions an
 offline `score` of the same student carries, so a certificate over a cascade composed from its parts can be checked
-against served traffic.
+against served traffic. A reader composing a cascade pairs a part's attempts by item and run, so rows meant to pair
+with an offline `score` of the same items take that score's run with `--run` (each row's request id otherwise).
 
 **What a version covers.** A student's `artifact_version` digests every artifact field that decides its answers
 (options, feature settings, idf, the model text, the backend), the Prismyra package that runs it, and the feature

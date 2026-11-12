@@ -199,14 +199,18 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
                       student=None, feedback: dict | None = None, labels: list[dict] | None = None,
                       label_source: str = "", verdict: Callable | None = None, verdict_name: str = "",
                       since: float | None = None, until: float | None = None,
-                      per_component: bool = False) -> tuple[list[dict], dict]:
+                      per_component: bool = False, run: str | None = None) -> tuple[list[dict], dict]:
     """Rows for a server's logged requests under the declared router ``arm``, and the counts behind them.
 
     With ``per_component`` the router arm is not written. Each request instead gives one row per component whose
     answer the log holds, under that component's own name and version: the student's (the artifact's
     `artifact_version`) wherever its probabilities were logged, and the fallback's (``backbone|package|spec``)
     wherever it answered or was audited. These are the versions an offline score of the same components carries,
-    so a certificate over a cascade composed from parts can be checked against served traffic."""
+    so a certificate over a cascade composed from parts can be checked against served traffic.
+
+    ``run`` replaces each row's run (the request id by default) with one name for the whole export. A reader that
+    composes a cascade from its parts pairs attempts by item and run, so rows meant to pair with an offline
+    ``score`` of the same items must carry that score's run."""
     if verdict is not None and not verdict_name:
         raise ObservationError("a verdict function needs a name, recorded as the grader")
     if labels and not label_source:
@@ -253,7 +257,7 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
         digest = content_digest(exp.context, exp.question or "")
         lab = by_content.get(digest)
         item = lab["item"] if lab is not None else "sha256:" + digest
-        run = exp.request_id or f"ts:{exp.ts!r}"
+        run_name = run or exp.request_id or f"ts:{exp.ts!r}"
         if per_component:
             by_student = answered.startswith("student:")
             student_probs = exp.probabilities if by_student else exp.comparison_probabilities
@@ -269,7 +273,7 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
                 continue
             _grade(out, counts, joined, exp, lab, feedback, label_source, verdict, verdict_name,
                    dict(item=item, task_type=task_type, arm=c_arm, arm_version=c_version,
-                        **({} if per_component else {"path": path}), observed_at=_iso(exp.ts), run=run),
+                        **({} if per_component else {"path": path}), observed_at=_iso(exp.ts), run=run_name),
                    dict(c_probs))
     counts["feedback not joined to any exported row"] = len(set(feedback) - joined)
     return out, dict(sorted(counts.items()))
@@ -354,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--per-component", action="store_true",
                    help="write one row per component answer (student, fallback) under its own version instead of "
                         "one row per request for the router arm")
+    e.add_argument("--run", default=None,
+                   help="one run name for every row instead of each request id, to pair with an offline score's run")
     e.add_argument("--features-module", action="append", default=[])
     e.add_argument("--out", required=True)
     args = ap.parse_args(argv)
@@ -384,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
             feedback=load_feedback(args.feedback_root) if args.feedback_root else {},
             labels=load_items(args.labels) if args.labels else None, label_source=args.label_source,
             verdict=_verdict_fn(args.verdict_module), verdict_name=args.verdict_module or "",
-            since=args.since, until=args.until, per_component=args.per_component)
+            since=args.since, until=args.until, per_component=args.per_component, run=args.run)
         manifest = {"rows": len(rows), "task": args.task, "arm": args.arm, "counts": counts,
                     "logged": stats["logged"] if stats else "unknown",
                     "dropped": stats["dropped"] if stats else "unknown", "stats_source": args.stats or None}

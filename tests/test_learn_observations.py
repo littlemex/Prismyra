@@ -192,3 +192,9 @@ def test_export_cli_reads_stats_first_and_says_when_drops_are_unknown(tmp_path, 
     good.write_text(json.dumps({"logged": 1, "dropped": 2}))
     assert obsmod.main(argv + ["--stats", str(good)]) == 0
     assert "dropped 2 rows" in capsys.readouterr().out
+
+
+def test_one_run_name_lets_served_rows_pair_with_an_offline_score():
+    rows, _ = obsmod.export_experience([_exp("x", 0.9, request_id="r1"), _exp("y", 0.9, request_id="r2")],
+                                       per_component=True, run="score", **KW)
+    assert [r["run"] for r in rows] == ["score", "score"]
