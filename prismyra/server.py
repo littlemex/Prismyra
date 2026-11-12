@@ -231,10 +231,11 @@ def _log_decide_routes(learn_hook, routed_calls: list, responses: list[dict], ro
     for call, response, engine_probabilities in zip(routed_calls, responses, route_probabilities, strict=True):
         if call is None:
             continue
-        tag, outcome, question, item = call
+        tag, outcome, question, item, unrouted_id = call
         if outcome is None:
             learn_hook.submit(
                 tag,
+                request_id=unrouted_id,
                 context=item.context,
                 question=question,
                 options=item.reported_options,
@@ -655,7 +656,10 @@ def create_app(
             outcome = learn_hook.route(
                 tag, question=question, options=item.reported_options, kind=raw["kind"], context=item.context
             )
-            routed_calls.append((tag, outcome, question, item))
+            # A tagged item with no router still gets a request id, so a gold label sent later to
+            # `/v1/feedback` can join its logged experience: a student can then be fit on gold labels before
+            # any router exists (`prismyra.learn.fit --feedback-dir`).
+            routed_calls.append((tag, outcome, question, item, uuid.uuid4().hex if outcome is None else None))
             return outcome
 
         try:
@@ -677,6 +681,10 @@ def create_app(
         # logging task below; `decide.py`'s own docstring is explicit that a caller outside this package never
         # sees it, which is why it is popped here, before the response is handed back, rather than after.
         route_probabilities = [r.pop("_route_probabilities", None) for r in responses]
+        if learn_hook is not None:
+            for call, resp in zip(routed_calls, responses, strict=True):
+                if call is not None and call[4] is not None:
+                    resp["request_id"] = call[4]
 
         if learn_hook is not None:
             background_tasks.add_task(_log_decide_routes, learn_hook, routed_calls, responses, route_probabilities)

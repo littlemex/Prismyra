@@ -758,6 +758,10 @@ against served traffic.
 (options, feature settings, idf, the model text, the backend), the Prismyra package that runs it, and the feature
 module's name. The module's code is not covered: a builder changed in place must be renamed.
 
+**Gold labels before any router.** A tagged `/v1/decide` item gets a `request_id` in its response even when its tag
+has no router, and the logged row carries it, so `POST /v1/feedback` can attach a gold label and `fit
+--feedback-dir` can train on gold before a student has ever been served.
+
 **Keeping a certifier's items out of a fit.** `python -m prismyra.learn.fit ... --exclude-set cert.jsonl` (a set
 manifest, JSONL `{item, content_sha256}`, repeatable) drops every logged row whose `[context, question]` digest is in
 a set, and every row whose context was not retained (it cannot be checked); both counts go in the artifact's

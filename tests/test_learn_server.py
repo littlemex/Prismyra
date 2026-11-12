@@ -179,6 +179,31 @@ def test_a_tagged_decide_request_is_logged_including_by_task_name(client_factory
     assert row["kind"] == "noul"
 
 
+def test_a_tagged_unrouted_decide_gets_a_request_id_its_feedback_joins(client_factory):
+    # With no router, a gold label must still be able to reach the logged row, or a student can only ever be fit
+    # on the teacher's answers.
+    from prismyra.learn.experience import load_feedback
+
+    make, tmp_path = client_factory
+    spec_path = write_spec(tmp_path, PHISHING_SPEC)
+    client = make(learn_spec=str(spec_path), learn_log_dir=str(tmp_path / "exp"))
+    body = client.post("/v1/decide", json={"kind": "noul", "state": "buy now", "question": "q",
+                                           "task": "phishing-decide-v1"}).json()
+    assert body["request_id"]
+    assert client.post("/v1/feedback", json={"request_id": body["request_id"], "label": "yes"}).status_code == 200
+    untagged = client.post("/v1/decide", json={"kind": "noul", "state": "hello", "question": "is it?"}).json()
+    assert "request_id" not in untagged
+    deadline = time.time() + 2.0
+    while time.time() < deadline and client.get("/stats").json()["learn"]["logged"] < 1:
+        time.sleep(0.02)
+    row = json.loads(next((tmp_path / "exp" / "phishing-decide-v1").glob("*.jsonl")).read_text().strip())
+    assert row["request_id"] == body["request_id"]
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not load_feedback(tmp_path / "exp" / "_feedback"):
+        time.sleep(0.02)
+    assert body["request_id"] in load_feedback(tmp_path / "exp" / "_feedback")
+
+
 def test_stats_omits_learn_when_disabled(client_factory):
     make, _ = client_factory
     client = make()

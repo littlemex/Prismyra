@@ -129,6 +129,7 @@ class LearnHook:
         probabilities,
         answered_by: str,
         h: tuple[float, ...] | None = None,
+        request_id: str = "",
     ) -> None:
         """Build and enqueue one `Experience`. Never blocks and never raises past a full queue -- see
         `experience.LocalExperienceLog.put`. Called from a FastAPI `BackgroundTasks` callback in
@@ -156,6 +157,7 @@ class LearnHook:
             answered_by=answered_by,
             versions=self.versions(),
             h=h if tag.keep_hidden else None,
+            request_id=request_id,
             feature_summary=feature_summary(context),
             precomputed_features=precomputed,
         )
