@@ -2,30 +2,41 @@
 
 Two producers, sharing one row writer:
 
-* ``score`` answers a declared item set with a student artifact that has never served (or is not serving now), so a
-  candidate can be measured before it is deployed. The experiment scripts this replaces scored candidates by hand.
-* ``export`` turns a running server's logged experience (and any feedback joined to it by ``request_id``) into rows,
-  one per logged request, attributed to the arm the request was **assigned** to (the router, under a stable name the
-  operator gives), with the components that actually answered in ``path``.
+* ``score`` answers a declared item set with a student artifact that is not serving, so a candidate can be measured
+  before it is deployed.
+* ``export`` turns a running server's logged requests (and feedback joined to them by ``request_id``) into rows, one per
+  logged request, under the arm name the operator declares for the router, with the components that answered in
+  ``path``.
 
-The record format is the one tierbook publishes (format 3: ``item``, ``task_type``, ``arm``, ``outcome``, ``usage``,
-and optional ``arm_version``, ``path``, ``score``, ``latency_s``, ``observed_at``, ``label_source``, ``grader``,
-``reason``). This module writes plain JSON and imports nothing from tierbook; a reader validates with its own tool
-(``tierbook check-observations``).
+The record format is the one tierbook publishes (format 3). This module writes plain JSON and imports nothing from
+tierbook; a reader validates with its own tool (``tierbook check-observations``).
 
-What this module does not decide: whether an answer is right. A row is ``accepted``/``rejected`` only against a label
-the operator supplied (an items file's ``label``, or a feedback record's ``label``). A scalar feedback ``reward`` becomes
-a verdict only through an injected ``--verdict-module MODULE:FUNC`` (``FUNC(reward, experience) -> "accepted" |
-"rejected" | None``), whose name is recorded as the grader. With no label and no verdict module the row is
-``unobserved`` with the reason saying which was missing -- never guessed.
+**Item ids.** An item's content is ``[context, question]`` as compact JSON in UTF-8; its digest is the hex SHA-256 of
+that. Unless an items file names an ``item``, the id is ``sha256:`` plus the digest. Labels are always joined by
+content, so a named items file and a server's log meet on the same item. Two items with the same content and
+different labels are refused.
 
-Item ids: an items file may name ``item`` per row. Otherwise the id is ``sha256:`` plus the hex SHA-256 of the context's
-UTF-8 bytes, the same content digest a set manifest uses, so a row and a manifest entry for the same text agree.
+**Grading.** A row is ``accepted``/``rejected`` only against a label the operator supplied (an items file's ``label``,
+or a feedback record's ``label``), and only when that label is one of the item's options; otherwise the input is
+refused. A feedback label and a labels-file label that disagree make the row ``unobserved``, counted in the manifest.
+A scalar feedback ``reward`` becomes a verdict only through an injected ``--verdict-module MODULE:FUNC``
+(``FUNC(reward, experience) -> "accepted" | "rejected" | None``), named as the grader. Tied or non-finite top
+probabilities make the row ``unobserved``: the writer does not pick an answer the server did not clearly give.
 
-    python -m prismyra.learn.observations score --artifact A --items items.jsonl --task-type T --arm NAME --out obs.jsonl
+**Versions.** ``score`` stamps the artifact's content-addressed name (plus its feature builder's name, which names the
+builder, not its code). ``export`` stamps backbone, package, spec, routing snapshot and the declared ``--student``
+artifact; a student-answered row from any other artifact is refused, and a log with student-answered rows and no
+``--student`` is refused. Rows the backbone answered cannot show which student was loaded; ``--since``/``--until``
+separate snapshots by time.
+
+**Not carried.** ``usage`` is empty: the server does not log tokens, so a self-hosted arm is priced from a declared
+per-attempt price, not from these rows.
+
+    python -m prismyra.learn.observations score --artifact A --items items.jsonl --task-type T --arm NAME \\
+        --label-source SRC --out obs.jsonl
     python -m prismyra.learn.observations export --log-root DIR --task TAG --task-type T --arm NAME \\
-        [--student A] [--feedback-root DIR] [--labels items.jsonl] [--verdict-module M:F] [--stats stats.json] \\
-        --out obs.jsonl
+        --student-arm S --fallback-arm F [--student A] [--feedback-root DIR] [--labels items.jsonl \\
+        --label-source SRC] [--verdict-module M:F] [--stats stats.json] [--since TS] [--until TS] --out obs.jsonl
 """
 
 from __future__ import annotations
@@ -34,45 +45,60 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
+import os
 import sys
+from collections import Counter
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
-FORMAT = 3
+#: The record format these writers emit when a row carries `arm_version` or `path` (every row they write does).
+RECORD_FORMAT = 3
 OUTCOMES = ("accepted", "rejected", "unobserved")
+#: What the grading in this module is: an exact match of the answer against an operator-supplied label.
+LABEL_EXACT = "label-exact"
 
 
 class ObservationError(Exception):
     """An input this module cannot turn into rows without guessing."""
 
 
-def item_id(context: str) -> str:
-    """The content digest of a context: ``sha256:`` and the hex digest of its UTF-8 bytes."""
-    return "sha256:" + hashlib.sha256(context.encode("utf-8")).hexdigest()
+def content_digest(context: str, question: str = "") -> str:
+    """The hex SHA-256 of ``[context, question]`` as compact JSON in UTF-8 (lone surrogates passed through)."""
+    payload = json.dumps([context, question], ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def item_id(context: str, question: str = "") -> str:
+    return "sha256:" + content_digest(context, question)
 
 
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def row(*, item: str, task_type: str, arm: str, outcome: str, arm_version: str = "", path: Iterable[str] = (),
-        score: float | None = None, latency_s: float | None = None, observed_at: str = "", label_source: str = "",
-        grader: str = "", reason: str = "", run: str = "") -> dict:
-    """One record. Refuses what a reader would refuse, so a bad row fails here rather than in someone else's tool."""
+def row(*, item: str, task_type: str, arm: str, outcome: str, run: str, arm_version: str, path: Iterable[str] = (),
+        score: float | None = None, observed_at: str = "", label_source: str = "", grader: str = "",
+        reason: str = "") -> dict:
+    """One record, refused here when the reader would refuse it."""
     if outcome not in OUTCOMES:
         raise ObservationError(f"outcome must be one of {OUTCOMES}, not {outcome!r}")
     if outcome == "unobserved" and not reason:
         raise ObservationError(f"item {item!r}: an unobserved row needs a reason")
-    for name, value in (("item", item), ("task_type", task_type), ("arm", arm)):
-        if not value:
+    for name, value in (("item", item), ("task_type", task_type), ("arm", arm), ("arm_version", arm_version)):
+        if not isinstance(value, str) or not value:
             raise ObservationError(f"a row needs a non-empty {name}")
-    path = [str(p) for p in path]
-    out: dict = {"format": FORMAT if (arm_version or path) else 2 if score is not None else 1, "item": item,
-                 "task_type": task_type, "arm": arm, "outcome": outcome, "usage": {}}
-    for key, value in (("arm_version", arm_version), ("score", score), ("latency_s", latency_s),
-                       ("observed_at", observed_at), ("label_source", label_source), ("grader", grader),
-                       ("reason", reason), ("run", run)):
+    path = list(path)
+    if not all(isinstance(p, str) and p for p in path):
+        raise ObservationError(f"path entries must be non-empty arm names, not {path!r}")
+    if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))
+                              or not math.isfinite(score)):
+        raise ObservationError(f"score {score!r} must be a finite number")
+    out: dict = {"format": RECORD_FORMAT, "item": item, "task_type": task_type, "arm": arm, "outcome": outcome,
+                 "usage": {}, "arm_version": arm_version}
+    for key, value in (("run", run), ("score", score), ("observed_at", observed_at), ("label_source", label_source),
+                       ("grader", grader), ("reason", reason)):
         if value not in (None, ""):
             out[key] = value
     if path:
@@ -80,49 +106,85 @@ def row(*, item: str, task_type: str, arm: str, outcome: str, arm_version: str =
     return out
 
 
-def _top(probabilities: dict[str, float]) -> tuple[str, float]:
-    label = max(sorted(probabilities), key=lambda k: probabilities[k])
-    return label, float(probabilities[label])
+def _answer(probabilities: dict) -> tuple[str | None, float | None, str]:
+    """The answer the probabilities clearly give, or None with why not."""
+    vals = {k: v for k, v in probabilities.items()}
+    if not vals:
+        return None, None, "no probabilities logged"
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in vals.values()):
+        return None, None, "non-finite probability"
+    top = max(vals.values())
+    best = [k for k, v in vals.items() if v == top]
+    if len(best) > 1:
+        return None, float(top), "tied top probabilities"
+    return best[0], float(top), ""
 
 
-def _items(path: str | Path) -> list[dict]:
-    out = []
-    for n, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+def load_items(path: str | Path) -> list[dict]:
+    """An items file: ``{item?, context, question?, label?}`` per line. Ids default to the content digest."""
+    out, seen_ids, by_content = [], set(), {}
+    for n, line in enumerate(Path(path).read_text(encoding="utf-8").split("\n"), 1):
         if not line.strip():
             continue
         raw = json.loads(line)
-        if not isinstance(raw.get("context"), str):
+        if not isinstance(raw, dict) or not isinstance(raw.get("context"), str):
             raise ObservationError(f"{path}:{n}: an item needs a 'context' string")
-        raw.setdefault("item", item_id(raw["context"]))
-        out.append(raw)
+        q = raw.get("question") or ""
+        if not isinstance(q, str):
+            raise ObservationError(f"{path}:{n}: 'question' must be a string")
+        digest = content_digest(raw["context"], q)
+        item = raw.get("item")
+        if item is None:
+            item = "sha256:" + digest
+        if not isinstance(item, str) or not item:
+            raise ObservationError(f"{path}:{n}: 'item' must be a non-empty string when given")
+        if item in seen_ids:
+            raise ObservationError(f"{path}:{n}: item {item!r} appears twice")
+        label = raw.get("label")
+        if label is not None and not isinstance(label, str):
+            raise ObservationError(f"{path}:{n}: 'label' must be a string")
+        prev = by_content.get(digest)
+        if prev is not None and prev.get("label") != label:
+            raise ObservationError(f"{path}:{n}: the same content as item {prev['item']!r} with a different label")
+        seen_ids.add(item)
+        entry = {"item": item, "context": raw["context"], "question": q, "label": label, "digest": digest}
+        by_content.setdefault(digest, entry)
+        out.append(entry)
     return out
 
 
+def _check_label(label: str, options) -> None:
+    if label not in options:
+        raise ObservationError(f"label {label!r} is not one of the options {list(options)}; a label the answer can "
+                               "never equal would grade every row rejected")
+
+
 def artifact_version(artifact) -> str:
-    """A student artifact's version as the open record carries it: the same content-addressed name Prismyra logs in
-    ``served_by``, plus the feature builder's name when the artifact uses a registered one (the builder changes what a
-    given model text computes)."""
     from .students import student_version
 
     v = f"student:{student_version(artifact)}"
     return f"{v}+features:{artifact.features}" if artifact.features else v
 
 
-def score_items(artifact, items: list[dict], *, task_type: str, arm: str, label_source: str,
+def score_items(artifact, items: list[dict], *, task_type: str, arm: str, label_source: str, run: str = "score",
                 predict: Callable[[str, str], dict[str, float]] | None = None) -> list[dict]:
-    """Answer every item with ``artifact`` and grade it against the item's ``label`` (absent: ``unobserved``)."""
+    """Answer every item with ``artifact`` and grade it against the item's label."""
     predict = predict or artifact.predict_proba
     version = artifact_version(artifact)
     out = []
     for it in items:
-        label, top = _top(predict(it["context"], it.get("question", "")))
-        gold = it.get("label")
-        common = dict(item=str(it["item"]), task_type=task_type, arm=arm, arm_version=version, score=top,
-                      label_source=label_source)
-        if gold is None:
+        probs = predict(it["context"], it["question"])
+        answer, top, why = _answer(probs)
+        common = dict(item=it["item"], task_type=task_type, arm=arm, run=run, arm_version=version, score=top)
+        if it["label"] is None:
             out.append(row(outcome="unobserved", reason="no label", **common))
+            continue
+        _check_label(it["label"], probs)
+        if answer is None:
+            out.append(row(outcome="unobserved", reason=why, label_source=label_source, **common))
         else:
-            out.append(row(outcome="accepted" if label == gold else "rejected", grader="label-exact", **common))
+            out.append(row(outcome="accepted" if answer == it["label"] else "rejected", grader=LABEL_EXACT,
+                           label_source=label_source, **common))
     return out
 
 
@@ -130,132 +192,182 @@ def _verdict_fn(spec: str | None):
     if not spec:
         return None
     mod, sep, attr = spec.partition(":")
-    if not sep:
+    if not sep or not mod or not attr:
         raise ObservationError(f"--verdict-module takes MODULE:FUNC, not {spec!r}")
-    return getattr(importlib.import_module(mod), attr)
+    try:
+        return getattr(importlib.import_module(mod), attr)
+    except (ImportError, AttributeError) as exc:
+        raise ObservationError(f"--verdict-module {spec!r}: {exc}") from None
 
 
-def export_experience(experiences: Iterable, *, task_type: str, arm: str, student=None,
-                      feedback: dict | None = None, labels: dict[str, str] | None = None,
-                      verdict: Callable | None = None, verdict_name: str = "") -> list[dict]:
-    """Rows for a server's logged requests, attributed to the assigned ``arm``.
-
-    ``arm_version`` names what was serving: the backbone and package, the routing snapshot (``route_params_version``)
-    and, when ``student`` is given, that artifact's version. A row answered by a different student artifact is refused
-    rather than relabelled. ``path`` is the components that answered: ``["student"]``, ``["prismyra"]``, or
-    ``["student", "prismyra"]`` when the student ran and the request fell back.
-    """
+def export_experience(experiences: Iterable, *, task_type: str, arm: str, student_arm: str, fallback_arm: str,
+                      student=None, feedback: dict | None = None, labels: list[dict] | None = None,
+                      label_source: str = "", verdict: Callable | None = None, verdict_name: str = "",
+                      since: float | None = None, until: float | None = None) -> tuple[list[dict], dict]:
+    """Rows for a server's logged requests under the declared router ``arm``, and the counts behind them."""
+    if verdict is not None and not verdict_name:
+        raise ObservationError("a verdict function needs a name, recorded as the grader")
+    if labels and not label_source:
+        raise ObservationError("labels need a label_source saying where they came from")
     feedback = feedback or {}
-    labels = labels or {}
-    want_student = artifact_version(student) if student is not None else None
-    want_short = want_student.split("+", 1)[0] if want_student else None
+    by_content = {it["digest"]: it for it in (labels or [])}
+    declared = None
+    if student is not None:
+        from .students import student_version
+        declared = f"student:{student_version(student)}"
+    counts: Counter = Counter()
+    joined: set[str] = set()
     out = []
     for exp in experiences:
-        item = labels_item = item_id(exp.context) if exp.context else ""
-        if not item:
-            raise ObservationError(f"request {exp.request_id!r} has no retained context, so it has no item id; "
-                                   "keep the context ('retain_context') for a tag whose rows are exported")
+        if (since is not None and exp.ts < since) or (until is not None and exp.ts >= until):
+            counts["outside_window"] += 1
+            continue
+        if not exp.context:
+            counts["skipped: context not retained"] += 1
+            continue
         answered = exp.answered_by or ""
-        if answered.startswith("student"):
-            if want_short is not None and answered != want_short:
+        if answered.startswith("student:"):
+            if declared is None:
+                raise ObservationError("the log has student-answered rows and no --student was declared; name the "
+                                       "artifact the router was serving")
+            if answered != declared:
                 raise ObservationError(f"request {exp.request_id!r} was answered by {answered!r}, not the declared "
-                                       f"student {want_short!r}; export each artifact's rows separately")
-            path = ["student"]
+                                       f"student {declared!r}; use --since/--until to export one snapshot at a time")
+            path = [student_arm]
         elif exp.comparison_probabilities is not None and exp.route_mode == "confidence":
-            path = ["student", "prismyra"]
+            path = [student_arm, fallback_arm]
         else:
-            path = ["prismyra"]
-        parts = [f"backbone:{exp.versions.get('backbone', '')}", f"package:{exp.versions.get('package', '')}",
-                 f"route:{exp.route_params_version or 'none'}"]
-        if want_student:
-            parts.append(want_student)
-        label, top = _top(dict(exp.probabilities))
-        common = dict(item=labels_item, task_type=task_type, arm=arm, arm_version="|".join(parts), path=path,
-                      score=top, observed_at=_iso(exp.ts))
+            path = [fallback_arm]
+        missing = [k for k in ("backbone", "package", "spec") if not exp.versions.get(k)]
+        if missing:
+            counts[f"skipped: versions missing {missing}"] += 1
+            continue
+        parts = [f"backbone:{exp.versions['backbone']}", f"package:{exp.versions['package']}",
+                 f"spec:{exp.versions['spec']}", f"route:{exp.route_params_version or 'none'}"]
+        if declared:
+            parts.append(declared)
+        digest = content_digest(exp.context, exp.question or "")
+        lab = by_content.get(digest)
+        item = lab["item"] if lab is not None else "sha256:" + digest
+        answer, top, why = _answer(dict(exp.probabilities or {}))
+        common = dict(item=item, task_type=task_type, arm=arm, arm_version="|".join(parts), path=path, score=top,
+                      observed_at=_iso(exp.ts), run=exp.request_id or f"ts:{exp.ts!r}")
         fb = feedback.get(exp.request_id) if exp.request_id else None
-        gold = labels.get(item)
-        if fb is not None and fb.label is not None:
-            out.append(row(outcome="accepted" if label == fb.label else "rejected", grader="label-exact",
-                           label_source="feedback", **common))
-        elif gold is not None:
-            out.append(row(outcome="accepted" if label == gold else "rejected", grader="label-exact",
-                           label_source="dataset", **common))
+        if fb is not None:
+            joined.add(exp.request_id)
+        options = exp.options or tuple(exp.probabilities or ())
+        fb_label = fb.label if fb is not None else None
+        gold = lab["label"] if lab is not None else None
+        for g in (fb_label, gold):
+            if g is not None:
+                _check_label(g, options)
+        if fb_label is not None and gold is not None and fb_label != gold:
+            counts["unobserved: feedback and labels disagree"] += 1
+            out.append(row(outcome="unobserved", reason="feedback and labels disagree", **common))
+            continue
+        truth, src = (fb_label, "feedback") if fb_label is not None else (gold, label_source)
+        if truth is not None:
+            if answer is None:
+                out.append(row(outcome="unobserved", reason=why, label_source=src, **common))
+            else:
+                out.append(row(outcome="accepted" if answer == truth else "rejected", grader=LABEL_EXACT,
+                               label_source=src, **common))
         elif fb is not None and fb.reward is not None and verdict is not None:
             v = verdict(fb.reward, exp)
             if v is None:
                 out.append(row(outcome="unobserved", reason="verdict module returned no verdict",
-                               label_source="feedback", **common))
+                               label_source="feedback-reward", **common))
             else:
-                out.append(row(outcome=v, grader=verdict_name, label_source="feedback", **common))
+                out.append(row(outcome=v, grader=verdict_name, label_source="feedback-reward", **common))
         else:
-            why = ("reward without a verdict module" if fb is not None and fb.reward is not None
-                   else "no label")
-            out.append(row(outcome="unobserved", reason=why, **common))
-    return out
+            out.append(row(outcome="unobserved",
+                           reason=("reward without a verdict module" if fb is not None and fb.reward is not None
+                                   else "no label"), **common))
+    counts["feedback not joined to any exported row"] = len(set(feedback) - joined)
+    return out, dict(sorted(counts.items()))
 
 
-def _write(rows: list[dict], path: str | Path) -> None:
-    with open(path, "w", encoding="utf-8") as fh:
-        for r in rows:
-            fh.write(json.dumps(r, sort_keys=True) + "\n")
+def _write_atomic(path: str | Path, text: str) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def _rows_text(rows: list[dict]) -> str:
+    return "".join(json.dumps(r, sort_keys=True, allow_nan=False) + "\n" for r in rows)
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="python -m prismyra.learn.observations", description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(prog="python -m prismyra.learn.observations",
+                                 description="Graded attempts in the open observation record format.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("score", help="answer a declared item set with a student artifact")
     s.add_argument("--artifact", required=True)
     s.add_argument("--items", required=True, help="JSONL of {item?, context, question?, label?}")
     s.add_argument("--task-type", required=True)
     s.add_argument("--arm", required=True)
-    s.add_argument("--label-source", default="dataset")
+    s.add_argument("--label-source", required=True, help="where the items' labels came from")
+    s.add_argument("--run", default="score")
     s.add_argument("--features-module", action="append", default=[])
     s.add_argument("--out", required=True)
-    e = sub.add_parser("export", help="turn a server's logged experience into rows for the assigned arm")
+    e = sub.add_parser("export", help="turn a server's logged requests into rows for the router arm")
     e.add_argument("--log-root", required=True)
     e.add_argument("--task", required=True, help="the learn-spec tag whose log is read")
     e.add_argument("--task-type", required=True)
-    e.add_argument("--arm", required=True, help="the assigned arm's stable name, e.g. the router's")
+    e.add_argument("--arm", required=True, help="the router's stable arm name")
+    e.add_argument("--student-arm", required=True, help="the name the student goes by in `path`")
+    e.add_argument("--fallback-arm", required=True, help="the name the fallback goes by in `path`")
     e.add_argument("--student", default=None, help="the student artifact the router was serving")
     e.add_argument("--feedback-root", default=None)
-    e.add_argument("--labels", default=None, help="JSONL of {item?, context, label}: labels joined by content")
+    e.add_argument("--labels", default=None, help="JSONL of {item?, context, question?, label}, joined by content")
+    e.add_argument("--label-source", default="", help="where --labels came from (required with --labels)")
     e.add_argument("--verdict-module", default=None, help="MODULE:FUNC turning a scalar reward into a verdict")
-    e.add_argument("--stats", default=None, help="the server's GET /stats JSON, for the manifest's logged/dropped")
+    e.add_argument("--stats", default=None, help="the server's GET /stats JSON, with top-level logged and dropped")
+    e.add_argument("--since", type=float, default=None, help="epoch seconds, inclusive")
+    e.add_argument("--until", type=float, default=None, help="epoch seconds, exclusive")
     e.add_argument("--features-module", action="append", default=[])
     e.add_argument("--out", required=True)
     args = ap.parse_args(argv)
-    from .features import import_feature_modules
-    from .fit import StudentArtifact
-
-    import_feature_modules(args.features_module)
     try:
+        from .features import import_feature_modules
+        from .fit import StudentArtifact
+
+        import_feature_modules(args.features_module)
         if args.cmd == "score":
             art = StudentArtifact.from_json(json.loads(Path(args.artifact).read_text()))
-            rows = score_items(art, _items(args.items), task_type=args.task_type, arm=args.arm,
-                               label_source=args.label_source)
-            _write(rows, args.out)
+            rows = score_items(art, load_items(args.items), task_type=args.task_type, arm=args.arm,
+                               label_source=args.label_source, run=args.run)
+            _write_atomic(args.out, _rows_text(rows))
             print(f"wrote {len(rows)} rows to {args.out}")
             return 0
         from .experience import LocalExperienceSource, load_feedback
 
+        stats = None
+        if args.stats:
+            stats = json.loads(Path(args.stats).read_text())
+            if not isinstance(stats, dict) or "logged" not in stats or "dropped" not in stats:
+                raise ObservationError(f"--stats {args.stats} has no top-level 'logged' and 'dropped'")
         student = (StudentArtifact.from_json(json.loads(Path(args.student).read_text()))
                    if args.student else None)
-        labels = {it["item"]: it["label"] for it in _items(args.labels) if "label" in it} if args.labels else {}
-        rows = export_experience(LocalExperienceSource(args.log_root).iter_experiences(args.task),
-                                 task_type=args.task_type, arm=args.arm, student=student,
-                                 feedback=load_feedback(args.feedback_root) if args.feedback_root else {},
-                                 labels=labels, verdict=_verdict_fn(args.verdict_module),
-                                 verdict_name=args.verdict_module or "")
-        _write(rows, args.out)
-        stats = json.loads(Path(args.stats).read_text()) if args.stats else None
-        manifest = {"rows": len(rows), "task": args.task, "arm": args.arm,
-                    "logged": (stats or {}).get("logged"), "dropped": (stats or {}).get("dropped"),
-                    "stats_source": args.stats or None}
-        Path(f"{args.out}.manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True))
-        tail = ("" if stats else "; logged/dropped unknown (no --stats), so a gap in the log cannot be ruled out")
-        print(f"wrote {len(rows)} rows to {args.out}{tail}")
+        rows, counts = export_experience(
+            LocalExperienceSource(args.log_root).iter_experiences(args.task), task_type=args.task_type,
+            arm=args.arm, student_arm=args.student_arm, fallback_arm=args.fallback_arm, student=student,
+            feedback=load_feedback(args.feedback_root) if args.feedback_root else {},
+            labels=load_items(args.labels) if args.labels else None, label_source=args.label_source,
+            verdict=_verdict_fn(args.verdict_module), verdict_name=args.verdict_module or "",
+            since=args.since, until=args.until)
+        manifest = {"rows": len(rows), "task": args.task, "arm": args.arm, "counts": counts,
+                    "logged": stats["logged"] if stats else "unknown",
+                    "dropped": stats["dropped"] if stats else "unknown", "stats_source": args.stats or None}
+        _write_atomic(args.out, _rows_text(rows))
+        _write_atomic(f"{args.out}.manifest.json", json.dumps(manifest, indent=1, sort_keys=True))
+        warn = "" if stats else "; logged/dropped unknown (no --stats), so a gap in the log cannot be ruled out"
+        if stats and stats["dropped"]:
+            warn = f"; the server dropped {stats['dropped']} rows that are not here"
+        print(f"wrote {len(rows)} rows to {args.out}{warn}")
         return 0
-    except (ObservationError, OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+    except (ObservationError, OSError, json.JSONDecodeError, UnicodeError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
 

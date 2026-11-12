@@ -717,21 +717,32 @@ reads), without importing any certifier:
 
 ```bash
 python -m prismyra.learn.observations score --artifact student.json --items items.jsonl \
-  --task-type sentiment --arm student-bge --out student.obs.jsonl
+  --task-type sentiment --arm student-bge --label-source dataset --out student.obs.jsonl
 python -m prismyra.learn.observations export --log-root experience/ --task sentiment-v1 \
-  --task-type sentiment --arm prismyra-router --student student.json --labels items.jsonl \
-  --stats stats.json --out router.obs.jsonl
+  --task-type sentiment --arm prismyra-router --student-arm student-bge --fallback-arm prismyra \
+  --student student.json --labels items.jsonl --label-source dataset --stats stats.json --out router.obs.jsonl
 ```
 
 | writer | answers | rows carry |
 |---|---|---|
 | `score` | a declared item set (`{item?, context, question?, label?}` per line), with an artifact that need not be serving | `arm` as given, `arm_version` the artifact's content-addressed name (plus its feature builder's name), `score` the top probability |
-| `export` | nothing: it reads the server's logged requests | `arm` the assigned arm's stable name, `path` the components that answered (`student`, `prismyra`, or both after a confidence fallback), `arm_version` the backbone, package, routing snapshot and declared student |
+| `export` | nothing: it reads the server's logged requests | `arm` the router's declared name, `path` the components that answered (named by `--student-arm` and `--fallback-arm`), `arm_version` the backbone, package, spec, routing snapshot and declared student, `run` the request id |
 
-A row is graded only against a label the operator supplied: an items file's `label`, or a feedback record's `label`.
-A scalar feedback `reward` becomes a verdict only through `--verdict-module MODULE:FUNC`, whose name is recorded as
-the grader; without one the row is `unobserved`, with the reason. A row answered by a different student artifact than
-the one declared is refused. Item ids are the content digest of the context (`sha256:` and the hex SHA-256 of its UTF-8
-bytes) unless the items file names them. `export` writes a manifest beside its output with the server's `logged` and
-`dropped` counts from `--stats`; without it the manifest says they are unknown, because a dropped row is a gap nobody
-else can see.
+**Items and labels.** An item's content is `[context, question]` as compact JSON in UTF-8, and its default id is
+`sha256:` plus the content's hex SHA-256. Labels are joined by content, so a named items file and a server's log meet
+on the same item, and the row carries the file's id. Two entries with the same content and different labels are
+refused, and so is a label that is not one of the item's options.
+
+**Grading.** A row is graded only against a label the operator supplied (a labels file, or a feedback record's
+`label`). A feedback label that disagrees with the labels file makes the row `unobserved`. A scalar `reward` becomes a
+verdict only through `--verdict-module MODULE:FUNC`, named as the grader. Tied or non-finite top probabilities make
+the row `unobserved`.
+
+**Versions.** A student-answered row from an artifact other than `--student` is refused, and so is a log with
+student-answered rows and no `--student`. Backbone-answered rows cannot show which student was loaded; `--since` and
+`--until` export one snapshot at a time.
+
+**Counts.** Rows that cannot be exported (no retained context, missing versions) are skipped and counted in a manifest
+beside the output, with feedback that joined no row and the server's `logged` and `dropped` from `--stats`. Without
+`--stats` the manifest says `unknown`, because a dropped row is a gap nobody else can see. The rows carry no `usage`:
+the server does not log tokens, so a self-hosted arm is priced from a declared per-attempt price.
