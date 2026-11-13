@@ -1,0 +1,77 @@
+{
+  "note": "Golden fixtures for the model half (spec section 9). File contents are given as utf-8 strings and each file's sha256 is over those bytes. Produced by the Python implementation and verified against the TypeScript one; every implementation MUST reproduce every digest and identity here.",
+  "cases": [
+    {
+      "name": "two shards, a tokenizer and a chat template, bf16",
+      "files": {
+        "model-00002-of-00002.safetensors": "shard two",
+        "model-00001-of-00002.safetensors": "shard one",
+        "tokenizer.json": "{\"v\":1}",
+        "chat_template.jinja": "{{ messages }}"
+      },
+      "precision": {
+        "dtype.bfloat16": "751632384",
+        "quantisation": "none",
+        "device": "cuda"
+      },
+      "runtime": {
+        "torch": "2.15.0",
+        "transformers": "4.57.1",
+        "vllm": "0.27.1"
+      },
+      "answer_mode": "generated_text",
+      "checkpoint_digest": "8255fa1d39cde7cfa1d02a6ba2c956fbfd1c8ac8f4e5fea1f01f7e6e1d441236",
+      "precision_digest": "8cd8dfb8788f54977f535a3a4d0b3ec9c93175757813aa44450e37a88b295e9c",
+      "runtime_digest": "8fe2315f2566276704d3cece987e5278892409030404d6afbdd0c5cc017147b0",
+      "model_identity": "71f2b15adb25322d755f7590",
+      "artifact_identity": "b1791d64de16e4867ad11d47"
+    },
+    {
+      "name": "the same files under dynamic int8 quantisation: a different model identity, the same artifact identity",
+      "files": {
+        "model-00002-of-00002.safetensors": "shard two",
+        "model-00001-of-00002.safetensors": "shard one",
+        "tokenizer.json": "{\"v\":1}",
+        "chat_template.jinja": "{{ messages }}"
+      },
+      "precision": {
+        "dtype.bfloat16": "262144",
+        "dtype.qint8": "751370240",
+        "quantisation": "dynamic_int8",
+        "device": "cpu"
+      },
+      "runtime": {
+        "torch": "2.15.0",
+        "transformers": "4.57.1"
+      },
+      "answer_mode": "generated_text",
+      "checkpoint_digest": "8255fa1d39cde7cfa1d02a6ba2c956fbfd1c8ac8f4e5fea1f01f7e6e1d441236",
+      "precision_digest": "4157545c63807711ae763521b0abeb5db380ed439916f5a02b606604ddd328ce",
+      "runtime_digest": "92602bd77d56250aa9c76eaadd9a3c74cb807725c9c524993c29fd5cdb0bdf63",
+      "model_identity": "e58c57c7ebd5fe54c521b3c4",
+      "artifact_identity": "b1791d64de16e4867ad11d47"
+    },
+    {
+      "name": "a non-ASCII path and an option-score read-out",
+      "files": {
+        "重み/model.safetensors": "weights",
+        "adapter/adapter_model.safetensors": "lora"
+      },
+      "precision": {
+        "dtype.float8_e4m3fn": "35000000000",
+        "quantisation": "fp8_block",
+        "device": "cuda"
+      },
+      "runtime": {
+        "prismyra": "0.4.13",
+        "torch": "2.15.0"
+      },
+      "answer_mode": "option_scores",
+      "checkpoint_digest": "945f6c7688b188e6d32dd97f35e6b5cfcc0a3cb9a6238f97b015ac082fe03407",
+      "precision_digest": "28ef001ecf9266f71c1caeb652c04a9d6fb80309179f58b0df653f2f20aa93f6",
+      "runtime_digest": "fd3eff2738dde71295f4187a42580f24b3aeb8b8e8940184f49fb8da394e9648",
+      "model_identity": "e606ef377215385ac8a01f6f",
+      "artifact_identity": "ee555b45d2370450bfed7830"
+    }
+  ]
+}

@@ -452,6 +452,7 @@ class Prismyra:
         pin_autotune: bool = True,
         wide_group: bool = False,
         interleaved_fork: bool = True,
+        identify: bool = True,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -855,6 +856,16 @@ class Prismyra:
                 if require_kernels:
                     raise PrismyraError(msg)
                 self.applied.notes.append(msg)
+
+        #: What answered, as perigraph's model half (`prismyra.identity`): read off what this process loaded, after
+        #: every conversion above, so an NVFP4 or FP8 engine and a bf16 one over the same files get different model
+        #: identities and the same artifact identity. ``identify=False`` skips hashing the checkpoint (minutes on a
+        #: large model) and records every part unreachable, which a receiver reads as "no verdict over this", not as
+        #: a clean record.
+        from .identity import backbone_stamp, unreachable
+
+        self.identity = (backbone_stamp(self, model=model, heads=heads, temperature=calibrate_temperature)
+                         if identify else unreachable("identify=False: the checkpoint was not hashed at load"))
 
     # ------------------------------------------------------------------ public
     def validate(self, questions: list[Question]) -> None:

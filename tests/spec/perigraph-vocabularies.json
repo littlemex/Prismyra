@@ -1,0 +1,278 @@
+{
+  "spec_version": 2,
+  "namespace": "perigraph",
+  "note": "Normative. Both a sender's shim and a receiver read this file, and each has a conformance test against it, so a vocabulary that drifts on one side is a test failure rather than a discovery. Every list is CLOSED: a value outside it is refused, not accepted with a warning.",
+  "parts": {
+    "note": "What surrounds the model. A part nobody named is a part that can change without the identity changing, which is the defect this vocabulary exists to close.",
+    "values": [
+      "instruction",
+      "tool_schemas",
+      "tool_extension",
+      "tool_trace",
+      "loop",
+      "turn_budget",
+      "retry_policy",
+      "readout",
+      "decoding",
+      "context_partitioning"
+    ]
+  },
+  "model_parts": {
+    "note": "What answered, as opposed to what surrounded it. Closed for the same reason parts are: a model part nobody named is one that can change while every name stays the same. Each value is here because the distillation record shows answers moving while it changed and the names did not.",
+    "values": [
+      "checkpoint",
+      "precision",
+      "runtime",
+      "answer_mode"
+    ],
+    "comparable_across_collectors": [
+      "checkpoint",
+      "answer_mode"
+    ],
+    "rationale": {
+      "checkpoint": "Every file the process read from the model artifact: parameters, adapters, tokenizer, chat template, configuration. A retrain with the same script and seed agreed with its predecessor on 93.4% of labels (R12 -> R13) under the same model name. Digest: for each file, sorted by the utf-8 bytes of its POSIX path relative to the artifact root with symlinks resolved, append '<path>\\t<sha256 of the file>\\n'; a path containing a tab or a newline is refused. Re-serialising identical tensors changes this digest, which is the safe direction.",
+      "precision": "The numeric transform in force once loading finished, read off the loaded parameters rather than the configuration: one 'dtype.<name>=<parameter count>' line per dtype, 'quantisation=<scheme or none>', 'device=<type>', sorted, '\\n'-terminated. Dynamic int8 quantisation at load left the stored bytes unchanged and agreed with the GPU on 33-40% of labels. A value the collector could not resolve (a dtype of 'auto') is extraction_failed, not a guess.",
+      "runtime": "The code that computes the answer: one '<distribution>==<version>' line per package the collector declares it reads, resolved in the answering process at load, sorted, '\\n'-terminated. The package list is part of the collector, static per collector version. A rebuilt serving image lost packages and the teacher re-answered 97 of 100 the same (R14). An image or lockfile digest may be a label; it changes on every rebuild and is not what computed the answer.",
+      "answer_mode": "Where the answer is taken from, one value of answer_modes, digested as its utf-8 bytes. A student trained to compare three label scores generated '1111' when asked to generate (R5-R10 against R12)."
+    }
+  },
+  "answer_modes": {
+    "note": "Where an answer comes from. Closed and descriptive: it says what produced the answer, never which is better.",
+    "values": [
+      "generated_text",
+      "option_scores",
+      "classifier_output"
+    ],
+    "rationale": {
+      "generated_text": "Text sampled from the language-model head, read out by the caller.",
+      "option_scores": "Scores from the language-model head over a declared option set, the best option taken.",
+      "classifier_output": "Scores from a head that is not a language-model head, such as a gradient-boosted classifier over features (the LightGBM students of R1-R4)."
+    }
+  },
+  "lineage": {
+    "note": "How a tuned model came to be: a document its trainer writes, outside any record, about one artifact. Never identifying -- two trainings that produced the same bytes are the same model -- and pushed by nature, because whoever serves the result holds the bytes and not their history. A lineage claim may trigger a refusal and may never lift one; an absent lineage, a missing ancestor or a set digest with no manifest is unknown, never clean.",
+    "fields": [
+      "spec_version",
+      "subject",
+      "parent",
+      "method",
+      "sets",
+      "signal",
+      "trainer"
+    ],
+    "methods": [
+      "pretrained",
+      "sft",
+      "distillation",
+      "rl",
+      "merge",
+      "reserialisation"
+    ],
+    "set_roles": [
+      "trained_on",
+      "consulted"
+    ],
+    "signal_forms": [
+      "artifact_identity",
+      "digest",
+      "label"
+    ],
+    "rationale": {
+      "subject": "The artifact_identity this document is about. A lineage whose subject differs from the artifact observed is read as absent: R5's history beside R6's bytes would otherwise describe a model that is not there.",
+      "parent": "The parent's artifact_identity, or 'none'. A quantised or merged child lists no sets of its own, so a receiver that checks training overlap walks the chain; a missing ancestor is unknown.",
+      "sets": "Item sets by the sha256 of their manifest file. 'excluded' is not a role: by the subtract-only rule it could have no effect.",
+      "signal": "What the training signal came from (a teacher, a grader, a reward): an artifact_identity, a content digest, or a label. A label is unverifiable and never matches anything."
+    }
+  },
+  "sourcing": {
+    "note": "How a fact reached the receiver. These are not interchangeable: they differ in what the fact can support.",
+    "values": [
+      "in_the_request",
+      "loaded_by_us",
+      "pulled_by_us",
+      "pushed_by_owner",
+      "not_observable"
+    ],
+    "may_key_identity": [
+      "in_the_request"
+    ],
+    "rationale": {
+      "in_the_request": "The bytes are held. It IS what was sent: verifiable and contemporaneous.",
+      "loaded_by_us": "The collector runs in the process that loaded the model and digested what it loaded, during this load. The only sourcing that can key a model identity: a request never carries weights, and R5 -> R6 certified bytes that no longer existed under an unchanged name. A digest cached from an earlier load is pulled_by_us with a lag equal to its age; a stamp relayed verbatim by a router or gateway keeps this sourcing, and a stamp read back over a separate request is pulled_by_us.",
+      "pulled_by_us": "Fetched, so verifiable and NOT contemporaneous. Carries its lag; a lag nobody bounded cannot support a per-request claim.",
+      "pushed_by_owner": "A declaration. Not checkable by the receiver, and a label the owner controls can stay fixed while the thing under it changes.",
+      "not_observable": "No mode reaches it. A tool's implementation behind an unchanged schema is the case that forced this entry."
+    },
+    "may_key_model_identity": [
+      "loaded_by_us"
+    ]
+  },
+  "boundaries": {
+    "note": "What a digest is a digest OF. Three things were being called 'the bytes', and the two mistakes they cause run in opposite directions, so neither is fixed by being careful.",
+    "values": [
+      "transport",
+      "parsed",
+      "model_visible"
+    ],
+    "may_key_identity": [
+      "model_visible"
+    ],
+    "rationale": {
+      "transport": "What a client put on the wire. Two client versions serialise differently and decode to the same text, so keying on this SPLITS runs that were identical.",
+      "parsed": "The protocol value after decoding. Two strings that canonicalise to one value can behave differently embedded verbatim in a prompt, so keying on this MERGES runs that were not.",
+      "model_visible": "The exact text the model read. The only boundary that can support a claim that two runs had the same input."
+    }
+  },
+  "never_identifying": {
+    "note": "Parts that may never key an identity whatever their sourcing and boundary say. Enforced by name because the general rules would admit them.",
+    "values": [
+      "tool_trace"
+    ],
+    "rationale": {
+      "tool_trace": "Bytes we hold, so the sourcing rule admits it -- and it is a per-run OUTCOME, unique per run, so keying on it makes every pair of runs incomparable."
+    }
+  },
+  "absence_reasons": {
+    "note": "Why a part is not in the record, and WHOSE absence it is. A single undifferentiated hole cannot serve, because a collector that loses the ability to read a part writes the same absence a sender's silence writes -- and then every consumer behaves exactly as designed while the regression is invisible. A closed vocabulary constrains spelling, not truth.",
+    "values": [
+      "not_provided",
+      "not_reachable",
+      "extraction_failed",
+      "redacted",
+      "not_observable"
+    ],
+    "blames": {
+      "not_provided": "sender",
+      "not_reachable": "collector",
+      "extraction_failed": "collector",
+      "redacted": "sender",
+      "not_observable": "nobody"
+    },
+    "detail_required_when_blames": "collector"
+  },
+  "status": {
+    "note": "Whether a record is complete about ITSELF. Separate from anything about the sender, because the two refusals are about different objects: toward the sender a collector is maximally permissive, and about itself it must be exact.",
+    "values": [
+      "complete",
+      "aborted",
+      "collector_failed"
+    ],
+    "admissible_to_a_verdict": [
+      "complete"
+    ]
+  },
+  "context_crossings": {
+    "note": "What crosses between two contexts, which is what decides whether splitting them is cheap. Counting contexts is not enough: the three have opposite economics.",
+    "values": [
+      "nothing",
+      "briefs_and_results",
+      "whole_history"
+    ],
+    "rationale": {
+      "nothing": "Two independent runs.",
+      "briefs_and_results": "Both caches stay warm, because neither context ever switches model. This is the arrangement a published 39.2% saving rests on.",
+      "whole_history": "The transcript is copied, so the entire prefix is billed as fresh input in the second context. The split COSTS rather than saves, and it is indistinguishable from the row above in any record that only counts contexts."
+    }
+  },
+  "tool_determinism": {
+    "note": "What a tool's contract promises for the same effective invocation context. Not a boolean: the third value, nobody said, is the common one and must not collapse into either of the others.",
+    "values": [
+      "declared_deterministic",
+      "known_to_vary",
+      "unstated"
+    ],
+    "divergence_licenses": {
+      "declared_deterministic": "refuse",
+      "known_to_vary": "unknown",
+      "unstated": "unknown"
+    },
+    "rationale": "A divergence between two traces on the same occasion is evidence of divergent recorded execution and never proof of a different tool implementation. Firing on argument equality alone was refuted three ways: it fires against a single run that writes a key and then reads it, it fires on essentially every networked tool because request ids sit in response bodies, and its conclusion is false even where firing is right."
+  },
+  "occasion": {
+    "note": "What must match before two tool calls are the same occasion. Anything else is a different occasion and says nothing about the tool. The prefix is what stops the rule firing against a single run.",
+    "fields": [
+      "tool",
+      "prefix_digest",
+      "arguments_digest",
+      "credentials_class",
+      "attempt"
+    ]
+  },
+  "billed_legs": {
+    "note": "The legs a price card actually bills, which is four and not two. The cache discount attaches to the SHAPE of a request rather than to its text: identical content measured a 0% cache rate as one long message and 99.9% as a growing conversation.",
+    "values": [
+      "fresh_in",
+      "cached_in",
+      "cache_write",
+      "generation"
+    ],
+    "all_or_nothing": [
+      "cached_in",
+      "cache_write"
+    ]
+  },
+  "attributes": {
+    "note": "The wire form. Flat, scalar-valued, and prefixed, so it rides on a span any tracer already emits. Indexed keys use the part name rather than an integer, because an integer index reorders and a part name does not.",
+    "record": {
+      "perigraph.spec_version": "integer. The format, so a reader can tell what it is looking at.",
+      "perigraph.collector": "string. Which collector produced this record.",
+      "perigraph.collector_version": "string. Its version. A part that stopped being readable between two versions cannot be attributed without it.",
+      "perigraph.collector_reaches": "comma-separated part names. What this collector CLAIMS it can reach here, static per version -- a manifest that adapted to what it found could never contradict a record, which is the one thing it is for.",
+      "perigraph.status": "one of status.values.",
+      "perigraph.harness_identity": "string or absent. Version 1's 'perigraph.identity', renamed now that there are three; computed exactly as before over the harness parts.",
+      "perigraph.model_identity": "string or absent. Over all four model parts, each loaded_by_us with a digest, sorted by part name, serialised as the harness identity is. Comparable only against another from the same collector and collector version, because precision and runtime are collector renderings. Stamped on every answer by the process that loaded the model.",
+      "perigraph.artifact_identity": "string or absent. Over the checkpoint part alone, when it is loaded_by_us. Comparable across collectors: what a trainer can compute at save time and a lineage document can name."
+    },
+    "per_part": {
+      "perigraph.part.<name>.sourcing": "one of sourcing.values.",
+      "perigraph.part.<name>.boundary": "one of boundaries.values. Absent when there is no digest.",
+      "perigraph.part.<name>.digest": "lowercase hex sha256 of the part's bytes at the stated boundary.",
+      "perigraph.part.<name>.label": "optional, for a reader. Explicitly NOT a key: a version string the owner controls can stay fixed while the text under it changes.",
+      "perigraph.part.<name>.read_lag_seconds": "number. Required for pulled_by_us and refused elsewhere.",
+      "perigraph.absent.<name>.reason": "one of absence_reasons.values.",
+      "perigraph.absent.<name>.detail": "string. Required when the reason blames the collector, refused otherwise."
+    },
+    "per_model_part": {
+      "perigraph.model.<name>.sourcing": "one of sourcing.values.",
+      "perigraph.model.<name>.digest": "lowercase hex sha256 of the part's content as model_parts.rationale defines it. Model parts carry no boundary.",
+      "perigraph.model.<name>.label": "optional, for a reader; never a key. A model name, a provider id, an image digest.",
+      "perigraph.model.<name>.read_lag_seconds": "number. Required for pulled_by_us and refused elsewhere.",
+      "perigraph.model_absent.<name>.reason": "one of absence_reasons.values.",
+      "perigraph.model_absent.<name>.detail": "string. Required when the reason blames the collector, refused otherwise."
+    }
+  },
+  "receiver_obligations": {
+    "note": "What a receiver must do to claim conformance. Stated as refusals, because every one of them exists because a published number needed withdrawing.",
+    "must_refuse": [
+      "A verdict over a record whose status is not complete.",
+      "A verdict over a record with no harness identity.",
+      "A verdict over a record where the collector's manifest claims a part the record reports not_reachable, or says nothing about.",
+      "An identity built on any digest whose boundary is not model_visible.",
+      "A comparison of two arms whose decisions were missing different facts, or where one recorded its missingness and the other did not.",
+      "A comparison of two conversations of different turn counts.",
+      "A statement of what an alternative would have cost when either side's context_partitioning is unrecorded.",
+      "A comparison where two traces diverge on the same occasion and the tool declared determinism.",
+      "A comparison of two `parsed` digests produced by different collectors or different collector versions.",
+      "A model identity or an artifact identity built on any part whose sourcing is not loaded_by_us.",
+      "A verdict over records grouped as one arm that carry more than one model identity, or some with one and some without.",
+      "A claim bound to a model identity, applied to records that do not carry that model identity.",
+      "A comparison of two model identities produced by different collectors or different collector versions."
+    ],
+    "must_not_refuse": [
+      "A record missing any number of parts. Toward the sender the collector is maximally permissive, and a collector that refuses a partial record produces no record at all.",
+      "A record whose status is not complete, as a LOG. It stays fully usable there.",
+      "A record with no model identity. A model served behind a provider's API stays admissible; claims about it are not bound to model bytes, and saying so is the receiver's job."
+    ]
+  },
+  "digest": {
+    "note": "Added in response to the second implementation, which could not interoperate without it. Section 5 said 'lowercase hex sha256 of the part's bytes' and never said what bytes a STRING has, nor how the identity combines its parts, nor that the result is truncated. A UTF-16 implementation would have produced a different identity for every non-ASCII instruction while passing every test it wrote for itself.",
+    "algorithm": "sha256",
+    "encoding": "utf-8",
+    "identity_length": 24,
+    "identity_serialisation": "For each identifying part, sorted by part name ascending, append the bytes of '<part_name>=<content_digest>;' in utf-8. Digest the concatenation and take the first identity_length characters of the lowercase hex.",
+    "model_visible_payload": "Hashed RAW. No canonicalisation, no trimming, no case folding. A model reads the string and not its meaning.",
+    "parsed_digests_are_collector_local": "A `parsed` digest is comparable ONLY against another digest from the same collector and the same collector version. The two reference implementations serialise protocol values differently -- Python's repr renders 0.0 as '0.0' and JSON.stringify renders it as '0' -- so the same request yields different `parsed` digests in each. This is stated rather than fixed because a `parsed` digest can never key an identity, so nothing that matters was lost; what was at risk before saying it is somebody comparing two and concluding the harnesses differed.",
+    "instruction_join": "Where several system messages are present, join their contents with a single U+000A in the order they appear. This is NORMATIVE rather than collector-local, because the instruction digest keys the identity and two collectors choosing differently would give two identities for one request.",
+    "model_identity_serialisation": "As identity_serialisation, over the four model parts: '<part_name>=<content_digest>;' for each, sorted by part name, utf-8, sha256, first identity_length hex characters. artifact_identity is the same over the checkpoint part alone."
+  }
+}

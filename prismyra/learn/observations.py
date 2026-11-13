@@ -8,7 +8,8 @@ Two producers, sharing one row writer:
   logged request, under the arm name the operator declares for the router, with the components that answered in
   ``path``.
 
-The record format is the one tierbook publishes (format 3). This module writes plain JSON and imports nothing from
+The record format is the one tierbook publishes (format 3, or 4 when a row names `arm_artifact`). This module writes
+plain JSON and imports nothing from
 tierbook; a reader validates with its own tool (``tierbook check-observations``).
 
 **Item ids.** An item's content is ``[context, question]`` as compact JSON in UTF-8; its digest is the hex SHA-256 of
@@ -53,8 +54,10 @@ from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
-#: The record format these writers emit when a row carries `arm_version` or `path` (every row they write does).
+#: The record format these writers emit: 3 for a row with `arm_version` (every row they write), 4 when it also names
+#: an `arm_artifact` -- the stored files that answered, as perigraph's artifact identity.
 RECORD_FORMAT = 3
+ARTIFACT_FORMAT = 4
 OUTCOMES = ("accepted", "rejected", "unobserved")
 #: What the grading in this module is: an exact match of the answer against an operator-supplied label.
 LABEL_EXACT = "label-exact"
@@ -80,7 +83,7 @@ def _iso(ts: float) -> str:
 
 def row(*, item: str, task_type: str, arm: str, outcome: str, run: str, arm_version: str, path: Iterable[str] = (),
         score: float | None = None, observed_at: str = "", label_source: str = "", grader: str = "",
-        reason: str = "") -> dict:
+        reason: str = "", arm_artifact: str = "") -> dict:
     """One record, refused here when the reader would refuse it."""
     if outcome not in OUTCOMES:
         raise ObservationError(f"outcome must be one of {OUTCOMES}, not {outcome!r}")
@@ -95,8 +98,12 @@ def row(*, item: str, task_type: str, arm: str, outcome: str, run: str, arm_vers
     if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))
                               or not math.isfinite(score)):
         raise ObservationError(f"score {score!r} must be a finite number")
-    out: dict = {"format": RECORD_FORMAT, "item": item, "task_type": task_type, "arm": arm, "outcome": outcome,
-                 "usage": {}, "arm_version": arm_version}
+    if not isinstance(arm_artifact, str):
+        raise ObservationError("arm_artifact must be a string")
+    out: dict = {"format": ARTIFACT_FORMAT if arm_artifact else RECORD_FORMAT, "item": item, "task_type": task_type,
+                 "arm": arm, "outcome": outcome, "usage": {}, "arm_version": arm_version}
+    if arm_artifact:
+        out["arm_artifact"] = arm_artifact
     for key, value in (("run", run), ("score", score), ("observed_at", observed_at), ("label_source", label_source),
                        ("grader", grader), ("reason", reason)):
         if value not in (None, ""):
@@ -159,18 +166,29 @@ def _check_label(label: str, options) -> None:
                                "never equal would grade every row rejected")
 
 
+def _with_model(version: str, versions: dict, prefix: str = "") -> str:
+    """``version`` with the perigraph model identity appended when the record has one: what answered, as the
+    process that loaded it saw it, beside the name the artifact gives itself."""
+    mid = versions.get(f"{prefix}model_identity")
+    return f"{version}+model:{mid}" if mid else version
+
+
 def score_items(artifact, items: list[dict], *, task_type: str, arm: str, label_source: str, run: str = "score",
-                predict: Callable[[str, str], dict[str, float]] | None = None) -> list[dict]:
-    """Answer every item with ``artifact`` and grade it against the item's label."""
+                predict: Callable[[str, str], dict[str, float]] | None = None, stamp=None) -> list[dict]:
+    """Answer every item with ``artifact`` and grade it against the item's label. ``stamp`` is this process's
+    `prismyra.identity.ModelStamp` for the artifact, read from the file it was loaded from."""
     from .students import artifact_version
 
     predict = predict or artifact.predict_proba
-    version = artifact_version(artifact)
+    ids = stamp.versions() if stamp is not None else {}
+    version = _with_model(artifact_version(artifact), ids)
+    artifact_id = ids.get("artifact_identity", "")
     out = []
     for it in items:
         probs = predict(it["context"], it["question"])
         answer, top, why = _answer(probs)
-        common = dict(item=it["item"], task_type=task_type, arm=arm, run=run, arm_version=version, score=top)
+        common = dict(item=it["item"], task_type=task_type, arm=arm, run=run, arm_version=version, score=top,
+                      arm_artifact=artifact_id)
         if it["label"] is None:
             out.append(row(outcome="unobserved", reason="no label", **common))
             continue
@@ -199,7 +217,8 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
                       student=None, feedback: dict | None = None, labels: list[dict] | None = None,
                       label_source: str = "", verdict: Callable | None = None, verdict_name: str = "",
                       since: float | None = None, until: float | None = None,
-                      per_component: bool = False, run: str | None = None) -> tuple[list[dict], dict]:
+                      per_component: bool = False, run: str | None = None,
+                      student_stamp=None) -> tuple[list[dict], dict]:
     """Rows for a server's logged requests under the declared router ``arm``, and the counts behind them.
 
     With ``per_component`` the router arm is not written. Each request instead gives one row per component whose
@@ -207,6 +226,11 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
     `artifact_version`) wherever its probabilities were logged, and the fallback's (``backbone|package|tag``, or ``spec`` for rows logged before tags had a version)
     wherever it answered or was audited. These are the versions an offline score of the same components carries,
     so a certificate over a cascade composed from parts can be checked against served traffic.
+
+    Rows logged with perigraph identities carry them: each component's ``arm_version`` gets ``+model:`` (or
+    ``|model:``) and the model identity the serving process stamped, and its ``arm_artifact`` names the stored files.
+    ``student_stamp`` is this process's stamp of the declared ``student`` file; a logged row whose student artifact
+    identity differs from it was answered beside another file under the same name, and is refused.
 
     ``run`` replaces each row's run (the request id by default) with one name for the whole export. A reader that
     composes a cascade from its parts pairs attempts by item and run, so rows meant to pair with an offline
@@ -245,6 +269,11 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
             path = [student_arm, fallback_arm]
         else:
             path = [fallback_arm]
+        logged_student = exp.versions.get("student_artifact_identity")
+        declared_artifact = student_stamp.versions().get("artifact_identity") if student_stamp is not None else None
+        if logged_student and declared_artifact and logged_student != declared_artifact:
+            raise ObservationError(f"request {exp.request_id!r} was logged beside student artifact "
+                                   f"{logged_student}, not the declared {declared_artifact}")
         missing = [k for k in ("backbone", "package", "spec") if not exp.versions.get(k)]
         if missing:
             counts[f"skipped: versions missing {missing}"] += 1
@@ -254,8 +283,11 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
         what = f"tag:{exp.versions['tag']}" if exp.versions.get("tag") else f"spec:{exp.versions['spec']}"
         serving = [f"backbone:{exp.versions['backbone']}", f"package:{exp.versions['package']}", what]
         parts = serving + [f"route:{exp.route_params_version or 'none'}"]
-        if student_version_:
-            parts.append(student_version_)
+        if exp.versions.get("model_identity"):
+            parts.append(f"model:{exp.versions['model_identity']}")
+        s_version = _with_model(student_version_, exp.versions, "student_") if student_version_ else None
+        if s_version:
+            parts.append(s_version)
         digest = content_digest(exp.context, exp.question or "")
         lab = by_content.get(digest)
         item = lab["item"] if lab is not None else "sha256:" + digest
@@ -266,15 +298,19 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
             fallback_probs = exp.comparison_probabilities if by_student else exp.probabilities
             if student_probs is not None and not by_student and student_version_ is None:
                 raise ObservationError("the log has the student's probabilities and no --student was declared")
-            components = [(student_arm, student_version_, student_probs), (fallback_arm, "|".join(serving),
-                                                                             fallback_probs)]
+            fb_version = "|".join(serving)
+            if exp.versions.get("model_identity"):
+                fb_version += f"|model:{exp.versions['model_identity']}"
+            components = [(student_arm, s_version, student_probs,
+                           exp.versions.get("student_artifact_identity", "")),
+                          (fallback_arm, fb_version, fallback_probs, exp.versions.get("artifact_identity", ""))]
         else:
-            components = [(arm, "|".join(parts), exp.probabilities)]
-        for c_arm, c_version, c_probs in components:
+            components = [(arm, "|".join(parts), exp.probabilities, "")]
+        for c_arm, c_version, c_probs, c_artifact in components:
             if c_probs is None:
                 continue
             _grade(out, counts, joined, exp, lab, feedback, label_source, verdict, verdict_name,
-                   dict(item=item, task_type=task_type, arm=c_arm, arm_version=c_version,
+                   dict(item=item, task_type=task_type, arm=c_arm, arm_version=c_version, arm_artifact=c_artifact,
                         **({} if per_component else {"path": path}), observed_at=_iso(exp.ts), run=run_name),
                    dict(c_probs))
     counts["feedback not joined to any exported row"] = len(set(feedback) - joined)
@@ -316,6 +352,14 @@ def _grade(out, counts, joined, exp, lab, feedback, label_source, verdict, verdi
         out.append(row(outcome="unobserved",
                        reason=("reward without a verdict module" if fb is not None and fb.reward is not None
                                else "no label"), **common))
+
+
+def _stamp_of(path, artifact):
+    if path is None or artifact is None:
+        return None
+    from prismyra.identity import student_stamp
+
+    return student_stamp(path, artifact)
 
 
 def _write_atomic(path: str | Path, text: str) -> None:
@@ -371,9 +415,12 @@ def main(argv: list[str] | None = None) -> int:
 
         import_feature_modules(args.features_module)
         if args.cmd == "score":
+            from prismyra.identity import student_stamp
+
             art = StudentArtifact.from_json(json.loads(Path(args.artifact).read_text()))
             rows = score_items(art, load_items(args.items), task_type=args.task_type, arm=args.arm,
-                               label_source=args.label_source, run=args.run)
+                               label_source=args.label_source, run=args.run,
+                               stamp=student_stamp(args.artifact, art))
             _write_atomic(args.out, _rows_text(rows))
             print(f"wrote {len(rows)} rows to {args.out}")
             return 0
@@ -392,7 +439,8 @@ def main(argv: list[str] | None = None) -> int:
             feedback=load_feedback(args.feedback_root) if args.feedback_root else {},
             labels=load_items(args.labels) if args.labels else None, label_source=args.label_source,
             verdict=_verdict_fn(args.verdict_module), verdict_name=args.verdict_module or "",
-            since=args.since, until=args.until, per_component=args.per_component, run=args.run)
+            since=args.since, until=args.until, per_component=args.per_component, run=args.run,
+            student_stamp=_stamp_of(args.student, student))
         if args.run and not args.labels:
             print("note: --run without --labels keeps content-digest item ids; they pair only with a score whose "
                   "items use the same ids", file=sys.stderr)

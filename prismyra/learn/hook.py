@@ -73,6 +73,7 @@ class LearnHook:
         max_queue: int = 10_000,
         otel_endpoint: str | None = None,
         otel_service_name: str = "prismyra",
+        model_versions: dict[str, str] | None = None,
     ):
         """``backend`` picks the primary `prismyra.learn.experience.ExperienceSink` -- ``"local"``
         (`LocalExperienceLog`, unchanged) or ``"ray"`` (`RayExperienceLogActor`), exactly as before
@@ -85,6 +86,9 @@ class LearnHook:
         self.spec: LearnSpec = load_spec(spec_path)
         self.package_version = package_version
         self.backbone = backbone
+        #: The backbone's perigraph identities as opaque version strings (`prismyra.identity.ModelStamp.versions`),
+        #: written into every logged row so an exporter can name what answered without re-deriving it.
+        self.model_versions = dict(model_versions or {})
         root = Path(log_dir) if log_dir is not None else self.spec.path.parent / "experience"
         if backend == "local":
             primary: ExperienceSink = LocalExperienceLog(root, self.spec, max_queue=max_queue).start()
@@ -123,7 +127,24 @@ class LearnHook:
         return tag_for(self.spec, task=task, question=question, options=options, kind=kind)
 
     def versions(self) -> dict[str, str]:
-        return {"package": self.package_version, "backbone": self.backbone, "spec": self.spec.version}
+        return {"package": self.package_version, "backbone": self.backbone, "spec": self.spec.version,
+                **self.model_versions}
+
+    def student_identity(self, task: str):
+        """The loaded student's `prismyra.identity.ModelStamp` for ``task``, or `None` when the tag routes nothing."""
+        handle = self._students.get(task) if self._students is not None else None
+        return getattr(handle, "identity", None)
+
+    def _row_versions(self, tag: TagSpec) -> dict[str, str]:
+        """`versions` for one logged row: the server's, the tag's own, and the perigraph identities of the student
+        this tag has loaded, whoever answered, so a row the backbone answered still names the student beside it."""
+        out = {**self.versions(), "tag": tag_version(tag)}
+        if self._students is not None:
+            handle = self._students.get(tag.task)
+            stamp = getattr(handle, "identity", None)
+            if stamp is not None:
+                out.update(stamp.versions("student_"))
+        return out
 
     def _retained_context(self, tag: TagSpec, context: str) -> tuple[str, tuple[float, ...] | None]:
         """`prismyra.learn.spec.TagSpec.retain_context`'s own enforcement point -- the only place either
@@ -175,7 +196,7 @@ class LearnHook:
             kind=kind,
             probabilities=dict(probabilities),
             answered_by=answered_by,
-            versions={**self.versions(), "tag": tag_version(tag)},
+            versions=self._row_versions(tag),
             h=h if tag.keep_hidden else None,
             request_id=request_id,
             feature_summary=feature_summary(context),
@@ -257,7 +278,7 @@ class LearnHook:
             kind=kind,
             probabilities=dict(final_probabilities),
             answered_by=outcome.served_by,
-            versions={**self.versions(), "tag": tag_version(tag)},
+            versions=self._row_versions(tag),
             h=None,
             request_id=outcome.request_id,
             route_mode=outcome.mode,

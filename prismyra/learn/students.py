@@ -97,7 +97,7 @@ class AdmissionRecord:
     evidence: dict
 
     @staticmethod
-    def load(path: Path) -> "AdmissionRecord":
+    def load(path: Path) -> AdmissionRecord:
         def bad(why: str):
             return StudentError(f"admission record {path}: {why}")
 
@@ -165,7 +165,7 @@ class StudentHandle:
     """
 
     def __init__(self, artifact: StudentArtifact, router: RouterConfig | None = None,
-                 record: AdmissionRecord | None = None):
+                 record: AdmissionRecord | None = None, path: str | Path | None = None):
         if record is not None:
             # An outside judgement replaces Prismyra's own bar (`admitted`, `admitted_for`) entirely.
             record.check(artifact, router)
@@ -195,6 +195,12 @@ class StudentHandle:
         self.artifact = artifact
         self.record = record
         self.version = student_version(artifact)
+        #: perigraph's model half for this student (`prismyra.identity.student_stamp`), from the file it was read
+        #: from. A handle built from an artifact in memory has no file to digest and says so.
+        from prismyra.identity import student_stamp, unreachable
+
+        self.identity = (student_stamp(path, artifact) if path is not None
+                         else unreachable("the artifact was handed over in memory, not read from a file"))
         # see module docstring: the one place either backend's own library is required, and only here
         self._model = get_backend(artifact.backend).load(artifact.model_text)
         self._vectorizer = artifact.vectorizer()
@@ -250,7 +256,7 @@ class StudentRegistry:
         if admission is not None and admission.mode == "external":
             rp = Path(admission.record)
             record = AdmissionRecord.load(rp if rp.is_absolute() else spec_dir / rp)
-        handle = StudentHandle(artifact, router=router, record=record)
+        handle = StudentHandle(artifact, router=router, record=record, path=path)
         with self._lock:
             self._handles[task] = handle
         return handle
