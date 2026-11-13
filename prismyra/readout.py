@@ -7,6 +7,7 @@ over the declared options only. Nothing is trained. See `schema.SCORING` for wha
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -145,9 +146,7 @@ def load_unembedding(
         if key is None:
             raise RuntimeError(f"{model_name} has no lm_head or embed_tokens")
         matrix = shard.get_tensor(key)
-        scale_key = next(
-            (k for k in (f"{key}_scale_inv", key.replace("weight", "weight_scale_inv")) if k in present), None
-        )
+        scale_key = scale_key_for(key, present)
         scale = shard.get_tensor(scale_key) if scale_key else None
 
     if matrix.shape[1] != hidden_size:
@@ -179,6 +178,15 @@ def _block_size(dimension: int, blocks: int) -> int:
     Not `ceil(dimension / blocks)`. That is the *smallest* size that would need this many blocks, and it is wrong
     whenever the last block is partial: 200 rows in 2 blocks of 128 gives 100, which then hands rows 100 to 127 the
     second block's multiplier instead of the first's. Wrong by a scale factor, on a fifth of the rows, silently.
+
+    Module-private: the one caller is `scale_layout` below, which is the shared recovery `_dequantise` and
+    `prismyra.identity.fp8_scale_description`'s label both go through -- two readings of one checkpoint disagreeing
+    because one of them drifted is the thing this is written to avoid.
+
+    Inherited ambiguity, not something this function or its caller resolves: when a dimension fits in exactly one
+    block (``blocks == 1``), every size at or above that dimension is equally consistent with the stored scale, and
+    this returns the smallest candidate in `BLOCK_SIZES`, or the dimension itself if none covers it in one block --
+    a guess among ties, not a recovered fact, for that one case.
     """
     for size in BLOCK_SIZES:
         if -(-dimension // size) == blocks:
@@ -191,6 +199,53 @@ def _block_size(dimension: int, blocks: int) -> int:
     )
 
 
+def scale_key_for(key: str, present) -> str | None:
+    """The scale tensor beside a quantised weight named ``key``.
+
+    Two candidates, both ways of writing the same convention. The real 35B checkpoint's keys all end in
+    ``.weight`` (e.g. ``experts.0.gate_proj.weight``), where appending ``_scale_inv`` and replacing the trailing
+    ``.weight`` with ``.weight_scale_inv`` produce the identical string -- confirmed on the pod. The plain-suffix
+    candidate alone covers a name that drops the ``.weight`` ending entirely, such as the in-memory, runtime-fused
+    tensor name Prismyra's own kernel replacement produces (never seen in the checkpoint *files* this function
+    reads). The second candidate is anchored to the trailing ``.weight``, not a bare substring match: a key with
+    "weight" elsewhere in its path (``model.weight_norm.layer.weight``) would have every occurrence rewritten by
+    `str.replace`, turning one correct candidate into two wrong ones; anchoring to the suffix changes only the part
+    of the name that is actually the weight marker. Only tried when the key has that suffix, so a key without it
+    (a mixture-of-experts tensor with no ``.weight`` ending at all) never gets a second, wrong candidate.
+    """
+    candidates = [f"{key}_scale_inv"]
+    if key.endswith(".weight"):
+        candidates.append(key[: -len(".weight")] + ".weight_scale_inv")
+    return next((k for k in candidates if k in present), None)
+
+
+def scale_layout(weight_shape, scale_shape):
+    """How `weight_shape` is divided into the blocks `scale_shape` holds one multiplier per: the string
+    ``"per_tensor"`` (one multiplier for the whole weight), the string ``"per_row"`` (one per row), or a
+    ``(down, across)`` pair of ints over a two-dimensional weight. Returned as data rather than a formatted
+    ``"block<R>x<C>"`` string so `_dequantise` uses the two ints directly and a caller that only wants the scheme's
+    name (`prismyra.identity`'s precision label) formats it once, instead of both sides parsing the same string back
+    apart.
+    """
+    if math.prod(scale_shape) == 1:
+        # Matches `_dequantise`'s historical `scale.numel() == 1` exactly: any shape with one element, whatever its
+        # rank -- `()`, `(1,)`, `(1, 1)` -- is one multiplier for the whole weight.
+        return "per_tensor"
+    if len(scale_shape) == 1:
+        if not weight_shape or scale_shape[0] != weight_shape[0]:
+            # `not weight_shape` (a 0-dimensional weight) is checked first: `weight_shape[0]` below would raise
+            # `IndexError` rather than the message this function promises everywhere else.
+            raise RuntimeError(f"a one-dimensional scale of shape {tuple(scale_shape)} does not have one entry per "
+                               f"row of a weight shaped {tuple(weight_shape)}")
+        return "per_row"
+    if len(weight_shape) != 2 or len(scale_shape) != 2:
+        raise RuntimeError(f"weight shape {tuple(weight_shape)} with scale shape {tuple(scale_shape)} is not a "
+                           f"layout this reader knows")
+    down = _block_size(weight_shape[0], scale_shape[0])
+    across = _block_size(weight_shape[1], scale_shape[1])
+    return (down, across)
+
+
 def _dequantise(matrix: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Undo block quantisation. `scale` holds one multiplier per block of the matrix, so it is expanded back to shape.
 
@@ -198,12 +253,12 @@ def _dequantise(matrix: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     borrowed matrix-multiply kernels use, and the one thing here that is easy to get backwards.
     """
     wide = matrix.float()
-    if scale.dim() == 0 or scale.numel() == 1:
+    layout = scale_layout(matrix.shape, scale.shape)
+    if layout == "per_tensor":
         return wide * scale.float()
-    if scale.dim() == 1:  # one multiplier per row
+    if layout == "per_row":
         return wide * scale.float().reshape(-1, 1)
-    down = _block_size(matrix.shape[0], scale.shape[0])
-    across = _block_size(matrix.shape[1], scale.shape[1])
+    down, across = layout
     expanded = scale.float().repeat_interleave(down, dim=0).repeat_interleave(across, dim=1)
     return wide * expanded[: matrix.shape[0], : matrix.shape[1]]
 

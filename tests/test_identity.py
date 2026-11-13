@@ -143,6 +143,147 @@ def test_parameters_on_two_devices_are_not_rendered_as_one(tmp_path):
     assert stamp.artifact_identity is not None and stamp.model_identity is None
 
 
+# --- the fp8 scale description, label-only -----------------------------------------------------------------------
+
+def _fp8_checkpoint(root: Path, tensors: dict) -> Path:
+    """A minimal checkpoint whose ``model.safetensors`` carries real float8 tensors, so `fp8_scale_description`
+    reads real shapes rather than the garbage bytes `_checkpoint` above writes (which is fine for the tests that
+    never ask for an fp8 label at all, i.e. every one above this point)."""
+    from safetensors.torch import save_file
+
+    root.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(root / "model.safetensors"))
+    (root / "config.json").write_text('{"model_type": "tiny"}')
+    return root
+
+
+def _fp8_engine() -> SimpleNamespace:
+    """An engine whose backbone carries an in-memory float8 buffer, so `quantisation_of`'s dtype scan finds
+    ``"fp8"`` regardless of the buffer's name -- the trigger for reading the checkpoint's own files at all. Not a
+    model of `Fp8Linear`'s own naming: the real kernel replacement leaves the float8 tensor itself named ``weight``
+    and adds a separate float32 ``scale`` buffer, neither of which this fixture needs to reproduce, because
+    `quantisation_of` dispatches on dtype alone, never on an attribute's name."""
+    eng = _engine(torch.bfloat16)
+    eng.backbone.register_buffer("scale", torch.zeros(2, dtype=torch.float8_e4m3fn))
+    return eng
+
+
+def test_the_fp8_scale_description_names_the_block_size_from_the_checkpoints_own_shapes(tmp_path):
+    root = _fp8_checkpoint(tmp_path / "ckpt", {
+        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+        "model.layer.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32),
+    })
+    stamp = I.backbone_stamp(_fp8_engine(), before=I.preload(str(root)))
+    assert "checkpoint_fp8_scale=block128x128:1" in stamp.parts["precision"].label
+
+
+def test_two_block_sizes_are_told_apart_in_the_label_but_not_in_model_identity(tmp_path):
+    """`checkpoint` already hashes these two directories' different bytes, so `model_identity` already differs
+    without the label; this is exactly why the description stays out of `precision`'s digest (module docstring).
+    The digest side of the same `Part` is asserted equal below: the label differs, nothing that is hashed does."""
+    a = I.backbone_stamp(_fp8_engine(), before=I.preload(str(_fp8_checkpoint(tmp_path / "a", {
+        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+        "model.layer.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32),
+    }))))
+    b = I.backbone_stamp(_fp8_engine(), before=I.preload(str(_fp8_checkpoint(tmp_path / "b", {
+        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+        "model.layer.weight_scale_inv": torch.zeros(4, 4, dtype=torch.float32),
+    }))))
+    assert "block128x128:1" in a.parts["precision"].label
+    assert "block64x64:1" in b.parts["precision"].label
+    assert a.model_identity != b.model_identity  # from `checkpoint`, not from the label
+    assert a.parts["precision"].digest == b.parts["precision"].digest  # the label-only field changed, nothing hashed
+
+
+def test_a_row_scale_and_a_tensor_scale_are_told_apart(tmp_path):
+    row = I.backbone_stamp(_fp8_engine(), before=I.preload(str(_fp8_checkpoint(tmp_path / "row", {
+        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+        "model.layer.weight_scale_inv": torch.zeros(256, dtype=torch.float32),
+    }))))
+    whole = I.backbone_stamp(_fp8_engine(), before=I.preload(str(_fp8_checkpoint(tmp_path / "whole", {
+        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+        "model.layer.weight_scale_inv": torch.zeros((), dtype=torch.float32),
+    }))))
+    assert "checkpoint_fp8_scale=per_row:1" in row.parts["precision"].label
+    assert "checkpoint_fp8_scale=per_tensor:1" in whole.parts["precision"].label
+
+
+def test_a_mixture_of_experts_name_with_no_weight_substring_is_not_matched_to_itself(tmp_path):
+    """Regression for the self-match bug: a tensor named with no ``"weight"`` substring at all (unlike the real 35B
+    checkpoint's own expert keys, which all end in ``.weight`` -- see `_fp8_checkpoint`'s other callers) must not
+    have `scale_key_for`'s second convention fall back to the key unchanged and accept the weight as its own scale.
+    No scale sibling is given here, so the only correct outcome is ``unresolved``, never a block layout read off the
+    weight's own shape."""
+    root = _fp8_checkpoint(tmp_path / "ckpt", {
+        "model.experts.0.gate_up_proj": torch.zeros(512, 2048, dtype=torch.float8_e4m3fn),
+    })
+    stamp = I.backbone_stamp(_fp8_engine(), before=I.preload(str(root)))
+    assert "checkpoint_fp8_scale=unresolved:1" in stamp.parts["precision"].label
+
+
+def test_block_scales_spanning_two_shards_are_still_resolved(tmp_path):
+    """The real 35B checkpoint is 38 shards; a weight and its scale can land in different ``.safetensors`` files, so
+    the reader has to see every shard's keys before it can match any of them."""
+    from safetensors.torch import save_file
+
+    root = tmp_path / "ckpt"
+    root.mkdir()
+    save_file({"model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn)},
+              str(root / "model-00001-of-00002.safetensors"))
+    save_file({"model.layer.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32)},
+              str(root / "model-00002-of-00002.safetensors"))
+    (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+        "model.layer.weight": "model-00001-of-00002.safetensors",
+        "model.layer.weight_scale_inv": "model-00002-of-00002.safetensors",
+    }}))
+    (root / "config.json").write_text('{"model_type": "tiny"}')
+    stamp = I.backbone_stamp(_fp8_engine(), before=I.preload(str(root)))
+    assert "checkpoint_fp8_scale=block128x128:1" in stamp.parts["precision"].label
+
+
+def test_an_fp8_weight_with_no_scale_tensor_is_counted_unresolved_without_failing_precision(tmp_path):
+    """A scale this reader cannot find never takes `precision` down over a cosmetic label: the digest and the
+    dtype-count fields stay present, and the gap is named as a count rather than hidden or guessed at."""
+    root = _fp8_checkpoint(tmp_path / "ckpt", {"model.layer.weight": torch.zeros(4, 4, dtype=torch.float8_e4m3fn)})
+    stamp = I.backbone_stamp(_fp8_engine(), before=I.preload(str(root)))
+    assert stamp.parts["precision"].absent == ""
+    assert "checkpoint_fp8_scale=unresolved:1" in stamp.parts["precision"].label
+    assert stamp.model_identity is not None
+
+
+def test_fp8_in_memory_but_not_in_the_checkpoint_files_is_named_rather_than_silently_none(tmp_path):
+    root = _fp8_checkpoint(tmp_path / "ckpt", {"model.layer.weight": torch.zeros(4, 4, dtype=torch.bfloat16)})
+    stamp = I.backbone_stamp(_fp8_engine(), before=I.preload(str(root)))
+    assert "checkpoint_fp8_scale=no_fp8_in_checkpoint_files" in stamp.parts["precision"].label
+
+
+def test_no_safetensors_shard_at_all_is_named_differently_from_no_fp8_found(tmp_path):
+    """Distinct absences: ``no_fp8_in_checkpoint_files`` means shards were opened and none held a float8 tensor;
+    this is the case where nothing was opened at all, so saying "no fp8" would overclaim a check that never ran."""
+    root = tmp_path / "ckpt"
+    root.mkdir()
+    (root / "model.bin").write_bytes(b"not a safetensors file")
+    (root / "config.json").write_text('{"model_type": "tiny"}')
+    assert I.fp8_scale_description(root, ("model.bin",)) == "no_safetensors_files_read"
+
+
+def test_a_scale_shape_this_reader_cannot_classify_is_counted_not_blanked(tmp_path):
+    """One tensor `scale_layout` cannot classify (a three-dimensional scale, which no real checkpoint produces,
+    confirmed on the pod -- every expert is its own two-dimensional tensor) must not blank the whole description:
+    the other, resolvable fp8 tensor in the same checkpoint still gets its own counted entry."""
+    root = _fp8_checkpoint(tmp_path / "ckpt", {
+        "model.layer_a.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+        "model.layer_a.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32),
+        "model.layer_b.weight": torch.zeros(4, 4, 4, dtype=torch.float8_e4m3fn),
+        "model.layer_b.weight_scale_inv": torch.zeros(2, 2, 2, dtype=torch.float32),
+    })
+    stamp = I.backbone_stamp(_fp8_engine(), before=I.preload(str(root)))
+    label = stamp.parts["precision"].label
+    assert "block128x128:1" in label
+    assert "unclassified:1" in label
+    assert stamp.model_identity is not None
+
+
 def test_a_file_the_loader_does_not_read_does_not_change_the_identity(tmp_path):
     root = _checkpoint(tmp_path, b"weights")
     before = _stamp(root).artifact_identity

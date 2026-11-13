@@ -192,6 +192,44 @@ def test_an_unrecognisable_block_layout_is_refused_rather_than_guessed(monkeypat
         readout.load_unembedding("stub/model", hidden_size=4, device="cpu", dtype=torch.float32)
 
 
+def test_a_two_dimensional_single_element_scale_is_still_per_tensor_not_a_block_guess(monkeypatch, tmp_path):
+    """Regression, on classification, not on the dequantised value: a scale shaped ``(1, 1)`` is one multiplier for
+    the whole weight, the same as the scalar ``()`` and one-element ``(1,)`` shapes -- matching `_dequantise`'s
+    historical ``scale.numel() == 1`` check, which never cared about the scale's rank. An earlier draft of
+    `scale_layout` checked rank (`dim() == 0` or `len == 1`) before checking element count, so a ``(1, 1)`` scale
+    fell through to the two-dimensional block branch instead, and `_block_size` on a weight dimension of 1024 with
+    a block count of 1 -- no `BLOCK_SIZES` candidate covers 1024 in one block -- fell back to its ``dimension %
+    blocks == 0`` case and returned 1024 itself, reporting ``block1024x1024`` on an 8x1024 weight.
+
+    That mislabel does not show up in the dequantised *value* here: the whole scale tensor holds one number, so any
+    one-block tiling of it -- correctly sized or not -- broadcasts the same number over the same ``(8, 1024)``
+    weight shape and multiplies every element by it either way. Only `scale_layout`'s return value discriminates
+    the fix; the `torch.equal` assertion below is a sanity check that dequantising at all still works, not the
+    regression guard.
+    """
+    from prismyra import readout
+
+    stored = torch.full((8, 1024), 2.0, dtype=torch.float8_e4m3fn)
+    scales = torch.full((1, 1), 3.0)
+    _stub_checkpoint(monkeypatch, tmp_path, {"lm_head.weight": stored, "lm_head.weight_scale_inv": scales})
+
+    got = readout.load_unembedding("stub/model", hidden_size=1024, device="cpu", dtype=torch.float32)
+    assert torch.equal(got, torch.full((8, 1024), 6.0))
+    assert readout.scale_layout(stored.shape, scales.shape) == "per_tensor"
+
+
+def test_a_per_row_scale_with_the_wrong_row_count_is_refused(monkeypatch, tmp_path):
+    """A one-dimensional scale is only "one per row" if it actually has one entry per row; a mismatched count is a
+    checkpoint this reader does not understand, not a silent broadcast against the wrong axis."""
+    from prismyra import readout
+
+    stored = torch.ones(8, 4, dtype=torch.float8_e4m3fn)
+    scales = torch.ones(5)  # neither 1 (per_tensor) nor 8 (per_row for this weight)
+    _stub_checkpoint(monkeypatch, tmp_path, {"lm_head.weight": stored, "lm_head.weight_scale_inv": scales})
+    with pytest.raises(RuntimeError, match="does not have one entry per row"):
+        readout.load_unembedding("stub/model", hidden_size=4, device="cpu", dtype=torch.float32)
+
+
 # --------------------------------------------------------------------------- choosing the rendering
 #: A tokenizer that behaves like this model's: a space merges into a word and splits from a digit.
 SPLITS_DIGITS = {

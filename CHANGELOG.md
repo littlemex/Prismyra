@@ -25,6 +25,13 @@
   names every row the fit used and the eval set, and is refused for a fit that used rows it cannot name.
 - **Gold labels before any router.** A tagged `/v1/decide` item with no router gets a `request_id`, so
   `/v1/feedback` can attach a gold label that `fit --feedback-dir` trains on.
+- **`precision`'s label names the fp8 block-scale scheme, counted (`prismyra.identity.fp8_scale_description`).**
+  `quantisation_of` only ever read dtype counts off the loaded modules, which cannot see a block scale a kernel
+  replacement moved off the module tree (`kernels/qwen3_moe.py`'s `Fp8Linear`/`FusedExperts`) -- so two fp8
+  checkpoints with different scale granularity reported the same `quantisation=fp8` with nothing beside it to
+  tell them apart by eye. `checkpoint_fp8_scale=<layout>:<count>+...` reads the checkpoint's own safetensors
+  files instead, label-only and never digested (`checkpoint` already hashes every scale byte, so `model_identity`
+  already differed without this). Confirmed on `littlemex/prismyra-decision-35b-a3b-fp8`: `block128x128:<count>`.
 
 ## 0.4.13
 

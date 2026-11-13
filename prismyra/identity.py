@@ -19,6 +19,14 @@ the same script and seed agreed with its predecessor on 93.4 % of labels (checkp
 stored bytes unchanged and agreed on 33-40 % (precision), a rebuilt image lost packages and 97 of 100 answers agreed
 (runtime), and a student trained on option scores generated "1111" when asked to generate (answer mode).
 
+``precision``'s *label* (never its digest) also carries the block-fp8 scale scheme beside the dtype, from
+`fp8_scale_description`. This is not a fifth part of the identity: `checkpoint` already hashes every byte the scale
+tensors are stored in, so two checkpoints with a different scheme already have two different `model_identity` values
+without it. It is a description added because a human reading the label had no way to tell, from the dtype element
+count alone, that `tensor_precision`'s scan over parameters and buffers does not reach a scale a kernel replacement
+has moved off the module tree -- see `fp8_scale_description`'s docstring for the measurement that found this and
+what it still cannot see.
+
 This module imports nothing from perigraph: it writes the record from the spec, and the test suite checks it against a
 committed copy of perigraph's vocabularies and model-identity fixtures. A part that cannot be read is recorded absent
 with the reason and a detail, never guessed, so a record without a model identity says why.
@@ -36,6 +44,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -346,8 +355,11 @@ def _extra_files(heads, temperature) -> list[tuple[str, str]]:
     return out
 
 
-def tensor_precision(modules, quantisation: str):
-    """``dtype.<name>`` element counts over every parameter and buffer, and the device read off the tensors."""
+def tensor_precision(modules, quantisation: str, *, before: "Preload | None" = None):
+    """``dtype.<name>`` element counts over every parameter and buffer, and the device read off the tensors.
+
+    ``before`` adds `fp8_scale_description` to the *label* only, never to the digested ``fields`` -- see that
+    function's docstring for why the block-fp8 scheme it finds must not change `ModelStamp.model_identity`."""
     counts: dict[str, int] = {}
     devices: set[str] = set()
     for m in modules:
@@ -360,7 +372,90 @@ def tensor_precision(modules, quantisation: str):
     if len(devices) != 1:
         raise IdentityError(f"parameters sit on {sorted(devices)}; one device per model is what this part can say")
     fields = {**{k: str(v) for k, v in counts.items()}, "quantisation": quantisation, "device": devices.pop()}
-    return precision_digest(fields), ",".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    digest = precision_digest(fields)
+    label = ",".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    if "fp8" in quantisation and before is not None and before.root is not None:
+        label += f",checkpoint_fp8_scale={fp8_scale_description(before.root, before.names)}"
+    return digest, label
+
+
+#: The dtype name strings `safe_open` itself returns for the two eight-bit float dtypes this project's checkpoints
+#: store weights in. Both pass this filter identically -- neither is told apart from the other in what gets
+#: counted below, only from every other (non-float8) dtype.
+_FP8_SAFETENSORS_DTYPES = ("F8_E4M3", "F8_E5M2")
+
+
+def fp8_scale_description(root: Path, names) -> str:
+    """A best-effort description of the block-fp8 scale scheme beside the checkpoint's own float8 weights, for
+    `tensor_precision`'s *label* only -- never its digest, so this can neither change `ModelStamp.model_identity`
+    nor take `precision` down to ``extraction_failed`` over a cosmetic addition.
+
+    Two things make this a description rather than an identity. First, `checkpoint`'s digest already hashes every
+    byte these files hold, so two checkpoints this function tells apart already have two different `model_identity`
+    values without it -- the actual gap this closes is a *human* reading `precision.label` unable to tell why the
+    dtype-based element count looked wrong (see below), not a collision between two certified arms. Second, this
+    reads the checkpoint's own files rather than the live, kernel-replaced module tree, because a replacement
+    renames the scale buffer (``kernels/qwen3_moe.py``'s ``Fp8Linear`` holds it as ``scale``) or moves it off the
+    module tree into a quantisation-config object (``FusedExperts.quant``) -- so it cannot see a kernel bug, or a
+    future load-time conversion, that serves a different scheme than the files hold; `checkpoint_fp8_scale=
+    "no_fp8_in_checkpoint_files"` is exactly that case; it is a known blind spot named rather than hidden, not a case
+    this was verified to cover. A checkpoint this reads no ``.safetensors`` file from at all (a pickled ``.bin``
+    layout, or an empty ``names``) is a different absence -- nothing was opened to decide there is no fp8 in it --
+    and is named separately as `checkpoint_fp8_scale="no_safetensors_files_read"`.
+
+    Counted, not just named: each resolved layout appears as ``<layout>:<count>`` (how many float8 tensors use it),
+    a tensor whose float8 dtype has no scale beside it in the files counts under ``unresolved:<count>``, and one
+    whose shapes `scale_layout` could not classify counts under ``unclassified:<count>`` without raising past this
+    function's own try -- so a mixed checkpoint (most experts ``block128x128``, a handful of stragglers in some
+    other scheme, from a partially re-quantised artifact or a bug in a conversion script) shows the mix and its
+    size, rather than collapsing every resolved layout down to a single flag.
+
+    What prompted this: on the 35B teacher, ``quantisation=fp8`` with ``dtype.float8_e4m3fn=31180455936`` sits
+    beside ``dtype.float32=134308`` -- far fewer than the roughly 1.9 million 128x128 block scales that many fp8
+    elements need, because `tensor_precision`'s scan over parameters and buffers does not reach scales a kernel
+    replacement moved off the module tree. Confirmed on the real checkpoint (``gate_proj``/``up_proj``/``down_proj``
+    weights of shape e.g. ``[512, 2048]`` beside a ``weight_scale_inv`` of ``[4, 16]``, every expert its own
+    two-dimensional tensor, nothing three-dimensional on disk): ``block128x128:<count>`` is what this reports there.
+    """
+    try:
+        from safetensors import safe_open
+
+        from .readout import scale_key_for, scale_layout
+
+        present: dict[str, tuple[str, tuple[int, ...]]] = {}
+        read_any_shard = False
+        for name in names:
+            if not name.endswith(".safetensors"):
+                continue
+            read_any_shard = True
+            with safe_open(root / name, framework="pt") as f:
+                for key in f.keys():
+                    sl = f.get_slice(key)
+                    present[key] = (sl.get_dtype(), tuple(sl.get_shape()))
+        if not read_any_shard:
+            return "no_safetensors_files_read"
+        counts: Counter = Counter()
+        for key, (dtype, shape) in sorted(present.items()):
+            if dtype not in _FP8_SAFETENSORS_DTYPES:
+                continue
+            scale_key = scale_key_for(key, present.keys())
+            if scale_key is None:
+                counts["unresolved"] += 1
+                continue
+            try:
+                layout = scale_layout(shape, present[scale_key][1])
+            except RuntimeError:
+                # One tensor's scale shape not matching anything this reader knows must not blank out what every
+                # other fp8 tensor in the same checkpoint reported -- that would hide a mostly-good description
+                # behind the one tensor this cannot classify.
+                counts["unclassified"] += 1
+                continue
+            counts[layout if isinstance(layout, str) else f"block{layout[0]}x{layout[1]}"] += 1
+        if not counts:
+            return "no_fp8_in_checkpoint_files"
+        return "+".join(f"{name}:{n}" for name, n in sorted(counts.items()))
+    except Exception as exc:  # noqa: BLE001 - this is for `precision.label` only; it must never reach `.digest`
+        return f"undescribed({type(exc).__name__}: {exc})"
 
 
 def quantisation_of(modules) -> str:
@@ -388,7 +483,7 @@ def backbone_stamp(engine, *, before: Preload, heads=None, temperature=None) -> 
     except Exception as exc:  # noqa: BLE001 - the collector boundary
         checkpoint = Part(absent="extraction_failed", detail=f"{type(exc).__name__}: {exc}")
     modules = [engine.backbone]
-    precision = _try(lambda: tensor_precision(modules, quantisation_of(modules)))
+    precision = _try(lambda: tensor_precision(modules, quantisation_of(modules), before=before))
     return ModelStamp({"checkpoint": checkpoint, "precision": precision, "runtime": _runtime(BACKBONE_RUNTIME),
                        "answer_mode": _answer_mode("option_scores")})
 
