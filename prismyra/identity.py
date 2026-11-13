@@ -287,7 +287,8 @@ class Preload:
     """What the checkpoint looked like just before the loader opened it: the root, the file names and each file's
     size, modification time and inode. Hashing happens after the load, so a file that changed in between -- a
     trainer overwriting the directory, a cache pointer moved -- would give a digest of bytes that were not loaded;
-    comparing against this turns that into a recorded failure."""
+    comparing against this turns that into a recorded failure. The file list itself is taken again after the load,
+    because a loader can fetch files it reads (a processor config absent from the cache is downloaded into it)."""
 
     root: Path | None
     names: tuple[str, ...] = ()
@@ -313,9 +314,15 @@ def _entries(root: Path, names, workers: int = 8) -> list[tuple[str, str]]:
 def _backbone_checkpoint(before: Preload, extra: list[tuple[str, str]]):
     if before.root is None:
         raise IdentityError(before.failure)
-    entries = _entries(before.root, before.names)
-    after = _stats(before.root, before.names)
-    changed = sorted(n for n in before.names if after[n] != before.stats[n])
+    names = backbone_files(before.root)
+    gone = sorted(set(before.names) - set(names))
+    if gone:
+        raise IdentityError(f"files the loader saw are gone by hashing: {gone}")
+    at_hash = _stats(before.root, names)
+    entries = _entries(before.root, names)
+    after = _stats(before.root, names)
+    changed = sorted(n for n in names
+                     if after[n] != at_hash[n] or (n in before.stats and before.stats[n] != at_hash[n]))
     if changed:
         raise IdentityError(f"files changed between load and hashing: {changed}")
     entries += extra

@@ -712,7 +712,7 @@ together with the untouched stage 1/2 case (neither on) and the case where both 
 ## Graded attempts for an outside certifier: `prismyra.learn.observations`
 
 A student is worth serving only once something outside the process that trained it has measured it. Two writers turn
-what this package already has into graded attempts in the open observation record format (format 3, the one tierbook
+what this package already has into graded attempts in the open observation record format (format 3, or 4 with `arm_artifact`; the one tierbook
 reads), without importing any certifier:
 
 ```bash
@@ -756,6 +756,16 @@ it; rows logged before the tag version existed carry `spec` instead). These are 
 offline `score` of the same student carries, so a certificate over a cascade composed from its parts can be checked
 against served traffic. A reader composing a cascade pairs a part's attempts by item and run, so rows meant to pair
 with an offline `score` of the same items take that score's run with `--run` (each row's request id otherwise).
+
+**Identities ([perigraph's model half](OBSERVABILITY.md#what-answered-perigraphs-model-half-on-every-answer)).** A
+server logs the backbone's identities on every row (`perigraph_model`, `perigraph_artifact`) and, on a row where the
+student ran, the identity of the student handle the routing decision was made with (`student_perigraph_artifact`).
+`score` and `export` write each row's artifact identity as `arm_artifact`, which makes the row format 4; rows logged
+before this have none and stay format 3, so an export spanning the upgrade mixes the two under one arm. The backbone's
+`arm_version` (and the router arm's) ends with its model identity, `|perigraph/2/model/<id>`, so another dtype or
+runtime under the same checkpoint is another version; this changes every backbone `arm_version` written before. A
+student's `arm_version` is unchanged, the one an offline `score` of the same artifact writes, because a student has no
+model identity. With `--student`, a student component logged beside another artifact is not written and is counted.
 
 **What a version covers.** A student's `artifact_version` digests every artifact field that decides its answers
 (options, feature settings, idf, the model text, the backend), the Prismyra package that runs it, and the feature

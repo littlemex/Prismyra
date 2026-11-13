@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
-from prismyra.identity import stand_in
+from prismyra.identity import stand_in, student_stamp
 from prismyra.schema import Answer, Result, Timing
 
 TASK = "snake-move-v1"
@@ -93,6 +94,8 @@ class FakeStudentHandle:
     def __init__(self, version: str, probs: dict):
         self.version = version
         self._probs = probs
+        #: A real stamp over bytes unique to this fake, so a test can tell which handle an answer names.
+        self.model_stamp = student_stamp(version.encode(), SimpleNamespace(backend="lightgbm"))
 
     def predict(self, context, question=""):
         return dict(self._probs)
@@ -181,6 +184,48 @@ def test_ask_routes_a_matched_question_to_the_student_and_skips_the_engine(clien
     row = json.loads(next((tmp_path / "exp" / TASK).glob("*.jsonl")).read_text().splitlines()[0])
     assert row["answered_by"] == "student:snake1"
     assert row["request_id"]
+    stamp = fake_students[TASK].model_stamp
+    assert answer["perigraph"]["perigraph.artifact_identity"] == stamp.artifact_identity
+    assert answer["perigraph"]["perigraph.model.answer_mode.label"] == "classifier_output"
+    assert row["versions"]["student_perigraph_artifact"] == stamp.versions()["perigraph_artifact"]
+
+
+def test_an_answer_names_the_student_it_was_routed_with_even_if_reloaded_before_it_is_written(
+        client_factory, fake_students):
+    """The stamp rides on the routing decision, so swapping the registry's handle afterwards does not relabel it."""
+    from prismyra.learn import hook as hook_mod
+
+    make, tmp_path = client_factory
+    client = make(learn_spec=str(write_spec(tmp_path, ROUTER_SPEC)), learn_log_dir=str(tmp_path / "exp"))
+    original = fake_students[TASK]
+    real_route = hook_mod.LearnHook.route
+
+    def route_then_swap(self, tag, **kw):
+        out = real_route(self, tag, **kw)
+        self._students._handles[TASK] = FakeStudentHandle("snake2", {"up": 0.95, "down": 0.05})
+        return out
+
+    hook_mod.LearnHook.route = route_then_swap
+    try:
+        body = client.post("/ask", json={"context": "board", "questions": [
+            {"id": "a", "prompt": "which way?", "kind": "choice", "choices": ["up", "down"]}]}).json()
+    finally:
+        hook_mod.LearnHook.route = real_route
+    assert body["answers"]["a"]["perigraph"]["perigraph.artifact_identity"] == original.model_stamp.artifact_identity
+    students = client.get("/perigraph").json()["students"]
+    assert students[TASK]["perigraph.artifact_identity"] != original.model_stamp.artifact_identity
+
+
+def test_an_engine_answer_carries_the_backbone_stamp_with_its_absences(client_factory, fake_students):
+    make, tmp_path = client_factory
+    client = make(learn_spec=str(write_spec(tmp_path, ROUTER_SPEC)), learn_log_dir=str(tmp_path / "exp"))
+    body = client.post("/ask", json={"context": "board", "questions": [
+        {"id": "b", "prompt": "totally unrelated", "kind": "boolean"}]}).json()
+    p = body["answers"]["b"]["perigraph"]
+    assert p["perigraph.collector"] == "prismyra" and p["perigraph.spec_version"] == 2
+    assert p["perigraph.model_absent.checkpoint.reason"] == "not_reachable"
+    assert "perigraph.model_identity" not in p
+    assert client.get("/perigraph").json()["backbone"] == p
 
 
 def test_ask_mixed_tagged_and_untagged_questions_only_routes_the_tagged_one(client_factory, fake_students):

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Every answer says what answered, as perigraph version 2's model half (`prismyra.identity`).** `/ask`,
+  `/v1/decide` and `/v1/chat/completions` put a `perigraph` object on each answer: checkpoint, precision, runtime and
+  answer mode, each digested by this process from what it loaded, and the model and artifact identities over them.
+  `GET /perigraph` lists the backbone's and each loaded student's. The checkpoint is hashed once per engine load. No
+  perigraph code is imported; tests check against a committed copy of its vocabularies and fixtures. See
+  [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
+- **Observation rows name the stored artifact.** `score` and `export` write `arm_artifact` (format 4) when the row's
+  model has an artifact identity; the backbone's `arm_version` gains its model identity. A student component logged
+  beside another artifact than `--student` is skipped and counted. See [docs/LEARN.md](docs/LEARN.md).
 - **Graded attempts for an outside certifier (`prismyra.learn.observations`).** `score` answers a declared item set
   with an artifact that is not serving; `export` turns a server's logged requests into rows of the open observation
   format, under the router's declared arm or, with `--per-component`, one row per component under its own version.

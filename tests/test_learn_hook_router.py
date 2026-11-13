@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
+from prismyra.identity import student_stamp
 from prismyra.learn.hook import LearnHook
 
 TASK = "snake-move-v1"
@@ -47,6 +49,8 @@ class FakeStudentHandle:
     def __init__(self, version: str, probs: dict[str, float]):
         self.version = version
         self._probs = probs
+        #: A real stamp over bytes unique to this fake, so a test can tell which handle an answer names.
+        self.model_stamp = student_stamp(version.encode(), SimpleNamespace(backend="lightgbm"))
         self.calls = 0
 
     def predict(self, context: str, question: str = "") -> dict[str, float]:

@@ -95,10 +95,57 @@ gives Prometheus something to scrape directly -- see the table above for exactly
 Requires `pip install "prismyra[otel]"`; with `--otel` unset, nothing under
 `prismyra.telemetry.otel_backend` is imported and the extra does not need to be installed at all.
 
+## What answered: perigraph's model half on every answer
+
+Every answer from `/ask`, `/v1/decide` and `/v1/chat/completions` carries a `perigraph` object: the model half of a
+[perigraph](https://github.com/littlemex/perigraph) version 2 record for whoever gave that answer, written by this
+process because only it holds what it loaded. It is unconditional (no flag), and it is not telemetry: it travels in
+the response, not over OTLP. `GET /perigraph` returns the same records for the backbone and each routed tag's loaded
+student, for looking rather than joining, because a student can be reloaded between that request and an answer.
+
+| part | backbone | student served by `prismyra.learn` |
+|---|---|---|
+| `checkpoint` | the files `prismyra.identity.backbone_files` names, hashed after load: `model.safetensors`, or the index and every shard its `weight_map` names; `config.json` and processor configs; known tokenizer and chat-template files; `adapter_config.json` and `adapter_model.safetensors`; the `*.py` files when the config has an `auto_map`; and `--heads` and `--calibrate-temperature`, entered as `+heads/<name>` and `+temperature/<name>` | the artifact's bytes as parsed, under the fixed name `student.json`, so a renamed copy is the same artifact |
+| `precision` | element counts by dtype over parameters and buffers, the quantisation read off the loaded tensors and module types (`fp8`, `nvfp4`, `none`), and the device | absent (`extraction_failed`): a tree model exposes no parameter dtype |
+| `runtime` | `prismyra`, `torch`, `transformers`, `kernels`, `triton`, `safetensors`, `tokenizers`, as installed | `prismyra`, the tree library, `numpy` |
+| `answer_mode` | `option_scores` | `classifier_output` |
+
+So a backbone answer has a `perigraph.model_identity` (all four parts) and a `perigraph.artifact_identity`
+(`checkpoint` alone). The same files loaded in another dtype, or under another runtime, are another model over the same
+artifact; a retrain, or other heads, is another artifact. A student answer has an artifact identity and no model
+identity. A part that could not be read is absent with its reason and a detail
+(`perigraph.model_absent.<part>.reason`), and an absent identity means unknown, never clean.
+
+**Why each part.** Each part is there because an earlier distillation record changed answers while every name stayed
+the same: retraining from the same script and seed agreed with the previous model on 93.4 % of labels (R5 to R6, R12
+to R13); dynamic int8 at load left the stored bytes unchanged and agreed on 33-40 %; a rebuilt image that lost
+packages agreed on 97 of 100 answers (R14); and a student trained on option scores generated "1111" when asked to
+generate. A version string that is not content (the phase 6 spec version, which changed when the spec was edited for
+deployment) cannot tell these apart.
+
+**Cost.** The checkpoint is hashed once per engine load, after the model is loaded, with eight threads. Each file's
+size, mtime and inode are taken before loading and again around the hash, and a file that changed in between makes the
+part `extraction_failed` rather than a digest of bytes that were not loaded; the file list is taken after the load,
+because a loader can download files it then reads. On a g6e.12xlarge pod reading a shared file system,
+`littlemex/prismyra-decision-35b-a3b-fp8` (47 files, 31.8 GiB) hashed in 17.4 s the first time and in 4.4 s with its
+files already in the page cache.
+
+**Comparability.** A model identity is comparable only within one collector and collector version
+(`perigraph.collector`, `perigraph.collector_version`), because `precision` and `runtime` are this collector's
+rendering: upgrading Prismyra or any listed package changes it. An artifact identity is what a trainer can compute when
+it saves the files, using the same names.
+
+**What it cannot see.** Files a loader reads that `backbone_files` does not name (a layout it cannot name, such as
+pickled `.bin` weights or a `.tiktoken` tokenizer, is refused as `extraction_failed` rather than identified); packages
+that matter and are not listed; and anything a student's feature builder computes with, such as an embedding model or
+a feature module's code. A wrong file list gives a confident wrong identity.
+
+**What it exposes.** The labels name dtype counts, the device and package versions. They do not name the model path.
+
 ## Guarantee
 
 With `--otel` unset (the default), `prismyra.telemetry` is never imported, `/ask` and `/v1/decide` answer
-exactly as they always did -- byte-identical responses, the same latency, the same code path -- and
+exactly as they do without it -- byte-identical responses, the same latency, the same code path -- and
 `/metrics` still works (it only ever reads `/stats`, which exists regardless). With `--otel` set, the added
 cost on the request path is one `record_request`/`record_rejection` call after the answer is already
 decided; the stats-derived gauges cost nothing on the request path at all, since they are read by the SDK's

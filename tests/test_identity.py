@@ -201,6 +201,17 @@ def test_a_file_changed_between_load_and_hashing_is_a_failure_not_a_digest(tmp_p
     assert "changed" in stamp.parts["checkpoint"].detail
 
 
+def test_a_file_the_loader_fetched_during_load_is_part_of_the_checkpoint(tmp_path):
+    """A loader fills a cache with files it is about to read (seen on the pod: a processor config fetched by the
+    first load), so the list is the directory after the load, not before it."""
+    root = _checkpoint(tmp_path, b"weights")
+    before = I.preload(str(root))
+    (root / "preprocessor_config.json").write_text("{}")
+    late = I.backbone_stamp(_engine(torch.bfloat16), before=before)
+    assert late.parts["checkpoint"].label == "4 files"
+    assert late.artifact_identity == _stamp(root).artifact_identity
+
+
 def test_heads_are_part_of_what_answered_under_their_own_prefix(tmp_path):
     root = _checkpoint(tmp_path, b"weights")
     heads = tmp_path / "heads.json"
