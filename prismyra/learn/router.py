@@ -111,6 +111,9 @@ class RouteOutcome:
     #: not it ended up answering (a "confidence" fallback runs it to check `tau` either way).
     answer_probabilities: Mapping[str, float] | None  #: set exactly when ``served_by`` starts with
     #: ``"student"`` -- the probabilities the caller gets back, computed before the engine is ever asked.
+    student_stamp: object = None  #: the `prismyra.identity.ModelStamp` of the student handle this outcome was
+    #: decided with, set by `prismyra.learn.hook.LearnHook.route`, so the answer and its logged row name the model
+    #: that ran rather than whichever one is loaded by the time they are written.
 
 
 #: ``() -> probabilities``. A thunk, not the probabilities themselves, so `decide()` never pays for a

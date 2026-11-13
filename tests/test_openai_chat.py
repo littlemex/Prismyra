@@ -7,6 +7,7 @@ import math
 
 import pytest
 
+from prismyra.identity import stand_in
 from prismyra.schema import Answer, Result, Timing
 
 TASK = "sentiment-v1"
@@ -17,6 +18,7 @@ SPEC = [{"task": TASK, "question": "What is the sentiment?", "options": ["bearis
 
 class StubEngine:
     model_name = "stub/model"
+    model_stamp = stand_in("a test stub loads no model")
     group = 32
     heads = None
     seen: list = []

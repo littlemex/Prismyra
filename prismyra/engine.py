@@ -452,7 +452,6 @@ class Prismyra:
         pin_autotune: bool = True,
         wide_group: bool = False,
         interleaved_fork: bool = True,
-        identify: bool = True,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -622,6 +621,11 @@ class Prismyra:
                 f"kernels exist only on CUDA, so this configuration can never satisfy it"
             )
 
+        from .identity import backbone_stamp, preload
+
+        #: The checkpoint's file list and stat, taken before the loader opens it, so `backbone_stamp` can refuse a
+        #: digest of bytes that changed after they were loaded.
+        checkpoint_before = preload(model)
         self.config = AutoConfig.from_pretrained(model)
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         # A processor only if the checkpoint has one. It is what turns an image into pixels and expands the
@@ -859,13 +863,9 @@ class Prismyra:
 
         #: What answered, as perigraph's model half (`prismyra.identity`): read off what this process loaded, after
         #: every conversion above, so an NVFP4 or FP8 engine and a bf16 one over the same files get different model
-        #: identities and the same artifact identity. ``identify=False`` skips hashing the checkpoint (minutes on a
-        #: large model) and records every part unreachable, which a receiver reads as "no verdict over this", not as
-        #: a clean record.
-        from .identity import backbone_stamp, unreachable
-
-        self.identity = (backbone_stamp(self, model=model, heads=heads, temperature=calibrate_temperature)
-                         if identify else unreachable("identify=False: the checkpoint was not hashed at load"))
+        #: identities and the same artifact identity.
+        self.model_stamp = backbone_stamp(self, before=checkpoint_before, heads=heads,
+                                          temperature=calibrate_temperature)
 
     # ------------------------------------------------------------------ public
     def validate(self, questions: list[Question]) -> None:

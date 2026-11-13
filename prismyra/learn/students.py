@@ -97,7 +97,7 @@ class AdmissionRecord:
     evidence: dict
 
     @staticmethod
-    def load(path: Path) -> AdmissionRecord:
+    def load(path: Path) -> "AdmissionRecord":
         def bad(why: str):
             return StudentError(f"admission record {path}: {why}")
 
@@ -165,7 +165,7 @@ class StudentHandle:
     """
 
     def __init__(self, artifact: StudentArtifact, router: RouterConfig | None = None,
-                 record: AdmissionRecord | None = None, path: str | Path | None = None):
+                 record: AdmissionRecord | None = None, raw: bytes | None = None):
         if record is not None:
             # An outside judgement replaces Prismyra's own bar (`admitted`, `admitted_for`) entirely.
             record.check(artifact, router)
@@ -195,12 +195,12 @@ class StudentHandle:
         self.artifact = artifact
         self.record = record
         self.version = student_version(artifact)
-        #: perigraph's model half for this student (`prismyra.identity.student_stamp`), from the file it was read
-        #: from. A handle built from an artifact in memory has no file to digest and says so.
-        from prismyra.identity import student_stamp, unreachable
+        #: perigraph's model half for this student (`prismyra.identity.student_stamp`), over ``raw``, the bytes the
+        #: artifact was parsed from. A handle built from an artifact in memory has no bytes to digest and says so.
+        from prismyra.identity import stand_in, student_stamp
 
-        self.identity = (student_stamp(path, artifact) if path is not None
-                         else unreachable("the artifact was handed over in memory, not read from a file"))
+        self.model_stamp = (student_stamp(raw, artifact) if raw is not None
+                            else stand_in("the artifact was handed over in memory, not read from bytes"))
         # see module docstring: the one place either backend's own library is required, and only here
         self._model = get_backend(artifact.backend).load(artifact.model_text)
         self._vectorizer = artifact.vectorizer()
@@ -247,7 +247,8 @@ class StudentRegistry:
             path = spec_dir / path
         if not path.is_file():
             raise StudentError(f"tag {task!r}: router.student_path {student_path!r} does not exist (resolved: {path})")
-        artifact = StudentArtifact.from_json(json.loads(path.read_text(encoding="utf-8")))
+        raw = path.read_bytes()
+        artifact = StudentArtifact.from_json(json.loads(raw.decode("utf-8")))
         if artifact.tag != task:
             raise StudentError(
                 f"tag {task!r}: router.student_path {student_path!r} is an artifact for tag {artifact.tag!r}"
@@ -256,7 +257,7 @@ class StudentRegistry:
         if admission is not None and admission.mode == "external":
             rp = Path(admission.record)
             record = AdmissionRecord.load(rp if rp.is_absolute() else spec_dir / rp)
-        handle = StudentHandle(artifact, router=router, record=record, path=path)
+        handle = StudentHandle(artifact, router=router, record=record, raw=raw)
         with self._lock:
             self._handles[task] = handle
         return handle

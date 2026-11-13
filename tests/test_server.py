@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from prismyra import Boolean, Choice
+from prismyra.identity import stand_in
 from prismyra.schema import Answer, QuestionError, Result, Timing
 from prismyra.server import as_json, build_questions, with_queue_time
 
@@ -83,6 +84,7 @@ def test_the_endpoint_accepts_a_request_body_over_real_http():
 
     class StubEngine:
         model_name = "stub"
+        model_stamp = stand_in("a test stub loads no model")
         group = 32
 
         class _Tok:
@@ -144,6 +146,7 @@ def test_the_served_version_is_the_package_version():
 
     class StubEngine:
         model_name = "stub"
+        model_stamp = stand_in("a test stub loads no model")
         group = 32
         tokenizer = None
 
@@ -189,6 +192,7 @@ def test_an_image_arrives_as_bytes_and_reaches_the_engine():
 
     class StubEngine:
         model_name = "stub"
+        model_stamp = stand_in("a test stub loads no model")
         group = 32
         tokenizer = staticmethod(lambda text, **_: {"input_ids": []})
 
@@ -393,6 +397,7 @@ class StubBatchableEngine:
     """
 
     model_name = "stub"
+    model_stamp = stand_in("a test stub loads no model")
     paged = True
     wide_group = False
     interleaved_fork = False
@@ -586,6 +591,7 @@ def test_restore_ids_drops_a_companions_answers_from_the_shared_merged_result():
 
 class _DecideStubEngine:
     model_name = "stub"
+    model_stamp = stand_in("a test stub loads no model")
     group = 32
 
     class _Tok:

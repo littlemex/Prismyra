@@ -5,8 +5,8 @@ process that loaded it (sourcing ``loaded_by_us``), and two identities over them
 
 | part | what this module digests |
 |---|---|
-| ``checkpoint`` | every file the loader read: ``<relative path>\\t<sha256>\\n`` lines, sorted by path bytes |
-| ``precision`` | ``dtype.<name>=<count>``, ``quantisation``, ``device``, read off the loaded parameters |
+| ``checkpoint`` | the files `backbone_files` names, plus heads and temperature: ``<path>\\t<sha256>\\n`` lines |
+| ``precision`` | ``dtype.<name>=<count>``, ``quantisation``, ``device``, read off the loaded parameters and buffers |
 | ``runtime`` | ``<distribution>==<version>`` for the packages declared below, resolved in this process |
 | ``answer_mode`` | ``option_scores`` for the backbone, ``classifier_output`` for a student |
 
@@ -22,6 +22,9 @@ stored bytes unchanged and agreed on 33-40 % (precision), a rebuilt image lost p
 This module imports nothing from perigraph: it writes the record from the spec, and the test suite checks it against a
 committed copy of perigraph's vocabularies and model-identity fixtures. A part that cannot be read is recorded absent
 with the reason and a detail, never guessed, so a record without a model identity says why.
+
+A student (`student_stamp`) has an artifact identity and no model identity: a tree model exposes no parameter dtype,
+so its ``precision`` is recorded as failed rather than declared.
 
 What it cannot see: files a loader reads that this module does not name, packages that matter and are not in the
 declared list, and anything a feature builder computes with (a student's embedding model is not in the student's
@@ -52,15 +55,6 @@ ABSENCE_BLAMES = {"not_provided": "sender", "redacted": "sender", "not_reachable
 #: The distributions whose versions decide the backbone's answers. Static per collector version, as perigraph's
 #: manifest must be: a list that adapted to what it found could never be wrong, and so could never be checked.
 BACKBONE_RUNTIME = ("prismyra", "torch", "transformers", "kernels", "triton", "safetensors", "tokenizers")
-#: The same for a student served by `prismyra.learn`: its tree library and what featurisation runs on.
-STUDENT_RUNTIME = ("prismyra", "lightgbm", "xgboost", "numpy", "scikit-learn", "sentence-transformers")
-
-#: Files outside the weights that a Hugging Face loader reads and that can change an answer: the configuration, the
-#: tokenizer and its chat template, and a processor. A file listed here and absent from the checkpoint is skipped;
-#: a file present and not listed is not read and not digested (an optimiser state, a stale shard).
-_SIDE_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json",
-               "vocab.json", "merges.txt", "tokenizer.model", "chat_template.jinja", "chat_template.json",
-               "preprocessor_config.json", "processor_config.json", "video_preprocessor_config.json")
 
 
 class IdentityError(Exception):
@@ -200,28 +194,51 @@ class ModelStamp:
         return out
 
     def versions(self, prefix: str = "") -> dict[str, str]:
-        """The two identities as opaque version strings, the form perigraph section 11 recommends to an emitter."""
+        """The two identities as opaque version strings, the form perigraph section 11 recommends to an emitter, under
+        ``<prefix>perigraph_model`` and ``<prefix>perigraph_artifact``."""
         out = {}
         if self.model_identity:
-            out[f"{prefix}model_identity"] = f"perigraph/{SPEC_VERSION}/model/{self.model_identity}"
+            out[f"{prefix}perigraph_model"] = f"perigraph/{SPEC_VERSION}/model/{self.model_identity}"
         if self.artifact_identity:
-            out[f"{prefix}artifact_identity"] = f"perigraph/{SPEC_VERSION}/artifact/{self.artifact_identity}"
+            out[f"{prefix}perigraph_artifact"] = f"perigraph/{SPEC_VERSION}/artifact/{self.artifact_identity}"
         return out
 
 
 def _try(fn, *args) -> Part:
+    """Run one part's collector. Any failure is this collector's, recorded with what went wrong, and never stops the
+    model from loading: a record that says a part failed is worth more than no server."""
     try:
         digest, label = fn(*args)
         return Part(digest=digest, label=label)
-    except (IdentityError, OSError, ValueError, KeyError) as exc:
+    except Exception as exc:  # noqa: BLE001 - the collector boundary; the failure is recorded, not hidden
         return Part(absent="extraction_failed", detail=f"{type(exc).__name__}: {exc}")
+
+
+def _answer_mode(label: str) -> Part:
+    if label not in ANSWER_MODES:
+        raise IdentityError(f"{label!r} is not one of perigraph's answer modes {ANSWER_MODES}")
+    return Part(digest=_hex(label), label=label)
+
+
+def _runtime(distributions) -> Part:
+    rv = runtime_versions(distributions)
+    return Part(digest=lines_digest(rv, "=="), label=",".join(f"{k}=={v}" for k, v in sorted(rv.items())))
 
 
 # --- the backbone -----------------------------------------------------------------------------------------------------
 
+#: Tokenizer and template files a Hugging Face loader may read. Present and listed: digested. A tokenizer file this
+#: list does not know is refused below rather than silently left out.
+_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json",
+                    "vocab.json", "vocab.txt", "merges.txt", "tokenizer.model", "spiece.model",
+                    "sentencepiece.bpe.model", "chat_template.jinja", "chat_template.json")
+_CONFIG_FILES = ("config.json", "preprocessor_config.json", "processor_config.json", "video_preprocessor_config.json")
+_ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
+
+
 def checkpoint_root(model: str) -> Path:
-    """The directory the loader read: ``model`` itself when it is one, else the cached Hugging Face snapshot that
-    ``config.json`` resolved to. Never downloads; a model that is not on disk was not loaded from disk."""
+    """The directory the loader reads: ``model`` itself when it is one, else the cached snapshot that ``config.json``
+    resolves to without a revision, as the engine's own ``from_pretrained(model)`` does. Never downloads."""
     if os.path.isdir(model):
         return Path(model)
     from transformers.utils import cached_file
@@ -233,16 +250,58 @@ def checkpoint_root(model: str) -> Path:
 
 
 def backbone_files(root: Path) -> list[str]:
-    """The weight files the index names (or the single ``model.safetensors``), plus the side files that exist."""
-    index = root / "model.safetensors.index.json"
-    if index.is_file():
-        weights = sorted(set(json.loads(index.read_text(encoding="utf-8"))["weight_map"].values()))
-        names = ["model.safetensors.index.json", *weights]
-    elif (root / "model.safetensors").is_file():
-        names = ["model.safetensors"]
+    """The files a ``from_pretrained`` of ``root`` reads, as far as this collector can name them.
+
+    Weights follow the loader's own preference: a single ``model.safetensors`` over a sharded index. Adapters, remote
+    code a configuration's ``auto_map`` names, and known tokenizer files are included. A layout this collector cannot
+    name -- pickled ``.bin`` weights only, or a tokenizer file it does not know -- is refused, so the part is recorded
+    as failed rather than as a confident identity over the wrong files."""
+    names: list[str] = []
+    if (root / "model.safetensors").is_file():
+        names.append("model.safetensors")
+    elif (root / "model.safetensors.index.json").is_file():
+        index = json.loads((root / "model.safetensors.index.json").read_text(encoding="utf-8"))
+        names += ["model.safetensors.index.json", *sorted(set(index["weight_map"].values()))]
     else:
-        raise IdentityError(f"{root} has neither model.safetensors.index.json nor model.safetensors")
-    return names + [n for n in _SIDE_FILES if (root / n).is_file()]
+        raise IdentityError(f"{root} has no safetensors weights this collector can name")
+    names += [n for n in (*_CONFIG_FILES, *_TOKENIZER_FILES, *_ADAPTER_FILES) if (root / n).is_file()]
+    config = json.loads((root / "config.json").read_text(encoding="utf-8")) if (root / "config.json").is_file() else {}
+    if config.get("auto_map"):
+        names += sorted(p.name for p in root.glob("*.py"))
+    unknown = sorted(p.name for p in root.iterdir() if p.is_file() and p.name.endswith(".tiktoken"))
+    if unknown:
+        raise IdentityError(f"{root} has tokenizer files this collector does not read: {unknown}")
+    return names
+
+
+def _stats(root: Path, names) -> dict[str, tuple[int, int, int]]:
+    out = {}
+    for n in names:
+        st = (root / n).resolve().stat()
+        out[n] = (st.st_size, st.st_mtime_ns, st.st_ino)
+    return out
+
+
+@dataclass(frozen=True)
+class Preload:
+    """What the checkpoint looked like just before the loader opened it: the root, the file names and each file's
+    size, modification time and inode. Hashing happens after the load, so a file that changed in between -- a
+    trainer overwriting the directory, a cache pointer moved -- would give a digest of bytes that were not loaded;
+    comparing against this turns that into a recorded failure."""
+
+    root: Path | None
+    names: tuple[str, ...] = ()
+    stats: dict = field(default_factory=dict)
+    failure: str = ""
+
+
+def preload(model: str) -> Preload:
+    try:
+        root = checkpoint_root(model)
+        names = tuple(backbone_files(root))
+        return Preload(root, names, _stats(root, names))
+    except Exception as exc:  # noqa: BLE001 - recorded as the checkpoint part's failure
+        return Preload(None, failure=f"{type(exc).__name__}: {exc}")
 
 
 def _entries(root: Path, names, workers: int = 8) -> list[tuple[str, str]]:
@@ -251,89 +310,110 @@ def _entries(root: Path, names, workers: int = 8) -> list[tuple[str, str]]:
     return list(zip(names, shas, strict=True))
 
 
-def _backbone_checkpoint(model: str, extra: list[tuple[str, str]]):
-    root = checkpoint_root(model)
-    entries = _entries(root, backbone_files(root)) + extra
-    return checkpoint_digest(entries), f"{model} ({len(entries)} files)"
+def _backbone_checkpoint(before: Preload, extra: list[tuple[str, str]]):
+    if before.root is None:
+        raise IdentityError(before.failure)
+    entries = _entries(before.root, before.names)
+    after = _stats(before.root, before.names)
+    changed = sorted(n for n in before.names if after[n] != before.stats[n])
+    if changed:
+        raise IdentityError(f"files changed between load and hashing: {changed}")
+    entries += extra
+    return checkpoint_digest(entries), f"{len(entries)} files"
 
 
 def _extra_files(heads, temperature) -> list[tuple[str, str]]:
-    """Heads and a calibrated temperature change answers and are read from outside the checkpoint, so they are part
-    of what answered. A path is digested as a file; an in-memory spec as its canonical JSON."""
+    """Heads and a calibrated temperature are read from outside the checkpoint and change answers, so they are part of
+    what answered. They are entered under ``+heads/`` and ``+temperature/``, which no file under an artifact root can
+    be named, so a trainer that publishes a base and its heads together can compute the same artifact identity, and a
+    reader can tell the base's files from the additions. A path is digested as a file; an in-memory spec as its
+    canonical JSON."""
     out = []
     for kind, spec in (("heads", heads), ("temperature", temperature)):
         if spec is None:
             continue
-        if isinstance(spec, (str, os.PathLike)):
+        if isinstance(spec, (str, os.PathLike)) and Path(spec).is_file():
             out.append((f"+{kind}/{Path(spec).name}", sha256_file(spec)))
         else:
             out.append((f"+{kind}/inline.json", _hex(json.dumps(spec, sort_keys=True, separators=(",", ":")))))
     return out
 
 
-def tensor_precision(modules, device: str, quantisation: str):
+def tensor_precision(modules, quantisation: str):
+    """``dtype.<name>`` element counts over every parameter and buffer, and the device read off the tensors."""
     counts: dict[str, int] = {}
+    devices: set[str] = set()
     for m in modules:
         for t in list(m.parameters()) + list(m.buffers()):
             name = str(t.dtype).replace("torch.", "")
             counts[f"dtype.{name}"] = counts.get(f"dtype.{name}", 0) + t.numel()
+            devices.add(t.device.type)
     if not counts:
         raise IdentityError("no parameters were loaded")
-    fields = {**{k: str(v) for k, v in counts.items()}, "quantisation": quantisation, "device": device}
+    if len(devices) != 1:
+        raise IdentityError(f"parameters sit on {sorted(devices)}; one device per model is what this part can say")
+    fields = {**{k: str(v) for k, v in counts.items()}, "quantisation": quantisation, "device": devices.pop()}
     return precision_digest(fields), ",".join(f"{k}={v}" for k, v in sorted(fields.items()))
 
 
-def backbone_stamp(engine, *, model: str, heads=None, temperature=None) -> ModelStamp:
-    """The engine's model half, read off what this process loaded."""
+def quantisation_of(modules) -> str:
+    """The scheme the loaded modules are in, read off their types and dtypes, never off configuration: an
+    environment variable that asked for a conversion says nothing about whether it happened."""
+    kinds = set()
+    for m in modules:
+        for sub in m.modules():
+            name = type(sub).__name__
+            if "Fp4" in name or "FP4" in name:
+                kinds.add("nvfp4")
+        for t in list(m.parameters()) + list(m.buffers()):
+            if "float8" in str(t.dtype):
+                kinds.add("fp8")
+            elif "int8" in str(t.dtype) or "qint" in str(t.dtype):
+                kinds.add("int8")
+    return "+".join(sorted(kinds)) or "none"
+
+
+def backbone_stamp(engine, *, before: Preload, heads=None, temperature=None) -> ModelStamp:
+    """The engine's model half, read off what this process loaded. ``before`` is `preload`, taken before loading."""
     try:
         extra = _extra_files(heads, temperature)
-    except OSError as exc:
-        extra, failure = [], f"OSError: {exc}"
-    else:
-        failure = ""
-    checkpoint = (Part(absent="extraction_failed", detail=failure) if failure
-                  else _try(_backbone_checkpoint, model, extra))
-    quant = "nvfp4_experts" if os.environ.get("PRISMYRA_EXPERTS") == "nvfp4" else "none"
-    if quant == "none" and any("float8" in str(p.dtype) for p in engine.backbone.parameters()):
-        quant = "fp8_block"
-    precision = _try(tensor_precision, [engine.backbone], engine.torch_device.type, quant)
-    rv = runtime_versions(BACKBONE_RUNTIME)
-    runtime = Part(digest=lines_digest(rv, "=="), label=",".join(f"{k}=={v}" for k, v in sorted(rv.items())))
-    mode = Part(digest=_hex("option_scores"), label="option_scores")
-    return ModelStamp({"checkpoint": checkpoint, "precision": precision, "runtime": runtime, "answer_mode": mode})
+        checkpoint = _try(_backbone_checkpoint, before, extra)
+    except Exception as exc:  # noqa: BLE001 - the collector boundary
+        checkpoint = Part(absent="extraction_failed", detail=f"{type(exc).__name__}: {exc}")
+    modules = [engine.backbone]
+    precision = _try(lambda: tensor_precision(modules, quantisation_of(modules)))
+    return ModelStamp({"checkpoint": checkpoint, "precision": precision, "runtime": _runtime(BACKBONE_RUNTIME),
+                       "answer_mode": _answer_mode("option_scores")})
 
 
 # --- a student served by prismyra.learn ----------------------------------------------------------------------------
 
-def _student_checkpoint(path: Path):
-    return checkpoint_digest([(path.name, sha256_file(path))]), path.name
+#: The fixed entry name a single-file student artifact is digested under, so the same bytes under another file name
+#: are the same artifact, and a trainer that saved them can compute the identity without knowing where they are served.
+STUDENT_ENTRY = "student.json"
+#: What each tree library's student runs on: the library, the arrays it is handed, and the package that featurises.
+STUDENT_RUNTIME = {"lightgbm": ("prismyra", "lightgbm", "numpy"), "xgboost": ("prismyra", "xgboost", "numpy")}
 
 
-def _student_precision(artifact):
-    """A tree model's parameters are its leaf values, held as float64 by both supported libraries."""
-    text = artifact.model_text
-    if artifact.backend == "lightgbm":
-        n = sum(len(line.split("=", 1)[1].split()) for line in text.splitlines() if line.startswith("leaf_value="))
-    else:
-        raise IdentityError(f"leaf values of a {artifact.backend!r} model are not counted by this collector")
-    if n == 0:
-        raise IdentityError("the model text has no leaf values")
-    fields = {"dtype.float64": str(n), "quantisation": "none", "device": "cpu"}
-    return precision_digest(fields), f"{artifact.backend},leaf_values={n}"
+def student_stamp(raw: bytes, artifact) -> ModelStamp:
+    """A student artifact's model half, from the bytes the loading process read and parsed (``raw``) -- one read, so
+    the digest is of what was loaded rather than of whatever the path holds a moment later.
 
-
-def student_stamp(path: str | Path, artifact) -> ModelStamp:
-    """A student artifact's model half, read by the process that loaded it from ``path``."""
-    path = Path(path)
-    rv = runtime_versions(STUDENT_RUNTIME)
+    ``precision`` is recorded as failed: a tree model exposes no parameter dtype to read, and writing the library's
+    arithmetic as a constant would be a declaration marked as a reading. So a student has an artifact identity and
+    no model identity. What its features compute with (a feature module's code, an embedding model) is not here."""
+    runtime = STUDENT_RUNTIME.get(artifact.backend)
     return ModelStamp({
-        "checkpoint": _try(_student_checkpoint, path),
-        "precision": _try(_student_precision, artifact),
-        "runtime": Part(digest=lines_digest(rv, "=="), label=",".join(f"{k}=={v}" for k, v in sorted(rv.items()))),
-        "answer_mode": Part(digest=_hex("classifier_output"), label="classifier_output"),
+        "checkpoint": Part(digest=checkpoint_digest([(STUDENT_ENTRY, hashlib.sha256(raw).hexdigest())]),
+                           label=f"{artifact.backend} student"),
+        "precision": Part(absent="extraction_failed", detail="a tree model exposes no parameter dtype to read"),
+        "runtime": _runtime(runtime) if runtime else Part(absent="extraction_failed",
+                                                          detail=f"no runtime list for backend {artifact.backend!r}"),
+        "answer_mode": _answer_mode("classifier_output"),
     })
 
 
-def unreachable(detail: str) -> ModelStamp:
-    """Every part absent because this collector could not reach it, with why: a record that says so, not none."""
-    return ModelStamp({k: Part(absent="not_reachable", detail=detail) for k in MODEL_PARTS})
+def stand_in(why: str) -> ModelStamp:
+    """Every part absent because this collector could not reach it, with why: for a model this process did not load
+    from a file (a handle built in memory, a stand-in engine), a record that says so rather than none."""
+    return ModelStamp({k: Part(absent="not_reachable", detail=why) for k in MODEL_PARTS})

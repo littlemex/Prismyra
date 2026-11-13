@@ -15,6 +15,7 @@ Nothing in this module imports Ray; `experience.RayExperienceLogActor` does that
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from pathlib import Path
 
@@ -73,7 +74,7 @@ class LearnHook:
         max_queue: int = 10_000,
         otel_endpoint: str | None = None,
         otel_service_name: str = "prismyra",
-        model_versions: dict[str, str] | None = None,
+        backbone_perigraph: dict[str, str] | None = None,
     ):
         """``backend`` picks the primary `prismyra.learn.experience.ExperienceSink` -- ``"local"``
         (`LocalExperienceLog`, unchanged) or ``"ray"`` (`RayExperienceLogActor`), exactly as before
@@ -88,7 +89,7 @@ class LearnHook:
         self.backbone = backbone
         #: The backbone's perigraph identities as opaque version strings (`prismyra.identity.ModelStamp.versions`),
         #: written into every logged row so an exporter can name what answered without re-deriving it.
-        self.model_versions = dict(model_versions or {})
+        self.backbone_perigraph = dict(backbone_perigraph or {})
         root = Path(log_dir) if log_dir is not None else self.spec.path.parent / "experience"
         if backend == "local":
             primary: ExperienceSink = LocalExperienceLog(root, self.spec, max_queue=max_queue).start()
@@ -128,22 +129,21 @@ class LearnHook:
 
     def versions(self) -> dict[str, str]:
         return {"package": self.package_version, "backbone": self.backbone, "spec": self.spec.version,
-                **self.model_versions}
+                **self.backbone_perigraph}
 
-    def student_identity(self, task: str):
-        """The loaded student's `prismyra.identity.ModelStamp` for ``task``, or `None` when the tag routes nothing."""
-        handle = self._students.get(task) if self._students is not None else None
-        return getattr(handle, "identity", None)
+    def student_stamps(self) -> dict:
+        """Each routed tag's loaded student's `prismyra.identity.ModelStamp`, by task."""
+        if self._students is None:
+            return {}
+        handles = {t.task: self._students.get(t.task) for t in self.spec.tags if t.router is not None}
+        return {task: h.model_stamp for task, h in handles.items() if h is not None}
 
-    def _row_versions(self, tag: TagSpec) -> dict[str, str]:
-        """`versions` for one logged row: the server's, the tag's own, and the perigraph identities of the student
-        this tag has loaded, whoever answered, so a row the backbone answered still names the student beside it."""
+    def _row_versions(self, tag: TagSpec, outcome=None) -> dict[str, str]:
+        """`versions` for one logged row: the server's, the tag's own, and -- exactly when the student ran for this
+        request -- the perigraph identities of the student handle it was routed with (`RouteOutcome.student_stamp`)."""
         out = {**self.versions(), "tag": tag_version(tag)}
-        if self._students is not None:
-            handle = self._students.get(tag.task)
-            stamp = getattr(handle, "identity", None)
-            if stamp is not None:
-                out.update(stamp.versions("student_"))
+        if outcome is not None and outcome.student_probabilities is not None:
+            out.update(outcome.student_stamp.versions("student_"))
         return out
 
     def _retained_context(self, tag: TagSpec, context: str) -> tuple[str, tuple[float, ...] | None]:
@@ -221,7 +221,7 @@ class LearnHook:
 
         normalized_input = context.strip()
         ratio, audit_fraction = self.controller.resolve(tag, tag.router)
-        return router_mod.decide(
+        outcome = router_mod.decide(
             tag,
             tag.router,
             normalized_input=normalized_input,
@@ -230,6 +230,7 @@ class LearnHook:
             student_version=handle.version,
             student_predict=lambda: handle.predict(context, tag.question),
         )
+        return dataclasses.replace(outcome, student_stamp=handle.model_stamp)
 
     def record_route(
         self,
@@ -278,7 +279,7 @@ class LearnHook:
             kind=kind,
             probabilities=dict(final_probabilities),
             answered_by=outcome.served_by,
-            versions=self._row_versions(tag),
+            versions=self._row_versions(tag, outcome),
             h=None,
             request_id=outcome.request_id,
             route_mode=outcome.mode,

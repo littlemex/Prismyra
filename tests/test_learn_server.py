@@ -13,11 +13,13 @@ import time
 
 import pytest
 
+from prismyra.identity import stand_in
 from prismyra.schema import Answer, Result, Timing
 
 
 class StubEngine:
     model_name = "stub/model"
+    model_stamp = stand_in("a test stub loads no model")
     group = 32
     heads = None
 

@@ -338,18 +338,17 @@ def create_app(
     if batcher:
         engine_kwargs.setdefault("paged", True)
     engine = Prismyra(model, **engine_kwargs)
-    #: perigraph's model half for the backbone (`prismyra.identity`), stamped on every answer by this process because
-    #: only it holds what it loaded. `None` for a stand-in engine that does not compute one.
-    engine_identity = getattr(engine, "identity", None)
+    #: perigraph's model half for the backbone (`prismyra.identity`), in its wire form, put on every answer the
+    #: backbone gave. Computed once: it describes what this process loaded, which does not change while it serves.
+    backbone_perigraph = engine.model_stamp.attributes()
 
-    def _stamp(stamp) -> dict:
-        if stamp is None:
-            return {}
-        return {k: v for k, v in stamp.attributes().items()
-                if k in ("perigraph.spec_version", "perigraph.model_identity", "perigraph.artifact_identity")}
+    def _perigraph_of(outcome) -> dict:
+        """The wire-form model half of whoever answered: the backbone when there was no routing decision or it
+        sent the request to ``"prismyra"``, else the student handle the decision was made with."""
+        if outcome is None or outcome.served_by == "prismyra":
+            return dict(backbone_perigraph)
+        return outcome.student_stamp.attributes()
 
-    def _student_stamp(task: str):
-        return learn_hook.student_identity(task) if learn_hook is not None else None
     worker = Worker(
         lambda payload: engine.ask(payload[0], payload[1], images=payload[2] or None, videos=payload[3] or None),
         max_queue=max_queue,
@@ -378,7 +377,7 @@ def create_app(
             max_queue=learn_max_queue,
             otel_endpoint=learn_otel_endpoint,
             otel_service_name=learn_otel_service_name,
-            model_versions=engine_identity.versions() if engine_identity is not None else None,
+            backbone_perigraph=engine.model_stamp.versions(),
         )
 
     # Same discipline as `learn_hook`: `telemetry` stays `None`, and nothing under `prismyra.telemetry.
@@ -594,11 +593,8 @@ def create_app(
                 traceparent=request.headers.get("traceparent"),
             )
         out = as_json(with_queue_time(result, queue_ms))
-        if engine_result is not None and engine_identity is not None:
-            out["perigraph"] = _stamp(engine_identity)
-        for qid, (tag, outcome, _q) in routes.items():
-            if outcome is not None and outcome.served_by.startswith("student") and qid in out["answers"]:
-                out["answers"][qid]["perigraph"] = _stamp(_student_stamp(tag.task))
+        for qid, answer in out["answers"].items():
+            answer["perigraph"] = _perigraph_of(routes[qid][1] if qid in routes else None)
         return out
 
     @app.post("/v1/decide")
@@ -723,11 +719,10 @@ def create_app(
                 served_by=served_by,
                 traceparent=request.headers.get("traceparent"),
             )
-        for call, resp in zip(routed_calls, responses, strict=True):
-            if resp.get("served_by", "prismyra").startswith("student") and call is not None:
-                resp["perigraph"] = _stamp(_student_stamp(call[0].task))
-            elif engine_identity is not None:
-                resp["perigraph"] = _stamp(engine_identity)
+        outcomes = [c[1] if c is not None else None for c in routed_calls] if learn_hook is not None else \
+            [None] * len(responses)
+        for outcome, resp in zip(outcomes, responses, strict=True):
+            resp["perigraph"] = _perigraph_of(outcome)
         if single:
             return responses[0]
         return {"results": responses, "num_model_requests": num_requests}
@@ -782,7 +777,7 @@ def create_app(
                 "top_logprobs": [{"token": o, "logprob": lp(p), "bytes": list(o.encode())} for o, p in top]}]}
         out = {"id": f"chatcmpl-{decided.get('request_id') or uuid.uuid4().hex}", "object": "chat.completion",
                "created": int(time.time()), "model": model, "choices": [message],
-               "prismyra": {"probabilities": probs}}
+               "prismyra": {"probabilities": probs}, "perigraph": decided["perigraph"]}
         for k in ("served_by", "request_id"):
             if k in decided:
                 out["prismyra"][k] = decided[k]
@@ -837,13 +832,11 @@ def create_app(
 
     @app.get("/perigraph")
     def perigraph() -> dict:
-        """The full model half of every model this process answers with, in perigraph's wire form: the backbone, and
-        each routed tag's student. What `/ask` and `/v1/decide` stamp on each answer is the identities alone."""
-        out: dict = {"backbone": engine_identity.attributes() if engine_identity is not None else None}
-        if learn_hook is not None:
-            stamps = {t.task: _student_stamp(t.task) for t in learn_hook.spec.tags}
-            out["students"] = {task: st.attributes() for task, st in stamps.items() if st is not None}
-        return out
+        """perigraph's model half, in its wire form, of every model this process can answer with now: the backbone,
+        and each routed tag's loaded student. Each answer from `/ask` and `/v1/decide` carries the same record for
+        whoever gave it, so this is for looking, not for joining: a student may be reloaded between the two."""
+        students = learn_hook.student_stamps() if learn_hook is not None else {}
+        return {"backbone": backbone_perigraph, "students": {t: st.attributes() for t, st in students.items()}}
 
     @app.get("/health")
     def health() -> dict:
