@@ -227,7 +227,7 @@
       "perigraph.part.<name>.sourcing": "one of sourcing.values.",
       "perigraph.part.<name>.boundary": "one of boundaries.values. Absent when there is no digest.",
       "perigraph.part.<name>.digest": "lowercase hex sha256 of the part's bytes at the stated boundary.",
-      "perigraph.part.<name>.label": "optional, for a reader. Explicitly NOT a key: a version string the owner controls can stay fixed while the text under it changes.",
+      "perigraph.part.<name>.label": "optional, for a reader. Explicitly NOT a key: a version string the owner controls can stay fixed while the text under it changes. Never compared and never part of a digest or identity; a receiver may ignore it without dropping an absence.",
       "perigraph.part.<name>.read_lag_seconds": "number. Required for pulled_by_us and refused elsewhere.",
       "perigraph.absent.<name>.reason": "one of absence_reasons.values.",
       "perigraph.absent.<name>.detail": "string. Required when the reason blames the collector, refused otherwise."
@@ -261,7 +261,8 @@
     "must_not_refuse": [
       "A record missing any number of parts. Toward the sender the collector is maximally permissive, and a collector that refuses a partial record produces no record at all.",
       "A record whose status is not complete, as a LOG. It stays fully usable there.",
-      "A record with no model identity. A model served behind a provider's API stays admissible; claims about it are not bound to model bytes, and saying so is the receiver's job."
+      "A record with no model identity. A model served behind a provider's API stays admissible; claims about it are not bound to model bytes, and saying so is the receiver's job.",
+      "A record with no model half. Its model parts are read as unknown, not as not_observable: a hole nobody named, which a receiver reports rather than refuses, as it does any missing part."
     ]
   },
   "digest": {

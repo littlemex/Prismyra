@@ -113,9 +113,25 @@ def lines_digest(pairs: dict, sep: str) -> str:
     return _hex("".join(r for _, r in sorted(lines)))
 
 
+#: The Unicode White_Space property, the set perigraph section 1.2 names for trimming. Not `str.strip()`, which also
+#: strips U+001C-U+001F, so a value perigraph accepts would be refused here.
+WHITE_SPACE = ("\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680"
+               + "".join(chr(c) for c in range(0x2000, 0x200b)) + "\u2028\u2029\u202f\u205f\u3000")
+
+
+def _unresolved(text: str) -> bool:
+    """Empty, or ``auto``, after trimming `WHITE_SPACE` and comparing ASCII letters without case (section 9)."""
+    t = text.strip(WHITE_SPACE)
+    return t == "" or (t.isascii() and t.lower() == "auto")
+
+
 def precision_digest(fields: dict) -> str:
+    """Refuses a dtype *name*, or any value, that is unresolved -- ``dtype.auto=10`` and ``dtype.=10`` as much as
+    ``quantisation=auto``. The test is for refusal only; what is digested is the text as read."""
     for k, v in fields.items():
-        if str(v).strip().lower() in ("", "auto"):
+        k = str(k)
+        name = k[len("dtype."):] if k.startswith("dtype.") else None
+        if _unresolved(str(v)) or (name is not None and _unresolved(name)):
             raise IdentityError(f"precision field {k}={v!r} is unresolved")
     return lines_digest(fields, "=")
 

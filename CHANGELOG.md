@@ -33,6 +33,11 @@
   files instead, label-only and never digested (`checkpoint` already hashes every scale byte, so `model_identity`
   already differed without this). Confirmed on `littlemex/prismyra-decision-35b-a3b-fp8`: `block128x128:<count>`.
 
+- **perigraph d695633's precision rule.** A dtype *name* that is empty or `auto` (`dtype.auto=10`, `dtype.=10`) is
+  now refused as unresolved, like a value, and the trim before that test is the Unicode White_Space set perigraph names
+  rather than Python's wider `str.strip()` (which also took U+001C-U+001F). The vendored vocabularies and model-identity
+  fixtures are perigraph main d695633's; its `refused_precision` vectors are in the conformance test.
+
 ## 0.4.13
 
 - **`/v1/decide` now reaches the shelf `--batcher` already gives `/ask`.** `decide_mod.decide_many`'s own `ask`

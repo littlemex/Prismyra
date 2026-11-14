@@ -2,7 +2,7 @@
 
 The copy is vendored rather than imported or fetched for the reason tierbook gives for its own copy: importing
 perigraph would put a dependency in front of the serving path, and a test that fetches skips when offline and so stops
-running. The copies are perigraph main ab50373's ``spec/vocabularies.json`` and ``spec/fixtures/model_identity.json``;
+running. The copies are perigraph main d695633's ``spec/vocabularies.json`` and ``spec/fixtures/model_identity.json``;
 the digests pin them, so a re-vendor changes the file and the constant in one diff and a reviewer sees the protocol
 move.
 """
@@ -20,8 +20,8 @@ import torch
 from prismyra import identity as I
 
 SPEC = Path(__file__).parent / "spec"
-VOCAB_DIGEST = "d2e12f5d935a623e1e89673e40744aca6d8a84a2c6a821b43605469d47e83074"
-FIXTURE_DIGEST = "cf92077e43a57d39847a9e5287664a3391c39b92add90a505f2dcc5eed6e642c"
+VOCAB_DIGEST = "7964b159ae93aa67932ce36759fecb758c3254883ae0e1bdee74b78d4ad49226"
+FIXTURE_DIGEST = "cdb1264048274508866a586a4c45462cda6da3a01352f4ffee6905d1b62394f7"
 
 
 def _load(name: str, digest: str) -> dict:
@@ -54,6 +54,18 @@ def test_reproduces_every_model_identity_fixture(case):
     pairs = [("checkpoint", cp), ("precision", pr), ("runtime", rt), ("answer_mode", am)]
     assert I.identity(pairs) == case["model_identity"]
     assert I.identity([("checkpoint", cp)]) == case["artifact_identity"]
+
+
+@pytest.mark.parametrize("fields", FIXTURES["refused_precision"]["cases"], ids=lambda f: repr(f)[:40])
+def test_refuses_every_unresolved_precision_fixture(fields):
+    with pytest.raises(I.IdentityError, match="unresolved"):
+        I.precision_digest(fields)
+
+
+@pytest.mark.parametrize("value", ["\x1cauto", "\x1f", "auto\x1e"])
+def test_only_unicode_white_space_is_trimmed_not_pythons_wider_set(value):
+    """U+001C-U+001F are not White_Space (perigraph section 1.2), so these values are neither empty nor ``auto``."""
+    assert I.precision_digest({"dtype.bfloat16": "10", "quantisation": value, "device": "cuda"})
 
 
 def test_attributes_use_only_keys_the_wire_form_defines():

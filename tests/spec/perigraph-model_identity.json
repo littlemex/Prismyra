@@ -73,5 +73,40 @@
       "model_identity": "e606ef377215385ac8a01f6f",
       "artifact_identity": "ee555b45d2370450bfed7830"
     }
-  ]
+  ],
+  "refused_precision": {
+    "note": "Every sender MUST refuse each of these precision maps as unresolved (spec section 9), so a record of it has no precision digest and no model identity.",
+    "cases": [
+      {
+        "dtype.auto": "10",
+        "quantisation": "none",
+        "device": "cuda"
+      },
+      {
+        "dtype.AUTO": "10",
+        "quantisation": "none",
+        "device": "cuda"
+      },
+      {
+        "dtype.": "10",
+        "quantisation": "none",
+        "device": "cuda"
+      },
+      {
+        "dtype.bfloat16": "10",
+        "quantisation": " Auto ",
+        "device": "cuda"
+      },
+      {
+        "dtype.bfloat16": "10",
+        "quantisation": "none",
+        "device": ""
+      },
+      {
+        "dtype.bfloat16": "10",
+        "quantisation": "　auto",
+        "device": "cuda"
+      }
+    ]
+  }
 }
