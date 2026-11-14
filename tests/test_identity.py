@@ -2,7 +2,7 @@
 
 The copy is vendored rather than imported or fetched for the reason tierbook gives for its own copy: importing
 perigraph would put a dependency in front of the serving path, and a test that fetches skips when offline and so stops
-running. The copies are perigraph main d695633's ``spec/vocabularies.json`` and ``spec/fixtures/model_identity.json``;
+running. The copies are perigraph main a4d2ff3's ``spec/vocabularies.json`` and ``spec/fixtures/model_identity.json``;
 the digests pin them, so a re-vendor changes the file and the constant in one diff and a reviewer sees the protocol
 move.
 """
@@ -20,7 +20,7 @@ import torch
 from prismyra import identity as I
 
 SPEC = Path(__file__).parent / "spec"
-VOCAB_DIGEST = "7964b159ae93aa67932ce36759fecb758c3254883ae0e1bdee74b78d4ad49226"
+VOCAB_DIGEST = "59d879b8a5fd5cfec00b422340ee5ffee086902a7981f9a115256f1fe112b996"
 FIXTURE_DIGEST = "cdb1264048274508866a586a4c45462cda6da3a01352f4ffee6905d1b62394f7"
 
 
@@ -37,6 +37,7 @@ FIXTURES = _load("perigraph-model_identity.json", FIXTURE_DIGEST)
 def test_vocabularies_match_the_spec_this_writer_follows():
     assert VOCAB["spec_version"] == I.SPEC_VERSION
     assert sorted(VOCAB["model_parts"]["values"]) == sorted(I.MODEL_PARTS)
+    assert sorted(VOCAB["parts"]["values"]) == sorted(I.HARNESS_PARTS)
     assert sorted(VOCAB["answer_modes"]["values"]) == sorted(I.ANSWER_MODES)
     assert VOCAB["absence_reasons"]["blames"] == I.ABSENCE_BLAMES
     assert VOCAB["digest"]["identity_length"] == I.IDENTITY_LENGTH
@@ -68,20 +69,51 @@ def test_only_unicode_white_space_is_trimmed_not_pythons_wider_set(value):
     assert I.precision_digest({"dtype.bfloat16": "10", "quantisation": value, "device": "cuda"})
 
 
+def _named(attrs: dict, prefix_held: str, prefix_absent: str, part: str) -> int:
+    return (f"{prefix_held}{part}.sourcing" in attrs) + (f"{prefix_absent}{part}.reason" in attrs)
+
+
+@pytest.mark.parametrize("stamp", [
+    I.ModelStamp({"checkpoint": I.Part(digest="a" * 64), "precision": I.Part(digest="b" * 64),
+                  "runtime": I.Part(digest="c" * 64), "answer_mode": I.Part(digest="d" * 64)}),
+    I.stand_in("built in memory"),
+], ids=["held", "stand_in"])
+def test_every_part_is_named_once_as_held_or_absent(stamp):
+    """perigraph section 1.2: each of the ten parts and each of the four model parts, held or absent, never both and
+    never silent. An absence that blames the collector carries a detail; one that does not, carries none."""
+    attrs = stamp.attributes()
+    for part in VOCAB["parts"]["values"]:
+        assert _named(attrs, "perigraph.part.", "perigraph.absent.", part) == 1, part
+    for part in VOCAB["model_parts"]["values"]:
+        assert _named(attrs, "perigraph.model.", "perigraph.model_absent.", part) == 1, part
+    blames = VOCAB["absence_reasons"]["blames"]
+    for key, reason in attrs.items():
+        if key.endswith(".reason"):
+            has_detail = key[: -len("reason")] + "detail" in attrs
+            assert has_detail == (blames[reason] == "collector"), key
+    assert attrs["perigraph.collector_reaches"] == ""
+    assert set(attrs["perigraph.model_reaches"].split(",")) == set(VOCAB["model_parts"]["values"])
+    assert attrs["perigraph.absent.tool_extension.reason"] == "not_observable"
+
+
 def test_attributes_use_only_keys_the_wire_form_defines():
     stamp = I.ModelStamp({"checkpoint": I.Part(digest="a" * 64), "precision": I.Part(digest="b" * 64),
                           "runtime": I.Part(digest="c" * 64),
                           "answer_mode": I.Part(digest=hashlib.sha256(b"option_scores").hexdigest())})
     attrs = stamp.attributes()
     record = set(VOCAB["attributes"]["record"])
-    per_part = VOCAB["attributes"]["per_model_part"]
+    per_model = VOCAB["attributes"]["per_model_part"]
+    per_part = VOCAB["attributes"]["per_part"]
     for key in attrs:
         if key in record:
             continue
         parts = key.split(".")
         pattern = ".".join([*parts[:2], "<name>", *parts[3:]])
-        assert pattern in per_part, key
-        assert parts[2] in I.MODEL_PARTS
+        if pattern in per_model:
+            assert parts[2] in I.MODEL_PARTS, key
+        else:
+            assert pattern in per_part, key
+            assert parts[2] in I.HARNESS_PARTS, key
     assert attrs["perigraph.model_identity"] == stamp.model_identity
     assert stamp.versions()["perigraph_artifact"] == "perigraph/2/artifact/" + stamp.artifact_identity
     assert stamp.versions("student_")["student_perigraph_model"] == "perigraph/2/model/" + stamp.model_identity

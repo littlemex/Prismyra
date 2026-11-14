@@ -33,10 +33,14 @@
   files instead, label-only and never digested (`checkpoint` already hashes every scale byte, so `model_identity`
   already differed without this). Confirmed on `littlemex/prismyra-decision-35b-a3b-fp8`: `block128x128:<count>`.
 
-- **perigraph d695633's precision rule.** A dtype *name* that is empty or `auto` (`dtype.auto=10`, `dtype.=10`) is
-  now refused as unresolved, like a value, and the trim before that test is the Unicode White_Space set perigraph names
-  rather than Python's wider `str.strip()` (which also took U+001C-U+001F). The vendored vocabularies and model-identity
-  fixtures are perigraph main d695633's; its `refused_precision` vectors are in the conformance test.
+- **perigraph a4d2ff3 conformance.** A dtype *name* that is empty or `auto` (`dtype.auto=10`, `dtype.=10`) is now
+  refused as unresolved, like a value, and the trim before that test is the Unicode White_Space set perigraph names
+  rather than Python's wider `str.strip()` (which also took U+001C-U+001F). Every record now names all ten harness
+  parts as absent (`tool_extension` `not_observable`, the rest `not_reachable` with a detail: this collector reads no
+  request field) and carries its static manifests, `perigraph.collector_reaches` (empty) and `perigraph.model_reaches`
+  (all four model parts); without `collector_reaches` a perigraph receiver rejected the record. The vendored vocabularies
+  and model-identity fixtures are perigraph main a4d2ff3's, its `refused_precision` vectors are in the conformance test,
+  and `tools/perigraph_conform.py` runs perigraph's `tools/conform.py` against this writer (stamper role).
 
 ## 0.4.13
 

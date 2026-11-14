@@ -61,6 +61,20 @@ ANSWER_MODES = ("classifier_output", "generated_text", "option_scores")
 ABSENCE_BLAMES = {"not_provided": "sender", "redacted": "sender", "not_reachable": "collector",
                   "extraction_failed": "collector", "not_observable": "nobody"}
 
+#: The ten harness parts (perigraph section 1.0), each of which a record names as held or absent.
+HARNESS_PARTS = ("instruction", "tool_schemas", "tool_extension", "tool_trace", "loop", "turn_budget",
+                 "retry_policy", "readout", "decoding", "context_partitioning")
+#: This collector's manifests (section 1.3). Static per collector version: it claims no harness part and every model
+#: part, whatever a given request or load turns out to hold.
+HARNESS_REACHES = ""
+MODEL_REACHES = MODEL_PARTS
+#: Why each harness part is absent. ``tool_extension`` is ``not_observable`` for every collector (section 3, PG-023);
+#: the rest are this collector's own gap -- it stamps what answered and reads none of the request's harness fields --
+#: so they blame the collector and say so, which an empty manifest makes no contradiction.
+_NOT_READ = "prismyra writes the model half only and reads none of the request's harness fields"
+HARNESS_ABSENCES = {p: (("not_observable", "") if p == "tool_extension" else ("not_reachable", _NOT_READ))
+                    for p in HARNESS_PARTS}
+
 #: The distributions whose versions decide the backbone's answers. Static per collector version, as perigraph's
 #: manifest must be: a list that adapted to what it found could never be wrong, and so could never be checked.
 BACKBONE_RUNTIME = ("prismyra", "torch", "transformers", "kernels", "triton", "safetensors", "tokenizers")
@@ -129,8 +143,8 @@ def precision_digest(fields: dict) -> str:
     """Refuses a dtype *name*, or any value, that is unresolved -- ``dtype.auto=10`` and ``dtype.=10`` as much as
     ``quantisation=auto``. The test is for refusal only; what is digested is the text as read."""
     for k, v in fields.items():
-        k = str(k)
-        name = k[len("dtype."):] if k.startswith("dtype.") else None
+        key = str(k)
+        name = key[len("dtype."):] if key.startswith("dtype.") else None
         if _unresolved(str(v)) or (name is not None and _unresolved(name)):
             raise IdentityError(f"precision field {k}={v!r} is unresolved")
     return lines_digest(fields, "=")
@@ -196,11 +210,23 @@ class ModelStamp:
         return None if cp.absent else identity([("checkpoint", cp.digest)])
 
     def attributes(self) -> dict:
-        """The wire form's model half (perigraph section 6): flat, prefixed, identities omitted when absent."""
+        """The wire form (perigraph section 6): flat, prefixed, identities omitted when absent.
+
+        A record names every part as held or absent (section 1.2), so the ten harness parts are here too, all absent:
+        this collector reads the model, never the request's harness. Its manifest therefore claims no harness part
+        (`HARNESS_REACHES`, the empty string) and all four model parts (`MODEL_REACHES`), static per version as
+        section 1.3 requires -- which also means a stamp whose model part is ``not_reachable`` (`stand_in`) is a
+        contradiction a receiver refuses a verdict over, as it should: the model was loaded, but not from files this
+        collector could read."""
         from prismyra import __version__
 
         out: dict = {"perigraph.spec_version": SPEC_VERSION, "perigraph.collector": COLLECTOR,
-                     "perigraph.collector_version": __version__, "perigraph.status": "complete"}
+                     "perigraph.collector_version": __version__, "perigraph.collector_reaches": HARNESS_REACHES,
+                     "perigraph.model_reaches": ",".join(MODEL_REACHES), "perigraph.status": "complete"}
+        for part, (reason, detail) in HARNESS_ABSENCES.items():
+            out[f"perigraph.absent.{part}.reason"] = reason
+            if detail:
+                out[f"perigraph.absent.{part}.detail"] = detail
         for kind in MODEL_PARTS:
             p = self.parts[kind]
             if p.absent:
@@ -371,7 +397,7 @@ def _extra_files(heads, temperature) -> list[tuple[str, str]]:
     return out
 
 
-def tensor_precision(modules, quantisation: str, *, before: "Preload | None" = None):
+def tensor_precision(modules, quantisation: str, *, before: Preload | None = None):
     """``dtype.<name>`` element counts over every parameter and buffer, and the device read off the tensors.
 
     ``before`` adds `fp8_scale_description` to the *label* only, never to the digested ``fields`` -- see that
@@ -454,7 +480,7 @@ def fp8_scale_description(root: Path, names) -> str:
         for key, (dtype, shape) in sorted(present.items()):
             if dtype not in _FP8_SAFETENSORS_DTYPES:
                 continue
-            scale_key = scale_key_for(key, present.keys())
+            scale_key = scale_key_for(key, present)
             if scale_key is None:
                 counts["unresolved"] += 1
                 continue

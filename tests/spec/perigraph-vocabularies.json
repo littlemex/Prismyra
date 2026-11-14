@@ -1,7 +1,7 @@
 {
   "spec_version": 2,
   "namespace": "perigraph",
-  "note": "Normative. Both a sender's shim and a receiver read this file, and each has a conformance test against it, so a vocabulary that drifts on one side is a test failure rather than a discovery. Every list is CLOSED: a value outside it is refused, not accepted with a warning.",
+  "note": "Normative. Both a sender's shim and a receiver read this file, and each has a conformance test against it, so a vocabulary that drifts on one side is a test failure rather than a discovery. Every list is CLOSED: a value outside it is rejected, not accepted with a warning.",
   "parts": {
     "note": "What surrounds the model. A part nobody named is a part that can change without the identity changing, which is the defect this vocabulary exists to close.",
     "values": [
@@ -30,10 +30,10 @@
       "answer_mode"
     ],
     "rationale": {
-      "checkpoint": "Every file the process read from the model artifact: parameters, adapters, tokenizer, chat template, configuration. A retrain with the same script and seed agreed with its predecessor on 93.4% of labels (R12 -> R13) under the same model name. Digest: for each file, sorted by the utf-8 bytes of its POSIX path relative to the artifact root with symlinks resolved, append '<path>\\t<sha256 of the file>\\n'; a path containing a tab or a newline is refused. Re-serialising identical tensors changes this digest, which is the safe direction.",
+      "checkpoint": "Every file the process read from the model artifact: parameters, adapters, tokenizer, chat template, configuration. A retrain with the same script and seed agreed with its predecessor on 93.4% of labels under the same model name. Digest: for each file, sorted by the utf-8 bytes of its POSIX path relative to the artifact root, append '<path>\\t<sha256 of the file>\\n', where the path is the path within the artifact, not the target of a symlink, and the sha256 is the lowercase hex of the bytes the path resolves to; a path containing a tab or a newline makes the part extraction_failed. Re-serialising identical tensors changes this digest, which is the safe direction.",
       "precision": "The numeric transform in force once loading finished, read off the loaded parameters rather than the configuration: one 'dtype.<name>=<parameter count>' line per dtype, 'quantisation=<scheme or none>', 'device=<type>', sorted, '\\n'-terminated. Dynamic int8 quantisation at load left the stored bytes unchanged and agreed with the GPU on 33-40% of labels. A value the collector could not resolve (a dtype of 'auto') is extraction_failed, not a guess.",
-      "runtime": "The code that computes the answer: one '<distribution>==<version>' line per package the collector declares it reads, resolved in the answering process at load, sorted, '\\n'-terminated. The package list is part of the collector, static per collector version. A rebuilt serving image lost packages and the teacher re-answered 97 of 100 the same (R14). An image or lockfile digest may be a label; it changes on every rebuild and is not what computed the answer.",
-      "answer_mode": "Where the answer is taken from, one value of answer_modes, digested as its utf-8 bytes. A student trained to compare three label scores generated '1111' when asked to generate (R5-R10 against R12)."
+      "runtime": "The code that computes the answer: one '<distribution>==<version>' line per package the collector declares it reads, resolved in the answering process at load, sorted, '\\n'-terminated. The package list is part of the collector, static per collector version. A rebuilt serving image lost packages and the teacher re-answered 97 of 100 the same. An image or lockfile digest may be a label; it changes on every rebuild and is not what computed the answer.",
+      "answer_mode": "Where the answer is taken from, one value of answer_modes, digested as its utf-8 bytes. A student trained to compare three label scores generated '1111' when asked to generate."
     }
   },
   "answer_modes": {
@@ -46,7 +46,7 @@
     "rationale": {
       "generated_text": "Text sampled from the language-model head, read out by the caller.",
       "option_scores": "Scores from the language-model head over a declared option set, the best option taken.",
-      "classifier_output": "Scores from a head that is not a language-model head, such as a gradient-boosted classifier over features (the LightGBM students of R1-R4)."
+      "classifier_output": "Scores from a head that is not a language-model head, such as a gradient-boosted classifier over features (for example a LightGBM student)."
     }
   },
   "lineage": {
@@ -78,7 +78,7 @@
       "label"
     ],
     "rationale": {
-      "subject": "The artifact_identity this document is about. A lineage whose subject differs from the artifact observed is read as absent: R5's history beside R6's bytes would otherwise describe a model that is not there.",
+      "subject": "The artifact_identity this document is about. A lineage whose subject differs from the artifact observed is read as absent: the history of an earlier training beside the bytes of a later one would otherwise describe a model that is not there.",
       "parent": "The parent's artifact_identity, or 'none'. A quantised or merged child lists no sets of its own, so a receiver that checks training overlap walks the chain; a missing ancestor is unknown.",
       "sets": "Item sets by the sha256 of their manifest file. 'excluded' is not a role: by the subtract-only rule it could have no effect.",
       "signal": "What the training signal came from (a teacher, a grader, a reward): an artifact_identity, a content digest, or a label. A label is unverifiable and never matches anything."
@@ -98,7 +98,7 @@
     ],
     "rationale": {
       "in_the_request": "The bytes are held. It IS what was sent: verifiable and contemporaneous.",
-      "loaded_by_us": "The collector runs in the process that loaded the model and digested what it loaded, during this load. The only sourcing that can key a model identity: a request never carries weights, and R5 -> R6 certified bytes that no longer existed under an unchanged name. A digest cached from an earlier load is pulled_by_us with a lag equal to its age; a stamp relayed verbatim by a router or gateway keeps this sourcing, and a stamp read back over a separate request is pulled_by_us.",
+      "loaded_by_us": "The collector runs in the process that loaded the model and digested what it loaded, during this load. The only sourcing that can key a model identity: a request never carries weights, and a certificate was once issued over bytes that no longer existed under an unchanged name. A digest cached from an earlier load is pulled_by_us with a lag equal to its age; a stamp relayed verbatim by a router or gateway keeps this sourcing, and a stamp read back over a separate request is pulled_by_us.",
       "pulled_by_us": "Fetched, so verifiable and NOT contemporaneous. Carries its lag; a lag nobody bounded cannot support a per-request claim.",
       "pushed_by_owner": "A declaration. Not checkable by the receiver, and a label the owner controls can stay fixed while the thing under it changes.",
       "not_observable": "No mode reaches it. A tool's implementation behind an unchanged schema is the case that forced this entry."
@@ -120,7 +120,7 @@
     "rationale": {
       "transport": "What a client put on the wire. Two client versions serialise differently and decode to the same text, so keying on this SPLITS runs that were identical.",
       "parsed": "The protocol value after decoding. Two strings that canonicalise to one value can behave differently embedded verbatim in a prompt, so keying on this MERGES runs that were not.",
-      "model_visible": "The exact text the model read. The only boundary that can support a claim that two runs had the same input."
+      "model_visible": "The text the requester supplied for the model to read, before any chat template the server applies and before any prompt a provider adds (SPEC section 2). The only boundary that can support a claim that two runs had the same input."
     }
   },
   "never_identifying": {
@@ -218,6 +218,7 @@
       "perigraph.collector": "string. Which collector produced this record.",
       "perigraph.collector_version": "string. Its version. A part that stopped being readable between two versions cannot be attributed without it.",
       "perigraph.collector_reaches": "comma-separated part names. What this collector CLAIMS it can reach here, static per version -- a manifest that adapted to what it found could never contradict a record, which is the one thing it is for.",
+      "perigraph.model_reaches": "comma-separated model part names. The model half's manifest: what this collector claims it can reach of checkpoint, precision, runtime and answer_mode, static per version, read and contradicted exactly as collector_reaches is.",
       "perigraph.status": "one of status.values.",
       "perigraph.harness_identity": "string or absent. Version 1's 'perigraph.identity', renamed now that there are three; computed exactly as before over the harness parts.",
       "perigraph.model_identity": "string or absent. Over all four model parts, each loaded_by_us with a digest, sorted by part name, serialised as the harness identity is. Comparable only against another from the same collector and collector version, because precision and runtime are collector renderings. Stamped on every answer by the process that loaded the model.",
@@ -239,6 +240,9 @@
       "perigraph.model.<name>.read_lag_seconds": "number. Required for pulled_by_us and refused elsewhere.",
       "perigraph.model_absent.<name>.reason": "one of absence_reasons.values.",
       "perigraph.model_absent.<name>.detail": "string. Required when the reason blames the collector, refused otherwise."
+    },
+    "extensions": {
+      "perigraph.ext.<vendor>.<key>": "reserved for attributes outside this specification. Never keys an identity, never lifts a refusal, and a receiver MUST NOT reject a record for carrying one (SPEC section 13.2)."
     }
   },
   "receiver_obligations": {
@@ -266,7 +270,7 @@
     ]
   },
   "digest": {
-    "note": "Added in response to the second implementation, which could not interoperate without it. Section 5 said 'lowercase hex sha256 of the part's bytes' and never said what bytes a STRING has, nor how the identity combines its parts, nor that the result is truncated. A UTF-16 implementation would have produced a different identity for every non-ASCII instruction while passing every test it wrote for itself.",
+    "note": "How a digest and an identity are computed. Stated exactly because SPEC section 6 alone does not say what bytes a string has, how the identity combines its parts, or that the result is truncated: a UTF-16 implementation would otherwise produce a different identity for every non-ASCII instruction while passing every test it wrote for itself.",
     "algorithm": "sha256",
     "encoding": "utf-8",
     "identity_length": 24,

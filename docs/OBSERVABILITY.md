@@ -116,6 +116,15 @@ artifact; a retrain, or other heads, is another artifact. A student answer has a
 identity. A part that could not be read is absent with its reason and a detail
 (`perigraph.model_absent.<part>.reason`), and an absent identity means unknown, never clean.
 
+**The harness half.** A record names every part, so the ten harness parts are on each record too, all absent: this
+process stamps what answered and reads none of the request's harness fields. `tool_extension` is `not_observable`, as
+it is for every collector; the other nine are `not_reachable` with a detail saying so. The manifests are static:
+`perigraph.collector_reaches` is the empty string and `perigraph.model_reaches` names all four model parts. A record
+from this collector therefore has no harness identity, and a perigraph receiver stores it and refuses a verdict on it
+until a collector that reads the request supplies one; the model and artifact identities are unaffected. A model part
+recorded `not_reachable` against that manifest is a contradiction, so a stand-in engine's record is refused a verdict.
+`tools/perigraph_conform.py` is the adapter for perigraph's `tools/conform.py` (stamper role).
+
 **Why each part.** Each part is there because an earlier distillation record changed answers while every name stayed
 the same: retraining from the same script and seed agreed with the previous model on 93.4 % of labels (R5 to R6, R12
 to R13); dynamic int8 at load left the stored bytes unchanged and agreed on 33-40 %; a rebuilt image that lost
