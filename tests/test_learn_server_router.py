@@ -191,7 +191,8 @@ def test_ask_routes_a_matched_question_to_the_student_and_skips_the_engine(clien
 
 
 def test_an_answer_names_the_student_it_was_routed_with_even_if_reloaded_before_it_is_written(
-        client_factory, fake_students):
+    client_factory, fake_students
+):
     """The stamp rides on the routing decision, so swapping the registry's handle afterwards does not relabel it."""
     from prismyra.learn import hook as hook_mod
 
@@ -207,8 +208,13 @@ def test_an_answer_names_the_student_it_was_routed_with_even_if_reloaded_before_
 
     hook_mod.LearnHook.route = route_then_swap
     try:
-        body = client.post("/ask", json={"context": "board", "questions": [
-            {"id": "a", "prompt": "which way?", "kind": "choice", "choices": ["up", "down"]}]}).json()
+        body = client.post(
+            "/ask",
+            json={
+                "context": "board",
+                "questions": [{"id": "a", "prompt": "which way?", "kind": "choice", "choices": ["up", "down"]}],
+            },
+        ).json()
     finally:
         hook_mod.LearnHook.route = real_route
     assert body["answers"]["a"]["perigraph"]["perigraph.artifact_identity"] == original.model_stamp.artifact_identity
@@ -219,8 +225,9 @@ def test_an_answer_names_the_student_it_was_routed_with_even_if_reloaded_before_
 def test_an_engine_answer_carries_the_backbone_stamp_with_its_absences(client_factory, fake_students):
     make, tmp_path = client_factory
     client = make(learn_spec=str(write_spec(tmp_path, ROUTER_SPEC)), learn_log_dir=str(tmp_path / "exp"))
-    body = client.post("/ask", json={"context": "board", "questions": [
-        {"id": "b", "prompt": "totally unrelated", "kind": "boolean"}]}).json()
+    body = client.post(
+        "/ask", json={"context": "board", "questions": [{"id": "b", "prompt": "totally unrelated", "kind": "boolean"}]}
+    ).json()
     p = body["answers"]["b"]["perigraph"]
     assert p["perigraph.collector"] == "prismyra" and p["perigraph.spec_version"] == 2
     assert p["perigraph.model_absent.checkpoint.reason"] == "not_reachable"

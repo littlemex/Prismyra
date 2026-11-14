@@ -719,8 +719,11 @@ def create_app(
                 served_by=served_by,
                 traceparent=request.headers.get("traceparent"),
             )
-        outcomes = [c[1] if c is not None else None for c in routed_calls] if learn_hook is not None else \
-            [None] * len(responses)
+        outcomes = (
+            [c[1] if c is not None else None for c in routed_calls]
+            if learn_hook is not None
+            else [None] * len(responses)
+        )
         for outcome, resp in zip(outcomes, responses, strict=True):
             resp["perigraph"] = _perigraph_of(outcome)
         if single:
@@ -747,8 +750,11 @@ def create_app(
         model = body.get("model")
         tag = next((t for t in learn_hook.spec.tags if t.task == model), None)
         if tag is None:
-            raise HTTPException(status_code=404, detail=f"model {model!r} names no tag of the learn spec "
-                                f"(tags: {sorted(t.task for t in learn_hook.spec.tags)})")
+            raise HTTPException(
+                status_code=404,
+                detail=f"model {model!r} names no tag of the learn spec "
+                f"(tags: {sorted(t.task for t in learn_hook.spec.tags)})",
+            )
         state = None
         for m in reversed(body.get("messages") or []):
             if m.get("role") == "user":
@@ -762,25 +768,51 @@ def create_app(
                 break
         if not isinstance(state, str) or not state:
             raise HTTPException(status_code=422, detail="the request has no user message with text content")
-        decided = decide(DecideIn(kind=tag.kind, state=state, question=tag.question, options=list(tag.options),
-                                  task=tag.task), background_tasks, request)
+        decided = decide(
+            DecideIn.model_validate(
+                {
+                    "kind": tag.kind,
+                    "state": state,
+                    "question": tag.question,
+                    "options": list(tag.options),
+                    "task": tag.task,
+                }
+            ),
+            background_tasks,
+            request,
+        )
         choice = str(decided["choice"])
         probs = dict(zip([str(o) for o in decided["options"]], decided["probabilities"], strict=True))
         message: dict = {"index": 0, "message": {"role": "assistant", "content": choice}, "finish_reason": "stop"}
         if body.get("logprobs"):
+
             def lp(p: float) -> float:
                 return math.log(p) if p > 0 else -1e9
+
             k = int(body.get("top_logprobs") or 0)
             top = sorted(probs.items(), key=lambda kv: -kv[1])[:k]
-            message["logprobs"] = {"content": [{
-                "token": choice, "logprob": lp(probs.get(choice, 0.0)), "bytes": list(choice.encode()),
-                "top_logprobs": [{"token": o, "logprob": lp(p), "bytes": list(o.encode())} for o, p in top]}]}
-        out = {"id": f"chatcmpl-{decided.get('request_id') or uuid.uuid4().hex}", "object": "chat.completion",
-               "created": int(time.time()), "model": model, "choices": [message],
-               "prismyra": {"probabilities": probs}, "perigraph": decided["perigraph"]}
-        for k in ("served_by", "request_id"):
-            if k in decided:
-                out["prismyra"][k] = decided[k]
+            message["logprobs"] = {
+                "content": [
+                    {
+                        "token": choice,
+                        "logprob": lp(probs.get(choice, 0.0)),
+                        "bytes": list(choice.encode()),
+                        "top_logprobs": [{"token": o, "logprob": lp(p), "bytes": list(o.encode())} for o, p in top],
+                    }
+                ]
+            }
+        out = {
+            "id": f"chatcmpl-{decided.get('request_id') or uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [message],
+            "prismyra": {"probabilities": probs},
+            "perigraph": decided["perigraph"],
+        }
+        for key in ("served_by", "request_id"):
+            if key in decided:
+                out["prismyra"][key] = decided[key]
         return out
 
     @app.post("/v1/feedback")

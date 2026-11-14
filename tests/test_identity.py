@@ -73,11 +73,21 @@ def _named(attrs: dict, prefix_held: str, prefix_absent: str, part: str) -> int:
     return (f"{prefix_held}{part}.sourcing" in attrs) + (f"{prefix_absent}{part}.reason" in attrs)
 
 
-@pytest.mark.parametrize("stamp", [
-    I.ModelStamp({"checkpoint": I.Part(digest="a" * 64), "precision": I.Part(digest="b" * 64),
-                  "runtime": I.Part(digest="c" * 64), "answer_mode": I.Part(digest="d" * 64)}),
-    I.stand_in("built in memory"),
-], ids=["held", "stand_in"])
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        I.ModelStamp(
+            {
+                "checkpoint": I.Part(digest="a" * 64),
+                "precision": I.Part(digest="b" * 64),
+                "runtime": I.Part(digest="c" * 64),
+                "answer_mode": I.Part(digest="d" * 64),
+            }
+        ),
+        I.stand_in("built in memory"),
+    ],
+    ids=["held", "stand_in"],
+)
 def test_every_part_is_named_once_as_held_or_absent(stamp):
     """perigraph section 1.2: each of the ten parts and each of the four model parts, held or absent, never both and
     never silent. An absence that blames the collector carries a detail; one that does not, carries none."""
@@ -97,9 +107,14 @@ def test_every_part_is_named_once_as_held_or_absent(stamp):
 
 
 def test_attributes_use_only_keys_the_wire_form_defines():
-    stamp = I.ModelStamp({"checkpoint": I.Part(digest="a" * 64), "precision": I.Part(digest="b" * 64),
-                          "runtime": I.Part(digest="c" * 64),
-                          "answer_mode": I.Part(digest=hashlib.sha256(b"option_scores").hexdigest())})
+    stamp = I.ModelStamp(
+        {
+            "checkpoint": I.Part(digest="a" * 64),
+            "precision": I.Part(digest="b" * 64),
+            "runtime": I.Part(digest="c" * 64),
+            "answer_mode": I.Part(digest=hashlib.sha256(b"option_scores").hexdigest()),
+        }
+    )
     attrs = stamp.attributes()
     record = set(VOCAB["attributes"]["record"])
     per_model = VOCAB["attributes"]["per_model_part"]
@@ -120,9 +135,14 @@ def test_attributes_use_only_keys_the_wire_form_defines():
 
 
 def test_an_absent_part_means_no_model_identity_but_keeps_the_artifact_identity():
-    stamp = I.ModelStamp({"checkpoint": I.Part(digest="a" * 64),
-                          "precision": I.Part(absent="extraction_failed", detail="unresolved"),
-                          "runtime": I.Part(digest="c" * 64), "answer_mode": I.Part(digest="d" * 64)})
+    stamp = I.ModelStamp(
+        {
+            "checkpoint": I.Part(digest="a" * 64),
+            "precision": I.Part(absent="extraction_failed", detail="unresolved"),
+            "runtime": I.Part(digest="c" * 64),
+            "answer_mode": I.Part(digest="d" * 64),
+        }
+    )
     assert stamp.model_identity is None
     assert stamp.artifact_identity is not None
     attrs = stamp.attributes()
@@ -189,6 +209,7 @@ def test_parameters_on_two_devices_are_not_rendered_as_one(tmp_path):
 
 # --- the fp8 scale description, label-only -----------------------------------------------------------------------
 
+
 def _fp8_checkpoint(root: Path, tensors: dict) -> Path:
     """A minimal checkpoint whose ``model.safetensors`` carries real float8 tensors, so `fp8_scale_description`
     reads real shapes rather than the garbage bytes `_checkpoint` above writes (which is fine for the tests that
@@ -213,10 +234,13 @@ def _fp8_engine() -> SimpleNamespace:
 
 
 def test_the_fp8_scale_description_names_the_block_size_from_the_checkpoints_own_shapes(tmp_path):
-    root = _fp8_checkpoint(tmp_path / "ckpt", {
-        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
-        "model.layer.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32),
-    })
+    root = _fp8_checkpoint(
+        tmp_path / "ckpt",
+        {
+            "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+            "model.layer.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32),
+        },
+    )
     stamp = I.backbone_stamp(_fp8_engine(), before=I.preload(str(root)))
     assert "checkpoint_fp8_scale=block128x128:1" in stamp.parts["precision"].label
 
@@ -225,14 +249,34 @@ def test_two_block_sizes_are_told_apart_in_the_label_but_not_in_model_identity(t
     """`checkpoint` already hashes these two directories' different bytes, so `model_identity` already differs
     without the label; this is exactly why the description stays out of `precision`'s digest (module docstring).
     The digest side of the same `Part` is asserted equal below: the label differs, nothing that is hashed does."""
-    a = I.backbone_stamp(_fp8_engine(), before=I.preload(str(_fp8_checkpoint(tmp_path / "a", {
-        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
-        "model.layer.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32),
-    }))))
-    b = I.backbone_stamp(_fp8_engine(), before=I.preload(str(_fp8_checkpoint(tmp_path / "b", {
-        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
-        "model.layer.weight_scale_inv": torch.zeros(4, 4, dtype=torch.float32),
-    }))))
+    a = I.backbone_stamp(
+        _fp8_engine(),
+        before=I.preload(
+            str(
+                _fp8_checkpoint(
+                    tmp_path / "a",
+                    {
+                        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+                        "model.layer.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32),
+                    },
+                )
+            )
+        ),
+    )
+    b = I.backbone_stamp(
+        _fp8_engine(),
+        before=I.preload(
+            str(
+                _fp8_checkpoint(
+                    tmp_path / "b",
+                    {
+                        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+                        "model.layer.weight_scale_inv": torch.zeros(4, 4, dtype=torch.float32),
+                    },
+                )
+            )
+        ),
+    )
     assert "block128x128:1" in a.parts["precision"].label
     assert "block64x64:1" in b.parts["precision"].label
     assert a.model_identity != b.model_identity  # from `checkpoint`, not from the label
@@ -240,14 +284,34 @@ def test_two_block_sizes_are_told_apart_in_the_label_but_not_in_model_identity(t
 
 
 def test_a_row_scale_and_a_tensor_scale_are_told_apart(tmp_path):
-    row = I.backbone_stamp(_fp8_engine(), before=I.preload(str(_fp8_checkpoint(tmp_path / "row", {
-        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
-        "model.layer.weight_scale_inv": torch.zeros(256, dtype=torch.float32),
-    }))))
-    whole = I.backbone_stamp(_fp8_engine(), before=I.preload(str(_fp8_checkpoint(tmp_path / "whole", {
-        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
-        "model.layer.weight_scale_inv": torch.zeros((), dtype=torch.float32),
-    }))))
+    row = I.backbone_stamp(
+        _fp8_engine(),
+        before=I.preload(
+            str(
+                _fp8_checkpoint(
+                    tmp_path / "row",
+                    {
+                        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+                        "model.layer.weight_scale_inv": torch.zeros(256, dtype=torch.float32),
+                    },
+                )
+            )
+        ),
+    )
+    whole = I.backbone_stamp(
+        _fp8_engine(),
+        before=I.preload(
+            str(
+                _fp8_checkpoint(
+                    tmp_path / "whole",
+                    {
+                        "model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+                        "model.layer.weight_scale_inv": torch.zeros((), dtype=torch.float32),
+                    },
+                )
+            )
+        ),
+    )
     assert "checkpoint_fp8_scale=per_row:1" in row.parts["precision"].label
     assert "checkpoint_fp8_scale=per_tensor:1" in whole.parts["precision"].label
 
@@ -258,9 +322,12 @@ def test_a_mixture_of_experts_name_with_no_weight_substring_is_not_matched_to_it
     have `scale_key_for`'s second convention fall back to the key unchanged and accept the weight as its own scale.
     No scale sibling is given here, so the only correct outcome is ``unresolved``, never a block layout read off the
     weight's own shape."""
-    root = _fp8_checkpoint(tmp_path / "ckpt", {
-        "model.experts.0.gate_up_proj": torch.zeros(512, 2048, dtype=torch.float8_e4m3fn),
-    })
+    root = _fp8_checkpoint(
+        tmp_path / "ckpt",
+        {
+            "model.experts.0.gate_up_proj": torch.zeros(512, 2048, dtype=torch.float8_e4m3fn),
+        },
+    )
     stamp = I.backbone_stamp(_fp8_engine(), before=I.preload(str(root)))
     assert "checkpoint_fp8_scale=unresolved:1" in stamp.parts["precision"].label
 
@@ -272,14 +339,24 @@ def test_block_scales_spanning_two_shards_are_still_resolved(tmp_path):
 
     root = tmp_path / "ckpt"
     root.mkdir()
-    save_file({"model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn)},
-              str(root / "model-00001-of-00002.safetensors"))
-    save_file({"model.layer.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32)},
-              str(root / "model-00002-of-00002.safetensors"))
-    (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
-        "model.layer.weight": "model-00001-of-00002.safetensors",
-        "model.layer.weight_scale_inv": "model-00002-of-00002.safetensors",
-    }}))
+    save_file(
+        {"model.layer.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn)},
+        str(root / "model-00001-of-00002.safetensors"),
+    )
+    save_file(
+        {"model.layer.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32)},
+        str(root / "model-00002-of-00002.safetensors"),
+    )
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layer.weight": "model-00001-of-00002.safetensors",
+                    "model.layer.weight_scale_inv": "model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
     (root / "config.json").write_text('{"model_type": "tiny"}')
     stamp = I.backbone_stamp(_fp8_engine(), before=I.preload(str(root)))
     assert "checkpoint_fp8_scale=block128x128:1" in stamp.parts["precision"].label
@@ -315,12 +392,15 @@ def test_a_scale_shape_this_reader_cannot_classify_is_counted_not_blanked(tmp_pa
     """One tensor `scale_layout` cannot classify (a three-dimensional scale, which no real checkpoint produces,
     confirmed on the pod -- every expert is its own two-dimensional tensor) must not blank the whole description:
     the other, resolvable fp8 tensor in the same checkpoint still gets its own counted entry."""
-    root = _fp8_checkpoint(tmp_path / "ckpt", {
-        "model.layer_a.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
-        "model.layer_a.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32),
-        "model.layer_b.weight": torch.zeros(4, 4, 4, dtype=torch.float8_e4m3fn),
-        "model.layer_b.weight_scale_inv": torch.zeros(2, 2, 2, dtype=torch.float32),
-    })
+    root = _fp8_checkpoint(
+        tmp_path / "ckpt",
+        {
+            "model.layer_a.weight": torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+            "model.layer_a.weight_scale_inv": torch.zeros(2, 2, dtype=torch.float32),
+            "model.layer_b.weight": torch.zeros(4, 4, 4, dtype=torch.float8_e4m3fn),
+            "model.layer_b.weight_scale_inv": torch.zeros(2, 2, 2, dtype=torch.float32),
+        },
+    )
     stamp = I.backbone_stamp(_fp8_engine(), before=I.preload(str(root)))
     label = stamp.parts["precision"].label
     assert "block128x128:1" in label
@@ -349,11 +429,16 @@ def test_sharded_weights_are_the_index_and_every_shard_it_names(tmp_path):
     root.mkdir()
     (root / "config.json").write_text("{}")
     (root / "model.safetensors.index.json").write_text(
-        '{"weight_map": {"a": "m-00001.safetensors", "b": "m-00002.safetensors", "c": "m-00001.safetensors"}}')
+        '{"weight_map": {"a": "m-00001.safetensors", "b": "m-00002.safetensors", "c": "m-00001.safetensors"}}'
+    )
     for n in ("m-00001.safetensors", "m-00002.safetensors", "m-00003-unused.safetensors"):
         (root / n).write_bytes(n.encode())
-    assert I.backbone_files(root) == ["model.safetensors.index.json", "m-00001.safetensors", "m-00002.safetensors",
-                                      "config.json"]
+    assert I.backbone_files(root) == [
+        "model.safetensors.index.json",
+        "m-00001.safetensors",
+        "m-00002.safetensors",
+        "config.json",
+    ]
 
 
 def test_remote_code_and_adapters_are_part_of_the_checkpoint(tmp_path):
@@ -422,8 +507,16 @@ def test_a_student_is_its_bytes_whatever_the_file_is_called():
     assert a.artifact_identity != b.artifact_identity
     assert I.student_stamp(b'{"model_text": "tree\\nleaf_value=0.1 0.2"}', art).artifact_identity == a.artifact_identity
     assert a.parts["answer_mode"].label == "classifier_output"
-    expected = I.identity([("checkpoint", I.checkpoint_digest(
-        [("student.json", hashlib.sha256(b'{"model_text": "tree\\nleaf_value=0.1 0.2"}').hexdigest())]))])
+    expected = I.identity(
+        [
+            (
+                "checkpoint",
+                I.checkpoint_digest(
+                    [("student.json", hashlib.sha256(b'{"model_text": "tree\\nleaf_value=0.1 0.2"}').hexdigest())]
+                ),
+            )
+        ]
+    )
     assert a.artifact_identity == expected
 
 
@@ -459,8 +552,9 @@ def test_the_registry_stamps_the_bytes_it_parsed(tmp_path, monkeypatch):
 
 
 def _outcome(served_by, student_ran, stamp):
-    return SimpleNamespace(served_by=served_by, student_probabilities={"a": 1.0} if student_ran else None,
-                           student_stamp=stamp)
+    return SimpleNamespace(
+        served_by=served_by, student_probabilities={"a": 1.0} if student_ran else None, student_stamp=stamp
+    )
 
 
 def test_a_row_names_the_student_that_ran_for_it_and_no_other():
@@ -488,21 +582,37 @@ def test_a_row_names_the_student_that_ran_for_it_and_no_other():
 
 
 def _exp(versions, answered_by="prismyra", probs=None):
-    return SimpleNamespace(ts=1.0, context="doc", question="q?", answered_by=answered_by,
-                           comparison_probabilities=None, route_mode="confidence", versions=versions,
-                           request_id="r1", route_params_version="p", probabilities=probs or {"a": 0.9, "b": 0.1},
-                           options=("a", "b"))
+    return SimpleNamespace(
+        ts=1.0,
+        context="doc",
+        question="q?",
+        answered_by=answered_by,
+        comparison_probabilities=None,
+        route_mode="confidence",
+        versions=versions,
+        request_id="r1",
+        route_params_version="p",
+        probabilities=probs or {"a": 0.9, "b": 0.1},
+        options=("a", "b"),
+    )
 
 
-BASE = {"backbone": "m", "package": "1", "spec": "s", "tag": "t",
-        "perigraph_model": "perigraph/2/model/" + "1" * 24, "perigraph_artifact": "perigraph/2/artifact/" + "2" * 24}
+BASE = {
+    "backbone": "m",
+    "package": "1",
+    "spec": "s",
+    "tag": "t",
+    "perigraph_model": "perigraph/2/model/" + "1" * 24,
+    "perigraph_artifact": "perigraph/2/artifact/" + "2" * 24,
+}
 
 
 def test_export_writes_format_4_rows_naming_the_backbone_artifact():
     from prismyra.learn.observations import export_experience
 
-    rows, _ = export_experience([_exp(dict(BASE))], task_type="tt", arm="router", student_arm="s",
-                                fallback_arm="teacher", per_component=True)
+    rows, _ = export_experience(
+        [_exp(dict(BASE))], task_type="tt", arm="router", student_arm="s", fallback_arm="teacher", per_component=True
+    )
     (r,) = rows
     assert r["format"] == 4 and r["arm"] == "teacher"
     assert r["arm_artifact"] == BASE["perigraph_artifact"]
@@ -513,8 +623,9 @@ def test_export_without_identities_still_writes_format_3():
     from prismyra.learn.observations import export_experience
 
     old = {k: v for k, v in BASE.items() if "perigraph" not in k}
-    rows, _ = export_experience([_exp(old)], task_type="tt", arm="router", student_arm="s", fallback_arm="teacher",
-                                per_component=True)
+    rows, _ = export_experience(
+        [_exp(old)], task_type="tt", arm="router", student_arm="s", fallback_arm="teacher", per_component=True
+    )
     assert rows[0]["format"] == 3 and "arm_artifact" not in rows[0]
 
 
@@ -528,8 +639,16 @@ def test_export_skips_and_counts_a_student_component_logged_beside_another_artif
     logged = {**BASE, "student_perigraph_artifact": "perigraph/2/artifact/" + "9" * 24}
     exp = _exp(logged)
     exp.comparison_probabilities = {"a": 0.6, "b": 0.4}
-    rows, counts = O.export_experience([exp], task_type="tt", arm="router", student_arm="s", fallback_arm="teacher",
-                                       per_component=True, student=student, student_stamp=declared)
+    rows, counts = O.export_experience(
+        [exp],
+        task_type="tt",
+        arm="router",
+        student_arm="s",
+        fallback_arm="teacher",
+        per_component=True,
+        student=student,
+        student_stamp=declared,
+    )
     assert [r["arm"] for r in rows] == ["teacher"]
     assert counts["student component skipped: logged beside another student artifact"] == 1
 
@@ -543,12 +662,26 @@ def test_a_student_row_keeps_the_version_an_offline_score_writes(monkeypatch):
     logged = {**BASE, **declared.versions("student_")}
     exp = _exp(logged)
     exp.comparison_probabilities = {"a": 0.6, "b": 0.4}
-    rows, _ = O.export_experience([exp], task_type="tt", arm="router", student_arm="s", fallback_arm="teacher",
-                                  per_component=True, student=SimpleNamespace(), student_stamp=declared)
+    rows, _ = O.export_experience(
+        [exp],
+        task_type="tt",
+        arm="router",
+        student_arm="s",
+        fallback_arm="teacher",
+        per_component=True,
+        student=SimpleNamespace(),
+        student_stamp=declared,
+    )
     s_row = next(r for r in rows if r["arm"] == "s")
     assert s_row["arm_version"] == "student-v"
     assert s_row["arm_artifact"] == declared.versions()["perigraph_artifact"]
-    scored = O.score_items(SimpleNamespace(), [{"item": "i", "context": "c", "question": "q", "label": "a"}],
-                           task_type="tt", arm="s", label_source="gold", predict=lambda c, q: {"a": 0.9, "b": 0.1},
-                           stamp=declared)
+    scored = O.score_items(
+        SimpleNamespace(),
+        [{"item": "i", "context": "c", "question": "q", "label": "a"}],
+        task_type="tt",
+        arm="s",
+        label_source="gold",
+        predict=lambda c, q: {"a": 0.9, "b": 0.1},
+        stamp=declared,
+    )
     assert scored[0]["arm_artifact"] == s_row["arm_artifact"] and scored[0]["format"] == 4

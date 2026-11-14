@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from typing import ClassVar
 
 import pytest
 
@@ -11,9 +12,18 @@ from prismyra.identity import stand_in
 from prismyra.schema import Answer, Result, Timing
 
 TASK = "sentiment-v1"
-SPEC = [{"task": TASK, "question": "What is the sentiment?", "options": ["bearish", "bullish", "neutral"],
-         "kind": "choice", "normalize": "strip+lower", "retain_days": 30, "keep_hidden": False,
-         "eval_set": "e.jsonl"}]
+SPEC = [
+    {
+        "task": TASK,
+        "question": "What is the sentiment?",
+        "options": ["bearish", "bullish", "neutral"],
+        "kind": "choice",
+        "normalize": "strip+lower",
+        "retain_days": 30,
+        "keep_hidden": False,
+        "eval_set": "e.jsonl",
+    }
+]
 
 
 class StubEngine:
@@ -21,7 +31,7 @@ class StubEngine:
     model_stamp = stand_in("a test stub loads no model")
     group = 32
     heads = None
-    seen: list = []
+    seen: ClassVar[list] = []
 
     class _Tok:
         """Every distinct string is one token (as in tests/test_decide.py), so choice labels can be planned."""
@@ -41,9 +51,10 @@ class StubEngine:
         StubEngine.seen.append((context, [q.prompt for q in questions]))
         answers = {}
         for q in questions:
-            p = dict(zip(q.options, [0.7, 0.2, 0.1][:len(q.options)]))
-            answers[q.id] = Answer(id=q.id, kind=q.kind, value=q.value_of(q.options[0]), option=q.options[0],
-                                   probabilities=p)
+            p = dict(zip(q.options, [0.7, 0.2, 0.1][: len(q.options)], strict=False))
+            answers[q.id] = Answer(
+                id=q.id, kind=q.kind, value=q.value_of(q.options[0]), option=q.options[0], probabilities=p
+            )
         return Result(answers=answers, timing=Timing(context_ms=1.0, readout_ms=2.0), model=self.model_name)
 
 
@@ -64,8 +75,10 @@ def client(tmp_path, monkeypatch):
 
 
 def chat(client, **over):
-    body = {"model": TASK, "messages": [{"role": "system", "content": "ignored"},
-                                        {"role": "user", "content": "Shares fell sharply"}]}
+    body = {
+        "model": TASK,
+        "messages": [{"role": "system", "content": "ignored"}, {"role": "user", "content": "Shares fell sharply"}],
+    }
     body.update(over)
     return client.post("/v1/chat/completions", json=body)
 
@@ -90,19 +103,24 @@ def test_logprobs_are_the_natural_log_of_prismyras_probabilities(client):
     assert tok["top_logprobs"][2]["logprob"] == pytest.approx(math.log(0.1))
 
 
-@pytest.mark.parametrize("over, status", [
-    ({"model": "nope"}, 404),
-    ({"stream": True}, 400),
-    ({"messages": [{"role": "system", "content": "x"}]}, 422),
-    ({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]}, 422),
-])
+@pytest.mark.parametrize(
+    "over, status",
+    [
+        ({"model": "nope"}, 404),
+        ({"stream": True}, 400),
+        ({"messages": [{"role": "system", "content": "x"}]}, 422),
+        ({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]}, 422),
+    ],
+)
 def test_refusals(client, over, status):
     assert chat(client, **over).status_code == status
 
 
 def test_text_content_parts_are_joined(client):
-    r = chat(client, messages=[{"role": "user", "content": [{"type": "text", "text": "Shares"},
-                                                            {"type": "text", "text": "fell"}]}])
+    r = chat(
+        client,
+        messages=[{"role": "user", "content": [{"type": "text", "text": "Shares"}, {"type": "text", "text": "fell"}]}],
+    )
     assert r.status_code == 200 and "Shares\nfell" in StubEngine.seen[0][0]
 
 

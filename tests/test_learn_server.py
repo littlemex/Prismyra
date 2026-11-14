@@ -189,8 +189,9 @@ def test_a_tagged_unrouted_decide_gets_a_request_id_its_feedback_joins(client_fa
     make, tmp_path = client_factory
     spec_path = write_spec(tmp_path, PHISHING_SPEC)
     client = make(learn_spec=str(spec_path), learn_log_dir=str(tmp_path / "exp"))
-    body = client.post("/v1/decide", json={"kind": "noul", "state": "buy now", "question": "q",
-                                           "task": "phishing-decide-v1"}).json()
+    body = client.post(
+        "/v1/decide", json={"kind": "noul", "state": "buy now", "question": "q", "task": "phishing-decide-v1"}
+    ).json()
     assert body["request_id"]
     assert client.post("/v1/feedback", json={"request_id": body["request_id"], "label": "yes"}).status_code == 200
     untagged = client.post("/v1/decide", json={"kind": "noul", "state": "hello", "question": "is it?"}).json()

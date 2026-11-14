@@ -199,9 +199,13 @@ class AdmissionConfig:
     record: str | None = None
 
     def __post_init__(self) -> None:
-        if (self.mode == "external") != (self.record is not None) or (self.mode == "external") == (self.tau is not None):
-            raise ValueError(f"admission mode {self.mode!r} takes {'a record' if self.mode == 'external' else 'a tau'} "
-                             "and nothing else")
+        if (self.mode == "external") != (self.record is not None) or (self.mode == "external") == (
+            self.tau is not None
+        ):
+            raise ValueError(
+                f"admission mode {self.mode!r} takes {'a record' if self.mode == 'external' else 'a tau'} "
+                "and nothing else"
+            )
 
 
 @dataclass(frozen=True)
@@ -410,8 +414,11 @@ def _check_admission(path: Path, where: str, raw: dict) -> AdmissionConfig:
     if missing:
         _fail(path, where, f"missing field(s): {sorted(missing)}")
     if extra:
-        _fail(path, where, f"unknown field(s): {sorted(extra)} -- the allowed fields for mode {mode!r} are "
-                           f"{sorted(required)}")
+        _fail(
+            path,
+            where,
+            f"unknown field(s): {sorted(extra)} -- the allowed fields for mode {mode!r} are {sorted(required)}",
+        )
 
     if mode == "external":
         record = raw["record"]

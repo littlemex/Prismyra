@@ -235,12 +235,16 @@ def scale_layout(weight_shape, scale_shape):
         if not weight_shape or scale_shape[0] != weight_shape[0]:
             # `not weight_shape` (a 0-dimensional weight) is checked first: `weight_shape[0]` below would raise
             # `IndexError` rather than the message this function promises everywhere else.
-            raise RuntimeError(f"a one-dimensional scale of shape {tuple(scale_shape)} does not have one entry per "
-                               f"row of a weight shaped {tuple(weight_shape)}")
+            raise RuntimeError(
+                f"a one-dimensional scale of shape {tuple(scale_shape)} does not have one entry per "
+                f"row of a weight shaped {tuple(weight_shape)}"
+            )
         return "per_row"
     if len(weight_shape) != 2 or len(scale_shape) != 2:
-        raise RuntimeError(f"weight shape {tuple(weight_shape)} with scale shape {tuple(scale_shape)} is not a "
-                           f"layout this reader knows")
+        raise RuntimeError(
+            f"weight shape {tuple(weight_shape)} with scale shape {tuple(scale_shape)} is not a "
+            f"layout this reader knows"
+        )
     down = _block_size(weight_shape[0], scale_shape[0])
     across = _block_size(weight_shape[1], scale_shape[1])
     return (down, across)

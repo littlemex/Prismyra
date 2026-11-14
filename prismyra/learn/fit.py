@@ -690,9 +690,7 @@ def run(
                 if not eval_path.is_file():
                     reasons.append(f"eval_set {eval_path} does not exist; condition 1 unmet")
                 else:
-                    reasons.append(
-                        f"eval_set {eval_path} has no item with 'prismyra_probabilities'; condition 1 unmet"
-                    )
+                    reasons.append(f"eval_set {eval_path} has no item with 'prismyra_probabilities'; condition 1 unmet")
             else:
                 required = effective_min_accuracy_ratio * confidence_eval["prismyra_accuracy"]
                 reasons.append(
@@ -824,7 +822,9 @@ def main(argv: list[str] | None = None) -> int:
         help="write the artifact's provenance here: its arm_version, the manifest of items it was fit on "
         "(training and held-out rows, written beside it), and the excluded sets' file digests",
     )
-    parser.add_argument("--provenance-arm", default=None, help="the arm name the provenance names (with --provenance-out)")
+    parser.add_argument(
+        "--provenance-arm", default=None, help="the arm name the provenance names (with --provenance-out)"
+    )
     args = parser.parse_args(argv)
     if bool(args.provenance_out) != bool(args.provenance_arm):
         parser.error("--provenance-out and --provenance-arm go together")
@@ -879,18 +879,23 @@ def main(argv: list[str] | None = None) -> int:
     out_path.write_text(json.dumps(artifact.to_json(), ensure_ascii=False, indent=2), encoding="utf-8")
     if args.provenance_out:
         tag = load_spec(args.learn_spec).by_task(args.task)
+        if tag is None:
+            raise FitError(f"{args.learn_spec}: no entry for task {args.task!r}")
         ev = Path(tag.eval_set) if Path(tag.eval_set).is_absolute() else Path(args.learn_spec).parent / tag.eval_set
         try:
-            _write_provenance(Path(args.provenance_out), args.provenance_arm, artifact, excluded_sets, used, ev,
-                              tag.question)
+            _write_provenance(
+                Path(args.provenance_out), args.provenance_arm, artifact, excluded_sets, used, ev, tag.question
+            )
         except FitError as e:
             print(f"refused: {e}", file=sys.stderr)
             return 2
         print(f"wrote {args.provenance_out}")
     if exclude:
         x = artifact.metrics["excluded"]
-        print(f"excluded {x['in_an_excluded_set']} logged row(s) matching {x['excluded_items_matched']} of "
-              f"{len(exclude)} excluded item(s); {x['context_not_retained']} row(s) dropped for no retained context")
+        print(
+            f"excluded {x['in_an_excluded_set']} logged row(s) matching {x['excluded_items_matched']} of "
+            f"{len(exclude)} excluded item(s); {x['context_not_retained']} row(s) dropped for no retained context"
+        )
     verdict = "ADMITTED" if artifact.admitted else "NOT ADMITTED"
     if artifact.admitted_for is not None:
         verdict += f" (for {artifact.admitted_for!r})"
@@ -899,7 +904,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  - {reason}")
     print(f"wrote {out_path}")
     return 0
-
 
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -947,8 +951,10 @@ def _write_provenance(path: Path, arm: str, artifact, excluded_sets, used_rows, 
 
     unnamed = sum(1 for e in used_rows if not e.context)
     if unnamed:
-        raise FitError(f"{unnamed} fitted row(s) have no retained context, so provenance cannot name them; fit with "
-                       "--exclude-set (which drops them) or from a log that keeps context")
+        raise FitError(
+            f"{unnamed} fitted row(s) have no retained context, so provenance cannot name them; fit with "
+            "--exclude-set (which drops them) or from a log that keeps context"
+        )
     sets = []
     fit_bytes = _manifest(used_rows)
     fit_path = path.with_name(path.name + ".trained_on.jsonl")
@@ -958,15 +964,28 @@ def _write_provenance(path: Path, arm: str, artifact, excluded_sets, used_rows, 
         from .observations import content_digest
 
         lines = [json.loads(line) for line in eval_set.read_text(encoding="utf-8").splitlines() if line.strip()]
-        ev = "".join(json.dumps({"item": "sha256:" + d, "content_sha256": d}) + "\n"
-                     for d in sorted({content_digest(x["context"], question) for x in lines}))
+        ev = "".join(
+            json.dumps({"item": "sha256:" + d, "content_sha256": d}) + "\n"
+            for d in sorted({content_digest(x["context"], question) for x in lines})
+        )
         ev_path = path.with_name(path.name + ".eval_set.jsonl")
         ev_path.write_bytes(ev.encode("utf-8"))
-        sets.append({"set": "eval_set", "manifest": ev_path.name,
-                     "sha256": hashlib.sha256(ev.encode("utf-8")).hexdigest()})
-    prov = {"format": 1, "arm": arm, "arm_version": artifact_version(artifact), "trained_on": sets, "requires": [],
-            "trainer": {"prismyra_fit": artifact.package_version, "backbone": artifact.backbone,
-                        "excluded_sets": excluded_sets, "excluded": artifact.metrics.get("excluded")}}
+        sets.append(
+            {"set": "eval_set", "manifest": ev_path.name, "sha256": hashlib.sha256(ev.encode("utf-8")).hexdigest()}
+        )
+    prov = {
+        "format": 1,
+        "arm": arm,
+        "arm_version": artifact_version(artifact),
+        "trained_on": sets,
+        "requires": [],
+        "trainer": {
+            "prismyra_fit": artifact.package_version,
+            "backbone": artifact.backbone,
+            "excluded_sets": excluded_sets,
+            "excluded": artifact.metrics.get("excluded"),
+        },
+    }
     path.write_text(json.dumps(prov, indent=2) + "\n", encoding="utf-8")
 
 

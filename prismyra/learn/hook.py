@@ -39,12 +39,23 @@ def _argmax(probs) -> str:
     return max(probs.items(), key=lambda kv: kv[1])[0]
 
 
-
 #: `TagSpec` fields that decide Prismyra's own answer for a tag, and the ones that do not. Every field is in exactly
 #: one set (a test enforces it), so a field added later must be placed deliberately.
 TAG_ANSWER_FIELDS = ("question", "options", "kind", "normalize")
-TAG_OTHER_FIELDS = ("task", "retain_days", "keep_hidden", "eval_set", "features", "min_match_rate",
-                    "min_accuracy_ratio", "retain_context", "router", "student", "text_tokenizer", "admission")
+TAG_OTHER_FIELDS = (
+    "task",
+    "retain_days",
+    "keep_hidden",
+    "eval_set",
+    "features",
+    "min_match_rate",
+    "min_accuracy_ratio",
+    "retain_context",
+    "router",
+    "student",
+    "text_tokenizer",
+    "admission",
+)
 
 
 def tag_version(tag: TagSpec) -> str:
@@ -54,8 +65,11 @@ def tag_version(tag: TagSpec) -> str:
     import hashlib
     import json
 
-    payload = json.dumps({k: list(v) if isinstance(v, tuple) else v for k, v in
-                          ((k, getattr(tag, k)) for k in TAG_ANSWER_FIELDS)}, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(
+        {k: list(v) if isinstance(v, tuple) else v for k, v in ((k, getattr(tag, k)) for k in TAG_ANSWER_FIELDS)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -120,16 +134,21 @@ class LearnHook:
             self._students = StudentRegistry()
             for t in routed:
                 assert t.router is not None
-                self._students.load(t.task, self.spec.path.parent, t.router.student_path, router=t.router,
-                                    admission=t.admission)
+                self._students.load(
+                    t.task, self.spec.path.parent, t.router.student_path, router=t.router, admission=t.admission
+                )
 
     def tag(self, *, task: str | None, question: str, options, kind: str) -> TagSpec | None:
         """The one comparison the request handler makes whether or not it turns out to match anything."""
         return tag_for(self.spec, task=task, question=question, options=options, kind=kind)
 
     def versions(self) -> dict[str, str]:
-        return {"package": self.package_version, "backbone": self.backbone, "spec": self.spec.version,
-                **self.backbone_perigraph}
+        return {
+            "package": self.package_version,
+            "backbone": self.backbone,
+            "spec": self.spec.version,
+            **self.backbone_perigraph,
+        }
 
     def student_stamps(self) -> dict:
         """Each routed tag's loaded student's `prismyra.identity.ModelStamp`, by task."""
@@ -310,8 +329,9 @@ class LearnHook:
             raise SpecError(f"no tag named {task!r} in this spec")
         if tag.router is None or self._students is None:
             raise ValueError(f"tag {task!r} has no router configured")
-        return self._students.load(task, self.spec.path.parent, tag.router.student_path, router=tag.router,
-                                   admission=tag.admission)
+        return self._students.load(
+            task, self.spec.path.parent, tag.router.student_path, router=tag.router, admission=tag.admission
+        )
 
     def submit_feedback(self, request_id: str, *, label: str | None = None, reward: float | None = None) -> bool:
         """``POST /v1/feedback``'s whole implementation: append one `FeedbackRecord`, off the request path,

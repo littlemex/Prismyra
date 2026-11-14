@@ -58,12 +58,27 @@ MODEL_PARTS = ("answer_mode", "checkpoint", "precision", "runtime")
 ANSWER_MODES = ("classifier_output", "generated_text", "option_scores")
 #: Reasons a part can be absent, and whose failure each is (perigraph section 1.2). Only the collector's own
 #: failures carry a detail.
-ABSENCE_BLAMES = {"not_provided": "sender", "redacted": "sender", "not_reachable": "collector",
-                  "extraction_failed": "collector", "not_observable": "nobody"}
+ABSENCE_BLAMES = {
+    "not_provided": "sender",
+    "redacted": "sender",
+    "not_reachable": "collector",
+    "extraction_failed": "collector",
+    "not_observable": "nobody",
+}
 
 #: The ten harness parts (perigraph section 1.0), each of which a record names as held or absent.
-HARNESS_PARTS = ("instruction", "tool_schemas", "tool_extension", "tool_trace", "loop", "turn_budget",
-                 "retry_policy", "readout", "decoding", "context_partitioning")
+HARNESS_PARTS = (
+    "instruction",
+    "tool_schemas",
+    "tool_extension",
+    "tool_trace",
+    "loop",
+    "turn_budget",
+    "retry_policy",
+    "readout",
+    "decoding",
+    "context_partitioning",
+)
 #: This collector's manifests (section 1.3). Static per collector version: it claims no harness part and every model
 #: part, whatever a given request or load turns out to hold.
 HARNESS_REACHES = ""
@@ -72,8 +87,9 @@ MODEL_REACHES = MODEL_PARTS
 #: the rest are this collector's own gap -- it stamps what answered and reads none of the request's harness fields --
 #: so they blame the collector and say so, which an empty manifest makes no contradiction.
 _NOT_READ = "prismyra writes the model half only and reads none of the request's harness fields"
-HARNESS_ABSENCES = {p: (("not_observable", "") if p == "tool_extension" else ("not_reachable", _NOT_READ))
-                    for p in HARNESS_PARTS}
+HARNESS_ABSENCES = {
+    p: (("not_observable", "") if p == "tool_extension" else ("not_reachable", _NOT_READ)) for p in HARNESS_PARTS
+}
 
 #: The distributions whose versions decide the backbone's answers. Static per collector version, as perigraph's
 #: manifest must be: a list that adapted to what it found could never be wrong, and so could never be checked.
@@ -100,8 +116,14 @@ def checkpoint_digest(entries) -> str:
     """Over ``(relative POSIX path, sha256)`` pairs, sorted by the path's utf-8 bytes (perigraph section 9)."""
     rows, seen = [], set()
     for path, sha in entries:
-        if not path or "\t" in path or "\n" in path or path.startswith("/") or "\\" in path \
-                or any(seg in ("", ".", "..") for seg in path.split("/")):
+        if (
+            not path
+            or "\t" in path
+            or "\n" in path
+            or path.startswith("/")
+            or "\\" in path
+            or any(seg in ("", ".", "..") for seg in path.split("/"))
+        ):
             raise IdentityError(f"checkpoint path {path!r} is not a normalised relative POSIX path")
         if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
             raise IdentityError(f"checkpoint file {path!r} has digest {sha!r}, which is not lowercase hex sha256")
@@ -129,8 +151,11 @@ def lines_digest(pairs: dict, sep: str) -> str:
 
 #: The Unicode White_Space property, the set perigraph section 1.2 names for trimming. Not `str.strip()`, which also
 #: strips U+001C-U+001F, so a value perigraph accepts would be refused here.
-WHITE_SPACE = ("\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680"
-               + "".join(chr(c) for c in range(0x2000, 0x200b)) + "\u2028\u2029\u202f\u205f\u3000")
+WHITE_SPACE = (
+    "\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680"
+    + "".join(chr(c) for c in range(0x2000, 0x200B))
+    + "\u2028\u2029\u202f\u205f\u3000"
+)
 
 
 def _unresolved(text: str) -> bool:
@@ -144,7 +169,7 @@ def precision_digest(fields: dict) -> str:
     ``quantisation=auto``. The test is for refusal only; what is digested is the text as read."""
     for k, v in fields.items():
         key = str(k)
-        name = key[len("dtype."):] if key.startswith("dtype.") else None
+        name = key[len("dtype.") :] if key.startswith("dtype.") else None
         if _unresolved(str(v)) or (name is not None and _unresolved(name)):
             raise IdentityError(f"precision field {k}={v!r} is unresolved")
     return lines_digest(fields, "=")
@@ -220,9 +245,14 @@ class ModelStamp:
         collector could read."""
         from prismyra import __version__
 
-        out: dict = {"perigraph.spec_version": SPEC_VERSION, "perigraph.collector": COLLECTOR,
-                     "perigraph.collector_version": __version__, "perigraph.collector_reaches": HARNESS_REACHES,
-                     "perigraph.model_reaches": ",".join(MODEL_REACHES), "perigraph.status": "complete"}
+        out: dict = {
+            "perigraph.spec_version": SPEC_VERSION,
+            "perigraph.collector": COLLECTOR,
+            "perigraph.collector_version": __version__,
+            "perigraph.collector_reaches": HARNESS_REACHES,
+            "perigraph.model_reaches": ",".join(MODEL_REACHES),
+            "perigraph.status": "complete",
+        }
         for part, (reason, detail) in HARNESS_ABSENCES.items():
             out[f"perigraph.absent.{part}.reason"] = reason
             if detail:
@@ -280,9 +310,20 @@ def _runtime(distributions) -> Part:
 
 #: Tokenizer and template files a Hugging Face loader may read. Present and listed: digested. A tokenizer file this
 #: list does not know is refused below rather than silently left out.
-_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json",
-                    "vocab.json", "vocab.txt", "merges.txt", "tokenizer.model", "spiece.model",
-                    "sentencepiece.bpe.model", "chat_template.jinja", "chat_template.json")
+_TOKENIZER_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "vocab.txt",
+    "merges.txt",
+    "tokenizer.model",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+    "chat_template.jinja",
+    "chat_template.json",
+)
 _CONFIG_FILES = ("config.json", "preprocessor_config.json", "processor_config.json", "video_preprocessor_config.json")
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 
@@ -372,8 +413,9 @@ def _backbone_checkpoint(before: Preload, extra: list[tuple[str, str]]):
     at_hash = _stats(before.root, names)
     entries = _entries(before.root, names)
     after = _stats(before.root, names)
-    changed = sorted(n for n in names
-                     if after[n] != at_hash[n] or (n in before.stats and before.stats[n] != at_hash[n]))
+    changed = sorted(
+        n for n in names if after[n] != at_hash[n] or (n in before.stats and before.stats[n] != at_hash[n])
+    )
     if changed:
         raise IdentityError(f"files changed between load and hashing: {changed}")
     entries += extra
@@ -391,7 +433,7 @@ def _extra_files(heads, temperature) -> list[tuple[str, str]]:
         if spec is None:
             continue
         if isinstance(spec, (str, os.PathLike)) and Path(spec).is_file():
-            out.append((f"+{kind}/{Path(spec).name}", sha256_file(spec)))
+            out.append((f"+{kind}/{Path(spec).name}", sha256_file(Path(spec))))
         else:
             out.append((f"+{kind}/inline.json", _hex(json.dumps(spec, sort_keys=True, separators=(",", ":")))))
     return out
@@ -471,7 +513,7 @@ def fp8_scale_description(root: Path, names) -> str:
                 continue
             read_any_shard = True
             with safe_open(root / name, framework="pt") as f:
-                for key in f.keys():
+                for key in f.keys():  # noqa: SIM118 - safe_open is not iterable; keys() is its only listing
                     sl = f.get_slice(key)
                     present[key] = (sl.get_dtype(), tuple(sl.get_shape()))
         if not read_any_shard:
@@ -526,8 +568,14 @@ def backbone_stamp(engine, *, before: Preload, heads=None, temperature=None) -> 
         checkpoint = Part(absent="extraction_failed", detail=f"{type(exc).__name__}: {exc}")
     modules = [engine.backbone]
     precision = _try(lambda: tensor_precision(modules, quantisation_of(modules), before=before))
-    return ModelStamp({"checkpoint": checkpoint, "precision": precision, "runtime": _runtime(BACKBONE_RUNTIME),
-                       "answer_mode": _answer_mode("option_scores")})
+    return ModelStamp(
+        {
+            "checkpoint": checkpoint,
+            "precision": precision,
+            "runtime": _runtime(BACKBONE_RUNTIME),
+            "answer_mode": _answer_mode("option_scores"),
+        }
+    )
 
 
 # --- a student served by prismyra.learn ----------------------------------------------------------------------------
@@ -547,14 +595,19 @@ def student_stamp(raw: bytes, artifact) -> ModelStamp:
     arithmetic as a constant would be a declaration marked as a reading. So a student has an artifact identity and
     no model identity. What its features compute with (a feature module's code, an embedding model) is not here."""
     runtime = STUDENT_RUNTIME.get(artifact.backend)
-    return ModelStamp({
-        "checkpoint": Part(digest=checkpoint_digest([(STUDENT_ENTRY, hashlib.sha256(raw).hexdigest())]),
-                           label=f"{artifact.backend} student"),
-        "precision": Part(absent="extraction_failed", detail="a tree model exposes no parameter dtype to read"),
-        "runtime": _runtime(runtime) if runtime else Part(absent="extraction_failed",
-                                                          detail=f"no runtime list for backend {artifact.backend!r}"),
-        "answer_mode": _answer_mode("classifier_output"),
-    })
+    return ModelStamp(
+        {
+            "checkpoint": Part(
+                digest=checkpoint_digest([(STUDENT_ENTRY, hashlib.sha256(raw).hexdigest())]),
+                label=f"{artifact.backend} student",
+            ),
+            "precision": Part(absent="extraction_failed", detail="a tree model exposes no parameter dtype to read"),
+            "runtime": _runtime(runtime)
+            if runtime
+            else Part(absent="extraction_failed", detail=f"no runtime list for backend {artifact.backend!r}"),
+            "answer_mode": _answer_mode("classifier_output"),
+        }
+    )
 
 
 def stand_in(why: str) -> ModelStamp:

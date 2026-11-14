@@ -28,10 +28,22 @@ def stamp(req: dict) -> dict:
         am = I._answer_mode(req["answer_mode"])
     except I.IdentityError as e:
         return {"refused": str(e)}
-    st = I.ModelStamp({"checkpoint": I.Part(digest=ck), "precision": I.Part(digest=pr),
-                       "runtime": I.Part(digest=rt), "answer_mode": am})
-    return {"checkpoint_digest": ck, "precision_digest": pr, "runtime_digest": rt, "model_identity": st.model_identity,
-            "artifact_identity": st.artifact_identity, "attributes": st.attributes()}
+    st = I.ModelStamp(
+        {
+            "checkpoint": I.Part(digest=ck),
+            "precision": I.Part(digest=pr),
+            "runtime": I.Part(digest=rt),
+            "answer_mode": am,
+        }
+    )
+    return {
+        "checkpoint_digest": ck,
+        "precision_digest": pr,
+        "runtime_digest": rt,
+        "model_identity": st.model_identity,
+        "artifact_identity": st.artifact_identity,
+        "attributes": st.attributes(),
+    }
 
 
 OPS = {"describe": describe, "stamp": stamp}

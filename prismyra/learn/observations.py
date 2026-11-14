@@ -80,9 +80,22 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def row(*, item: str, task_type: str, arm: str, outcome: str, run: str, arm_version: str, path: Iterable[str] = (),
-        score: float | None = None, observed_at: str = "", label_source: str = "", grader: str = "",
-        reason: str = "", arm_artifact: str = "") -> dict:
+def row(
+    *,
+    item: str,
+    task_type: str,
+    arm: str,
+    outcome: str,
+    run: str,
+    arm_version: str,
+    path: Iterable[str] = (),
+    score: float | None = None,
+    observed_at: str = "",
+    label_source: str = "",
+    grader: str = "",
+    reason: str = "",
+    arm_artifact: str = "",
+) -> dict:
     """One record, refused here when the reader would refuse it."""
     if outcome not in OUTCOMES:
         raise ObservationError(f"outcome must be one of {OUTCOMES}, not {outcome!r}")
@@ -94,19 +107,34 @@ def row(*, item: str, task_type: str, arm: str, outcome: str, run: str, arm_vers
     path = list(path)
     if not all(isinstance(p, str) and p for p in path):
         raise ObservationError(f"path entries must be non-empty arm names, not {path!r}")
-    if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))
-                              or not math.isfinite(score)):
+    if score is not None and (
+        isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score)
+    ):
         raise ObservationError(f"score {score!r} must be a finite number")
     if not isinstance(arm_artifact, str):
         raise ObservationError("arm_artifact must be a string")
-    out: dict = {"format": FORMAT_WITH_ARTIFACT if arm_artifact else RECORD_FORMAT, "item": item,
-                 "task_type": task_type, "arm": arm, "outcome": outcome, "usage": {}, "arm_version": arm_version}
+    out: dict = {
+        "format": FORMAT_WITH_ARTIFACT if arm_artifact else RECORD_FORMAT,
+        "item": item,
+        "task_type": task_type,
+        "arm": arm,
+        "outcome": outcome,
+        "usage": {},
+        "arm_version": arm_version,
+    }
     if arm_artifact:
         out["arm_artifact"] = arm_artifact
-    for key, value in (("run", run), ("score", score), ("observed_at", observed_at), ("label_source", label_source),
-                       ("grader", grader), ("reason", reason)):
-        if value not in (None, ""):
-            out[key] = value
+    extras: tuple[tuple[str, object], ...] = (
+        ("run", run),
+        ("score", score),
+        ("observed_at", observed_at),
+        ("label_source", label_source),
+        ("grader", grader),
+        ("reason", reason),
+    )
+    for key, field_value in extras:
+        if field_value not in (None, ""):
+            out[key] = field_value
     if path:
         out["path"] = path
     return out
@@ -114,7 +142,7 @@ def row(*, item: str, task_type: str, arm: str, outcome: str, run: str, arm_vers
 
 def _answer(probabilities: dict) -> tuple[str | None, float | None, str]:
     """The answer the probabilities clearly give, or None with why not."""
-    vals = {k: v for k, v in probabilities.items()}
+    vals = dict(probabilities.items())
     if not vals:
         return None, None, "no probabilities logged"
     if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in vals.values()):
@@ -128,7 +156,9 @@ def _answer(probabilities: dict) -> tuple[str | None, float | None, str]:
 
 def load_items(path: str | Path) -> list[dict]:
     """An items file: ``{item?, context, question?, label?}`` per line. Ids default to the content digest."""
-    out, seen_ids, by_content = [], set(), {}
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+    by_content: dict[str, dict] = {}
     for n, line in enumerate(Path(path).read_text(encoding="utf-8").split("\n"), 1):
         if not line.strip():
             continue
@@ -161,12 +191,23 @@ def load_items(path: str | Path) -> list[dict]:
 
 def _check_label(label: str, options) -> None:
     if label not in options:
-        raise ObservationError(f"label {label!r} is not one of the options {list(options)}; a label the answer can "
-                               "never equal would grade every row rejected")
+        raise ObservationError(
+            f"label {label!r} is not one of the options {list(options)}; a label the answer can "
+            "never equal would grade every row rejected"
+        )
 
 
-def score_items(artifact, items: list[dict], *, task_type: str, arm: str, label_source: str, run: str = "score",
-                predict: Callable[[str, str], dict[str, float]] | None = None, stamp=None) -> list[dict]:
+def score_items(
+    artifact,
+    items: list[dict],
+    *,
+    task_type: str,
+    arm: str,
+    label_source: str,
+    run: str = "score",
+    predict: Callable[[str, str], dict[str, float]] | None = None,
+    stamp=None,
+) -> list[dict]:
     """Answer every item with ``artifact`` and grade it against the item's label. ``stamp`` is this process's
     `prismyra.identity.ModelStamp` of the bytes ``artifact`` was parsed from; its artifact identity is each row's
     ``arm_artifact``."""
@@ -179,8 +220,15 @@ def score_items(artifact, items: list[dict], *, task_type: str, arm: str, label_
     for it in items:
         probs = predict(it["context"], it["question"])
         answer, top, why = _answer(probs)
-        common = dict(item=it["item"], task_type=task_type, arm=arm, run=run, arm_version=version, score=top,
-                      arm_artifact=artifact_id)
+        common = {
+            "item": it["item"],
+            "task_type": task_type,
+            "arm": arm,
+            "run": run,
+            "arm_version": version,
+            "score": top,
+            "arm_artifact": artifact_id,
+        }
         if it["label"] is None:
             out.append(row(outcome="unobserved", reason="no label", **common))
             continue
@@ -188,8 +236,14 @@ def score_items(artifact, items: list[dict], *, task_type: str, arm: str, label_
         if answer is None:
             out.append(row(outcome="unobserved", reason=why, label_source=label_source, **common))
         else:
-            out.append(row(outcome="accepted" if answer == it["label"] else "rejected", grader=LABEL_EXACT,
-                           label_source=label_source, **common))
+            out.append(
+                row(
+                    outcome="accepted" if answer == it["label"] else "rejected",
+                    grader=LABEL_EXACT,
+                    label_source=label_source,
+                    **common,
+                )
+            )
     return out
 
 
@@ -205,19 +259,33 @@ def _verdict_fn(spec: str | None):
         raise ObservationError(f"--verdict-module {spec!r}: {exc}") from None
 
 
-def export_experience(experiences: Iterable, *, task_type: str, arm: str, student_arm: str, fallback_arm: str,
-                      student=None, feedback: dict | None = None, labels: list[dict] | None = None,
-                      label_source: str = "", verdict: Callable | None = None, verdict_name: str = "",
-                      since: float | None = None, until: float | None = None,
-                      per_component: bool = False, run: str | None = None,
-                      student_stamp=None) -> tuple[list[dict], dict]:
+def export_experience(
+    experiences: Iterable,
+    *,
+    task_type: str,
+    arm: str,
+    student_arm: str,
+    fallback_arm: str,
+    student=None,
+    feedback: dict | None = None,
+    labels: list[dict] | None = None,
+    label_source: str = "",
+    verdict: Callable | None = None,
+    verdict_name: str = "",
+    since: float | None = None,
+    until: float | None = None,
+    per_component: bool = False,
+    run: str | None = None,
+    student_stamp=None,
+) -> tuple[list[dict], dict]:
     """Rows for a server's logged requests under the declared router ``arm``, and the counts behind them.
 
     With ``per_component`` the router arm is not written. Each request instead gives one row per component whose
     answer the log holds, under that component's own name and version: the student's (the artifact's
-    `artifact_version`) wherever its probabilities were logged, and the fallback's (``backbone|package|tag``, or ``spec`` for rows logged before tags had a version)
-    wherever it answered or was audited. These are the versions an offline score of the same components carries,
-    so a certificate over a cascade composed from parts can be checked against served traffic.
+    `artifact_version`) wherever its probabilities were logged, and the fallback's (``backbone|package|tag``, or
+    ``spec`` for rows logged before tags had a version) wherever it answered or was audited. These are the versions an
+    offline score of the same components carries, so a certificate over a cascade composed from parts can be checked
+    against served traffic.
 
     Rows the server logged with perigraph identities carry them. The backbone's ``arm_version`` (and the router
     arm's) ends with its model identity, ``|perigraph/2/model/<id>``, so a change of precision or runtime under one
@@ -238,12 +306,13 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
     declared = student_version_ = None
     if student is not None:
         from .students import artifact_version, student_version
+
         declared = f"student:{student_version(student)}"
         student_version_ = artifact_version(student)
     declared_student = student_stamp.versions().get("perigraph_artifact", "") if student_stamp is not None else ""
     counts: Counter = Counter()
     joined: set[str] = set()
-    out = []
+    out: list[dict] = []
     for exp in experiences:
         if (since is not None and exp.ts < since) or (until is not None and exp.ts >= until):
             counts["outside_window"] += 1
@@ -254,11 +323,15 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
         answered = exp.answered_by or ""
         if answered.startswith("student:"):
             if declared is None:
-                raise ObservationError("the log has student-answered rows and no --student was declared; name the "
-                                       "artifact the router was serving")
+                raise ObservationError(
+                    "the log has student-answered rows and no --student was declared; name the "
+                    "artifact the router was serving"
+                )
             if answered != declared:
-                raise ObservationError(f"request {exp.request_id!r} was answered by {answered!r}, not the declared "
-                                       f"student {declared!r}; use --since/--until to export one snapshot at a time")
+                raise ObservationError(
+                    f"request {exp.request_id!r} was answered by {answered!r}, not the declared "
+                    f"student {declared!r}; use --since/--until to export one snapshot at a time"
+                )
             path = [student_arm]
         elif exp.comparison_probabilities is not None and exp.route_mode == "confidence":
             path = [student_arm, fallback_arm]
@@ -274,7 +347,7 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
         # router into the spec does not make the fallback a different arm. Older rows name only the spec.
         what = f"tag:{exp.versions['tag']}" if exp.versions.get("tag") else f"spec:{exp.versions['spec']}"
         serving = [f"backbone:{exp.versions['backbone']}", f"package:{exp.versions['package']}", what]
-        parts = serving + [f"route:{exp.route_params_version or 'none'}"]
+        parts = [*serving, f"route:{exp.route_params_version or 'none'}"]
         backbone_model = exp.versions.get("perigraph_model", "")
         if backbone_model:
             parts.append(backbone_model)
@@ -293,18 +366,42 @@ def export_experience(experiences: Iterable, *, task_type: str, arm: str, studen
             if other_student and student_probs is not None:
                 counts["student component skipped: logged beside another student artifact"] += 1
                 student_probs = None
-            components = [(student_arm, student_version_, student_probs, logged_student),
-                          (fallback_arm, "|".join(serving + ([backbone_model] if backbone_model else [])),
-                           fallback_probs, exp.versions.get("perigraph_artifact", ""))]
+            components = [
+                (student_arm, student_version_, student_probs, logged_student),
+                (
+                    fallback_arm,
+                    "|".join(serving + ([backbone_model] if backbone_model else [])),
+                    fallback_probs,
+                    exp.versions.get("perigraph_artifact", ""),
+                ),
+            ]
         else:
             components = [(arm, "|".join(parts), exp.probabilities, "")]
         for c_arm, c_version, c_probs, c_artifact in components:
             if c_probs is None:
                 continue
-            _grade(out, counts, joined, exp, lab, feedback, label_source, verdict, verdict_name,
-                   dict(item=item, task_type=task_type, arm=c_arm, arm_version=c_version, arm_artifact=c_artifact,
-                        **({} if per_component else {"path": path}), observed_at=_iso(exp.ts), run=run_name),
-                   dict(c_probs))
+            _grade(
+                out,
+                counts,
+                joined,
+                exp,
+                lab,
+                feedback,
+                label_source,
+                verdict,
+                verdict_name,
+                dict(
+                    item=item,
+                    task_type=task_type,
+                    arm=c_arm,
+                    arm_version=c_version,
+                    arm_artifact=c_artifact,
+                    **({} if per_component else {"path": path}),
+                    observed_at=_iso(exp.ts),
+                    run=run_name,
+                ),
+                dict(c_probs),
+            )
     counts["feedback not joined to any exported row"] = len(set(feedback) - joined)
     return out, dict(sorted(counts.items()))
 
@@ -331,19 +428,35 @@ def _grade(out, counts, joined, exp, lab, feedback, label_source, verdict, verdi
         if answer is None:
             out.append(row(outcome="unobserved", reason=why, label_source=src, **common))
         else:
-            out.append(row(outcome="accepted" if answer == truth else "rejected", grader=LABEL_EXACT,
-                           label_source=src, **common))
+            out.append(
+                row(
+                    outcome="accepted" if answer == truth else "rejected",
+                    grader=LABEL_EXACT,
+                    label_source=src,
+                    **common,
+                )
+            )
     elif fb is not None and fb.reward is not None and verdict is not None:
         v = verdict(fb.reward, exp)
         if v is None:
-            out.append(row(outcome="unobserved", reason="verdict module returned no verdict",
-                           label_source="feedback-reward", **common))
+            out.append(
+                row(
+                    outcome="unobserved",
+                    reason="verdict module returned no verdict",
+                    label_source="feedback-reward",
+                    **common,
+                )
+            )
         else:
             out.append(row(outcome=v, grader=verdict_name, label_source="feedback-reward", **common))
     else:
-        out.append(row(outcome="unobserved",
-                       reason=("reward without a verdict module" if fb is not None and fb.reward is not None
-                               else "no label"), **common))
+        out.append(
+            row(
+                outcome="unobserved",
+                reason=("reward without a verdict module" if fb is not None and fb.reward is not None else "no label"),
+                **common,
+            )
+        )
 
 
 def _write_atomic(path: str | Path, text: str) -> None:
@@ -358,8 +471,10 @@ def _rows_text(rows: list[dict]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="python -m prismyra.learn.observations",
-                                 description="Graded attempts in the open observation record format.")
+    ap = argparse.ArgumentParser(
+        prog="python -m prismyra.learn.observations",
+        description="Graded attempts in the open observation record format.",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("score", help="answer a declared item set with a student artifact")
     s.add_argument("--artifact", required=True)
@@ -385,11 +500,17 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--stats", default=None, help="the server's GET /stats JSON, with top-level logged and dropped")
     e.add_argument("--since", type=float, default=None, help="epoch seconds, inclusive")
     e.add_argument("--until", type=float, default=None, help="epoch seconds, exclusive")
-    e.add_argument("--per-component", action="store_true",
-                   help="write one row per component answer (student, fallback) under its own version instead of "
-                        "one row per request for the router arm")
-    e.add_argument("--run", default=None,
-                   help="one run name for every row instead of each request id, to pair with an offline score's run")
+    e.add_argument(
+        "--per-component",
+        action="store_true",
+        help="write one row per component answer (student, fallback) under its own version instead of "
+        "one row per request for the router arm",
+    )
+    e.add_argument(
+        "--run",
+        default=None,
+        help="one run name for every row instead of each request id, to pair with an offline score's run",
+    )
     e.add_argument("--features-module", action="append", default=[])
     e.add_argument("--out", required=True)
     args = ap.parse_args(argv)
@@ -403,8 +524,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "score":
             raw = Path(args.artifact).read_bytes()
             art = StudentArtifact.from_json(json.loads(raw.decode("utf-8")))
-            rows = score_items(art, load_items(args.items), task_type=args.task_type, arm=args.arm,
-                               label_source=args.label_source, run=args.run, stamp=student_stamp(raw, art))
+            rows = score_items(
+                art,
+                load_items(args.items),
+                task_type=args.task_type,
+                arm=args.arm,
+                label_source=args.label_source,
+                run=args.run,
+                stamp=student_stamp(raw, art),
+            )
             _write_atomic(args.out, _rows_text(rows))
             print(f"wrote {len(rows)} rows to {args.out}")
             return 0
@@ -418,20 +546,42 @@ def main(argv: list[str] | None = None) -> int:
         student_raw = Path(args.student).read_bytes() if args.student else None
         student = StudentArtifact.from_json(json.loads(student_raw.decode("utf-8"))) if student_raw else None
         rows, counts = export_experience(
-            LocalExperienceSource(args.log_root).iter_experiences(args.task), task_type=args.task_type,
-            arm=args.arm, student_arm=args.student_arm, fallback_arm=args.fallback_arm, student=student,
+            LocalExperienceSource(args.log_root).iter_experiences(args.task),
+            task_type=args.task_type,
+            arm=args.arm,
+            student_arm=args.student_arm,
+            fallback_arm=args.fallback_arm,
+            student=student,
             feedback=load_feedback(args.feedback_root) if args.feedback_root else {},
-            labels=load_items(args.labels) if args.labels else None, label_source=args.label_source,
-            verdict=_verdict_fn(args.verdict_module), verdict_name=args.verdict_module or "",
-            since=args.since, until=args.until, per_component=args.per_component, run=args.run,
-            student_stamp=student_stamp(student_raw, student) if student is not None else None)
+            labels=load_items(args.labels) if args.labels else None,
+            label_source=args.label_source,
+            verdict=_verdict_fn(args.verdict_module),
+            verdict_name=args.verdict_module or "",
+            since=args.since,
+            until=args.until,
+            per_component=args.per_component,
+            run=args.run,
+            student_stamp=student_stamp(student_raw, student)
+            if student is not None and student_raw is not None
+            else None,
+        )
         if args.run and not args.labels:
-            print("note: --run without --labels keeps content-digest item ids; they pair only with a score whose "
-                  "items use the same ids", file=sys.stderr)
-        manifest = {"rows": len(rows), "task": args.task, "arm": args.arm, "counts": counts,
-                    "run": args.run or "request id", "per_component": args.per_component,
-                    "logged": stats["logged"] if stats else "unknown",
-                    "dropped": stats["dropped"] if stats else "unknown", "stats_source": args.stats or None}
+            print(
+                "note: --run without --labels keeps content-digest item ids; they pair only with a score whose "
+                "items use the same ids",
+                file=sys.stderr,
+            )
+        manifest = {
+            "rows": len(rows),
+            "task": args.task,
+            "arm": args.arm,
+            "counts": counts,
+            "run": args.run or "request id",
+            "per_component": args.per_component,
+            "logged": stats["logged"] if stats else "unknown",
+            "dropped": stats["dropped"] if stats else "unknown",
+            "stats_source": args.stats or None,
+        }
         _write_atomic(args.out, _rows_text(rows))
         _write_atomic(f"{args.out}.manifest.json", json.dumps(manifest, indent=1, sort_keys=True))
         warn = "" if stats else "; logged/dropped unknown (no --stats), so a gap in the log cannot be ruled out"

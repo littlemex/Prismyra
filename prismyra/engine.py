@@ -864,8 +864,9 @@ class Prismyra:
         #: What answered, as perigraph's model half (`prismyra.identity`): read off what this process loaded, after
         #: every conversion above, so an NVFP4 or FP8 engine and a bf16 one over the same files get different model
         #: identities and the same artifact identity.
-        self.model_stamp = backbone_stamp(self, before=checkpoint_before, heads=heads,
-                                          temperature=calibrate_temperature)
+        self.model_stamp = backbone_stamp(
+            self, before=checkpoint_before, heads=heads, temperature=calibrate_temperature
+        )
 
     # ------------------------------------------------------------------ public
     def validate(self, questions: list[Question]) -> None:

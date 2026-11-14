@@ -110,9 +110,7 @@ def _exp(context: str, p_positive: float) -> Experience:
 def test_held_out_confidence_agreement_only_scores_the_answered_subset():
     held_out = [_exp("a", 0.9), _exp("b", 0.9)]  # teacher: both "positive"
     # The student answers "a" confidently and agrees; "b" it is unsure about (0.6 < tau) and is never counted.
-    predict_fn = _stub_predict(
-        {"a": {"negative": 0.02, "positive": 0.98}, "b": {"negative": 0.4, "positive": 0.6}}
-    )
+    predict_fn = _stub_predict({"a": {"negative": 0.02, "positive": 0.98}, "b": {"negative": 0.4, "positive": 0.6}})
     out = held_out_confidence_agreement(held_out, predict_fn, tau=0.8)
     assert out["held_out_n"] == 2
     assert out["answered"] == 1
@@ -341,12 +339,35 @@ def test_an_exclude_set_keeps_its_items_out_of_the_fit_and_provenance_names_the_
     question = json.loads(spec_path.read_text())[0]["question"]
     held = rows[:10]
     excl = tmp_path / "cert.jsonl"
-    excl.write_text("".join(json.dumps({"item": f"c{i}", "content_sha256": content_digest(r[0], question)})
-                            + "\n" for i, r in enumerate(held)))
+    excl.write_text(
+        "".join(
+            json.dumps({"item": f"c{i}", "content_sha256": content_digest(r[0], question)}) + "\n"
+            for i, r in enumerate(held)
+        )
+    )
     out, prov = tmp_path / "student.json", tmp_path / "student.provenance.json"
-    argv = ["--learn-spec", str(spec_path), "--task", TASK, "--log-dir", str(tmp_path / "experience"),
-            "--backbone", "stub/model", "--out", str(out), "--exclude-set", str(excl), "--provenance-out", str(prov),
-            "--provenance-arm", "student", "--min-data-in-leaf", "2", "--num-boost-round", "10"]
+    argv = [
+        "--learn-spec",
+        str(spec_path),
+        "--task",
+        TASK,
+        "--log-dir",
+        str(tmp_path / "experience"),
+        "--backbone",
+        "stub/model",
+        "--out",
+        str(out),
+        "--exclude-set",
+        str(excl),
+        "--provenance-out",
+        str(prov),
+        "--provenance-arm",
+        "student",
+        "--min-data-in-leaf",
+        "2",
+        "--num-boost-round",
+        "10",
+    ]
     assert fitmod.main(argv) == 0
     art = fitmod.StudentArtifact.from_json(json.loads(out.read_text()))
     x = art.metrics["excluded"]

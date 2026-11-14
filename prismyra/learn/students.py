@@ -53,8 +53,20 @@ def student_version(artifact: StudentArtifact) -> str:
 
 #: The artifact fields that decide what a student answers. Everything else (when it was fit, Prismyra's own verdict
 #: and its numbers) is a statement about the artifact, not part of it.
-_ANSWER_FIELDS = ("tag", "spec_version", "options", "kind", "dims", "idf", "model_text", "features", "feature_names",
-                  "backend", "backend_version", "text_tokenizer")
+_ANSWER_FIELDS = (
+    "tag",
+    "spec_version",
+    "options",
+    "kind",
+    "dims",
+    "idf",
+    "model_text",
+    "features",
+    "feature_names",
+    "backend",
+    "backend_version",
+    "text_tokenizer",
+)
 
 
 def artifact_version(artifact: StudentArtifact) -> str:
@@ -97,7 +109,7 @@ class AdmissionRecord:
     evidence: dict
 
     @staticmethod
-    def load(path: Path) -> "AdmissionRecord":
+    def load(path: Path) -> AdmissionRecord:
         def bad(why: str):
             return StudentError(f"admission record {path}: {why}")
 
@@ -115,8 +127,14 @@ class AdmissionRecord:
             if not isinstance(raw[k], str) or not raw[k]:
                 raise bad(f"{k!r} must be a non-empty string")
         ev = raw["evidence"]
-        if not (isinstance(ev, dict) and set(ev) == {"uri", "sha256"} and isinstance(ev["uri"], str) and ev["uri"]
-                and isinstance(ev["sha256"], str) and _HEX64.fullmatch(ev["sha256"])):
+        if not (
+            isinstance(ev, dict)
+            and set(ev) == {"uri", "sha256"}
+            and isinstance(ev["uri"], str)
+            and ev["uri"]
+            and isinstance(ev["sha256"], str)
+            and _HEX64.fullmatch(ev["sha256"])
+        ):
             raise bad("'evidence' must be {uri, sha256 (64 lowercase hex)}")
         if not isinstance(raw["router"], dict):
             raise bad("'router' must be a router block")
@@ -124,8 +142,9 @@ class AdmissionRecord:
             router = parse_router(raw["router"], str(path))
         except SpecError as e:
             raise bad(f"its router block: {e}") from None
-        return AdmissionRecord(tag=raw["tag"], version=raw["version"], router=router, admitted_by=raw["admitted_by"],
-                               evidence=dict(ev))
+        return AdmissionRecord(
+            tag=raw["tag"], version=raw["version"], router=router, admitted_by=raw["admitted_by"], evidence=dict(ev)
+        )
 
     def check(self, artifact: StudentArtifact, router: RouterConfig | None) -> None:
         """Refuse unless this record admits exactly ``artifact`` under exactly ``router``."""
@@ -133,11 +152,15 @@ class AdmissionRecord:
             raise StudentError(f"tag {artifact.tag!r}: the admission record is for tag {self.tag!r}")
         mine = artifact_version(artifact)
         if mine != self.version:
-            raise StudentError(f"tag {artifact.tag!r}: the artifact to serve is {mine!r}, but the admission record "
-                               f"(by {self.admitted_by!r}) admits {self.version!r}. A refit needs a new judgement")
+            raise StudentError(
+                f"tag {artifact.tag!r}: the artifact to serve is {mine!r}, but the admission record "
+                f"(by {self.admitted_by!r}) admits {self.version!r}. A refit needs a new judgement"
+            )
         if router != self.router:
-            raise StudentError(f"tag {artifact.tag!r}: the live router block {router!r} is not the one the admission "
-                               f"record declares ({self.router!r})")
+            raise StudentError(
+                f"tag {artifact.tag!r}: the live router block {router!r} is not the one the admission "
+                f"record declares ({self.router!r})"
+            )
 
 
 class StudentHandle:
@@ -164,8 +187,13 @@ class StudentHandle:
     own `admitted` and `admitted_for` are not read, and the record alone decides, by `AdmissionRecord.check`.
     """
 
-    def __init__(self, artifact: StudentArtifact, router: RouterConfig | None = None,
-                 record: AdmissionRecord | None = None, raw: bytes | None = None):
+    def __init__(
+        self,
+        artifact: StudentArtifact,
+        router: RouterConfig | None = None,
+        record: AdmissionRecord | None = None,
+        raw: bytes | None = None,
+    ):
         if record is not None:
             # An outside judgement replaces Prismyra's own bar (`admitted`, `admitted_for`) entirely.
             record.check(artifact, router)
@@ -199,8 +227,11 @@ class StudentHandle:
         #: artifact was parsed from. A handle built from an artifact in memory has no bytes to digest and says so.
         from prismyra.identity import stand_in, student_stamp
 
-        self.model_stamp = (student_stamp(raw, artifact) if raw is not None
-                            else stand_in("the artifact was handed over in memory, not read from bytes"))
+        self.model_stamp = (
+            student_stamp(raw, artifact)
+            if raw is not None
+            else stand_in("the artifact was handed over in memory, not read from bytes")
+        )
         # see module docstring: the one place either backend's own library is required, and only here
         self._model = get_backend(artifact.backend).load(artifact.model_text)
         self._vectorizer = artifact.vectorizer()
@@ -232,8 +263,15 @@ class StudentRegistry:
         self._handles: dict[str, StudentHandle] = {}
         self._lock = threading.Lock()
 
-    def load(self, task: str, spec_dir: Path, student_path: str, router: RouterConfig | None = None, *,
-             admission: AdmissionConfig | None) -> StudentHandle:
+    def load(
+        self,
+        task: str,
+        spec_dir: Path,
+        student_path: str,
+        router: RouterConfig | None = None,
+        *,
+        admission: AdmissionConfig | None,
+    ) -> StudentHandle:
         """``router`` is the tag's own `RouterConfig` (its ``mode``/``tau``, specifically) -- passed through to
         `StudentHandle.__init__` unchanged, so it can refuse to load a `"confidence"`-admitted artifact under a
         router that would not actually serve it the way it was measured (see that class's own docstring).
@@ -255,6 +293,8 @@ class StudentRegistry:
             )
         record = None
         if admission is not None and admission.mode == "external":
+            if admission.record is None:
+                raise StudentError(f"tag {task!r}: admission mode 'external' names no record")
             rp = Path(admission.record)
             record = AdmissionRecord.load(rp if rp.is_absolute() else spec_dir / rp)
         handle = StudentHandle(artifact, router=router, record=record, raw=raw)
