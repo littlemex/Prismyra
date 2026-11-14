@@ -1,5 +1,5 @@
 {
-  "spec_version": 3,
+  "spec_version": 4,
   "namespace": "perigraph",
   "note": "Normative. Both a sender's shim and a receiver read this file, and each has a conformance test against it, so a vocabulary that drifts on one side is a test failure rather than a discovery. Every list is CLOSED: a value outside it is rejected, not accepted with a warning.",
   "parts": {
@@ -14,6 +14,7 @@
       "turn_budget",
       "retry_policy",
       "readout",
+      "generation_controls",
       "decoding",
       "context_partitioning"
     ]
@@ -109,19 +110,26 @@
     ]
   },
   "boundaries": {
-    "note": "What a digest is a digest OF. Three things were being called 'the bytes', and the two mistakes they cause run in opposite directions, so neither is fixed by being careful.",
+    "note": "What a digest is a digest OF. Three things were being called 'the bytes', and the two mistakes keying on the wrong one causes run in opposite directions, so neither is fixed by being careful. canonical_value is the decoded value again, under one normative serialisation.",
     "values": [
       "transport",
       "parsed",
-      "model_visible"
-    ],
-    "may_key_identity": [
+      "canonical_value",
       "model_visible"
     ],
     "rationale": {
       "transport": "What a client put on the wire. Two client versions serialise differently and decode to the same text, so keying on this SPLITS runs that were identical.",
       "parsed": "The protocol value after decoding. Two strings that canonicalise to one value can behave differently embedded verbatim in a prompt, so keying on this MERGES runs that were not.",
+      "canonical_value": "The protocol value as the JSON text sent decodes, serialised by digest.canonical_value_serialisation, which every implementation computes byte for byte alike. Not text the model read: it merges two spellings of one JSON value (1 and 1.0, members in another order), which is right when an engine reads the value and wrong when a template prints it, and it is the boundary at which a protocol value is compared across collectors (SPEC sections 2.1 and 2.3).",
       "model_visible": "The text the requester supplied for the model to read, before any chat template the server applies and before any prompt a provider adds (SPEC section 2). The only boundary that can support a claim that two runs had the same input. A request_template digest is at this boundary although the requester decides where its holes are: that can split identical input, the safe direction (SPEC section 2.1)."
+    }
+  },
+  "keying_boundary": {
+    "note": "The one boundary at which each part may key the harness identity. A part not listed never keys it, and a listed part held at any other boundary keys nothing. Per part rather than per boundary, because a boundary that may key one part must not let every part emitted at it key: tool_schemas at canonical_value would otherwise establish an identity, and an instruction at canonical_value would key canonicalised text (SPEC section 2).",
+    "parts": {
+      "instruction": "model_visible",
+      "request_template": "model_visible",
+      "generation_controls": "canonical_value"
     }
   },
   "never_identifying": {
@@ -134,21 +142,174 @@
     }
   },
   "refines_only": {
-    "note": "Parts that may refine an identity another identifying part establishes and may never establish one. A record whose only identifying parts are in this list has no harness identity. Needed because what such a part names is decided by a requester's declaration nobody can check (SPEC section 1.1a): it may split two runs a held instruction would otherwise join, and must never give an identity to a run that has none.",
+    "note": "Parts that may refine an identity another identifying part establishes and may never establish one, however many of them a record holds. A record whose only identifying parts are in this list has no harness identity. Each entry's rationale names its ground, and there are two: a declared division nobody can check (SPEC section 1.1a), and a part whose value is the same whatever messages are sent, which alone would give one identity to every prompt sent with the same settings (SPEC section 2).",
     "values": [
-      "request_template"
+      "request_template",
+      "generation_controls"
     ],
     "rationale": {
-      "request_template": "The template names the fixed text of the non-system messages, and which text is fixed and which fills a hole is the requester's split. Beside another identifying part it can only split: two runs under one system message whose user-message wrappers differ get two identities instead of one. On its own it would join runs on the requester's word: two runs declaring the same fixed text, one of which appended a block to the text in a hole, would share an identity that version 2 gave neither. The case it separates is unmeasured; the part is motivated by R17a, where the same instruction in the user message instead of nowhere moved accuracy 4.58 points and an irrelevant suffix of about 150 tokens in the user message moved it 0.898 to 0.858, both without a system message and so without an identity in either version."
+      "request_template": "The template names the fixed text of the non-system messages, and which text is fixed and which fills a hole is the requester's split. Beside an identifying part outside refines_only it can only split: two runs under one system message whose user-message wrappers differ get two identities instead of one. On its own it would join runs on the requester's word: two runs declaring the same fixed text, one of which appended a block to the text in a hole, would share an identity that version 2 gave neither. The case it separates is unmeasured; the part is motivated by R17a, where the same instruction in the user message instead of nowhere moved accuracy 4.58 points and an irrelevant suffix of about 150 tokens in the user message moved it 0.898 to 0.858, both without a system message and so without an identity in either version.",
+      "generation_controls": "Ground: independent of the messages. The collector holds the value, so the part is verifiable, and the value is the same whatever messages are sent. Beside an instruction it splits runs that differ in what the engine was told to render or how long the output may be: R17b's base and reasoning-before-answer bodies, which differ in max_tokens and chat_template_kwargs.enable_thinking, shared one version 3 identity. On its own it would give one identity to a run with no instruction and a run with the instruction in the user message, which differed by 4.58 points on one checkpoint (R17a): the identity constant across every possible harness that SPEC section 2 refuses. Not measured: any accuracy difference caused by these members."
     }
   },
   "must_be_known_for_identity": {
-    "note": "Parts whose state a record must know to have a harness identity: each must be held, in any sourcing, or absent with the reason in known_when_absent_as. A record in which one of these is absent for any other reason, or is not mentioned, has no harness identity: the collector could not show that the part was not there, and an identity computed without it would join runs that differ in it. The list names the parts that some binding makes model_visible and in_the_request; a binding that makes another part so needs this list amended, which is a change of version. A collector that cannot reach request_template therefore gives no record a harness identity unless it can see that the request carries no template.",
+    "note": "Parts whose state a record must know to have a harness identity: each must be held in_the_request at the boundary keying_boundary lists for it, or absent with the reason in known_when_absent_as. A record in which one of these is absent for any other reason, is not mentioned, or is held with another sourcing or at another boundary has no harness identity: the collector could not show what the request carried there, and an identity computed without it would join runs that differ in it. A declaration in place of the part would lift that refusal on the owner's word, which SPEC section 1.1a forbids. The list names the parts that some binding makes identifying; a binding that makes another part so needs this list amended, which is a change of version.",
     "values": [
       "instruction",
-      "request_template"
+      "request_template",
+      "generation_controls"
     ],
     "known_when_absent_as": "not_provided"
+  },
+  "uniform_within_arm": {
+    "note": "Parts that never key the harness identity and that records grouped as one arm must still agree on (SPEC section 4): the pushed parts and decoding, every part a record can hold at canonical_value that keying_boundary does not list. For each, a record is in one of three states: held at canonical_value with a digest, absent as not_provided, or anything else, which is unknown. Two different digests, or a digest beside not_provided, refuse one verdict over the arm; otherwise any unknown makes the outcome unknown. All not_provided and all one digest refuse nothing, so a declaration can cause a refusal and never lift one. Only readout and retry_policy have a case (R17b); the other pushed parts are of the same kind.",
+    "values": [
+      "readout",
+      "retry_policy",
+      "loop",
+      "turn_budget",
+      "context_partitioning",
+      "decoding"
+    ],
+    "rationale": {
+      "readout": "The caller's rule for taking the answer out of the reply, which no request carries. A mis-set one put 1,822 of 2,364 answers on one option; pooled with a different rule, the rate describes neither.",
+      "retry_policy": "What a caller retries and how. A retry after malformed output changes which answer is scored, with the request of the first turn unchanged.",
+      "decoding": "The sampler settings: the distribution each token is drawn from. An arm pooling two distributions describes neither.",
+      "loop": "How calls are sequenced and what ends the run; of the same kind as retry_policy, unmeasured.",
+      "turn_budget": "How many turns a run may take; of the same kind as retry_policy, unmeasured.",
+      "context_partitioning": "How many contexts exist and what crosses between them; it changes what a run costs (SPEC section 5)."
+    }
+  },
+  "bindings": {
+    "note": "Per binding, the closed list of top-level request members a collector recognises, and the parts each is read into; an empty list means recognised and recorded nowhere. A member not listed is unlisted, and its name is written in perigraph.request.unlisted. Frozen per spec_version: adding a member to a part changes what that part's digest is over. Version 4 has one binding. The binding documents under spec/bindings/ restate these lists, and this file governs.",
+    "openai_chat_completions": {
+      "members": {
+        "messages": [
+          "instruction",
+          "request_template"
+        ],
+        "perigraph_template": [
+          "request_template"
+        ],
+        "tools": [
+          "tool_schemas"
+        ],
+        "chat_template_kwargs": [
+          "generation_controls"
+        ],
+        "reasoning_effort": [
+          "generation_controls"
+        ],
+        "reasoning": [
+          "generation_controls"
+        ],
+        "thinking": [
+          "generation_controls"
+        ],
+        "enable_thinking": [
+          "generation_controls"
+        ],
+        "max_tokens": [
+          "generation_controls"
+        ],
+        "max_completion_tokens": [
+          "generation_controls"
+        ],
+        "stop": [
+          "generation_controls"
+        ],
+        "response_format": [
+          "generation_controls"
+        ],
+        "tool_choice": [
+          "generation_controls"
+        ],
+        "parallel_tool_calls": [
+          "generation_controls"
+        ],
+        "chat_template": [
+          "generation_controls"
+        ],
+        "add_generation_prompt": [
+          "generation_controls"
+        ],
+        "continue_final_message": [
+          "generation_controls"
+        ],
+        "guided_json": [
+          "generation_controls"
+        ],
+        "guided_regex": [
+          "generation_controls"
+        ],
+        "guided_choice": [
+          "generation_controls"
+        ],
+        "guided_grammar": [
+          "generation_controls"
+        ],
+        "structured_outputs": [
+          "generation_controls"
+        ],
+        "min_tokens": [
+          "generation_controls"
+        ],
+        "stop_token_ids": [
+          "generation_controls"
+        ],
+        "temperature": [
+          "decoding"
+        ],
+        "top_p": [
+          "decoding"
+        ],
+        "top_k": [
+          "decoding"
+        ],
+        "min_p": [
+          "decoding"
+        ],
+        "presence_penalty": [
+          "decoding"
+        ],
+        "frequency_penalty": [
+          "decoding"
+        ],
+        "repetition_penalty": [
+          "decoding"
+        ],
+        "logit_bias": [
+          "decoding"
+        ],
+        "n": [
+          "decoding"
+        ],
+        "logprobs": [
+          "decoding"
+        ],
+        "top_logprobs": [
+          "decoding"
+        ],
+        "model": [],
+        "seed": [],
+        "stream": [],
+        "stream_options": [],
+        "user": [],
+        "metadata": [],
+        "store": [],
+        "service_tier": []
+      },
+      "rationale": {
+        "generation_controls": "Members that select what the engine renders into the prompt, exclude outputs by their form, or bound the output's length, even where an engine enforces them on the scores. Observed: R17b's bodies differing in max_tokens and chat_template_kwargs.enable_thinking shared every version 3 digest. The list is the members of this kind the authors identified in the OpenAI Chat Completions reference and in vLLM's chat completion request, plus the top-level reasoning switches of other servers, all unmeasured; a member of this kind outside the list is unlisted: its presence is recorded and its value is not.",
+        "decoding": "Members that reshape or report the distribution a token is drawn from, or say how many completions are drawn. Where a member fits two kinds, this list governs.",
+        "recorded_nowhere": "Members the binding recognises and records in no part: the model name (a label, never a key), the seed (which selects a draw from the distribution the other members define and changes none of them), and transport and accounting members. A request with a seed and one without are not told apart."
+      }
+    }
+  },
+  "unlisted_names": {
+    "note": "What a collector may write in perigraph.request.unlisted. The character class excludes the list separator and everything a log or a query language could interpret. The two numbers are bounds on requester-controlled text, chosen and not measured: the attribute is at most 32 x 64 + 31 = 2,079 bytes. The names written are the first max of those matching the pattern, in ascending order; the rest are counted, and two different omitted names are not told apart.",
+    "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+    "max": 32
   },
   "absence_reasons": {
     "note": "Why a part is not in the record, and WHOSE absence it is. A single undifferentiated hole cannot serve, because a collector that loses the ability to read a part writes the same absence a sender's silence writes -- and then every consumer behaves exactly as designed while the regression is invisible. A closed vocabulary constrains spelling, not truth.",
@@ -268,9 +429,11 @@
       "perigraph.collector_reaches": "comma-separated part names. What this collector CLAIMS it can reach here, static per version -- a manifest that adapted to what it found could never contradict a record, which is the one thing it is for.",
       "perigraph.model_reaches": "comma-separated model part names. The model half's manifest: what this collector claims it can reach of checkpoint, precision, runtime and answer_mode, static per version, read and contradicted exactly as collector_reaches is.",
       "perigraph.status": "one of status.values.",
-      "perigraph.harness_identity": "string or absent. Version 1's 'perigraph.identity', renamed in version 2. Over the identifying parts as section 2.2 serialises them, after the rules of refines_only and read_for_identity; for a record with no request_template part held, the same value version 2 gave.",
+      "perigraph.harness_identity": "string or absent. Version 1's 'perigraph.identity', renamed in version 2. Over the identifying parts as section 2.2 serialises them, after the rules of keying_boundary, refines_only and must_be_known_for_identity; for a record whose generation_controls is absent as not_provided and whose request_template is held in_the_request or absent as not_provided, the same value version 3 gave.",
       "perigraph.model_identity": "string or absent. Over all four model parts, each loaded_by_us with a digest, sorted by part name, serialised as the harness identity is. Comparable only against another from the same collector and collector version, because precision and runtime are collector renderings. Stamped on every answer by the process that loaded the model.",
-      "perigraph.artifact_identity": "string or absent. Over the checkpoint part alone, when it is loaded_by_us. Comparable across collectors: what a trainer can compute at save time and a lineage document can name."
+      "perigraph.artifact_identity": "string or absent. Over the checkpoint part alone, when it is loaded_by_us. Comparable across collectors: what a trainer can compute at save time and a lineage document can name.",
+      "perigraph.request.unlisted": "comma-separated set of names, written by a collector that read a request body that is a JSON object, with perigraph.request.unlisted_omitted. The top-level members of the body that the binding's members list does not name, null-valued ones included. The empty string means the collector looked and found none. Only names matching unlisted_names.pattern, at most unlisted_names.max of them, the first in ascending order. Names only, never values. Never keys anything.",
+      "perigraph.request.unlisted_omitted": "integer, non-negative. How many unlisted members the collector counted and did not write. Present exactly when perigraph.request.unlisted is."
     },
     "per_part": {
       "perigraph.part.<name>.sourcing": "one of sourcing.values.",
@@ -299,7 +462,7 @@
       "A verdict over a record whose status is not complete.",
       "A verdict over a record with no harness identity.",
       "A verdict over a record where the collector's manifest claims a part the record reports not_reachable, or says nothing about.",
-      "An identity built on any digest whose boundary is not model_visible.",
+      "An identity built on any digest whose boundary is not the one keying_boundary lists for its part.",
       "A comparison of two arms whose decisions were missing different facts, or where one recorded its missingness and the other did not.",
       "A comparison of two conversations of different turn counts.",
       "A statement of what an alternative would have cost when either side's context_partitioning is unrecorded.",
@@ -309,7 +472,9 @@
       "A verdict over records grouped as one arm when the distinct harness identities derived from them number more than one, or number one while some record has none.",
       "A verdict over records grouped as one arm that carry more than one model identity, or some with one and some without.",
       "A claim bound to a model identity, applied to records that do not carry that model identity.",
-      "A comparison of two model identities produced by different collectors or different collector versions."
+      "A comparison of two model identities produced by different collectors or different collector versions.",
+      "A verdict over records grouped as one arm when, for a part in uniform_within_arm, two records hold it at canonical_value with different digests, or one holds it at canonical_value and another has it absent as not_provided.",
+      "A verdict over records grouped as one arm whose perigraph.request.unlisted sets or perigraph.request.unlisted_omitted counts differ, or where some records carry them and some do not."
     ],
     "must_not_refuse": [
       "A record missing any number of parts. Toward the sender the collector is maximally permissive, and a collector that refuses a partial record produces no record at all.",
@@ -325,9 +490,10 @@
     "identity_length": 24,
     "identity_serialisation": "For each identifying part, sorted by part name ascending, append the bytes of '<part_name>=<content_digest>;' in utf-8. Digest the concatenation and take the first identity_length characters of the lowercase hex.",
     "model_visible_payload": "Hashed RAW. No canonicalisation, no trimming, no case folding. A model reads the string and not its meaning. A request_template digest is over model-visible strings with the framing of request_template_serialisation: it may split runs whose model input was identical, because the requester places the holes, and it never joins two runs whose fixed strings differ, except that two templates fixing only white space are both treated as not sent.",
-    "parsed_digests_are_collector_local": "A `parsed` digest is comparable ONLY against another digest from the same collector and the same collector version. The two reference implementations serialise protocol values differently -- Python's repr renders 0.0 as '0.0' and JSON.stringify renders it as '0' -- so the same request yields different `parsed` digests in each. This is stated rather than fixed because a `parsed` digest can never key an identity, so nothing that matters was lost; what was at risk before saying it is somebody comparing two and concluding the harnesses differed.",
+    "parsed_digests_are_collector_local": "A `parsed` digest is comparable ONLY against another digest from the same collector and the same collector version. The two reference implementations serialise protocol values differently -- Python's repr renders 0.0 as '0.0' and JSON.stringify renders it as '0' -- so the same request yields different `parsed` digests in each. This is stated rather than fixed because a `parsed` digest can never key an identity, so nothing that matters was lost; what was at risk before saying it is somebody comparing two and concluding the harnesses differed. A `canonical_value` digest is the opposite case: its serialisation is normative, so it compares across collectors.",
     "instruction_join": "Where several system messages are present, join their contents with a single U+000A in the order they appear. This is NORMATIVE rather than collector-local, because the instruction digest keys the identity and two collectors choosing differently would give two identities for one request.",
     "model_identity_serialisation": "As identity_serialisation, over the four model parts: '<part_name>=<content_digest>;' for each, sorted by part name, utf-8, sha256, first identity_length hex characters. artifact_identity is the same over the checkpoint part alone.",
-    "request_template_serialisation": "Over the request_template entries, one per message in order: the utf-8 bytes of '<m>:', where m is the number of entries; then for each entry '<r>:<role><k>:', where r is the utf-8 byte length of the role and k the number of fixed strings (0 for an untemplated entry); then for each fixed string '<n>:<string>', where n is its utf-8 byte length. Every number is decimal ASCII with no sign and no leading zeros. Every fixed string is included, empty ones too, so a string fixed before the hole and the same string fixed after it digest differently. The fixed strings are model-visible text and are not canonicalised. The entry count and the roles are digested as well, so the digest also changes with the number and the roles of the messages, untemplated ones included; the framing is injective."
+    "request_template_serialisation": "Over the request_template entries, one per message in order: the utf-8 bytes of '<m>:', where m is the number of entries; then for each entry '<r>:<role><k>:', where r is the utf-8 byte length of the role and k the number of fixed strings (0 for an untemplated entry); then for each fixed string '<n>:<string>', where n is its utf-8 byte length. Every number is decimal ASCII with no sign and no leading zeros. Every fixed string is included, empty ones too, so a string fixed before the hole and the same string fixed after it digest differently. The fixed strings are model-visible text and are not canonicalised. The entry count and the roles are digested as well, so the digest also changes with the number and the roles of the messages, untemplated ones included; the framing is injective.",
+    "canonical_value_serialisation": "RFC 8785 (JSON Canonicalization Scheme) over the JSON value, with one restriction and one relaxation, then utf-8 and sha256; two RFC 8785 failures are restated because decoders hide them. The value is the JSON object whose members are the request members read into the part that are present and not null at the top level, under their request names, each value as the JSON text sent decodes it. Member names are compared exactly, by code unit. The relaxation: a member name repeated at any depth takes its last value, as the reference parsers do. Objects: members sorted by name compared as UTF-16 code units, no white space. Strings: RFC 8785 section 3.2.2.2, escaping only U+0022, U+005C and U+0000-U+001F, with \\b \\t \\n \\f \\r for U+0008, U+0009, U+000A, U+000C, U+000D and \\u00xx in lowercase hex for the rest; every other code point is literal utf-8, U+2028, U+2029, '<', '>', '&' and '/' included; no Unicode normalisation. Numbers: the nearest IEEE-754 binary64 value to the token, ties to even, rendered by ECMAScript Number::toString as RFC 8785 section 3.2.2.3 requires, so 256, 256.0 and 2.56e2 all give 256, -0 gives 0 and 1e-7 gives 1e-7. The restriction, which fails the part: a number whose binary64 value has magnitude greater than 9007199254740991 (so 1e22 fails). The restated failures, which fail the part and never the body: a number that is not finite after decoding (1e400 included; a decoder that rejects the body for it does not conform), and a string or member name that is not a sequence of Unicode scalar values, detected on the JSON text or before any decoder substitutes U+FFFD for an unpaired surrogate escape. A value outside the JSON data model fails the part as well. A top-level null means the member is absent; a nested null is rendered. A pushed_by_owner declaration is a string, digested at this boundary as that JSON string, quotes included."
   }
 }

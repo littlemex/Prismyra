@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **perigraph 4 records.** Records carry `perigraph.spec_version` 4 and name the new harness part
+  `generation_controls` absent as `not_reachable`, as the other harness parts this collector does not read. The model
+  and artifact identities and their `perigraph/2/...` strings are unchanged. Vendored vocabularies are perigraph main
+  6b7392f's.
 - **Every answer says what answered, as perigraph version 2's model half (`prismyra.identity`).** `/ask`,
   `/v1/decide` and `/v1/chat/completions` put a `perigraph` object on each answer: checkpoint, precision, runtime and
   answer mode, each digested by this process from what it loaded, and the model and artifact identities over them.
