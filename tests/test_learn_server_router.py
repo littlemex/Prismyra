@@ -229,7 +229,7 @@ def test_an_engine_answer_carries_the_backbone_stamp_with_its_absences(client_fa
         "/ask", json={"context": "board", "questions": [{"id": "b", "prompt": "totally unrelated", "kind": "boolean"}]}
     ).json()
     p = body["answers"]["b"]["perigraph"]
-    assert p["perigraph.collector"] == "prismyra" and p["perigraph.spec_version"] == 2
+    assert p["perigraph.collector"] == "prismyra" and p["perigraph.spec_version"] == 3
     assert p["perigraph.model_absent.checkpoint.reason"] == "not_reachable"
     assert "perigraph.model_identity" not in p
     assert client.get("/perigraph").json()["backbone"] == p

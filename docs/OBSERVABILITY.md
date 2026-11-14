@@ -98,7 +98,7 @@ Requires `pip install "prismyra[otel]"`; with `--otel` unset, nothing under
 ## What answered: perigraph's model half on every answer
 
 Every answer from `/ask`, `/v1/decide` and `/v1/chat/completions` carries a `perigraph` object: the model half of a
-[perigraph](https://github.com/littlemex/perigraph) version 2 record for whoever gave that answer, written by this
+[perigraph](https://github.com/littlemex/perigraph) version 3 record for whoever gave that answer, written by this
 process because only it holds what it loaded. It is unconditional (no flag), and it is not telemetry: it travels in
 the response, not over OTLP. `GET /perigraph` returns the same records for the backbone and each routed tag's loaded
 student, for looking rather than joining, because a student can be reloaded between that request and an answer.
@@ -116,13 +116,16 @@ artifact; a retrain, or other heads, is another artifact. A student answer has a
 identity. A part that could not be read is absent with its reason and a detail
 (`perigraph.model_absent.<part>.reason`), and an absent identity means unknown, never clean.
 
-**The harness half.** A record names every part, so the ten harness parts are on each record too, all absent: this
+**The harness half.** A record names every part, so the eleven harness parts are on each record too, all absent: this
 process stamps what answered and reads none of the request's harness fields. `tool_extension` is `not_observable`, as
 it is for every collector; the other nine are `not_reachable` with a detail saying so. The manifests are static:
 `perigraph.collector_reaches` is the empty string and `perigraph.model_reaches` names all four model parts. A record
 from this collector therefore has no harness identity, and a perigraph receiver stores it and refuses a verdict on it
 until a collector that reads the request supplies one; the model and artifact identities are unaffected. A model part
 recorded `not_reachable` against that manifest is a contradiction, so a stand-in engine's record is refused a verdict.
+The opaque version strings (`perigraph/2/model/<id>`, `perigraph/2/artifact/<id>`) keep the 2 that perigraph section 11
+recommends, although records are version 3: the identities are derived as version 2 derived them, so a load keeps
+its string, and every `arm_version` built from it, across the record version.
 `tools/perigraph_conform.py` is the adapter for perigraph's `tools/conform.py` (stamper role).
 
 **Why each part.** Each part is there because an earlier distillation record changed answers while every name stayed

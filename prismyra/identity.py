@@ -1,4 +1,4 @@
-"""What answered: the model half of a perigraph version 2 record, written by the process that loaded the model.
+"""What answered: the model half of a perigraph version 3 record, written by the process that loaded the model.
 
 perigraph (github.com/littlemex/perigraph, SPEC.md section 9) describes a model by four parts, each digested by the
 process that loaded it (sourcing ``loaded_by_us``), and two identities over them:
@@ -50,7 +50,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 #: The perigraph version these records follow.
-SPEC_VERSION = 2
+SPEC_VERSION = 3
+#: The version in the opaque identity strings `ModelStamp.versions` writes (``perigraph/2/model/<id>``), as perigraph
+#: section 11 recommends them. Not `SPEC_VERSION`: the model and artifact identities are derived as version 2 derived
+#: them, so the same load keeps the same string -- and the same `arm_version` downstream -- across the record bump.
+IDENTITY_STRING_VERSION = 2
 #: Who wrote the record. With the package version, it is what a model identity is local to.
 COLLECTOR = "prismyra"
 IDENTITY_LENGTH = 24
@@ -66,9 +70,10 @@ ABSENCE_BLAMES = {
     "not_observable": "nobody",
 }
 
-#: The ten harness parts (perigraph section 1.0), each of which a record names as held or absent.
+#: The eleven harness parts (perigraph section 1.0), each of which a record names as held or absent.
 HARNESS_PARTS = (
     "instruction",
+    "request_template",
     "tool_schemas",
     "tool_extension",
     "tool_trace",
@@ -237,7 +242,7 @@ class ModelStamp:
     def attributes(self) -> dict:
         """The wire form (perigraph section 6): flat, prefixed, identities omitted when absent.
 
-        A record names every part as held or absent (section 1.2), so the ten harness parts are here too, all absent:
+        A record names every part as held or absent (section 1.2), so the eleven harness parts are here too, all absent:
         this collector reads the model, never the request's harness. Its manifest therefore claims no harness part
         (`HARNESS_REACHES`, the empty string) and all four model parts (`MODEL_REACHES`), static per version as
         section 1.3 requires -- which also means a stamp whose model part is ``not_reachable`` (`stand_in`) is a
@@ -279,9 +284,11 @@ class ModelStamp:
         ``<prefix>perigraph_model`` and ``<prefix>perigraph_artifact``."""
         out = {}
         if self.model_identity:
-            out[f"{prefix}perigraph_model"] = f"perigraph/{SPEC_VERSION}/model/{self.model_identity}"
+            out[f"{prefix}perigraph_model"] = f"perigraph/{IDENTITY_STRING_VERSION}/model/{self.model_identity}"
         if self.artifact_identity:
-            out[f"{prefix}perigraph_artifact"] = f"perigraph/{SPEC_VERSION}/artifact/{self.artifact_identity}"
+            out[f"{prefix}perigraph_artifact"] = (
+                f"perigraph/{IDENTITY_STRING_VERSION}/artifact/{self.artifact_identity}"
+            )
         return out
 
 

@@ -1,11 +1,12 @@
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "namespace": "perigraph",
   "note": "Normative. Both a sender's shim and a receiver read this file, and each has a conformance test against it, so a vocabulary that drifts on one side is a test failure rather than a discovery. Every list is CLOSED: a value outside it is rejected, not accepted with a warning.",
   "parts": {
     "note": "What surrounds the model. A part nobody named is a part that can change without the identity changing, which is the defect this vocabulary exists to close.",
     "values": [
       "instruction",
+      "request_template",
       "tool_schemas",
       "tool_extension",
       "tool_trace",
@@ -120,7 +121,7 @@
     "rationale": {
       "transport": "What a client put on the wire. Two client versions serialise differently and decode to the same text, so keying on this SPLITS runs that were identical.",
       "parsed": "The protocol value after decoding. Two strings that canonicalise to one value can behave differently embedded verbatim in a prompt, so keying on this MERGES runs that were not.",
-      "model_visible": "The text the requester supplied for the model to read, before any chat template the server applies and before any prompt a provider adds (SPEC section 2). The only boundary that can support a claim that two runs had the same input."
+      "model_visible": "The text the requester supplied for the model to read, before any chat template the server applies and before any prompt a provider adds (SPEC section 2). The only boundary that can support a claim that two runs had the same input. A request_template digest is at this boundary although the requester decides where its holes are: that can split identical input, the safe direction (SPEC section 2.1)."
     }
   },
   "never_identifying": {
@@ -131,6 +132,23 @@
     "rationale": {
       "tool_trace": "Bytes we hold, so the sourcing rule admits it -- and it is a per-run OUTCOME, unique per run, so keying on it makes every pair of runs incomparable."
     }
+  },
+  "refines_only": {
+    "note": "Parts that may refine an identity another identifying part establishes and may never establish one. A record whose only identifying parts are in this list has no harness identity. Needed because what such a part names is decided by a requester's declaration nobody can check (SPEC section 1.1a): it may split two runs a held instruction would otherwise join, and must never give an identity to a run that has none.",
+    "values": [
+      "request_template"
+    ],
+    "rationale": {
+      "request_template": "The template names the fixed text of the non-system messages, and which text is fixed and which fills a hole is the requester's split. Beside another identifying part it can only split: two runs under one system message whose user-message wrappers differ get two identities instead of one. On its own it would join runs on the requester's word: two runs declaring the same fixed text, one of which appended a block to the text in a hole, would share an identity that version 2 gave neither. The case it separates is unmeasured; the part is motivated by R17a, where the same instruction in the user message instead of nowhere moved accuracy 4.58 points and an irrelevant suffix of about 150 tokens in the user message moved it 0.898 to 0.858, both without a system message and so without an identity in either version."
+    }
+  },
+  "must_be_known_for_identity": {
+    "note": "Parts whose state a record must know to have a harness identity: each must be held, in any sourcing, or absent with the reason in known_when_absent_as. A record in which one of these is absent for any other reason, or is not mentioned, has no harness identity: the collector could not show that the part was not there, and an identity computed without it would join runs that differ in it. The list names the parts that some binding makes model_visible and in_the_request; a binding that makes another part so needs this list amended, which is a change of version. A collector that cannot reach request_template therefore gives no record a harness identity unless it can see that the request carries no template.",
+    "values": [
+      "instruction",
+      "request_template"
+    ],
+    "known_when_absent_as": "not_provided"
   },
   "absence_reasons": {
     "note": "Why a part is not in the record, and WHOSE absence it is. A single undifferentiated hole cannot serve, because a collector that loses the ability to read a part writes the same absence a sender's silence writes -- and then every consumer behaves exactly as designed while the regression is invisible. A closed vocabulary constrains spelling, not truth.",
@@ -149,6 +167,36 @@
       "not_observable": "nobody"
     },
     "detail_required_when_blames": "collector"
+  },
+  "white_space": {
+    "note": "The code points SPEC section 1.2 calls white space, the Unicode White_Space property, for the emptiness tests of section 1.2 and section 9 and nothing else: U+0009-U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000. U+001F and U+FEFF are not white space here, whatever a language's trim does.",
+    "code_points": [
+      9,
+      10,
+      11,
+      12,
+      13,
+      32,
+      133,
+      160,
+      5760,
+      8192,
+      8193,
+      8194,
+      8195,
+      8196,
+      8197,
+      8198,
+      8199,
+      8200,
+      8201,
+      8202,
+      8232,
+      8233,
+      8239,
+      8287,
+      12288
+    ]
   },
   "status": {
     "note": "Whether a record is complete about ITSELF. Separate from anything about the sender, because the two refusals are about different objects: toward the sender a collector is maximally permissive, and about itself it must be exact.",
@@ -220,7 +268,7 @@
       "perigraph.collector_reaches": "comma-separated part names. What this collector CLAIMS it can reach here, static per version -- a manifest that adapted to what it found could never contradict a record, which is the one thing it is for.",
       "perigraph.model_reaches": "comma-separated model part names. The model half's manifest: what this collector claims it can reach of checkpoint, precision, runtime and answer_mode, static per version, read and contradicted exactly as collector_reaches is.",
       "perigraph.status": "one of status.values.",
-      "perigraph.harness_identity": "string or absent. Version 1's 'perigraph.identity', renamed now that there are three; computed exactly as before over the harness parts.",
+      "perigraph.harness_identity": "string or absent. Version 1's 'perigraph.identity', renamed in version 2. Over the identifying parts as section 2.2 serialises them, after the rules of refines_only and read_for_identity; for a record with no request_template part held, the same value version 2 gave.",
       "perigraph.model_identity": "string or absent. Over all four model parts, each loaded_by_us with a digest, sorted by part name, serialised as the harness identity is. Comparable only against another from the same collector and collector version, because precision and runtime are collector renderings. Stamped on every answer by the process that loaded the model.",
       "perigraph.artifact_identity": "string or absent. Over the checkpoint part alone, when it is loaded_by_us. Comparable across collectors: what a trainer can compute at save time and a lineage document can name."
     },
@@ -258,6 +306,7 @@
       "A comparison where two traces diverge on the same occasion and the tool declared determinism.",
       "A comparison of two `parsed` digests produced by different collectors or different collector versions.",
       "A model identity or an artifact identity built on any part whose sourcing is not loaded_by_us.",
+      "A verdict over records grouped as one arm when the distinct harness identities derived from them number more than one, or number one while some record has none.",
       "A verdict over records grouped as one arm that carry more than one model identity, or some with one and some without.",
       "A claim bound to a model identity, applied to records that do not carry that model identity.",
       "A comparison of two model identities produced by different collectors or different collector versions."
@@ -275,9 +324,10 @@
     "encoding": "utf-8",
     "identity_length": 24,
     "identity_serialisation": "For each identifying part, sorted by part name ascending, append the bytes of '<part_name>=<content_digest>;' in utf-8. Digest the concatenation and take the first identity_length characters of the lowercase hex.",
-    "model_visible_payload": "Hashed RAW. No canonicalisation, no trimming, no case folding. A model reads the string and not its meaning.",
+    "model_visible_payload": "Hashed RAW. No canonicalisation, no trimming, no case folding. A model reads the string and not its meaning. A request_template digest is over model-visible strings with the framing of request_template_serialisation: it may split runs whose model input was identical, because the requester places the holes, and it never joins two runs whose fixed strings differ, except that two templates fixing only white space are both treated as not sent.",
     "parsed_digests_are_collector_local": "A `parsed` digest is comparable ONLY against another digest from the same collector and the same collector version. The two reference implementations serialise protocol values differently -- Python's repr renders 0.0 as '0.0' and JSON.stringify renders it as '0' -- so the same request yields different `parsed` digests in each. This is stated rather than fixed because a `parsed` digest can never key an identity, so nothing that matters was lost; what was at risk before saying it is somebody comparing two and concluding the harnesses differed.",
     "instruction_join": "Where several system messages are present, join their contents with a single U+000A in the order they appear. This is NORMATIVE rather than collector-local, because the instruction digest keys the identity and two collectors choosing differently would give two identities for one request.",
-    "model_identity_serialisation": "As identity_serialisation, over the four model parts: '<part_name>=<content_digest>;' for each, sorted by part name, utf-8, sha256, first identity_length hex characters. artifact_identity is the same over the checkpoint part alone."
+    "model_identity_serialisation": "As identity_serialisation, over the four model parts: '<part_name>=<content_digest>;' for each, sorted by part name, utf-8, sha256, first identity_length hex characters. artifact_identity is the same over the checkpoint part alone.",
+    "request_template_serialisation": "Over the request_template entries, one per message in order: the utf-8 bytes of '<m>:', where m is the number of entries; then for each entry '<r>:<role><k>:', where r is the utf-8 byte length of the role and k the number of fixed strings (0 for an untemplated entry); then for each fixed string '<n>:<string>', where n is its utf-8 byte length. Every number is decimal ASCII with no sign and no leading zeros. Every fixed string is included, empty ones too, so a string fixed before the hole and the same string fixed after it digest differently. The fixed strings are model-visible text and are not canonicalised. The entry count and the roles are digested as well, so the digest also changes with the number and the roles of the messages, untemplated ones included; the framing is injective."
   }
 }

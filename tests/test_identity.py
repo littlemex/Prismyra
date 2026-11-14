@@ -2,7 +2,7 @@
 
 The copy is vendored rather than imported or fetched for the reason tierbook gives for its own copy: importing
 perigraph would put a dependency in front of the serving path, and a test that fetches skips when offline and so stops
-running. The copies are perigraph main a4d2ff3's ``spec/vocabularies.json`` and ``spec/fixtures/model_identity.json``;
+running. The copies are perigraph main f24674a's ``spec/vocabularies.json`` and ``spec/fixtures/model_identity.json``;
 the digests pin them, so a re-vendor changes the file and the constant in one diff and a reviewer sees the protocol
 move.
 """
@@ -20,7 +20,7 @@ import torch
 from prismyra import identity as I
 
 SPEC = Path(__file__).parent / "spec"
-VOCAB_DIGEST = "59d879b8a5fd5cfec00b422340ee5ffee086902a7981f9a115256f1fe112b996"
+VOCAB_DIGEST = "1ca5b18c7a2f66f3fd8d0140709b4e570004590ff2f11b4e3932f74b9e9e62b3"
 FIXTURE_DIGEST = "cdb1264048274508866a586a4c45462cda6da3a01352f4ffee6905d1b62394f7"
 
 
@@ -89,7 +89,7 @@ def _named(attrs: dict, prefix_held: str, prefix_absent: str, part: str) -> int:
     ids=["held", "stand_in"],
 )
 def test_every_part_is_named_once_as_held_or_absent(stamp):
-    """perigraph section 1.2: each of the ten parts and each of the four model parts, held or absent, never both and
+    """perigraph section 1.2: each of the eleven parts and each of the four model parts, held or absent, never both and
     never silent. An absence that blames the collector carries a detail; one that does not, carries none."""
     attrs = stamp.attributes()
     for part in VOCAB["parts"]["values"]:
@@ -104,6 +104,16 @@ def test_every_part_is_named_once_as_held_or_absent(stamp):
     assert attrs["perigraph.collector_reaches"] == ""
     assert set(attrs["perigraph.model_reaches"].split(",")) == set(VOCAB["model_parts"]["values"])
     assert attrs["perigraph.absent.tool_extension.reason"] == "not_observable"
+    assert attrs["perigraph.absent.request_template.reason"] == "not_reachable"
+    assert attrs["perigraph.absent.request_template.detail"] == attrs["perigraph.absent.instruction.detail"]
+
+
+def test_identity_strings_keep_version_2_across_the_record_version():
+    """perigraph section 11 recommends ``perigraph/2/model/<id>``; the identities are derived as version 2 derived them,
+    so a version 3 record of the same load keeps the same string and the same downstream ``arm_version``."""
+    stamp = I.ModelStamp({k: I.Part(digest=c * 64) for k, c in zip(I.MODEL_PARTS, "abcd", strict=True)})
+    assert stamp.attributes()["perigraph.spec_version"] == 3
+    assert stamp.versions()["perigraph_model"] == f"perigraph/2/model/{stamp.model_identity}"
 
 
 def test_attributes_use_only_keys_the_wire_form_defines():
